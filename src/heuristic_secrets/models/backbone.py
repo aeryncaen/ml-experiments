@@ -837,6 +837,18 @@ class ContextualAttentionBlock(nn.Module):
             )
             if attn_mask is not None:
                 print(f"  attn_mask all True (fully masked): {attn_mask.all().item()}")
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False
+        ):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+            )
+            if attn_mask is not None:
+                print(f"  attn_mask all True (fully masked): {attn_mask.all().item()}")
         out = F.scaled_dot_product_attention(
             q,
             k,
