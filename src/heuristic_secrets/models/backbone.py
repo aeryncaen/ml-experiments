@@ -837,26 +837,26 @@ class ContextualAttentionBlock(nn.Module):
             )
             if attn_mask is not None:
                 print(f"  attn_mask all True (fully masked): {attn_mask.all().item()}")
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=False, enable_math=True, enable_mem_efficient=False
-        ):
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
+
+        scale = self.head_dim**-0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        check_nan(scores, "ctx_attn_scores")
+        if DEBUG_NAN:
+            print(
+                f"  scores range: {scores.min().item():.4f}/{scores.max().item():.4f}"
             )
-            if attn_mask is not None:
-                print(f"  attn_mask all True (fully masked): {attn_mask.all().item()}")
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
-        check_nan(out, "ctx_attn_sdpa_out")
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask, float("-inf"))
+            check_nan(scores, "ctx_attn_scores_masked")
+            if DEBUG_NAN:
+                all_inf_rows = (scores == float("-inf")).all(dim=-1).any()
+                print(f"  any row all -inf: {all_inf_rows.item()}")
+        attn_weights = F.softmax(scores, dim=-1)
+        check_nan(attn_weights, "ctx_attn_weights")
+        if self.training and self.dropout_p > 0:
+            attn_weights = F.dropout(attn_weights, p=self.dropout_p)
+        out = torch.matmul(attn_weights, v)
+        check_nan(out, "ctx_attn_out_manual")
 
         out = out.transpose(1, 2).reshape(B, attn_len, self.width)
         x_attn = self.norm1(x_attn + self.dropout(self.out(out)))
