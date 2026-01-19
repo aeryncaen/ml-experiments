@@ -6,6 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
+DEBUG_NAN = True
+
+
+def check_nan(t: torch.Tensor, name: str) -> None:
+    if DEBUG_NAN and t.device.type == "cuda" and torch.isnan(t).any():
+        print(f"NaN detected in {name}, shape={t.shape}, device={t.device}")
+        print(f"  nan count: {torch.isnan(t).sum().item()}")
+        print(f"  inf count: {torch.isinf(t).sum().item()}")
+        raise RuntimeError(f"NaN in {name}")
+
 
 @dataclass
 class AdaptiveConvBiases2d:
@@ -695,7 +705,9 @@ class ContextualAttentionBlock2d(nn.Module):
         L = win_h * win_w
         x_flat = x_attn.reshape(B, L, C)
 
+        check_nan(x_flat, "ctx_attn2d_x_input")
         qkv = self.qkv(x_flat).reshape(B, L, 3, self.num_heads, self.head_dim)
+        check_nan(qkv, "ctx_attn2d_qkv")
         q, k, v = qkv.unbind(dim=2)
 
         q = q.view(B, win_h, win_w, self.num_heads, self.head_dim).permute(
@@ -711,6 +723,8 @@ class ContextualAttentionBlock2d(nn.Module):
         if self.use_rope:
             cos_h, sin_h, cos_w, sin_w = self.rotary(win_h, win_w, x.device)
             q, k = apply_rotary_pos_emb_qk_2d(q, k, cos_h, sin_h, cos_w, sin_w)
+            check_nan(q, "ctx_attn2d_q_rope")
+            check_nan(k, "ctx_attn2d_k_rope")
 
         q_flat = q.reshape(B, self.num_heads, L, self.head_dim)
         k_flat = k.reshape(B, self.num_heads, L, self.head_dim)
@@ -725,13 +739,17 @@ class ContextualAttentionBlock2d(nn.Module):
 
         scale = self.head_dim**-0.5
         scores = torch.matmul(q_flat, k_flat.transpose(-2, -1)) * scale
+        check_nan(scores, "ctx_attn2d_scores")
         if attn_mask is not None:
             scores = scores.masked_fill(attn_mask, float("-inf"))
+            check_nan(scores, "ctx_attn2d_scores_masked")
         attn_weights = F.softmax(scores, dim=-1)
+        check_nan(attn_weights, "ctx_attn2d_weights")
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         if self.training and self.dropout_p > 0:
             attn_weights = F.dropout(attn_weights, p=self.dropout_p)
         out = torch.matmul(attn_weights, v_flat)
+        check_nan(out, "ctx_attn2d_out")
 
         out = out.transpose(1, 2).reshape(B, L, self.width)
         out = out.view(B, win_h, win_w, C)
@@ -740,7 +758,9 @@ class ContextualAttentionBlock2d(nn.Module):
             x_attn
             + self.dropout(self.out(out.reshape(B, L, C)).view(B, win_h, win_w, C))
         )
+        check_nan(x_attn, "ctx_attn2d_after_norm1")
         x_attn = self.norm2(x_attn + self.ffn(x_attn))
+        check_nan(x_attn, "ctx_attn2d_after_norm2")
 
         if self.window_size > 0 and (H > self.window_size or W > self.window_size):
             top_left = x_attn
@@ -896,6 +916,7 @@ class SSMBlock3_2d(nn.Module):
         P = self.head_dim
 
         xz = self.in_proj(x)
+        check_nan(xz, "ssm3_2d_in_proj")
         x_branch, z = xz.chunk(2, dim=-1)
 
         if mask is not None:
@@ -905,6 +926,7 @@ class SSMBlock3_2d(nn.Module):
         if self.use_conv:
             if self.adaptive_conv:
                 x_ssm, aux_losses = self.conv(x_branch, mask, biases)
+                check_nan(x_ssm, "ssm3_2d_adaptive_conv")
                 x_ssm = F.silu(x_ssm)
             else:
                 x_conv = x_branch.permute(0, 3, 1, 2)
@@ -913,6 +935,7 @@ class SSMBlock3_2d(nn.Module):
                 x_ssm = self.conv_norm(x_ssm)
                 x_ssm = self.se(x_ssm, mask)
                 x_ssm = F.silu(x_ssm)
+            check_nan(x_ssm, "ssm3_2d_conv")
             if mask is not None:
                 x_ssm = x_ssm.masked_fill(mask.unsqueeze(-1), 0.0)
         else:
@@ -923,13 +946,18 @@ class SSMBlock3_2d(nn.Module):
 
         B_param = self.norm_b(B_param) + self.b_bias
         C_param = self.norm_c(C_param) + self.c_bias
+        check_nan(B_param, "ssm3_2d_B_param")
+        check_nan(C_param, "ssm3_2d_C_param")
 
         dt = F.softplus(self.dt_proj(x_ssm))
         A = -torch.exp(self.A_log.float())
+        check_nan(dt, "ssm3_2d_dt")
+        check_nan(A, "ssm3_2d_A")
 
         x_heads = x_ssm.view(B, H_img, W_img, Heads, P)
 
         y = self._ssm_scan_4way(x_heads, B_param, C_param, dt, A, mask)
+        check_nan(y, "ssm3_2d_scan_output")
 
         y = y.view(B, H_img, W_img, Heads, P)
         y = y + x_heads * self.D
@@ -1023,7 +1051,7 @@ class SSMBlock3_2d(nn.Module):
 
             outputs.append(y_dir)
 
-        y = sum(outputs) / 4.0
+        y = torch.stack(outputs, dim=0).mean(dim=0)
         y = y.reshape(B_batch, H_img, W_img, Heads, P)
 
         if mask is not None:
@@ -1046,6 +1074,7 @@ class SSMBlock3_2d(nn.Module):
         dtype = x.dtype
 
         alpha = torch.exp(dt.unsqueeze(-1).unsqueeze(-1) * A.view(1, 1, Heads, 1, 1))
+        check_nan(alpha, "ssm2d_scan_alpha")
 
         B_param = B_param.float()
         C_param = C_param.float()
@@ -1053,6 +1082,7 @@ class SSMBlock3_2d(nn.Module):
         alpha = alpha.float()
 
         Bx = torch.einsum("blhn,blhp->blhnp", B_param, x)
+        check_nan(Bx, "ssm2d_scan_Bx")
 
         outputs = torch.empty(batch, L, Heads, P, device=device, dtype=torch.float32)
         state = torch.zeros(batch, Heads, N, P, device=device, dtype=torch.float32)
@@ -1068,6 +1098,7 @@ class SSMBlock3_2d(nn.Module):
             chunk_out, state = self._scan_chunk(
                 alpha_chunk, Bx_chunk, C_chunk, state, K
             )
+            check_nan(chunk_out, f"ssm2d_scan_chunk{chunk_start}_out")
             outputs[:, chunk_start:chunk_end] = chunk_out
 
         return outputs.to(dtype)
@@ -1083,16 +1114,21 @@ class SSMBlock3_2d(nn.Module):
         B, _, Heads, N, P = Bx.shape
 
         alpha_cumprod = alpha.cumprod(dim=1)
+        check_nan(alpha_cumprod, "scan_chunk_alpha_cumprod")
 
         inv_alpha = 1.0 / alpha.clamp(min=1e-8)
         inv_alpha_cumprod = inv_alpha.cumprod(dim=1)
+        check_nan(inv_alpha_cumprod, "scan_chunk_inv_alpha_cumprod")
 
         Bx_scaled = Bx * inv_alpha_cumprod
         Bx_scaled_cumsum = Bx_scaled.cumsum(dim=1)
+        check_nan(Bx_scaled_cumsum, "scan_chunk_Bx_cumsum")
 
         h_all = alpha_cumprod * (h_prev.unsqueeze(1) + Bx_scaled_cumsum)
+        check_nan(h_all, "scan_chunk_h_all")
 
         y = torch.einsum("bkhnp,bkhn->bkhp", h_all, C)
+        check_nan(y, "scan_chunk_y")
         h_final = h_all[:, -1]
 
         return y, h_final
@@ -1220,7 +1256,9 @@ class MultiKernelSSMBlock2d(nn.Module):
         pooler_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         B, H, W, _ = x.shape
+        check_nan(x, "mkssm2d_input")
         h = self.in_proj(x)
+        check_nan(h, "mkssm2d_in_proj")
 
         chunks = h.chunk(self.n_branches, dim=-1)
 
@@ -1245,10 +1283,12 @@ class MultiKernelSSMBlock2d(nn.Module):
                 out, aux = branch(chunk, mask, branch_bias)
             else:
                 out, aux = branch(chunk, mask)
+            check_nan(out, f"mkssm2d_branch{i}_out")
             branch_outputs.append(out)
             all_aux_losses.append(aux)
 
         combined = torch.cat(branch_outputs, dim=-1)
+        check_nan(combined, "mkssm2d_combined_branches")
 
         aux_losses: dict[str, torch.Tensor] = {}
         if all_aux_losses:
@@ -1257,9 +1297,12 @@ class MultiKernelSSMBlock2d(nn.Module):
                 aux_losses[key] = total
 
         h = self.proj_down(combined)
+        check_nan(h, "mkssm2d_proj_down")
         h = self.norm_merge(h + residual)
+        check_nan(h, "mkssm2d_norm_merge")
 
         h = self.merge_attn(h, mask)
+        check_nan(h, "mkssm2d_merge_attn")
 
         h_res = h
         h, ssm_aux = self.ssm(h, mask)

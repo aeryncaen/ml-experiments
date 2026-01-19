@@ -476,7 +476,7 @@ def main():
     if args.unified:
         ssm_kernel_sizes = tuple(int(k) for k in args.ssm_kernels.split(","))
         layer_config = LayerConfig(
-            embed_width=12,
+            embed_width=24,
             conv_groups=2,
             attn_heads=2,
             attn_ffn_mult=2,
