@@ -19,6 +19,7 @@ from heuristic_secrets.models import (
     create_binary_batches,
     get_device,
     set_seed,
+    setup_cuda,
 )
 
 
@@ -132,6 +133,9 @@ def main():
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--n-branches", type=int, default=3)
     parser.add_argument("--n-layers", type=int, default=1)
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device: cuda, mps, cpu"
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -139,8 +143,9 @@ def main():
 
     ds_config = DATASET_CONFIGS[args.dataset]
 
+    setup_cuda()
     set_seed(args.seed)
-    device = get_device()
+    device = get_device(args.device)
     print(f"Device: {device}")
 
     ssm_kernel_sizes = tuple(int(k) for k in args.ssm_kernels.split(","))

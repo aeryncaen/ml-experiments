@@ -20,6 +20,7 @@ from .train import (
     create_binary_batches,
     get_device,
     set_seed,
+    setup_cuda,
 )
 
 __all__ = [
@@ -47,4 +48,5 @@ __all__ = [
     "create_binary_batches",
     "get_device",
     "set_seed",
+    "setup_cuda",
 ]

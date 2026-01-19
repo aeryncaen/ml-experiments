@@ -17,6 +17,7 @@ from heuristic_secrets.models import (
     create_binary_batches,
     get_device,
     set_seed,
+    setup_cuda,
 )
 from heuristic_secrets.bytemasker.dataset import (
     load_bytemasker_dataset,
@@ -453,6 +454,12 @@ def main():
         default=1,
         help="Number of unified layers to stack (default: 1)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device: cuda, mps, cpu (default: auto)",
+    )
     args = parser.parse_args()
 
     if args.adaptive:
@@ -460,8 +467,9 @@ def main():
     if args.ssm_with_conv:
         args.ssm = True
 
+    setup_cuda()
     set_seed(args.seed)
-    device = get_device()
+    device = get_device(args.device)
     print(f"Device: {device}")
 
     if args.unified:

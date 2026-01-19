@@ -13,12 +13,21 @@ from tqdm import tqdm
 from .composed import Model, ModelConfig
 
 
-def get_device() -> torch.device:
+def get_device(device: str | None = None) -> torch.device:
+    if device is not None:
+        return torch.device(device)
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def setup_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def set_seed(seed: int) -> None:
