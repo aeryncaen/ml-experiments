@@ -5,6 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
+DEBUG_NAN = True
+
+
+def check_nan(t: torch.Tensor, name: str) -> None:
+    if DEBUG_NAN and torch.isnan(t).any():
+        print(f"NaN detected in {name}, shape={t.shape}, device={t.device}")
+        print(f"  nan count: {torch.isnan(t).sum().item()}")
+        print(f"  inf count: {torch.isinf(t).sum().item()}")
+        raise RuntimeError(f"NaN in {name}")
+
 
 class RotaryEmbedding(nn.Module):
     """Precomputes and caches rotary position embeddings (RoPE)."""
@@ -1264,6 +1274,7 @@ class SSMMixer3(nn.Module):
         P = self.head_dim
 
         xz = self.in_proj(x)
+        check_nan(xz, "ssm3_in_proj")
         x_branch, z = xz.chunk(2, dim=-1)
 
         if mask is not None:
@@ -1273,47 +1284,54 @@ class SSMMixer3(nn.Module):
         if self.use_conv:
             if self.adaptive_conv:
                 x_ssm, aux_losses = self.conv(x_branch, mask, biases)
+                check_nan(x_ssm, "ssm3_adaptive_conv")
                 x_ssm = F.silu(x_ssm)
             else:
                 x_ssm = self.conv(x_branch)
                 x_ssm = self.conv_norm(x_ssm)
                 x_ssm = self.se(x_ssm, mask)
                 x_ssm = F.silu(x_ssm)
+            check_nan(x_ssm, "ssm3_conv")
             if mask is not None:
                 x_ssm = x_ssm.masked_fill(mask.unsqueeze(-1), 0.0)
         else:
             x_ssm = x_branch
 
-        # Project B, C with norm + bias
         B_param = self.B_proj(x_ssm).view(B, L, H, N)
         C_param = self.C_proj(x_ssm).view(B, L, H, N)
 
         B_param = self.norm_b(B_param) + self.b_bias
         C_param = self.norm_c(C_param) + self.c_bias
+        check_nan(B_param, "ssm3_B_param")
+        check_nan(C_param, "ssm3_C_param")
 
-        # Discretization - per head
-        dt = F.softplus(self.dt_proj(x_ssm))  # (B, L, H)
-        A = -torch.exp(self.A_log.float())  # (H,)
+        dt = F.softplus(self.dt_proj(x_ssm))
+        A = -torch.exp(self.A_log.float())
+        check_nan(dt, "ssm3_dt")
+        check_nan(A, "ssm3_A")
 
-        # Data-dependent RoPE - per head
         theta = self.theta_proj(x_ssm).view(B, L, H, N // 2)
         delta_theta = dt.unsqueeze(-1) * theta
         cum_theta = torch.cumsum(delta_theta, dim=1)
+        check_nan(cum_theta, "ssm3_cum_theta")
 
         B_rot = apply_rotary_emb(B_param, cum_theta)
         C_rot = apply_rotary_emb(C_param, cum_theta)
+        check_nan(B_rot, "ssm3_B_rot")
+        check_nan(C_rot, "ssm3_C_rot")
 
-        # Trapezoidal - lambda is scalar per head
-        lam = torch.sigmoid(self.lambda_proj(x_ssm))  # (B, L, H)
+        lam = torch.sigmoid(self.lambda_proj(x_ssm))
         alpha = torch.exp(dt * A)
         beta = (1 - lam) * dt * alpha
         gamma = lam * dt
+        check_nan(alpha, "ssm3_alpha")
+        check_nan(beta, "ssm3_beta")
+        check_nan(gamma, "ssm3_gamma")
 
-        # Reshape x for multi-head
         x_heads = x_ssm.view(B, L, H, P)
 
-        # SSM scan
         y = self._ssm_scan(x_heads, B_rot, C_rot, alpha, beta, gamma, mask)
+        check_nan(y, "ssm3_scan_output")
 
         # Skip connection and gating
         y = y.view(B, L, H, P)
@@ -1349,6 +1367,7 @@ class SSMMixer3(nn.Module):
         Bx = torch.einsum("blhn,blhp->blhnp", B_rot, x)
         Bx_prev = F.pad(Bx[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
         u = gamma[:, :, :, None, None] * Bx + beta[:, :, :, None, None] * Bx_prev
+        check_nan(u, "scan_u")
 
         outputs = torch.empty(batch, L, H, P, device=device, dtype=torch.float32)
         state = torch.zeros(batch, H, N, P, device=device, dtype=torch.float32)
@@ -1362,15 +1381,20 @@ class SSMMixer3(nn.Module):
             C_chunk = C_rot[:, chunk_start:chunk_end]
 
             decay_matrix = self._build_decay_matrix(alpha_chunk, K, device)
+            check_nan(decay_matrix, f"scan_decay_matrix_chunk{chunk_start}")
 
             h_from_input = torch.einsum("bijh,bjhnp->bihnp", decay_matrix, u_chunk)
+            check_nan(h_from_input, f"scan_h_from_input_chunk{chunk_start}")
 
             carry = torch.cumprod(alpha_chunk, dim=1)
+            check_nan(carry, f"scan_carry_chunk{chunk_start}")
             h_from_state = torch.einsum("bih,bhnp->bihnp", carry, state)
 
             h_chunk = h_from_input + h_from_state
+            check_nan(h_chunk, f"scan_h_chunk{chunk_start}")
 
             y_chunk = torch.einsum("blhnp,blhn->blhp", h_chunk, C_chunk)
+            check_nan(y_chunk, f"scan_y_chunk{chunk_start}")
             outputs[:, chunk_start:chunk_end] = y_chunk
 
             state = h_chunk[:, -1]
@@ -1385,20 +1409,26 @@ class SSMMixer3(nn.Module):
     ) -> torch.Tensor:
         batch, _, H = alpha.shape
 
+        check_nan(alpha, "decay_alpha_input")
         log_alpha = torch.log(alpha.clamp(min=1e-8))
+        check_nan(log_alpha, "decay_log_alpha")
         cumsum = torch.cumsum(log_alpha, dim=1)
+        check_nan(cumsum, "decay_cumsum")
 
         cumsum_i = cumsum.unsqueeze(2)
         cumsum_j = cumsum.unsqueeze(1)
 
         log_decay = cumsum_i - cumsum_j
+        check_nan(log_decay, "decay_log_decay_pre_mask")
 
         causal_mask = torch.tril(torch.ones(K, K, device=device, dtype=torch.bool))
         log_decay = log_decay.masked_fill(
             ~causal_mask.unsqueeze(0).unsqueeze(-1), float("-inf")
         )
 
-        return torch.exp(log_decay)
+        result = torch.exp(log_decay)
+        check_nan(result, "decay_matrix_result")
+        return result
 
 
 class SSMBlock3(nn.Module):

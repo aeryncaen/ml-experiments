@@ -23,6 +23,16 @@ from .backbone import (
 from .features import PrecomputedFeature
 from .heads import BinaryHead, MaskHead, ClassifierHead
 
+DEBUG_NAN = True
+
+
+def check_nan(t: torch.Tensor, name: str) -> None:
+    if DEBUG_NAN and torch.isnan(t).any():
+        print(f"NaN detected in {name}, shape={t.shape}, device={t.device}")
+        print(f"  nan count: {torch.isnan(t).sum().item()}")
+        print(f"  inf count: {torch.isinf(t).sum().item()}")
+        raise RuntimeError(f"NaN in {name}")
+
 
 @dataclass
 class LayerConfig:
@@ -719,11 +729,14 @@ class UnifiedLayer(nn.Module):
         mask: torch.Tensor | None = None,
         precomputed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        check_nan(h, "layer_input")
         if self.uses_adaptive_conv:
             h, biases, pooler_context = self.attn_block(h, mask)
+            check_nan(h, "attn_block_adaptive")
             attn_features = self.attn_proj(self._pool_for_features(h, mask))
         else:
             h = self.attn_block(h, mask)
+            check_nan(h, "attn_block")
             attn_pooled = self.attn_pooler(h, mask)
             attn_features = self.attn_proj(attn_pooled)
             biases = None
@@ -734,6 +747,7 @@ class UnifiedLayer(nn.Module):
             h, ssm_features, aux_losses = self.ssm_block(
                 h, h, mask, biases, pooler_context
             )
+            check_nan(h, "multi_kernel_ssm")
         else:
             if self.uses_adaptive_conv and biases is not None:
                 single_bias = AdaptiveConvBiases(
@@ -750,6 +764,7 @@ class UnifiedLayer(nn.Module):
                 h, aux_losses = self.ssm_block(h, mask, single_bias)
             else:
                 h, aux_losses = self.ssm_block(h, mask)
+            check_nan(h, "ssm_block")
             ssm_pooled = self.ssm_pooler(h, mask)
             ssm_features = self.ssm_proj(ssm_pooled)
 
@@ -816,14 +831,18 @@ class UnifiedModel(nn.Module):
         all_aux = {}
 
         h = self.embedding(x)
+        check_nan(h, "embedding")
 
         for i, layer in enumerate(self.layers):
             h, features, aux = layer(h, mask, precomputed)
+            check_nan(h, f"layer{i}")
             for k, v in aux.items():
                 all_aux[f"layer{i}_{k}"] = v
 
         pooled = self.output_pooler(h, mask)
+        check_nan(pooled, "pooler")
         output = self.head(pooled)
+        check_nan(output, "head")
         return output, all_aux
 
 
