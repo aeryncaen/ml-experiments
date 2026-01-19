@@ -831,6 +831,12 @@ class ContextualAttentionBlock(nn.Module):
                 .unsqueeze(2)
                 .expand(B, self.num_heads, attn_len, attn_len)
             )
+        if DEBUG_NAN:
+            print(
+                f"SDPA inputs: q={q.min().item():.4f}/{q.max().item():.4f}, k={k.min().item():.4f}/{k.max().item():.4f}, v={v.min().item():.4f}/{v.max().item():.4f}"
+            )
+            if attn_mask is not None:
+                print(f"  attn_mask all True (fully masked): {attn_mask.all().item()}")
         out = F.scaled_dot_product_attention(
             q,
             k,
