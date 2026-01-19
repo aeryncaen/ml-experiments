@@ -476,7 +476,7 @@ def main():
     if args.unified:
         ssm_kernel_sizes = tuple(int(k) for k in args.ssm_kernels.split(","))
         layer_config = LayerConfig(
-            embed_width=8,
+            embed_width=12,
             conv_groups=2,
             attn_heads=2,
             attn_ffn_mult=2,
@@ -664,7 +664,7 @@ def main():
         lr=args.lr,
         seed=args.seed,
         pos_weight=pos_weight_start,
-        threshold_optimize_for="recall",
+        threshold_optimize_for="geom_r_f1",
         use_swa=not args.no_swa,
         preload_to_device=False,
         hard_example_ratio=args.hard_ratio,

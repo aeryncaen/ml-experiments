@@ -413,28 +413,64 @@ class AdaptiveDeformConv1d(nn.Module):
 
         kw = kernel_weights.view(G, gc, K)
 
-        for k in range(K):
-            abs_pos = pos_indices + ref_offsets[k] + offsets[:, :, :, k]
-            abs_pos_clamped = abs_pos.clamp(0, L - 1)
+        # Vectorized: compute all K positions at once
+        # abs_pos: [N, L, G, K]
+        abs_pos = pos_indices.unsqueeze(-1) + ref_offsets.view(1, 1, 1, K) + offsets
+        abs_pos_clamped = abs_pos.clamp(0, L - 1)
 
-            p_floor = abs_pos_clamped.long().clamp(0, L - 1)
-            p_ceil = (p_floor + 1).clamp(0, L - 1)
-            w_ceil = abs_pos_clamped - p_floor.float()
-            w_floor = 1.0 - w_ceil
+        p_floor = abs_pos_clamped.long().clamp(0, L - 1)
+        p_ceil = (p_floor + 1).clamp(0, L - 1)
+        w_ceil = abs_pos_clamped - p_floor.float()
+        w_floor = 1.0 - w_ceil
 
-            oob = (abs_pos < 0) | (abs_pos > L - 1)
-            w_floor = w_floor * (~oob).float()
-            w_ceil = w_ceil * (~oob).float()
+        oob = (abs_pos < 0) | (abs_pos > L - 1)
+        w_floor = w_floor * (~oob).float()
+        w_ceil = w_ceil * (~oob).float()
 
-            v_floor = x_grouped[batch_idx, p_floor, group_idx, :]
-            v_ceil = x_grouped[batch_idx, p_ceil, group_idx, :]
+        # Gather all values at once using advanced indexing
+        # Expand indices for [N, L, G, K] -> need to sample from [N, L, G, gc]
+        batch_idx_exp = batch_idx.unsqueeze(-1).expand(N, L, G, K)
+        group_idx_exp = group_idx.unsqueeze(-1).expand(N, L, G, K)
 
-            sampled = v_floor * w_floor.unsqueeze(-1) + v_ceil * w_ceil.unsqueeze(-1)
+        # Flatten for gather, then reshape
+        # x_grouped: [N, L, G, gc] -> we need x_grouped[n, p_floor[n,l,g,k], g, :]
+        # Use gather on flattened version
+        p_floor_flat = p_floor.reshape(N, -1)  # [N, L*G*K]
+        p_ceil_flat = p_ceil.reshape(N, -1)
 
-            kernel_weight_k = kw[:, :, k].unsqueeze(0).unsqueeze(0)
-            sampled = sampled * kernel_weight_k
+        # For each (n, l, g, k), we need x_grouped[n, p, g, :] where p = p_floor[n,l,g,k]
+        # Reshape x_grouped for easier indexing: [N, L, G*gc] -> gather on dim 1
+        x_grouped_flat = x_grouped.reshape(N, L, G * gc)
 
-            output = output + sampled * attn_mask[:, :, :, k : k + 1]
+        # Create indices for gathering: for position p, group g, we want indices [g*gc : (g+1)*gc]
+        # Shape: [N, L, G, K, gc]
+        group_offsets = torch.arange(gc, device=x.device).view(1, 1, 1, 1, gc)
+        group_base = group_idx.unsqueeze(-1).unsqueeze(-1) * gc  # [1, 1, G, 1, 1]
+
+        gather_idx_floor = (
+            p_floor.unsqueeze(-1) * (G * gc) + group_base + group_offsets
+        )  # [N, L, G, K, gc]
+        gather_idx_ceil = p_ceil.unsqueeze(-1) * (G * gc) + group_base + group_offsets
+
+        # Flatten x_grouped to [N, L*G*gc] for gather
+        x_flat = x_grouped.reshape(N, -1)  # [N, L*G*gc]
+        gather_idx_floor_flat = gather_idx_floor.reshape(N, -1)  # [N, L*G*K*gc]
+        gather_idx_ceil_flat = gather_idx_ceil.reshape(N, -1)
+
+        v_floor = x_flat.gather(1, gather_idx_floor_flat).reshape(N, L, G, K, gc)
+        v_ceil = x_flat.gather(1, gather_idx_ceil_flat).reshape(N, L, G, K, gc)
+
+        # Interpolate: [N, L, G, K, gc]
+        sampled = v_floor * w_floor.unsqueeze(-1) + v_ceil * w_ceil.unsqueeze(-1)
+
+        # Apply kernel weights: kw is [G, gc, K] -> [1, 1, G, K, gc]
+        kernel_weights_exp = (
+            kw.permute(0, 2, 1).unsqueeze(0).unsqueeze(0)
+        )  # [1, 1, G, K, gc]
+        sampled = sampled * kernel_weights_exp
+
+        # Apply attention mask and sum over K: attn_mask is [N, L, G, K]
+        output = (sampled * attn_mask.unsqueeze(-1)).sum(dim=3)  # [N, L, G, gc]
 
         output = output.reshape(N, L, C)
         output = self.se(output, mask)

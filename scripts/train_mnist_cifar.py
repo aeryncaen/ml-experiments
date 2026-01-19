@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 import argparse
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
 from heuristic_secrets.models.composed2d import (
     Model2d,
@@ -97,14 +98,14 @@ def load_vision_dataset(
 
 @torch.no_grad()
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device
+    model: nn.Module, loader: DataLoader, device: torch.device, desc: str = "Eval"
 ) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for images, labels in loader:
+    for images, labels in tqdm(loader, desc=desc, leave=False):
         images = images.to(device)
         labels = labels.to(device)
 
@@ -123,16 +124,18 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     device: torch.device,
     aux_weight: float = 0.01,
+    desc: str = "Training",
 ) -> tuple[float, float]:
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for images, labels in loader:
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for images, labels in pbar:
         images = images.to(device)
         labels = labels.to(device)
 
@@ -148,12 +151,15 @@ def train_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item() * labels.size(0)
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
+
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{correct / total:.4f}")
 
     return total_loss / total, correct / total
 
@@ -178,6 +184,11 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--swa", action="store_true", help="Use SWA")
+    parser.add_argument(
+        "--swa-start", type=float, default=0.75, help="SWA start epoch ratio"
+    )
+    parser.add_argument("--swa-lr", type=float, default=None, help="SWA learning rate")
     args = parser.parse_args()
 
     if args.output is None:
@@ -190,25 +201,31 @@ def main():
     device = get_device(args.device)
     print(f"Device: {device}")
 
+    attn_heads = max(1, min(4, args.width // 4))
+    ssm_n_heads = max(1, min(4, args.width // 4))
+    conv_groups = max(1, min(4, args.width // 4))
+
     layer_config = LayerConfig2d(
         embed_width=args.width,
         in_channels=ds_config.channels,
         dropout=0.1,
-        conv_groups=4,
-        attn_heads=4,
+        conv_groups=conv_groups,
+        attn_heads=attn_heads,
         attn_ffn_mult=4,
         attn_window_size=16,
         attn_use_rope=True,
         num_attn_features=4,
         ssm_state_size=32,
-        ssm_n_heads=4,
+        ssm_n_heads=ssm_n_heads,
         ssm_kernel_sizes=(3, 5, 7),
         ssm_expand=2,
         num_ssm_features=4,
         adaptive_conv=args.adaptive,
         n_adaptive_branches=args.n_branches,
         adaptive_kernel_size=7,
-        adaptive_init_sigmas=(0.15, 0.25, 0.35) if args.adaptive else None,
+        adaptive_init_sigmas=tuple(0.1 + 0.15 * i for i in range(args.n_branches))
+        if args.adaptive
+        else None,
         context_dim=16,
         num_embed_features=4,
         mlp_hidden_mult=4,
@@ -241,12 +258,13 @@ def main():
         args.dataset, args.data_dir, train=False, ds_config=ds_config
     )
 
+    pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -254,7 +272,7 @@ def main():
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     print(f"  Train: {len(train_dataset):,} samples, {len(train_loader):,} batches")
     print(f"  Val: {len(val_dataset):,} samples, {len(val_loader):,} batches")
@@ -264,6 +282,14 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=args.lr * 0.01
     )
+
+    swa_model = None
+    swa_scheduler = None
+    swa_start_epoch = int(args.epochs * args.swa_start) if args.swa else args.epochs + 1
+    if args.swa:
+        swa_model = AveragedModel(model)
+        swa_lr = args.swa_lr if args.swa_lr else args.lr * 0.05
+        swa_scheduler = SWALR(optimizer, swa_lr=swa_lr, anneal_epochs=5)
 
     start_epoch = 0
     best_acc = 0.0
@@ -282,11 +308,24 @@ def main():
         print(f"  Resuming from epoch {start_epoch}, best_acc={best_acc:.4f}")
 
     print(f"\nTraining for {args.epochs} epochs...")
+    if args.swa:
+        print(f"  SWA starts at epoch {swa_start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device
-        )
+        swa_active = args.swa and epoch >= swa_start_epoch
+        desc = f"Epoch {epoch + 1}/{args.epochs}" + (" [SWA]" if swa_active else "")
+
+        if swa_active and swa_model is not None and swa_scheduler is not None:
+            train_loss, train_acc = train_epoch(
+                model, train_loader, optimizer, None, device, desc=desc
+            )
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            train_loss, train_acc = train_epoch(
+                model, train_loader, optimizer, scheduler, device, desc=desc
+            )
+
         val_loss, val_acc = evaluate(model, val_loader, device)
 
         best_str = ""
@@ -321,6 +360,16 @@ def main():
                 ckpt_path,
             )
             print(f"  -> {ckpt_path}")
+
+    if args.swa and swa_model is not None:
+        print("\nFinalizing SWA...")
+        update_bn(train_loader, swa_model, device=device)
+        model.load_state_dict(swa_model.module.state_dict())
+        val_loss, val_acc = evaluate(model, val_loader, device)
+        print(f"SWA model: val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
