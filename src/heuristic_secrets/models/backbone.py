@@ -810,7 +810,9 @@ class ContextualAttentionBlock(nn.Module):
             x_rest = None
             mask_attn = mask
 
+        check_nan(x_attn, "ctx_attn_x_input")
         qkv = self.qkv(x_attn).reshape(B, attn_len, 3, self.num_heads, self.head_dim)
+        check_nan(qkv, "ctx_attn_qkv")
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -819,6 +821,8 @@ class ContextualAttentionBlock(nn.Module):
         if self.use_rope:
             cos, sin = self.rotary(attn_len, x.device)
             q, k = apply_rotary_pos_emb_qk(q, k, cos, sin)
+            check_nan(q, "ctx_attn_q_rope")
+            check_nan(k, "ctx_attn_k_rope")
 
         attn_mask = None
         if mask_attn is not None:
@@ -834,10 +838,13 @@ class ContextualAttentionBlock(nn.Module):
             attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
+        check_nan(out, "ctx_attn_sdpa_out")
 
         out = out.transpose(1, 2).reshape(B, attn_len, self.width)
         x_attn = self.norm1(x_attn + self.dropout(self.out(out)))
+        check_nan(x_attn, "ctx_attn_after_norm1")
         x_attn = self.norm2(x_attn + self.ffn(x_attn))
+        check_nan(x_attn, "ctx_attn_after_norm2")
 
         if x_rest is not None:
             x_rest = self.norm2(x_rest + self.ffn(x_rest))
