@@ -136,6 +136,7 @@ def main():
     parser.add_argument(
         "--device", type=str, default=None, help="Device: cuda, mps, cpu"
     )
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     args = parser.parse_args()
 
     if args.output is None:
@@ -214,6 +215,9 @@ def main():
     print(f"  Val batches: {len(val_batches):,}")
 
     model = Model(model_config)
+    if args.compile:
+        model = torch.compile(model)
+        print("\nUsing torch.compile")
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} params")
     print(model_config)
 

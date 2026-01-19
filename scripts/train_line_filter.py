@@ -460,6 +460,7 @@ def main():
         default=None,
         help="Device: cuda, mps, cpu (default: auto)",
     )
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     args = parser.parse_args()
 
     if args.adaptive:
@@ -475,13 +476,13 @@ def main():
     if args.unified:
         ssm_kernel_sizes = tuple(int(k) for k in args.ssm_kernels.split(","))
         layer_config = LayerConfig(
-            embed_width=8,
-            conv_groups=2,
-            attn_heads=1,
+            embed_width=16,
+            conv_groups=4,
+            attn_heads=2,
             attn_ffn_mult=2,
             num_attn_features=4,
             ssm_state_size=16,
-            ssm_n_heads=2,
+            ssm_n_heads=4,
             ssm_expand=2,
             ssm_kernel_sizes=ssm_kernel_sizes,
             num_ssm_features=4,
@@ -647,6 +648,14 @@ def main():
     initial_batches = sample_train_batches(args.seed)
 
     model = Model(model_config)
+    if args.compile:
+        if device.type == "mps":
+            print("\nSkipping torch.compile on MPS (Inductor backend not supported)")
+        else:
+            # Allow .item() calls to be captured in graph (for adaptive kernel size)
+            torch._dynamo.config.capture_scalar_outputs = True
+            model = torch.compile(model)
+            print("\nUsing torch.compile (with capture_scalar_outputs=True)")
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} params")
     print(model_config)
 

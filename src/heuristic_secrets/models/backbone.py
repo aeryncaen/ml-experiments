@@ -166,32 +166,34 @@ class DeformConv1d(nn.Module):
         mask = F.softmax(self.mask_net(x_dw).view(N, L, G, K), dim=-1)
 
         ref_offsets = torch.linspace(-(K // 2), K // 2, K, device=x.device)
-        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
+        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)
 
         x_grouped = x_proj.view(N, L, G, gc)
-        output = torch.zeros(N, L, G, gc, device=x.device, dtype=x.dtype)
 
-        batch_idx = torch.arange(N, device=x.device).view(N, 1, 1)
-        group_idx = torch.arange(G, device=x.device).view(1, 1, G)
+        abs_pos = pos_indices + ref_offsets.view(1, 1, 1, K) + offsets
+        abs_pos_clamped = abs_pos.clamp(0, L - 1)
 
-        for k in range(K):
-            abs_pos = pos_indices + ref_offsets[k] + offsets[:, :, :, k]
-            abs_pos_clamped = abs_pos.clamp(0, L - 1)
+        p_floor = abs_pos_clamped.long().clamp(0, L - 1)
+        p_ceil = (p_floor + 1).clamp(0, L - 1)
+        w_ceil = abs_pos_clamped - p_floor.float()
+        w_floor = 1.0 - w_ceil
 
-            p_floor = abs_pos_clamped.long().clamp(0, L - 1)
-            p_ceil = (p_floor + 1).clamp(0, L - 1)
-            w_ceil = abs_pos_clamped - p_floor.float()
-            w_floor = 1.0 - w_ceil
+        oob = (abs_pos < 0) | (abs_pos > L - 1)
+        w_floor = w_floor * (~oob).float()
+        w_ceil = w_ceil * (~oob).float()
 
-            oob = (abs_pos < 0) | (abs_pos > L - 1)
-            w_floor = w_floor * (~oob).float()
-            w_ceil = w_ceil * (~oob).float()
+        p_floor_flat = p_floor.view(N, -1)
+        p_ceil_flat = p_ceil.view(N, -1)
 
-            v_floor = x_grouped[batch_idx, p_floor, group_idx, :]
-            v_ceil = x_grouped[batch_idx, p_ceil, group_idx, :]
+        x_flat = x_grouped.view(N, L, -1)
+        v_floor = x_flat.gather(1, p_floor_flat.unsqueeze(-1).expand(-1, -1, gc * G))
+        v_ceil = x_flat.gather(1, p_ceil_flat.unsqueeze(-1).expand(-1, -1, gc * G))
 
-            sampled = v_floor * w_floor.unsqueeze(-1) + v_ceil * w_ceil.unsqueeze(-1)
-            output = output + sampled * mask[:, :, :, k : k + 1]
+        v_floor = v_floor.view(N, L, G, K, gc)
+        v_ceil = v_ceil.view(N, L, G, K, gc)
+
+        sampled = v_floor * w_floor.unsqueeze(-1) + v_ceil * w_ceil.unsqueeze(-1)
+        output = (sampled * mask.unsqueeze(-1)).sum(dim=3)
 
         return self.output_proj(output.reshape(N, L, C))
 
@@ -355,10 +357,7 @@ class AdaptiveDeformConv1d(nn.Module):
             sigma = sigma + torch.nan_to_num(sigma_bias, nan=0.0)
         sigma = sigma.clamp(self.min_sigma, self.max_sigma)
 
-        if self.dynamic_kernel:
-            K = self._get_effective_kernel_size(sigma)
-        else:
-            K = self.kernel_size
+        K = max_K
 
         grid = torch.linspace(-0.5, 0.5, K, device=x.device)
 
@@ -377,12 +376,8 @@ class AdaptiveDeformConv1d(nn.Module):
         if offset_scale_bias is not None:
             offset_scale = offset_scale * (1.0 + 0.2 * offset_scale_bias.mean())
 
-        offsets_full = self.offset_net(x_dw).view(N, L, G, max_K) * offset_scale
-        raw_mask_full = self.mask_net(x_dw).view(N, L, G, max_K)
-
-        start = (max_K - K) // 2
-        offsets = offsets_full[:, :, :, start : start + K]
-        raw_mask = raw_mask_full[:, :, :, start : start + K]
+        offsets = self.offset_net(x_dw).view(N, L, G, K) * offset_scale
+        raw_mask = self.mask_net(x_dw).view(N, L, G, K)
 
         if envelope.dim() == 1:
             raw_mask = raw_mask * envelope.view(1, 1, 1, K)
@@ -848,6 +843,7 @@ class ContextualAttentionBlock(nn.Module):
         if pool_mask is not None:
             attn_scores = attn_scores.masked_fill(pool_mask.unsqueeze(1), float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         pooled = torch.bmm(attn_weights, pool_target).squeeze(1)
 
         if self.n_branches > 0:
@@ -1664,6 +1660,7 @@ class MultiKernelSSMBlock(nn.Module):
         if mask is not None:
             attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
         attn = F.softmax(attn, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)
         pooled = torch.bmm(attn, h).squeeze(1)
         features = self.feature_proj(pooled)
 
