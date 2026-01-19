@@ -23,11 +23,11 @@ def get_device(device: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
-def setup_cuda() -> None:
+def setup_cuda(allow_tf32: bool = False) -> None:
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
 
 
 def set_seed(seed: int) -> None:
