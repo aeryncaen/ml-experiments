@@ -1073,7 +1073,10 @@ class SSMBlock3_2d(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        alpha = torch.exp(dt.unsqueeze(-1).unsqueeze(-1) * A.view(1, 1, Heads, 1, 1))
+        alpha_full = torch.exp(
+            dt.unsqueeze(-1).unsqueeze(-1) * A.view(1, 1, Heads, 1, 1)
+        )
+        alpha = alpha_full.squeeze(-1).squeeze(-1)  # [B, L, Heads]
         check_nan(alpha, "ssm2d_scan_alpha")
 
         B_param = B_param.float()
@@ -1112,19 +1115,19 @@ class SSMBlock3_2d(nn.Module):
         K: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, _, Heads, N, P = Bx.shape
+        device = alpha.device
 
-        alpha_cumprod = alpha.cumprod(dim=1)
-        check_nan(alpha_cumprod, "scan_chunk_alpha_cumprod")
+        decay_matrix = self._build_decay_matrix(alpha, K, device)
+        check_nan(decay_matrix, "scan_chunk_decay_matrix")
 
-        inv_alpha = 1.0 / alpha.clamp(min=1e-8)
-        inv_alpha_cumprod = inv_alpha.cumprod(dim=1)
-        check_nan(inv_alpha_cumprod, "scan_chunk_inv_alpha_cumprod")
+        h_from_input = torch.einsum("bijh,bjhnp->bihnp", decay_matrix, Bx)
+        check_nan(h_from_input, "scan_chunk_h_from_input")
 
-        Bx_scaled = Bx * inv_alpha_cumprod
-        Bx_scaled_cumsum = Bx_scaled.cumsum(dim=1)
-        check_nan(Bx_scaled_cumsum, "scan_chunk_Bx_cumsum")
+        carry = torch.cumprod(alpha, dim=1)
+        check_nan(carry, "scan_chunk_carry")
+        h_from_state = torch.einsum("bih,bhnp->bihnp", carry, h_prev)
 
-        h_all = alpha_cumprod * (h_prev.unsqueeze(1) + Bx_scaled_cumsum)
+        h_all = h_from_input + h_from_state
         check_nan(h_all, "scan_chunk_h_all")
 
         y = torch.einsum("bkhnp,bkhn->bkhp", h_all, C)
@@ -1132,6 +1135,26 @@ class SSMBlock3_2d(nn.Module):
         h_final = h_all[:, -1]
 
         return y, h_final
+
+    def _build_decay_matrix(
+        self, alpha: torch.Tensor, K: int, device: torch.device
+    ) -> torch.Tensor:
+        batch, _, Heads = alpha.shape
+
+        log_alpha = torch.log(alpha.clamp(min=1e-8))
+        cumsum = torch.cumsum(log_alpha, dim=1)
+
+        cumsum_i = cumsum.unsqueeze(2)
+        cumsum_j = cumsum.unsqueeze(1)
+
+        log_decay = cumsum_i - cumsum_j
+
+        causal_mask = torch.tril(torch.ones(K, K, device=device, dtype=torch.bool))
+        log_decay = log_decay.masked_fill(
+            ~causal_mask.unsqueeze(0).unsqueeze(-1), float("-inf")
+        )
+
+        return torch.exp(log_decay)
 
 
 class MultiKernelSSMBlock2d(nn.Module):
