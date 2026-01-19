@@ -164,6 +164,7 @@ class DeformConv1d(nn.Module):
 
         offsets = self.offset_net(x_dw).view(N, L, G, K) * self.offset_scale
         mask = F.softmax(self.mask_net(x_dw).view(N, L, G, K), dim=-1)
+        mask = torch.nan_to_num(mask, nan=0.0)
 
         ref_offsets = torch.linspace(-(K // 2), K // 2, K, device=x.device)
         pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)
@@ -385,6 +386,7 @@ class AdaptiveDeformConv1d(nn.Module):
             raw_mask = raw_mask * envelope.view(N, 1, 1, K)
 
         attn_mask = F.softmax(raw_mask, dim=-1)
+        attn_mask = torch.nan_to_num(attn_mask, nan=0.0)
 
         ref_offsets = torch.linspace(-(K // 2), K // 2, K, device=x.device)
         pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
