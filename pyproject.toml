@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "heuristic-secrets"
+version = "0.1.0"
+description = "Heuristic-based secret detection using ML"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "safetensors>=0.4",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+heuristic-secrets-data = "heuristic_secrets.data.build:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/heuristic_secrets"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
