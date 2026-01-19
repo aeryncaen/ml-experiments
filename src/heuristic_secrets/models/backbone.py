@@ -9,7 +9,7 @@ DEBUG_NAN = True
 
 
 def check_nan(t: torch.Tensor, name: str) -> None:
-    if DEBUG_NAN and torch.isnan(t).any():
+    if DEBUG_NAN and t.device.type == "cuda" and torch.isnan(t).any():
         print(f"NaN detected in {name}, shape={t.shape}, device={t.device}")
         print(f"  nan count: {torch.isnan(t).sum().item()}")
         print(f"  inf count: {torch.isinf(t).sum().item()}")
@@ -710,13 +710,16 @@ class AttentionBlock(nn.Module):
                 .unsqueeze(2)
                 .expand(B, self.num_heads, attn_len, attn_len)
             )
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
+
+        scale = self.head_dim**-0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask, float("-inf"))
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        if self.training and self.dropout_p > 0:
+            attn_weights = F.dropout(attn_weights, p=self.dropout_p)
+        out = torch.matmul(attn_weights, v)
 
         out = out.transpose(1, 2).reshape(B, attn_len, self.width)
         x_attn = self.norm1(x_attn + self.dropout(self.out(out)))
@@ -831,7 +834,7 @@ class ContextualAttentionBlock(nn.Module):
                 .unsqueeze(2)
                 .expand(B, self.num_heads, attn_len, attn_len)
             )
-        if DEBUG_NAN:
+        if DEBUG_NAN and q.device.type == "cuda":
             print(
                 f"SDPA inputs: q={q.min().item():.4f}/{q.max().item():.4f}, k={k.min().item():.4f}/{k.max().item():.4f}, v={v.min().item():.4f}/{v.max().item():.4f}"
             )
@@ -841,14 +844,14 @@ class ContextualAttentionBlock(nn.Module):
         scale = self.head_dim**-0.5
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale
         check_nan(scores, "ctx_attn_scores")
-        if DEBUG_NAN:
+        if DEBUG_NAN and scores.device.type == "cuda":
             print(
                 f"  scores range: {scores.min().item():.4f}/{scores.max().item():.4f}"
             )
         if attn_mask is not None:
             scores = scores.masked_fill(attn_mask, float("-inf"))
             check_nan(scores, "ctx_attn_scores_masked")
-            if DEBUG_NAN:
+            if DEBUG_NAN and scores.device.type == "cuda":
                 all_inf_rows = (scores == float("-inf")).all(dim=-1).any()
                 print(f"  any row all -inf: {all_inf_rows.item()}")
         attn_weights = F.softmax(scores, dim=-1)

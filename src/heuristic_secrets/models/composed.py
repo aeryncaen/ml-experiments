@@ -27,7 +27,7 @@ DEBUG_NAN = True
 
 
 def check_nan(t: torch.Tensor, name: str) -> None:
-    if DEBUG_NAN and torch.isnan(t).any():
+    if DEBUG_NAN and t.device.type == "cuda" and torch.isnan(t).any():
         print(f"NaN detected in {name}, shape={t.shape}, device={t.device}")
         print(f"  nan count: {torch.isnan(t).sum().item()}")
         print(f"  inf count: {torch.isinf(t).sum().item()}")
