@@ -1664,7 +1664,9 @@ class MultiKernelSSMBlock(nn.Module):
         pooler_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         B, L, _ = x.shape
+        check_nan(x, "mkssm_input")
         h = self.in_proj(x)
+        check_nan(h, "mkssm_in_proj")
 
         chunks = h.chunk(self.n_branches, dim=-1)
 
@@ -1686,10 +1688,12 @@ class MultiKernelSSMBlock(nn.Module):
                 out, aux = branch(chunk, mask, branch_bias)
             else:
                 out, aux = branch(chunk, mask)
+            check_nan(out, f"mkssm_branch{i}_out")
             branch_outputs.append(out)
             all_aux_losses.append(aux)
 
         combined = torch.cat(branch_outputs, dim=-1)
+        check_nan(combined, "mkssm_combined_branches")
 
         aux_losses: dict[str, torch.Tensor] = {}
         if all_aux_losses:
@@ -1698,9 +1702,12 @@ class MultiKernelSSMBlock(nn.Module):
                 aux_losses[key] = total
 
         h = self.proj_down(combined)
+        check_nan(h, "mkssm_proj_down")
         h = self.norm_merge(h + residual)
+        check_nan(h, "mkssm_norm_merge")
 
         h = self.merge_attn(h, mask)
+        check_nan(h, "mkssm_merge_attn")
 
         h_res = h
         h, ssm_aux = self.ssm(h, mask)
