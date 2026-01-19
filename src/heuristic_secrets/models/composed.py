@@ -47,7 +47,7 @@ class LayerConfig:
     attn_depth: int = 2
     attn_heads: int = 2
     attn_ffn_mult: int = 4
-    attn_window_size: int = 512
+    attn_window_size: int = 768
     attn_use_rope: bool = True
     num_attn_features: int = 4
 
