@@ -19,9 +19,12 @@ def check_nan(t: torch.Tensor, name: str) -> None:
 
 @dataclass
 class AdaptiveConvBiases2d:
-    sigma: torch.Tensor | None = None
-    offset_scale: torch.Tensor | None = None
-    omega: torch.Tensor | None = None
+    sigma_h: torch.Tensor | None = None
+    sigma_w: torch.Tensor | None = None
+    offset_scale_h: torch.Tensor | None = None
+    offset_scale_w: torch.Tensor | None = None
+    omega_h: torch.Tensor | None = None
+    omega_w: torch.Tensor | None = None
     se_bias: torch.Tensor | None = None
 
 
@@ -289,8 +292,10 @@ class AdaptiveDeformConv2d(nn.Module):
         self.omega_max = 2.0
 
         init_raw = math.log(math.exp(init_sigma) - 1.0) if init_sigma > 0 else 0.0
-        self.raw_sigma = nn.Parameter(torch.tensor(init_raw))
-        self.base_offset_scale = nn.Parameter(torch.tensor(0.1))
+        self.raw_sigma_h = nn.Parameter(torch.tensor(init_raw))
+        self.raw_sigma_w = nn.Parameter(torch.tensor(init_raw))
+        self.base_offset_scale_h = nn.Parameter(torch.tensor(0.1))
+        self.base_offset_scale_w = nn.Parameter(torch.tensor(0.1))
 
         self.input_proj = nn.Linear(channels, channels)
         self.output_proj = nn.Linear(channels, channels)
@@ -328,15 +333,20 @@ class AdaptiveDeformConv2d(nn.Module):
         constant_(self.output_proj.bias.data, 0.0)
 
     def _compute_envelope(
-        self, grid_h: torch.Tensor, grid_w: torch.Tensor, sigma: torch.Tensor
+        self,
+        grid_h: torch.Tensor,
+        grid_w: torch.Tensor,
+        sigma_h: torch.Tensor,
+        sigma_w: torch.Tensor,
     ) -> torch.Tensor:
         gh = grid_h.view(1, -1, 1)
         gw = grid_w.view(1, 1, -1)
 
-        if sigma.dim() > 0:
-            sigma = sigma.view(-1, 1, 1)
+        if sigma_h.dim() > 0:
+            sigma_h = sigma_h.view(-1, 1, 1)
+            sigma_w = sigma_w.view(-1, 1, 1)
 
-        envelope = torch.exp(-(gh**2 + gw**2) / (2 * sigma**2))
+        envelope = torch.exp(-(gh**2) / (2 * sigma_h**2) - (gw**2) / (2 * sigma_w**2))
         envelope = envelope / envelope.sum(dim=(1, 2), keepdim=True).clamp(min=1e-8)
         return envelope
 
@@ -344,16 +354,21 @@ class AdaptiveDeformConv2d(nn.Module):
         self,
         grid_h: torch.Tensor,
         grid_w: torch.Tensor,
-        omega_bias: torch.Tensor | None = None,
+        omega_h: torch.Tensor | None = None,
+        omega_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         K = grid_h.shape[0]
-        gh = grid_h.view(-1, 1)
-        gw = grid_w.view(1, -1).expand(K, -1)
-        positions = torch.stack([gh.expand(K, K).flatten(), gw.flatten()], dim=-1) * 2
+        gh = grid_h.view(-1, 1).expand(K, K).flatten()
+        gw = grid_w.view(1, -1).expand(K, K).flatten()
 
-        if omega_bias is not None:
-            omega_scale = 1.0 + torch.tanh(omega_bias.mean()) * self.omega_max
-            positions = positions * omega_scale
+        if omega_h is not None:
+            scale_h = 1.0 + torch.tanh(omega_h.mean()) * self.omega_max
+            gh = gh * scale_h
+        if omega_w is not None:
+            scale_w = 1.0 + torch.tanh(omega_w.mean()) * self.omega_max
+            gw = gw * scale_w
+
+        positions = torch.stack([gh * 2, gw * 2], dim=-1)
 
         weights = self.kernel_net(positions)
         return weights.view(K, K, self.groups, self.group_channels)
@@ -370,14 +385,21 @@ class AdaptiveDeformConv2d(nn.Module):
         K = self.kernel_size
         K2 = K * K
 
-        sigma_bias = biases.sigma if biases else None
-        offset_scale_bias = biases.offset_scale if biases else None
-        omega_bias = biases.omega if biases else None
+        sigma_h_bias = biases.sigma_h if biases else None
+        sigma_w_bias = biases.sigma_w if biases else None
+        offset_scale_h_bias = biases.offset_scale_h if biases else None
+        offset_scale_w_bias = biases.offset_scale_w if biases else None
+        omega_h_bias = biases.omega_h if biases else None
+        omega_w_bias = biases.omega_w if biases else None
 
-        raw = self.raw_sigma
-        if sigma_bias is not None:
-            raw = raw + torch.nan_to_num(sigma_bias, nan=0.0)
-        sigma = F.softplus(raw).clamp(min=1e-3, max=self.max_sigma)
+        raw_h = self.raw_sigma_h
+        raw_w = self.raw_sigma_w
+        if sigma_h_bias is not None:
+            raw_h = raw_h + torch.nan_to_num(sigma_h_bias, nan=0.0)
+        if sigma_w_bias is not None:
+            raw_w = raw_w + torch.nan_to_num(sigma_w_bias, nan=0.0)
+        sigma_h = F.softplus(raw_h).clamp(min=1e-3, max=self.max_sigma)
+        sigma_w = F.softplus(raw_w).clamp(min=1e-3, max=self.max_sigma)
 
         grid = torch.linspace(-0.5, 0.5, K, device=x.device)
 
@@ -387,14 +409,26 @@ class AdaptiveDeformConv2d(nn.Module):
         x_dw = self.dw_conv(x_dw)
         x_dw = x_dw.permute(0, 2, 3, 1).contiguous()
 
-        envelope = self._compute_envelope(grid, grid, sigma)
-        kernel_weights = self._get_kernel_weights(grid, grid, omega_bias)
+        envelope = self._compute_envelope(grid, grid, sigma_h, sigma_w)
+        kernel_weights = self._get_kernel_weights(
+            grid, grid, omega_h_bias, omega_w_bias
+        )
 
-        offset_scale = self.base_offset_scale
-        if offset_scale_bias is not None:
-            offset_scale = offset_scale * (1.0 + 0.2 * offset_scale_bias.mean())
+        offset_scale_h = self.base_offset_scale_h
+        offset_scale_w = self.base_offset_scale_w
+        if offset_scale_h_bias is not None:
+            offset_scale_h = offset_scale_h * (1.0 + 0.2 * offset_scale_h_bias.mean())
+        if offset_scale_w_bias is not None:
+            offset_scale_w = offset_scale_w * (1.0 + 0.2 * offset_scale_w_bias.mean())
 
-        offsets = self.offset_net(x_dw).view(B, H, W, G, K2, 2) * offset_scale
+        offsets_raw = self.offset_net(x_dw).view(B, H, W, G, K2, 2)
+        offsets = torch.stack(
+            [
+                offsets_raw[..., 0] * offset_scale_h,
+                offsets_raw[..., 1] * offset_scale_w,
+            ],
+            dim=-1,
+        )
         raw_mask = self.mask_net(x_dw).view(B, H, W, G, K2)
 
         if envelope.shape[0] == 1:
@@ -670,12 +704,22 @@ class ContextualAttentionBlock2d(nn.Module):
             self.pool_scale = width**-0.5
 
         if n_branches > 0:
-            self.sigma_proj = nn.Linear(width, n_branches)
-            self.offset_scale_proj = nn.Linear(width, n_branches)
-            self.omega_proj = nn.Linear(width, n_branches)
+            self.sigma_h_proj = nn.Linear(width, n_branches)
+            self.sigma_w_proj = nn.Linear(width, n_branches)
+            self.offset_scale_h_proj = nn.Linear(width, n_branches)
+            self.offset_scale_w_proj = nn.Linear(width, n_branches)
+            self.omega_h_proj = nn.Linear(width, n_branches)
+            self.omega_w_proj = nn.Linear(width, n_branches)
             self.se_bias_proj = nn.Linear(width, n_branches * width)
 
-            for proj in [self.sigma_proj, self.offset_scale_proj, self.omega_proj]:
+            for proj in [
+                self.sigma_h_proj,
+                self.sigma_w_proj,
+                self.offset_scale_h_proj,
+                self.offset_scale_w_proj,
+                self.omega_h_proj,
+                self.omega_w_proj,
+            ]:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
             nn.init.zeros_(self.se_bias_proj.weight)
@@ -799,9 +843,12 @@ class ContextualAttentionBlock2d(nn.Module):
         if self.n_branches > 0:
             se_bias = self.se_bias_proj(pooled).view(B, self.n_branches, self.width)
             biases = AdaptiveConvBiases2d(
-                sigma=self.sigma_proj(pooled),
-                offset_scale=self.offset_scale_proj(pooled),
-                omega=self.omega_proj(pooled),
+                sigma_h=self.sigma_h_proj(pooled),
+                sigma_w=self.sigma_w_proj(pooled),
+                offset_scale_h=self.offset_scale_h_proj(pooled),
+                offset_scale_w=self.offset_scale_w_proj(pooled),
+                omega_h=self.omega_h_proj(pooled),
+                omega_w=self.omega_w_proj(pooled),
                 se_bias=se_bias,
             )
         else:
@@ -1290,14 +1337,23 @@ class MultiKernelSSMBlock2d(nn.Module):
         for i, (branch, chunk) in enumerate(zip(self.branches, chunks)):
             if biases is not None:
                 branch_bias = AdaptiveConvBiases2d(
-                    sigma=biases.sigma[:, i : i + 1].squeeze(-1)
-                    if biases.sigma is not None
+                    sigma_h=biases.sigma_h[:, i : i + 1].squeeze(-1)
+                    if biases.sigma_h is not None
                     else None,
-                    offset_scale=biases.offset_scale[:, i : i + 1].squeeze(-1)
-                    if biases.offset_scale is not None
+                    sigma_w=biases.sigma_w[:, i : i + 1].squeeze(-1)
+                    if biases.sigma_w is not None
                     else None,
-                    omega=biases.omega[:, i : i + 1].squeeze(-1)
-                    if biases.omega is not None
+                    offset_scale_h=biases.offset_scale_h[:, i : i + 1].squeeze(-1)
+                    if biases.offset_scale_h is not None
+                    else None,
+                    offset_scale_w=biases.offset_scale_w[:, i : i + 1].squeeze(-1)
+                    if biases.offset_scale_w is not None
+                    else None,
+                    omega_h=biases.omega_h[:, i : i + 1].squeeze(-1)
+                    if biases.omega_h is not None
+                    else None,
+                    omega_w=biases.omega_w[:, i : i + 1].squeeze(-1)
+                    if biases.omega_w is not None
                     else None,
                     se_bias=biases.se_bias[:, i, :]
                     if biases.se_bias is not None
