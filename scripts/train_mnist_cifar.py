@@ -37,10 +37,15 @@ DATASET_CONFIGS = {
 }
 
 
-def get_transforms(ds_config: DatasetConfig, train: bool):
+def get_transforms(ds_config: DatasetConfig, train: bool, grayscale: bool = False):
+    t_list = []
+
+    if grayscale and ds_config.channels == 3:
+        t_list.append(transforms.Grayscale(num_output_channels=1))
+
     if train:
-        if ds_config.channels == 1:
-            return transforms.Compose(
+        if ds_config.channels == 1 or grayscale:
+            t_list.extend(
                 [
                     transforms.RandomAffine(
                         degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)
@@ -50,7 +55,7 @@ def get_transforms(ds_config: DatasetConfig, train: bool):
                 ]
             )
         else:
-            return transforms.Compose(
+            t_list.extend(
                 [
                     transforms.RandomCrop(32, padding=4),
                     transforms.RandomHorizontalFlip(),
@@ -59,26 +64,32 @@ def get_transforms(ds_config: DatasetConfig, train: bool):
                 ]
             )
     else:
-        if ds_config.channels == 1:
-            return transforms.Compose(
+        if ds_config.channels == 1 or grayscale:
+            t_list.extend(
                 [
                     transforms.ToTensor(),
                     transforms.Normalize((0.5,), (0.5,)),
                 ]
             )
         else:
-            return transforms.Compose(
+            t_list.extend(
                 [
                     transforms.ToTensor(),
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                 ]
             )
 
+    return transforms.Compose(t_list)
+
 
 def load_vision_dataset(
-    name: str, data_dir: Path, train: bool, ds_config: DatasetConfig
+    name: str,
+    data_dir: Path,
+    train: bool,
+    ds_config: DatasetConfig,
+    grayscale: bool = False,
 ):
-    transform = get_transforms(ds_config, train)
+    transform = get_transforms(ds_config, train, grayscale)
     if name == "mnist":
         return datasets.MNIST(data_dir, train=train, download=True, transform=transform)
     elif name == "fashion-mnist":
@@ -189,6 +200,9 @@ def main():
         "--swa-start", type=float, default=0.75, help="SWA start epoch ratio"
     )
     parser.add_argument("--swa-lr", type=float, default=None, help="SWA learning rate")
+    parser.add_argument(
+        "--grayscale", action="store_true", help="Convert RGB to grayscale"
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -205,9 +219,10 @@ def main():
     ssm_n_heads = max(1, min(4, args.width // 4))
     conv_groups = max(1, min(4, args.width // 4))
 
+    in_channels = 1 if args.grayscale else ds_config.channels
     layer_config = LayerConfig2d(
         embed_width=args.width,
-        in_channels=ds_config.channels,
+        in_channels=in_channels,
         dropout=0.1,
         conv_groups=conv_groups,
         attn_heads=attn_heads,
@@ -250,12 +265,20 @@ def main():
         + (f" ({args.n_branches} branches)" if args.adaptive else "")
     )
 
-    print(f"\nLoading {args.dataset}...")
+    print(f"\nLoading {args.dataset}..." + (" (grayscale)" if args.grayscale else ""))
     train_dataset = load_vision_dataset(
-        args.dataset, args.data_dir, train=True, ds_config=ds_config
+        args.dataset,
+        args.data_dir,
+        train=True,
+        ds_config=ds_config,
+        grayscale=args.grayscale,
     )
     val_dataset = load_vision_dataset(
-        args.dataset, args.data_dir, train=False, ds_config=ds_config
+        args.dataset,
+        args.data_dir,
+        train=False,
+        ds_config=ds_config,
+        grayscale=args.grayscale,
     )
 
     pin_memory = device.type == "cuda"
