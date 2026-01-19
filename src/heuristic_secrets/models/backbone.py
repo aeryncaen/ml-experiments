@@ -212,17 +212,19 @@ class DeformConv1d(nn.Module):
 class AdaptiveConvBiases:
     """Container for all adaptive convolution biases from attention."""
 
-    __slots__ = ("sigma", "offset_scale", "omega")
+    __slots__ = ("sigma", "offset_scale", "omega", "se_bias")
 
     def __init__(
         self,
         sigma: torch.Tensor | None = None,
         offset_scale: torch.Tensor | None = None,
         omega: torch.Tensor | None = None,
+        se_bias: torch.Tensor | None = None,
     ):
         self.sigma = sigma
         self.offset_scale = offset_scale
         self.omega = omega
+        self.se_bias = se_bias
 
 
 class AdaptiveDeformConv1d(nn.Module):
@@ -272,11 +274,13 @@ class AdaptiveDeformConv1d(nn.Module):
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
         self.base_omega_0 = omega_0
+        self.omega_max = 2.0
         self.min_kernel_size = min_kernel_size
         self.max_kernel_size = max_kernel_size
         self.dynamic_kernel = dynamic_kernel
 
-        self.log_sigma = nn.Parameter(torch.tensor(math.log(init_sigma)))
+        init_raw = math.log(math.exp(init_sigma) - 1.0) if init_sigma > 0 else 0.0
+        self.raw_sigma = nn.Parameter(torch.tensor(init_raw))
 
         grid = torch.linspace(-0.5, 0.5, kernel_size)
         self.register_buffer("grid", grid)
@@ -341,7 +345,7 @@ class AdaptiveDeformConv1d(nn.Module):
         positions = (grid * 2).view(1, 1, -1)
 
         if omega_bias is not None:
-            omega_scale = 1.0 + 0.1 * omega_bias.mean()
+            omega_scale = 1.0 + torch.tanh(omega_bias.mean()) * self.omega_max
             positions = positions * omega_scale
 
         weights = self.kernel_net(positions)
@@ -363,10 +367,10 @@ class AdaptiveDeformConv1d(nn.Module):
         offset_scale_bias = biases.offset_scale if biases else None
         omega_bias = biases.omega if biases else None
 
-        sigma = self.log_sigma.exp()
+        raw = self.raw_sigma
         if sigma_bias is not None:
-            sigma = sigma + torch.nan_to_num(sigma_bias, nan=0.0)
-        sigma = sigma.clamp(self.min_sigma, self.max_sigma)
+            raw = raw + torch.nan_to_num(sigma_bias, nan=0.0)
+        sigma = F.softplus(raw).clamp(min=1e-3, max=self.max_sigma)
 
         K = max_K
 
@@ -452,8 +456,11 @@ class AdaptiveConvBranch(nn.Module):
         groups: int = 4,
         kernel_size: int = 15,
         max_kernel_size: int = 31,
+        se_reduction: int = 4,
+        se_bias_dim: int | None = None,
     ):
         super().__init__()
+        self.width = width
         self.norm = RMSNorm(width)
         self.conv = AdaptiveDeformConv1d(
             width,
@@ -464,6 +471,13 @@ class AdaptiveConvBranch(nn.Module):
             max_sigma=max_sigma,
             max_kernel_size=max_kernel_size,
         )
+        self.se = SEBlock(width, reduction=se_reduction)
+        if se_bias_dim is not None and se_bias_dim != width:
+            self.se_bias_proj = nn.Linear(se_bias_dim, width)
+            nn.init.zeros_(self.se_bias_proj.weight)
+            nn.init.zeros_(self.se_bias_proj.bias)
+        else:
+            self.se_bias_proj = None
 
     def forward(
         self,
@@ -472,7 +486,14 @@ class AdaptiveConvBranch(nn.Module):
         biases: AdaptiveConvBiases | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         out, aux = self.conv(x, mask, biases)
-        return self.norm(F.silu(out)), aux
+        out = self.norm(F.silu(out))
+        se_bias = None
+        if biases is not None and biases.se_bias is not None:
+            se_bias = biases.se_bias
+            if self.se_bias_proj is not None:
+                se_bias = self.se_bias_proj(se_bias)
+        out = self.se(out, mask, se_bias)
+        return out, aux
 
 
 class Sine(nn.Module):
@@ -786,10 +807,13 @@ class ContextualAttentionBlock(nn.Module):
             self.sigma_proj = nn.Linear(width, n_branches)
             self.offset_scale_proj = nn.Linear(width, n_branches)
             self.omega_proj = nn.Linear(width, n_branches)
+            self.se_bias_proj = nn.Linear(width, n_branches * width)
 
             for proj in [self.sigma_proj, self.offset_scale_proj, self.omega_proj]:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
+            nn.init.zeros_(self.se_bias_proj.weight)
+            nn.init.zeros_(self.se_bias_proj.bias)
 
         if context_dim > 0:
             self.context_proj = nn.Linear(width, context_dim)
@@ -887,10 +911,12 @@ class ContextualAttentionBlock(nn.Module):
         pooled = torch.bmm(attn_weights, pool_target).squeeze(1)
 
         if self.n_branches > 0:
+            se_bias = self.se_bias_proj(pooled).view(B, self.n_branches, self.width)
             biases = AdaptiveConvBiases(
                 sigma=self.sigma_proj(pooled),
                 offset_scale=self.offset_scale_proj(pooled),
                 omega=self.omega_proj(pooled),
+                se_bias=se_bias,
             )
         else:
             biases = None
@@ -925,28 +951,28 @@ class AttentionBackbone(nn.Module):
 
 
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for channel recalibration."""
-
     def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction),
-            nn.SiLU(),
-            nn.Linear(channels // reduction, channels),
-            nn.Sigmoid(),
-        )
+        self.fc1 = nn.Linear(channels, channels // reduction)
+        self.fc2 = nn.Linear(channels // reduction, channels)
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # x: [B, L, C]
         if mask is not None:
             x_masked = x.masked_fill(mask.unsqueeze(-1), 0.0)
             lengths = (~mask).sum(dim=1, keepdim=True).float().clamp(min=1)
-            w = x_masked.sum(dim=1) / lengths
+            pooled = x_masked.sum(dim=1) / lengths
         else:
-            w = x.mean(dim=1)
-        w = self.fc(w)
+            pooled = x.mean(dim=1)
+
+        w = self.fc2(F.silu(self.fc1(pooled)))
+        if bias is not None:
+            w = w + bias
+        w = torch.sigmoid(w)
         return x * w.unsqueeze(1)
 
 
@@ -1603,6 +1629,7 @@ class MultiKernelSSMBlock(nn.Module):
                         max_sigma=max_sigma,
                         groups=branch_groups,
                         kernel_size=adaptive_kernel_size,
+                        se_bias_dim=width,
                     )
                     for sigma in init_sigmas
                 ]
@@ -1617,6 +1644,7 @@ class MultiKernelSSMBlock(nn.Module):
                         max_sigma=max_sigma,
                         groups=branch_groups,
                         kernel_size=max(ks, 3) if ks != 0 else 7,
+                        se_bias_dim=width,
                     )
                     for ks in kernel_sizes
                 ]
@@ -1686,6 +1714,9 @@ class MultiKernelSSMBlock(nn.Module):
                     else None,
                     omega=biases.omega[:, i : i + 1].squeeze(-1)
                     if biases.omega is not None
+                    else None,
+                    se_bias=biases.se_bias[:, i, :]
+                    if biases.se_bias is not None
                     else None,
                 )
                 out, aux = branch(chunk, mask, branch_bias)

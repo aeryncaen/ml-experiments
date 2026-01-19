@@ -47,7 +47,8 @@ class ValidatorTrainer:
         self,
         model: ValidatorModel,
         train_data: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
-        val_data: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
+        val_data: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+        | None = None,
         lr: float = 1e-3,
         device: torch.device | None = None,
         epochs: int = 20,
@@ -66,7 +67,7 @@ class ValidatorTrainer:
     ):
         if seed is not None:
             set_seed(seed)
-        
+
         self.device = device or get_device()
         self.model = model.to(self.device)
         self.train_data = train_data
@@ -76,7 +77,7 @@ class ValidatorTrainer:
         self.epochs = epochs
         self.swa_start_epoch = int(epochs * swa_start_pct)
         self.pos_weight = pos_weight
-        
+
         self.curriculum_start_epoch = curriculum_start_epoch
         self.curriculum_end_epoch = curriculum_end_epoch or (epochs // 2)
         self.threshold_search = threshold_search
@@ -95,7 +96,7 @@ class ValidatorTrainer:
             max_lr=lr,
             total_steps=total_steps,
             pct_start=pct_start,
-            anneal_strategy='cos',
+            anneal_strategy="cos",
         )
 
         self.swa_model = AveragedModel(model)
@@ -103,7 +104,7 @@ class ValidatorTrainer:
             self.optimizer,
             swa_lr=swa_lr or lr * 0.05,
             anneal_epochs=swa_anneal_epochs,
-            anneal_strategy='cos',
+            anneal_strategy="cos",
         )
         self.swa_active = False
 
@@ -126,14 +127,18 @@ class ValidatorTrainer:
             return nn.functional.binary_cross_entropy_with_logits(
                 logits.squeeze(-1), labels, weight=weight
             )
-        return nn.functional.binary_cross_entropy_with_logits(logits.squeeze(-1), labels)
+        return nn.functional.binary_cross_entropy_with_logits(
+            logits.squeeze(-1), labels
+        )
 
     def _get_curriculum_hard_ratio(self, epoch: int) -> float:
         if epoch < self.curriculum_start_epoch:
             return 0.0
         if epoch >= self.curriculum_end_epoch:
             return self.max_hard_example_ratio
-        progress = (epoch - self.curriculum_start_epoch) / (self.curriculum_end_epoch - self.curriculum_start_epoch)
+        progress = (epoch - self.curriculum_start_epoch) / (
+            self.curriculum_end_epoch - self.curriculum_start_epoch
+        )
         return self.max_hard_example_ratio * progress
 
     def train_epoch(self, seed: int | None = None, epoch: int = 0) -> TrainMetrics:
@@ -154,7 +159,7 @@ class ValidatorTrainer:
                 hard_indices = sorted(
                     range(len(self._batch_losses)),
                     key=lambda i: self._batch_losses[i],
-                    reverse=True
+                    reverse=True,
                 )[:n_hard]
                 batch_indices = batch_indices + hard_indices
                 random.shuffle(batch_indices)
@@ -168,7 +173,9 @@ class ValidatorTrainer:
         pbar = tqdm(batch_indices, desc=desc, leave=False)
 
         for batch_idx in pbar:
-            bytes_batch, features_batch, labels_batch, lengths_batch = self.train_data[batch_idx]
+            bytes_batch, features_batch, labels_batch, lengths_batch = self.train_data[
+                batch_idx
+            ]
             bytes_batch = bytes_batch.to(self.device)
             features_batch = features_batch.to(self.device)
             labels_batch = labels_batch.to(self.device)
@@ -211,9 +218,15 @@ class ValidatorTrainer:
         if self.swa_active:
             self.swa_model.update_parameters(self.model)
 
-        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        precision = (
+            total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        )
         recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
         total_neg = total_samples - (total_tp + total_fn)
         total_pos = total_tp + total_fn
         fp_rate = total_fp / total_neg if total_neg > 0 else 0.0
@@ -268,7 +281,9 @@ class ValidatorTrainer:
         all_labels_t = torch.cat(all_labels)
 
         if optimize_threshold and self.threshold_search:
-            self.optimal_threshold = self._find_optimal_threshold(all_probs_t, all_labels_t)
+            self.optimal_threshold = self._find_optimal_threshold(
+                all_probs_t, all_labels_t
+            )
 
         threshold = self.optimal_threshold
         preds = (all_probs_t >= threshold).float()
@@ -279,9 +294,15 @@ class ValidatorTrainer:
         total_fp = ((preds == 1) & (all_labels_t == 0)).sum().item()
         total_fn = ((preds == 0) & (all_labels_t == 1)).sum().item()
 
-        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        precision = (
+            total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        )
         recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
         total_neg = total_samples - (total_tp + total_fn)
         total_pos = total_tp + total_fn
         fp_rate = total_fp / total_neg if total_neg > 0 else 0.0
@@ -289,7 +310,9 @@ class ValidatorTrainer:
 
         if f1 > self.best_f1:
             self.best_f1 = f1
-            self.best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+            self.best_state = {
+                k: v.cpu().clone() for k, v in self.model.state_dict().items()
+            }
 
         return TrainMetrics(
             loss=total_loss / len(self.val_data) if self.val_data else 0.0,
@@ -301,8 +324,10 @@ class ValidatorTrainer:
             fn_rate=fn_rate,
         )
 
-    def _find_optimal_threshold(self, probs: torch.Tensor, labels: torch.Tensor) -> float:
-        best_f1 = 0.0
+    def _find_optimal_threshold(
+        self, probs: torch.Tensor, labels: torch.Tensor
+    ) -> float:
+        best_score = 0.0
         best_threshold = 0.5
         for t in torch.linspace(0.1, 0.9, self.threshold_search_steps):
             threshold = t.item()
@@ -312,20 +337,28 @@ class ValidatorTrainer:
             fn = ((preds == 0) & (labels == 1)).sum().item()
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-            if f1 > best_f1:
-                best_f1 = f1
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if (precision + recall) > 0
+                else 0.0
+            )
+            score = (recall * f1) ** 0.5
+            if score > best_score:
+                best_score = score
                 best_threshold = threshold
         return best_threshold
 
     def save_checkpoint(self, path) -> None:
-        torch.save({
-            "config": self.model.config.to_dict(),
-            "state_dict": self.model.state_dict(),
-            "best_f1": self.best_f1,
-            "best_state": self.best_state,
-            "optimal_threshold": self.optimal_threshold,
-        }, path)
+        torch.save(
+            {
+                "config": self.model.config.to_dict(),
+                "state_dict": self.model.state_dict(),
+                "best_f1": self.best_f1,
+                "best_state": self.best_state,
+                "optimal_threshold": self.optimal_threshold,
+            },
+            path,
+        )
 
     def load_best_model(self) -> None:
         if self.best_state is not None:
@@ -334,6 +367,7 @@ class ValidatorTrainer:
 
 def load_checkpoint(path, device: torch.device | None = None) -> ValidatorModel:
     from heuristic_secrets.validator.model import ValidatorConfig
+
     device = device or get_device()
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = ValidatorConfig.from_dict(checkpoint["config"])

@@ -76,7 +76,7 @@ class TrainConfig:
 
     threshold_search: bool = True
     threshold_search_steps: int = 50
-    threshold_optimize_for: Literal["f1", "recall"] = "f1"
+    threshold_optimize_for: Literal["f1", "recall", "gmean_r_f1"] = "gmean_r_f1"
     threshold_min_precision: float = 0.5
 
     preload_to_device: bool = False
@@ -671,6 +671,11 @@ class Trainer:
             if cfg.threshold_optimize_for == "recall":
                 if precision >= cfg.threshold_min_precision and recall > best_score:
                     best_score = recall
+                    best_threshold = threshold
+            elif cfg.threshold_optimize_for == "gmean_r_f1":
+                score = (recall * f1) ** 0.5
+                if score > best_score:
+                    best_score = score
                     best_threshold = threshold
             else:
                 if f1 > best_score:
