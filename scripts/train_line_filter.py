@@ -22,6 +22,7 @@ from heuristic_secrets.models import (
 from heuristic_secrets.bytemasker.dataset import (
     load_bytemasker_dataset,
     load_mixed_windows,
+    load_and_split_mixed_windows,
     LineSample,
 )
 from heuristic_secrets.validator.features import (
@@ -245,7 +246,7 @@ def load_mixed_dataset_with_features(
         print(f"  Loading cached mixed {split} from {cache_path}")
         return _load_mixed_npz(cache_path)
 
-    print(f"  Building mixed {split} dataset (single-line + multi-line windows)...")
+    print(f"  Building mixed {split} dataset (single-line + multi-line + secrets-only)...")
     windows, all_secret_ids = load_mixed_windows(data_dir, split)
 
     print(f"  Extracting text_freq features for {len(windows):,} windows...")
@@ -273,6 +274,102 @@ def load_mixed_dataset_with_features(
     }
 
 
+def _windows_to_data_dict(windows: list[LineSample], secret_ids_set: set[str], text_freq: FrequencyTable) -> dict:
+    features = [char_frequency_difference(w.bytes, text_freq) for w in windows]
+    byte_tensors = [torch.tensor(list(w.bytes), dtype=torch.long) for w in windows]
+    lengths = [len(w.bytes) for w in windows]
+    labels = [1.0 if w.has_secret else 0.0 for w in windows]
+    secret_indices = [i for i, w in enumerate(windows) if w.has_secret]
+    clean_indices = [i for i, w in enumerate(windows) if not w.has_secret]
+    secret_ids_per_window = [w.secret_ids if w.secret_ids else [] for w in windows]
+    categories_per_window = [w.categories if w.categories else [] for w in windows]
+
+    return {
+        "bytes": byte_tensors,
+        "labels": labels,
+        "lengths": lengths,
+        "features": [torch.tensor([f], dtype=torch.float32) for f in features],
+        "secret_indices": secret_indices,
+        "clean_indices": clean_indices,
+        "secret_ids": secret_ids_per_window,
+        "all_secret_ids": secret_ids_set,
+        "categories": categories_per_window,
+    }
+
+
+def load_stratified_mixed_datasets_with_features(
+    data_dir: Path, text_freq: FrequencyTable, seed: int = 42
+) -> tuple[dict, dict]:
+    cache_path = CACHE_DIR / f"stratified_mixed_seed{seed}_v1.npz"
+
+    if cache_path.exists():
+        print(f"  Loading cached stratified mixed datasets from {cache_path}")
+        data = np.load(cache_path, allow_pickle=True)
+        keys = ["bytes", "labels", "lengths", "features", "secret_indices", "clean_indices", "secret_ids", "all_secret_ids", "categories"]
+        train_data = {}
+        val_data = {}
+        for k in keys:
+            train_key = f"train_{k}"
+            val_key = f"val_{k}"
+            if train_key in data:
+                train_data[k] = set(data[train_key]) if k == "all_secret_ids" else data[train_key].tolist()
+            if val_key in data:
+                val_data[k] = set(data[val_key]) if k == "all_secret_ids" else data[val_key].tolist()
+        
+        train_data["bytes"] = [torch.tensor(list(b), dtype=torch.long) for b in train_data["bytes"]]
+        train_data["features"] = [torch.tensor([f], dtype=torch.float32) for f in train_data["features"]]
+        val_data["bytes"] = [torch.tensor(list(b), dtype=torch.long) for b in val_data["bytes"]]
+        val_data["features"] = [torch.tensor([f], dtype=torch.float32) for f in val_data["features"]]
+        
+        return train_data, val_data
+
+    print("  Building stratified mixed datasets (single-line + multi-line + secrets-only)...")
+    print("  This loads ALL documents and properly stratifies by category (88% train / 12% val)...")
+    
+    (train_windows, train_ids), (val_windows, val_ids) = load_and_split_mixed_windows(
+        data_dir, seed=seed, show_progress=True
+    )
+
+    print(f"  Extracting text_freq features for {len(train_windows):,} train windows...")
+    train_data = _windows_to_data_dict(train_windows, train_ids, text_freq)
+    
+    print(f"  Extracting text_freq features for {len(val_windows):,} val windows...")
+    val_data = _windows_to_data_dict(val_windows, val_ids, text_freq)
+
+    print(f"  Caching to {cache_path}...")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    train_bytes_raw = [list(w.bytes) for w in train_windows]
+    val_bytes_raw = [list(w.bytes) for w in val_windows]
+    train_features_raw = [char_frequency_difference(w.bytes, text_freq) for w in train_windows]
+    val_features_raw = [char_frequency_difference(w.bytes, text_freq) for w in val_windows]
+    
+    np.savez(
+        cache_path,
+        train_bytes=np.array(train_bytes_raw, dtype=object),
+        train_labels=np.array(train_data["labels"]),
+        train_lengths=np.array(train_data["lengths"]),
+        train_features=np.array(train_features_raw),
+        train_secret_indices=np.array(train_data["secret_indices"]),
+        train_clean_indices=np.array(train_data["clean_indices"]),
+        train_secret_ids=np.array(train_data["secret_ids"], dtype=object),
+        train_all_secret_ids=np.array(list(train_ids)),
+        train_categories=np.array(train_data["categories"], dtype=object),
+        val_bytes=np.array(val_bytes_raw, dtype=object),
+        val_labels=np.array(val_data["labels"]),
+        val_lengths=np.array(val_data["lengths"]),
+        val_features=np.array(val_features_raw),
+        val_secret_indices=np.array(val_data["secret_indices"]),
+        val_clean_indices=np.array(val_data["clean_indices"]),
+        val_secret_ids=np.array(val_data["secret_ids"], dtype=object),
+        val_all_secret_ids=np.array(list(val_ids)),
+        val_categories=np.array(val_data["categories"], dtype=object),
+    )
+    print(f"  Cached stratified datasets to {cache_path}")
+
+    return train_data, val_data
+
+
 @torch.no_grad()
 def validate_unique_secrets(
     model: Model,
@@ -294,7 +391,8 @@ def validate_unique_secrets(
             ).unsqueeze(1)
         features = batch.features.to(device) if batch.features is not None else None
 
-        logits = model(batch_bytes, mask=mask, precomputed=features)
+        out = model(batch_bytes, mask=mask, precomputed=features)
+        logits = out[0] if isinstance(out, tuple) else out
         probs = torch.sigmoid(logits).view(-1)
         preds = (probs >= threshold).cpu().tolist()
 
@@ -379,12 +477,7 @@ def main():
         action="store_true",
         help="Cosine decay pos_weight from factor*base to base",
     )
-    parser.add_argument(
-        "--max-clean-pool",
-        type=int,
-        default=500_000,
-        help="Max clean lines to keep in memory for resampling",
-    )
+
     parser.add_argument(
         "--clean-ratio",
         type=float,
@@ -406,7 +499,7 @@ def main():
     parser.add_argument(
         "--mixed",
         action="store_true",
-        help="Train on mixed single-line + multi-line windows",
+        help="Train on mixed single-line + multi-line + secrets-only windows",
     )
     parser.add_argument(
         "--quick-eval",
@@ -455,12 +548,22 @@ def main():
         help="Number of unified layers to stack (default: 1)",
     )
     parser.add_argument(
+        "--depthwise",
+        action="store_true",
+        help="Use depthwise conv (each channel independent) instead of grouped",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
         help="Device: cuda, mps, cpu (default: auto)",
     )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+    parser.add_argument(
+        "--profile-slow",
+        action="store_true",
+        help="Profile batches that take >3x median time",
+    )
     args = parser.parse_args()
 
     if args.adaptive:
@@ -476,32 +579,35 @@ def main():
     if args.unified:
         ssm_kernel_sizes = tuple(int(k) for k in args.ssm_kernels.split(","))
         layer_config = LayerConfig(
-            embed_width=24,
+            embed_width=12,
             conv_groups=2,
             attn_heads=2,
             attn_ffn_mult=2,
-            num_attn_features=8,
-            ssm_state_size=16,
-            ssm_n_heads=2,
+            num_attn_features=16,
+            ssm_state_size=24,
+            ssm_n_heads=4,
             ssm_expand=2,
             ssm_kernel_sizes=ssm_kernel_sizes,
-            num_ssm_features=8,
-            num_embed_features=8,
-            num_hidden_features=8,
-            num_heuristic_features=8,
-            mlp_hidden_mult=4,
-            mlp_output_dim=16,
+            num_ssm_features=16,
+            num_embed_features=16,
+            num_hidden_features=16,
+            num_heuristic_features=16,
+            mlp_hidden_mult=16,
+            mlp_output_dim=128,
             dropout=0.1,
             adaptive_conv=args.adaptive,
             n_adaptive_branches=args.n_branches,
+            depthwise_conv=args.depthwise,
+            use_attention=False,
         )
         head_config = HeadConfig(head_type="classifier", n_classes=2)
         model_config = ModelConfig(
             n_layers=args.n_layers, layer=layer_config, head=head_config
         )
         if args.adaptive:
+            dw_str = " DEPTHWISE" if args.depthwise else ""
             print(
-                f"\nUsing unified architecture with ADAPTIVE conv ({args.n_branches} branches)"
+                f"\nUsing unified architecture with{dw_str} ADAPTIVE conv ({args.n_branches} branches)"
             )
         else:
             print(
@@ -547,12 +653,20 @@ def main():
 
     print(f"\nLoading datasets with features...")
     if args.mixed:
-        print("  Mode: MIXED (single-line + multi-line windows)")
-        train_data = load_mixed_dataset_with_features(args.data_dir, "train", text_freq)
-        val_data = load_mixed_dataset_with_features(args.data_dir, "val", text_freq)
+        print("  Mode: MIXED (single-line + multi-line + secrets-only) with STRATIFIED splitting")
+        train_data, val_data = load_stratified_mixed_datasets_with_features(
+            args.data_dir, text_freq, seed=args.seed
+        )
         val_secret_ids = val_data["secret_ids"]
         all_val_secret_ids = val_data["all_secret_ids"]
-        print(f"  Unique secrets in val: {len(all_val_secret_ids):,}")
+        all_train_secret_ids = train_data["all_secret_ids"]
+        
+        train_val_overlap = all_train_secret_ids & all_val_secret_ids
+        if train_val_overlap:
+            raise RuntimeError(f"SECRET LEAKAGE: {len(train_val_overlap)} secrets in both train and val!")
+        print(f"  Train unique secrets: {len(all_train_secret_ids):,}")
+        print(f"  Val unique secrets: {len(all_val_secret_ids):,}")
+        print(f"  No secret leakage between train/val (verified)")
     else:
         train_data = load_dataset_with_features(args.data_dir, "train", text_freq)
         val_data = load_dataset_with_features(args.data_dir, "val", text_freq)
@@ -566,14 +680,6 @@ def main():
     print(
         f"Val: {len(val_data['labels']):,} samples ({n_val_secrets:,} secret windows)"
     )
-
-    if n_train_clean > args.max_clean_pool:
-        print(f"Subsampling clean pool: {n_train_clean:,} -> {args.max_clean_pool:,}")
-        rng = random.Random(args.seed)
-        train_data["clean_indices"] = rng.sample(
-            train_data["clean_indices"], args.max_clean_pool
-        )
-        n_train_clean = args.max_clean_pool
 
     n_clean_per_epoch = min(int(n_train_secrets * args.clean_ratio), n_train_clean)
     print(
@@ -597,14 +703,47 @@ def main():
     else:
         print("Curriculum: disabled")
 
+    def preload_batches(batches: list, target_device: torch.device) -> list:
+        return [
+            type(b)(
+                bytes=b.bytes.to(target_device),
+                labels=b.labels.to(target_device),
+                lengths=b.lengths.to(target_device) if b.lengths is not None else None,
+                features=b.features.to(target_device) if b.features is not None else None,
+                secret_ids=b.secret_ids,
+            )
+            for b in batches
+        ]
+
     if args.quick_eval:
-        n_val_clean = len(val_data["clean_indices"])
-        n_val_clean_sample = min(n_val_secrets, n_val_clean)
         rng = random.Random(args.seed)
+        categories = val_data.get("categories", [])
+        
+        if categories:
+            cat_to_indices: dict[str, list[int]] = {}
+            for idx in val_data["secret_indices"]:
+                cats = categories[idx] if idx < len(categories) else []
+                cat = cats[0] if cats else "unknown"
+                cat_to_indices.setdefault(cat, []).append(idx)
+            
+            target_per_cat = max(1, n_val_secrets // (len(cat_to_indices) * 2))
+            secret_sample = []
+            cat_counts = {}
+            for cat, indices in cat_to_indices.items():
+                n_sample = min(len(indices), target_per_cat)
+                cat_counts[cat] = n_sample
+                secret_sample.extend(rng.sample(indices, n_sample))
+            
+            print(f"Quick eval stratified by category: {cat_counts}")
+        else:
+            secret_sample = val_data["secret_indices"]
+        
+        n_val_clean = len(val_data["clean_indices"])
+        n_val_clean_sample = min(len(secret_sample), n_val_clean)
         val_clean_sample = rng.sample(val_data["clean_indices"], n_val_clean_sample)
-        val_indices = val_data["secret_indices"] + val_clean_sample
+        val_indices = secret_sample + val_clean_sample
         print(
-            f"Quick eval: {n_val_secrets:,} secrets + {n_val_clean_sample:,} clean = {len(val_indices):,} samples"
+            f"Quick eval: {len(secret_sample):,} secrets + {n_val_clean_sample:,} clean = {len(val_indices):,} samples"
         )
 
         val_batches = create_binary_batches(
@@ -627,14 +766,17 @@ def main():
             secret_ids=val_secret_ids,
             shuffle=False,
         )
+    
     print(f"Val batches: {len(val_batches):,}")
+    print(f"  Preloading val batches to {device}...")
+    val_batches = preload_batches(val_batches, device)
 
-    def sample_train_batches(epoch_seed: int) -> list:
+    def sample_train_batches(epoch_seed: int, to_device: torch.device | None = None) -> list:
         rng = random.Random(epoch_seed)
         secret_idx = train_data["secret_indices"]
         clean_idx = rng.sample(train_data["clean_indices"], n_clean_per_epoch)
         indices = secret_idx + clean_idx
-        return create_binary_batches(
+        batches = create_binary_batches(
             train_data["bytes"],
             train_data["labels"],
             train_data["lengths"],
@@ -644,8 +786,12 @@ def main():
             seed=epoch_seed,
             show_progress=False,
         )
+        if to_device is not None:
+            batches = preload_batches(batches, to_device)
+        return batches
 
-    initial_batches = sample_train_batches(args.seed)
+    print(f"  Preloading initial train batches to {device}...")
+    initial_batches = sample_train_batches(args.seed, to_device=device)
 
     model = Model(model_config)
     if args.compile:
@@ -664,9 +810,9 @@ def main():
         lr=args.lr,
         seed=args.seed,
         pos_weight=pos_weight_start,
-        threshold_optimize_for="geom_r_f1",
+        threshold_search=False,
         use_swa=not args.no_swa,
-        preload_to_device=False,
+        preload_to_device=True,
         hard_example_ratio=args.hard_ratio,
         curriculum_start_epoch=args.curriculum_start,
     )
@@ -705,12 +851,12 @@ def main():
     print(f"\nTraining for epochs {start_epoch + 1}-{args.epochs}...")
 
     for epoch in range(start_epoch, args.epochs):
-        trainer.train_data = sample_train_batches(args.seed + epoch)
+        trainer.train_data = sample_train_batches(args.seed + epoch, to_device=device)
         trainer._batch_losses = [0.0] * len(trainer.train_data)
         if args.pos_weight_decay:
             pw = cosine_schedule(epoch, args.epochs, pos_weight_start, pos_weight_end)
             trainer.config.pos_weight = pw
-        train_metrics = trainer.train_epoch(epoch)
+        train_metrics = trainer.train_epoch(epoch, profile_slow=args.profile_slow)
         val_metrics = trainer.validate(optimize_threshold=True)
 
         pw_str = f" pw={trainer.config.pos_weight:.2f}" if args.pos_weight_decay else ""
@@ -767,6 +913,22 @@ def main():
             },
         )
         print(f"  -> {epoch_path}")
+
+        timing_stats = trainer.get_batch_time_stats()
+        if timing_stats:
+            mpt_str = ""
+            if "ms_per_token_mean" in timing_stats:
+                mpt_str = (
+                    f" | ms/tok: {timing_stats['ms_per_token_mean']:.3f}"
+                    f"±{timing_stats['ms_per_token_std']:.3f}"
+                )
+            print(
+                f"         Timing: mean={timing_stats['mean']:.3f}s "
+                f"median={timing_stats['median']:.3f}s "
+                f"p99={timing_stats['p99']:.3f}s "
+                f"max={timing_stats['max']:.3f}s "
+                f"slow={timing_stats['slow_batches']}{mpt_str}"
+            )
 
         swa_recall, swa_threshold, swa_metrics = eval_swa_model(
             trainer, val_batches, all_val_secret_ids, device, args.mixed

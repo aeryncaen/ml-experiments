@@ -14,16 +14,18 @@ from .backbone import (
     DeformConv1d,
     AttentionBlock,
     ContextualAttentionBlock,
+    BiasProjection,
     SSMBlock3,
     RMSNorm,
     SEBlock,
+    SwiGLU,
     MultiKernelSSMBlock,
     AdaptiveConvBiases,
 )
 from .features import PrecomputedFeature
 from .heads import BinaryHead, MaskHead, ClassifierHead
 
-DEBUG_NAN = True
+DEBUG_NAN = False
 
 
 def check_nan(t: torch.Tensor, name: str) -> None:
@@ -43,6 +45,8 @@ class LayerConfig:
 
     conv_kernel_sizes: tuple[int, ...] = (3, 5, 7, 9)
     conv_groups: int = 2
+
+    use_attention: bool = True
 
     attn_depth: int = 2
     attn_heads: int = 2
@@ -68,6 +72,7 @@ class LayerConfig:
     adaptive_min_sigma: float = 0.05
     adaptive_max_sigma: float = 0.5
     depthwise_conv: bool = False
+    bias_ffn_mult: int = 2
     context_dim: int = 16
 
     num_embed_features: int = 4
@@ -573,6 +578,7 @@ class UnifiedLayer(nn.Module):
         w = config.embed_width
 
         self.uses_adaptive_conv = config.adaptive_conv
+        self.use_attention = config.use_attention
 
         if config.adaptive_conv:
             if config.adaptive_init_sigmas is not None:
@@ -596,32 +602,36 @@ class UnifiedLayer(nn.Module):
         n_envelope = n_branches if config.adaptive_conv else 0
         ctx_dim = config.context_dim if config.adaptive_conv else 0
 
-        if config.adaptive_conv:
-            self.attn_block = ContextualAttentionBlock(
-                w,
-                config.attn_heads,
-                n_envelope,
-                ctx_dim,
-                config.attn_ffn_mult,
-                config.dropout,
-                window_size=config.attn_window_size,
-                use_rope=config.attn_use_rope,
-            )
-            self.attn_pooler = None
-        else:
-            self.attn_block = AttentionBlock(
-                w,
-                config.attn_heads,
-                config.attn_ffn_mult,
-                config.dropout,
-                window_size=config.attn_window_size,
-                use_rope=config.attn_use_rope,
-            )
-            self.attn_pooler = LearnedPooler(w, num_queries=1)
+        if config.use_attention:
+            if config.adaptive_conv:
+                self.attn_block = ContextualAttentionBlock(
+                    w,
+                    config.attn_heads,
+                    n_envelope,
+                    ctx_dim,
+                    config.attn_ffn_mult,
+                    config.dropout,
+                    window_size=config.attn_window_size,
+                    use_rope=config.attn_use_rope,
+                )
+                self.attn_pooler = None
+            else:
+                self.attn_block = AttentionBlock(
+                    w,
+                    config.attn_heads,
+                    config.attn_ffn_mult,
+                    config.dropout,
+                    window_size=config.attn_window_size,
+                    use_rope=config.attn_use_rope,
+                )
+                self.attn_pooler = LearnedPooler(w, num_queries=1)
 
-        self.attn_proj = nn.Sequential(
-            nn.Linear(w, config.num_attn_features), nn.SiLU()
-        )
+            self.attn_proj = nn.Sequential(
+                nn.Linear(w, config.num_attn_features), nn.SiLU()
+            )
+        else:
+            if config.adaptive_conv:
+                self.bias_proj = BiasProjection(w, n_branches, ctx_dim)
 
         if self.multi_kernel_ssm:
             self.ssm_block = MultiKernelSSMBlock(
@@ -636,12 +646,14 @@ class UnifiedLayer(nn.Module):
                 adaptive_conv=config.adaptive_conv,
                 depthwise_conv=config.depthwise_conv,
                 context_dim=ctx_dim,
+                bias_ffn_mult=config.bias_ffn_mult,
                 adaptive_kernel_size=config.adaptive_kernel_size,
                 init_sigmas=init_sigmas,
                 min_sigma=config.adaptive_min_sigma,
                 max_sigma=config.adaptive_max_sigma,
                 attn_window_size=config.attn_window_size,
                 attn_use_rope=config.attn_use_rope,
+                use_merge_attention=config.use_attention,
             )
             self.ssm_pooler = None
             self.ssm_proj = None
@@ -698,13 +710,21 @@ class UnifiedLayer(nn.Module):
 
         self.heuristic_embed = HeuristicEmbed(config.num_heuristic_features)
 
-        self.total_features = (
-            config.num_attn_features
-            + config.num_ssm_features
-            + config.num_embed_features
-            + config.num_hidden_features
-            + config.num_heuristic_features
-        )
+        if config.use_attention:
+            self.total_features = (
+                config.num_attn_features
+                + config.num_ssm_features
+                + config.num_embed_features
+                + config.num_hidden_features
+                + config.num_heuristic_features
+            )
+        else:
+            self.total_features = (
+                config.num_ssm_features
+                + config.num_embed_features
+                + config.num_hidden_features
+                + config.num_heuristic_features
+            )
         self.feature_integration = FeatureIntegration(
             w, self.total_features, config.dropout
         )
@@ -730,17 +750,24 @@ class UnifiedLayer(nn.Module):
         precomputed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         check_nan(h, "layer_input")
-        if self.uses_adaptive_conv:
-            h, biases, pooler_context = self.attn_block(h, mask)
-            check_nan(h, "attn_block_adaptive")
-            attn_features = self.attn_proj(self._pool_for_features(h, mask))
+        if self.use_attention:
+            if self.uses_adaptive_conv:
+                h, biases, pooler_context = self.attn_block(h, mask)
+                check_nan(h, "attn_block_adaptive")
+                attn_features = self.attn_proj(self._pool_for_features(h, mask))
+            else:
+                h = self.attn_block(h, mask)
+                check_nan(h, "attn_block")
+                attn_pooled = self.attn_pooler(h, mask)
+                attn_features = self.attn_proj(attn_pooled)
+                biases = None
+                pooler_context = None
         else:
-            h = self.attn_block(h, mask)
-            check_nan(h, "attn_block")
-            attn_pooled = self.attn_pooler(h, mask)
-            attn_features = self.attn_proj(attn_pooled)
-            biases = None
-            pooler_context = None
+            if self.uses_adaptive_conv:
+                biases, pooler_context = self.bias_proj(h, mask)
+            else:
+                biases = None
+                pooler_context = None
 
         aux_losses = {}
         if self.multi_kernel_ssm:
@@ -783,16 +810,27 @@ class UnifiedLayer(nn.Module):
                 dtype=h.dtype,
             )
 
-        features = torch.cat(
-            [
-                attn_features,
-                ssm_features,
-                embed_features,
-                hidden_features,
-                heuristic_features,
-            ],
-            dim=-1,
-        )
+        if self.use_attention:
+            features = torch.cat(
+                [
+                    attn_features,
+                    ssm_features,
+                    embed_features,
+                    hidden_features,
+                    heuristic_features,
+                ],
+                dim=-1,
+            )
+        else:
+            features = torch.cat(
+                [
+                    ssm_features,
+                    embed_features,
+                    hidden_features,
+                    heuristic_features,
+                ],
+                dim=-1,
+            )
 
         h = self.feature_integration(h, features, mask)
 

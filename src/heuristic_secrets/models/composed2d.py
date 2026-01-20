@@ -8,10 +8,12 @@ import torch.nn.functional as F
 from .encoder2d import PixelEmbedding2d
 from .backbone2d import (
     ContextualAttentionBlock2d,
+    BiasProjection2d,
     SSMBlock3_2d,
     RMSNorm,
     MultiKernelSSMBlock2d,
     AdaptiveConvBiases2d,
+    SwiGLU,
 )
 from .heads import ClassifierHead
 
@@ -23,6 +25,8 @@ class LayerConfig2d:
     dropout: float = 0.1
 
     conv_groups: int = 2
+
+    use_attention: bool = True
 
     attn_heads: int = 2
     attn_ffn_mult: int = 4
@@ -171,6 +175,7 @@ class UnifiedLayer2d(nn.Module):
         w = config.embed_width
 
         self.uses_adaptive_conv = config.adaptive_conv
+        self.use_attention = config.use_attention
 
         init_sigmas = config.adaptive_init_sigmas
         if config.adaptive_conv and init_sigmas is None:
@@ -186,23 +191,30 @@ class UnifiedLayer2d(nn.Module):
         ctx_dim = config.context_dim if config.adaptive_conv else 0
         n_branches = len(init_sigmas) if init_sigmas else len(config.ssm_kernel_sizes)
 
-        self.attn_block = ContextualAttentionBlock2d(
-            w,
-            config.attn_heads,
-            n_branches=n_branches if config.adaptive_conv else 0,
-            context_dim=ctx_dim,
-            ffn_mult=config.attn_ffn_mult,
-            dropout=config.dropout,
-            window_size=config.attn_window_size,
-            use_rope=config.attn_use_rope,
-        )
+        if config.use_attention:
+            self.attn_block = ContextualAttentionBlock2d(
+                w,
+                config.attn_heads,
+                n_branches=n_branches if config.adaptive_conv else 0,
+                context_dim=ctx_dim,
+                ffn_mult=config.attn_ffn_mult,
+                dropout=config.dropout,
+                window_size=config.attn_window_size,
+                use_rope=config.attn_use_rope,
+            )
 
-        if not self.uses_adaptive_conv:
-            self.attn_pooler = LearnedPooler2d(w, num_queries=1)
+            if not self.uses_adaptive_conv:
+                self.attn_pooler = LearnedPooler2d(w, num_queries=1)
 
-        self.attn_proj = nn.Sequential(
-            nn.Linear(w, config.num_attn_features), nn.SiLU()
-        )
+            self.attn_proj = nn.Sequential(
+                nn.Linear(w, config.num_attn_features), nn.SiLU()
+            )
+        else:
+            if config.adaptive_conv:
+                self.bias_proj = BiasProjection2d(w, n_branches, ctx_dim)
+            self.input_ffn = SwiGLU(
+                w, mult=config.attn_ffn_mult, dropout=config.dropout
+            )
 
         self.multi_kernel_ssm = True
         self.ssm_block = MultiKernelSSMBlock2d(
@@ -222,6 +234,7 @@ class UnifiedLayer2d(nn.Module):
             max_sigma=config.adaptive_max_sigma,
             attn_window_size=config.attn_window_size,
             attn_use_rope=config.attn_use_rope,
+            use_merge_attention=config.use_attention,
         )
 
         self.embed_pooler = EmbedPooler2d(w, config.num_embed_features)
@@ -231,12 +244,19 @@ class UnifiedLayer2d(nn.Module):
             nn.Linear(w, config.num_hidden_features), nn.SiLU()
         )
 
-        self.total_features = (
-            config.num_attn_features
-            + config.num_ssm_features
-            + config.num_embed_features
-            + config.num_hidden_features
-        )
+        if config.use_attention:
+            self.total_features = (
+                config.num_attn_features
+                + config.num_ssm_features
+                + config.num_embed_features
+                + config.num_hidden_features
+            )
+        else:
+            self.total_features = (
+                config.num_ssm_features
+                + config.num_embed_features
+                + config.num_hidden_features
+            )
         self.feature_integration = FeatureIntegration2d(
             w, self.total_features, config.dropout
         )
@@ -263,15 +283,23 @@ class UnifiedLayer2d(nn.Module):
         h: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        if self.uses_adaptive_conv:
-            h, biases, pooler_context = self.attn_block(h, mask)
-            attn_features = self.attn_proj(self._pool_for_features(h, mask))
+        if self.use_attention:
+            if self.uses_adaptive_conv:
+                h, biases, pooler_context = self.attn_block(h, mask)
+                attn_features = self.attn_proj(self._pool_for_features(h, mask))
+            else:
+                h = self.attn_block(h, mask)
+                attn_pooled = self.attn_pooler(h, mask)
+                attn_features = self.attn_proj(attn_pooled)
+                biases = None
+                pooler_context = None
         else:
-            h = self.attn_block(h, mask)
-            attn_pooled = self.attn_pooler(h, mask)
-            attn_features = self.attn_proj(attn_pooled)
-            biases = None
-            pooler_context = None
+            if self.uses_adaptive_conv:
+                biases, pooler_context = self.bias_proj(h, mask)
+            else:
+                biases = None
+                pooler_context = None
+            h = h + self.input_ffn(h)
 
         h, ssm_features, aux_losses = self.ssm_block(h, h, mask, biases, pooler_context)
 
@@ -280,15 +308,16 @@ class UnifiedLayer2d(nn.Module):
         hidden_pooled = self.hidden_pooler(h, mask)
         hidden_features = self.hidden_proj(hidden_pooled)
 
-        features = torch.cat(
-            [
-                attn_features,
-                ssm_features,
-                embed_features,
-                hidden_features,
-            ],
-            dim=-1,
-        )
+        if self.use_attention:
+            features = torch.cat(
+                [attn_features, ssm_features, embed_features, hidden_features],
+                dim=-1,
+            )
+        else:
+            features = torch.cat(
+                [ssm_features, embed_features, hidden_features],
+                dim=-1,
+            )
 
         h = self.feature_integration(h, features, mask)
 

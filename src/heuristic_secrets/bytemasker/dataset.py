@@ -10,7 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from heuristic_secrets.data.types import SpanFinderSample
+from heuristic_secrets.data.types import SpanFinderSample, SecretCategory, CATEGORY_LABELS
 
 
 CACHE_DIR = Path(".cache/bytemasker")
@@ -20,6 +20,19 @@ DEFAULT_SUFFIX_LEN = 64
 DEFAULT_MIDDLE_LEN = 384
 
 
+def _content_hash_secret_id(secret_bytes: bytes) -> str:
+    """Generate a content-based secret ID from the secret bytes.
+    
+    This ensures the same secret text always gets the same ID,
+    regardless of which file/source it appears in. Critical for
+    preventing data leakage during train/val splitting.
+    """
+    return hashlib.sha256(secret_bytes).hexdigest()[:16]
+
+
+MIN_WINDOW_LENGTH = 7
+
+
 @dataclass
 class LineSample:
     bytes: bytes
@@ -27,19 +40,37 @@ class LineSample:
     has_secret: bool
     source: str
     categories: list[str] | None = None
-    secret_ids: list[str] | None = None  # Unique IDs for each secret span in this sample
+    secret_ids: list[str] | None = None
 
 
 def extract_lines_with_masks(sample: SpanFinderSample) -> list[LineSample]:
     text_bytes = sample.text.encode("utf-8")
     
     pos_to_secret_ids: dict[int, set[str]] = {}
+    pos_to_categories: dict[int, set[str]] = {}
+    
     for span_idx, (start, end) in enumerate(zip(sample.starts, sample.ends)):
-        secret_id = f"{sample.source}:{span_idx}"
+        category = "unknown"
+        is_true_secret = True
+        if sample.categories and span_idx < len(sample.categories):
+            category = sample.categories[span_idx]
+            try:
+                is_true_secret = CATEGORY_LABELS.get(SecretCategory(category), 0) == 1
+            except ValueError:
+                is_true_secret = not category.startswith("fp_")
+        
+        if not is_true_secret:
+            continue
+        
+        secret_bytes = text_bytes[start:min(end, len(text_bytes))]
+        secret_id = _content_hash_secret_id(secret_bytes)
         for pos in range(start, min(end, len(text_bytes))):
             if pos not in pos_to_secret_ids:
                 pos_to_secret_ids[pos] = set()
             pos_to_secret_ids[pos].add(secret_id)
+            if pos not in pos_to_categories:
+                pos_to_categories[pos] = set()
+            pos_to_categories[pos].add(category)
     
     lines = []
     current_line_start = 0
@@ -47,14 +78,16 @@ def extract_lines_with_masks(sample: SpanFinderSample) -> list[LineSample]:
     for i, byte in enumerate(text_bytes):
         if byte == ord('\n'):
             line_bytes = text_bytes[current_line_start:i]
-            if len(line_bytes) > 0:
+            if len(line_bytes) > 0 and line_bytes.strip():
                 mask = []
                 line_secret_ids: set[str] = set()
+                line_categories: set[str] = set()
                 for j in range(len(line_bytes)):
                     pos = current_line_start + j
                     if pos in pos_to_secret_ids:
                         mask.append(1)
                         line_secret_ids.update(pos_to_secret_ids[pos])
+                        line_categories.update(pos_to_categories[pos])
                     else:
                         mask.append(0)
                 lines.append(LineSample(
@@ -62,20 +95,23 @@ def extract_lines_with_masks(sample: SpanFinderSample) -> list[LineSample]:
                     mask=mask,
                     has_secret=len(line_secret_ids) > 0,
                     source=sample.source,
+                    categories=list(line_categories) if line_categories else None,
                     secret_ids=list(line_secret_ids) if line_secret_ids else None,
                 ))
             current_line_start = i + 1
     
     if current_line_start < len(text_bytes):
         line_bytes = text_bytes[current_line_start:]
-        if len(line_bytes) > 0:
+        if len(line_bytes) > 0 and line_bytes.strip():
             mask = []
-            line_secret_ids = set()
+            line_secret_ids: set[str] = set()
+            line_categories: set[str] = set()
             for j in range(len(line_bytes)):
                 pos = current_line_start + j
                 if pos in pos_to_secret_ids:
                     mask.append(1)
                     line_secret_ids.update(pos_to_secret_ids[pos])
+                    line_categories.update(pos_to_categories[pos])
                 else:
                     mask.append(0)
             lines.append(LineSample(
@@ -83,6 +119,7 @@ def extract_lines_with_masks(sample: SpanFinderSample) -> list[LineSample]:
                 mask=mask,
                 has_secret=len(line_secret_ids) > 0,
                 source=sample.source,
+                categories=list(line_categories) if line_categories else None,
                 secret_ids=list(line_secret_ids) if line_secret_ids else None,
             ))
     
@@ -140,14 +177,12 @@ def extract_multiline_windows(
     max_bytes: int = DEFAULT_MULTILINE_MAX_BYTES,
 ) -> list[LineSample]:
     lines = extract_lines_with_masks(sample)
-    lines = [ln for ln in lines if ln.bytes.strip()]
+    lines = [ln for ln in lines if ln.bytes.strip() and len(ln.bytes) <= max_bytes]
     
-    if len(lines) < min_lines:
+    if len(lines) < 2:
         return []
     
     windows = []
-    step = max_lines - overlap
-    
     start = 0
     while start < len(lines):
         window_lines = []
@@ -155,36 +190,82 @@ def extract_multiline_windows(
         
         for i in range(start, min(start + max_lines, len(lines))):
             line_len = len(lines[i].bytes) + 1
-            if window_bytes_total + line_len > max_bytes and len(window_lines) >= min_lines:
+            if window_bytes_total + line_len > max_bytes:
                 break
             window_lines.append(lines[i])
             window_bytes_total += line_len
         
-        if len(window_lines) < min_lines:
-            break
+        if len(window_lines) >= 2:
+            combined_bytes = b"\n".join(ln.bytes for ln in window_lines)
+            combined_mask: list[int] = []
+            combined_secret_ids: set[str] = set()
+            combined_categories: set[str] = set()
+            
+            for j, ln in enumerate(window_lines):
+                combined_mask.extend(ln.mask)
+                if j < len(window_lines) - 1:
+                    combined_mask.append(0)
+                if ln.secret_ids:
+                    combined_secret_ids.update(ln.secret_ids)
+                if ln.categories:
+                    combined_categories.update(ln.categories)
+            
+            windows.append(LineSample(
+                bytes=combined_bytes,
+                mask=combined_mask,
+                has_secret=len(combined_secret_ids) > 0,
+                source=sample.source,
+                categories=list(combined_categories) if combined_categories else None,
+                secret_ids=list(combined_secret_ids) if combined_secret_ids else None,
+            ))
         
-        combined_bytes = b"\n".join(ln.bytes for ln in window_lines)
-        combined_mask: list[int] = []
-        combined_secret_ids: set[str] = set()
-        
-        for i, ln in enumerate(window_lines):
-            combined_mask.extend(ln.mask)
-            if i < len(window_lines) - 1:
-                combined_mask.append(0)
-            if ln.secret_ids:
-                combined_secret_ids.update(ln.secret_ids)
-        
-        windows.append(LineSample(
-            bytes=combined_bytes,
-            mask=combined_mask,
-            has_secret=len(combined_secret_ids) > 0,
-            source=sample.source,
-            secret_ids=list(combined_secret_ids) if combined_secret_ids else None,
-        ))
-        
+        step = max(1, len(window_lines) - overlap)
         start += step
     
     return windows
+
+
+def extract_secret_only_samples(
+    sample: SpanFinderSample,
+    max_bytes: int = DEFAULT_MAX_LEN,
+) -> list[LineSample]:
+    if not sample.starts:
+        return []
+    
+    text_bytes = sample.text.encode("utf-8")
+    samples = []
+    
+    for span_idx, (start, end) in enumerate(zip(sample.starts, sample.ends)):
+        original_secret_bytes = text_bytes[start:end]
+        if len(original_secret_bytes) == 0:
+            continue
+        
+        secret_id = _content_hash_secret_id(original_secret_bytes)
+        
+        secret_bytes = original_secret_bytes
+        if len(secret_bytes) > max_bytes:
+            secret_bytes = secret_bytes[:max_bytes]
+        
+        category = None
+        is_true_secret = True
+        if sample.categories and span_idx < len(sample.categories):
+            category = sample.categories[span_idx]
+            try:
+                is_true_secret = CATEGORY_LABELS.get(SecretCategory(category), 0) == 1
+            except ValueError:
+                is_true_secret = not category.startswith("fp_")
+        mask = [1 if is_true_secret else 0] * len(secret_bytes)
+        
+        samples.append(LineSample(
+            bytes=secret_bytes,
+            mask=mask,
+            has_secret=is_true_secret,
+            source=sample.source,
+            categories=[category] if category else None,
+            secret_ids=[secret_id] if is_true_secret else None,
+        ))
+    
+    return samples
 
 
 def load_spanfinder_samples(path: Path) -> list[SpanFinderSample]:
@@ -214,7 +295,9 @@ class LineMaskDataset(Dataset):
         
         windowed_lines = []
         for line in tqdm(lines, desc="Windowing lines", disable=not show_progress):
-            windowed_lines.extend(window_line(line, max_len, prefix_len, suffix_len, middle_len))
+            for w in window_line(line, max_len, prefix_len, suffix_len, middle_len):
+                if len(w.bytes) >= MIN_WINDOW_LENGTH:
+                    windowed_lines.append(w)
         
         self.lines = windowed_lines
         self.secret_lines = [i for i, ln in enumerate(windowed_lines) if ln.has_secret]
@@ -450,6 +533,8 @@ def _load_cache_jsonl(cache_path: Path, secrets_only: bool = False) -> tuple["Li
             continue
         
         raw_bytes = base64.b64decode(row["b"])
+        if len(raw_bytes) < MIN_WINDOW_LENGTH:
+            continue
         mask = row["m"]
         secret_ids = row.get("ids")
         
@@ -553,9 +638,11 @@ def load_mixed_windows(
         single_lines = extract_lines_with_masks(sample)
         for ln in single_lines:
             windowed = window_line(ln, max_len, prefix_len, suffix_len, middle_len)
-            all_windows.extend(windowed)
-            if ln.secret_ids:
-                all_secret_ids.update(ln.secret_ids)
+            for w in windowed:
+                if len(w.bytes) >= MIN_WINDOW_LENGTH:
+                    all_windows.append(w)
+                    if w.secret_ids:
+                        all_secret_ids.update(w.secret_ids)
         
         multi_windows = extract_multiline_windows(
             sample,
@@ -564,9 +651,272 @@ def load_mixed_windows(
             min_lines=multiline_min_lines,
             max_bytes=multiline_max_bytes,
         )
-        all_windows.extend(multi_windows)
         for mw in multi_windows:
-            if mw.secret_ids:
-                all_secret_ids.update(mw.secret_ids)
+            if len(mw.bytes) >= MIN_WINDOW_LENGTH:
+                all_windows.append(mw)
+                if mw.secret_ids:
+                    all_secret_ids.update(mw.secret_ids)
+        
+        secret_only = extract_secret_only_samples(sample, max_bytes=max_len)
+        for so in secret_only:
+            if len(so.bytes) >= MIN_WINDOW_LENGTH:
+                all_windows.append(so)
+                if so.secret_ids:
+                    all_secret_ids.update(so.secret_ids)
     
     return all_windows, all_secret_ids
+
+
+class _UnionFind:
+    def __init__(self) -> None:
+        self.parent: dict[int, int] = {}
+        self.rank: dict[int, int] = {}
+    
+    def find(self, x: int) -> int:
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+    
+    def union(self, x: int, y: int) -> None:
+        px, py = self.find(x), self.find(y)
+        if px == py:
+            return
+        if self.rank[px] < self.rank[py]:
+            px, py = py, px
+        self.parent[py] = px
+        if self.rank[px] == self.rank[py]:
+            self.rank[px] += 1
+
+
+def _build_sample_components(
+    samples: list[LineSample],
+) -> tuple[list[list[int]], dict[int, set[str]]]:
+    """Group samples into components where samples sharing any secret_id are together.
+    
+    Returns:
+        components: List of sample index lists (each component)
+        component_categories: Map from component root to set of categories
+    """
+    uf = _UnionFind()
+    secret_to_samples: dict[str, list[int]] = {}
+    
+    for idx, sample in enumerate(samples):
+        uf.find(idx)
+        if sample.secret_ids:
+            for sid in sample.secret_ids:
+                if sid not in secret_to_samples:
+                    secret_to_samples[sid] = []
+                secret_to_samples[sid].append(idx)
+    
+    for sid, sample_indices in secret_to_samples.items():
+        for i in range(1, len(sample_indices)):
+            uf.union(sample_indices[0], sample_indices[i])
+    
+    root_to_members: dict[int, list[int]] = {}
+    for idx in range(len(samples)):
+        root = uf.find(idx)
+        if root not in root_to_members:
+            root_to_members[root] = []
+        root_to_members[root].append(idx)
+    
+    component_categories: dict[int, set[str]] = {}
+    for root, members in root_to_members.items():
+        cats: set[str] = set()
+        for idx in members:
+            sample_cats = samples[idx].categories
+            if sample_cats is not None:
+                cats.update(sample_cats)
+            elif samples[idx].has_secret:
+                cats.add("unknown_secret")
+            else:
+                cats.add("clean")
+        component_categories[root] = cats
+    
+    components = list(root_to_members.values())
+    comp_roots = list(root_to_members.keys())
+    return components, {i: component_categories[comp_roots[i]] for i in range(len(components))}
+
+
+def stratified_split_samples(
+    samples: list[LineSample],
+    train_ratio: float = 0.88,
+    val_ratio: float = 0.12,
+    seed: int | None = None,
+) -> tuple[list[LineSample], list[LineSample]]:
+    """Split samples with multi-label stratification, ensuring no secret leakage.
+    
+    Groups samples by shared secret_ids (same secret text = same group).
+    Splits at component level with stratification by category distribution.
+    """
+    assert abs(train_ratio + val_ratio - 1.0) < 0.01
+    
+    if seed is not None:
+        random.seed(seed)
+    
+    components, comp_categories = _build_sample_components(samples)
+    
+    all_categories = set()
+    for cats in comp_categories.values():
+        all_categories.update(cats)
+    
+    cat_counts: dict[str, int] = {cat: 0 for cat in all_categories}
+    for comp_idx, cats in comp_categories.items():
+        for cat in cats:
+            cat_counts[cat] += 1
+    
+    cat_to_target: dict[str, dict[str, float]] = {}
+    for cat in all_categories:
+        total = cat_counts[cat]
+        cat_to_target[cat] = {
+            "train": total * train_ratio,
+            "val": total * val_ratio,
+        }
+    
+    split_counts: dict[str, dict[str, int]] = {
+        cat: {"train": 0, "val": 0} for cat in all_categories
+    }
+    
+    comp_indices = list(range(len(components)))
+    random.shuffle(comp_indices)
+    comp_indices.sort(key=lambda i: min(cat_counts[c] for c in comp_categories[i]))
+    
+    assignments: dict[int, str] = {}
+    
+    for comp_idx in comp_indices:
+        cats = comp_categories[comp_idx]
+        
+        best_split = "train"
+        best_score = float("-inf")
+        
+        for split in ["train", "val"]:
+            score = 0.0
+            for cat in cats:
+                target = cat_to_target[cat][split]
+                current = split_counts[cat][split]
+                if target > 0:
+                    score += (target - current) / target
+            
+            if score > best_score:
+                best_score = score
+                best_split = split
+        
+        assignments[comp_idx] = best_split
+        for cat in cats:
+            split_counts[cat][best_split] += 1
+    
+    train_samples: list[LineSample] = []
+    val_samples: list[LineSample] = []
+    
+    for comp_idx, component in enumerate(components):
+        split = assignments[comp_idx]
+        for sample_idx in component:
+            if split == "train":
+                train_samples.append(samples[sample_idx])
+            else:
+                val_samples.append(samples[sample_idx])
+    
+    random.shuffle(train_samples)
+    random.shuffle(val_samples)
+    
+    return train_samples, val_samples
+
+
+def load_all_documents(data_dir: Path, show_progress: bool = True) -> list[SpanFinderSample]:
+    """Load all documents from train+val+test splits."""
+    data_dir = Path(data_dir)
+    splits_dir = data_dir / "splits" / "documents"
+    
+    all_samples: list[SpanFinderSample] = []
+    for split_name in ["train", "val", "test"]:
+        path = splits_dir / f"{split_name}.jsonl"
+        if path.exists():
+            samples = load_spanfinder_samples(path)
+            all_samples.extend(samples)
+            if show_progress:
+                print(f"  Loaded {len(samples):,} documents from {split_name}")
+    
+    return all_samples
+
+
+def load_and_split_mixed_windows(
+    data_dir: Path,
+    train_ratio: float = 0.88,
+    val_ratio: float = 0.12,
+    seed: int = 42,
+    max_len: int = DEFAULT_MAX_LEN,
+    prefix_len: int = DEFAULT_PREFIX_LEN,
+    suffix_len: int = DEFAULT_SUFFIX_LEN,
+    middle_len: int = DEFAULT_MIDDLE_LEN,
+    multiline_max_lines: int = DEFAULT_MULTILINE_MAX_LINES,
+    multiline_overlap: int = DEFAULT_MULTILINE_OVERLAP,
+    multiline_min_lines: int = DEFAULT_MULTILINE_MIN_LINES,
+    multiline_max_bytes: int = DEFAULT_MULTILINE_MAX_BYTES,
+    show_progress: bool = True,
+) -> tuple[tuple[list[LineSample], set[str]], tuple[list[LineSample], set[str]]]:
+    """Load all documents, window into samples, and split with proper stratification.
+    
+    Returns:
+        ((train_samples, train_secret_ids), (val_samples, val_secret_ids))
+    """
+    data_dir = Path(data_dir)
+    
+    if show_progress:
+        print("  Loading all documents...")
+    documents = load_all_documents(data_dir, show_progress=show_progress)
+    
+    if show_progress:
+        print(f"  Windowing {len(documents):,} documents...")
+    
+    all_windows: list[LineSample] = []
+    for sample in tqdm(documents, desc="Extracting windows", disable=not show_progress):
+        single_lines = extract_lines_with_masks(sample)
+        for ln in single_lines:
+            windowed = window_line(ln, max_len, prefix_len, suffix_len, middle_len)
+            all_windows.extend(w for w in windowed if len(w.bytes) >= MIN_WINDOW_LENGTH)
+        
+        multi_windows = extract_multiline_windows(
+            sample,
+            max_lines=multiline_max_lines,
+            overlap=multiline_overlap,
+            min_lines=multiline_min_lines,
+            max_bytes=multiline_max_bytes,
+        )
+        all_windows.extend(w for w in multi_windows if len(w.bytes) >= MIN_WINDOW_LENGTH)
+        
+        secret_only = extract_secret_only_samples(sample, max_bytes=max_len)
+        all_windows.extend(w for w in secret_only if len(w.bytes) >= MIN_WINDOW_LENGTH)
+    
+    if show_progress:
+        print(f"  Total samples: {len(all_windows):,}")
+        print(f"  Stratified splitting (seed={seed}, {train_ratio:.0%} train / {val_ratio:.0%} val)...")
+    
+    train, val = stratified_split_samples(
+        all_windows,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+    )
+    
+    def collect_secret_ids(samples: list[LineSample]) -> set[str]:
+        ids: set[str] = set()
+        for s in samples:
+            if s.secret_ids:
+                ids.update(s.secret_ids)
+        return ids
+    
+    train_ids = collect_secret_ids(train)
+    val_ids = collect_secret_ids(val)
+    
+    train_val_leak = train_ids & val_ids
+    if train_val_leak:
+        raise RuntimeError(f"Secret leakage detected! {len(train_val_leak)} secrets in both train and val")
+    
+    if show_progress:
+        print(f"  Train: {len(train):,} samples, {len(train_ids):,} unique secrets")
+        print(f"  Val: {len(val):,} samples, {len(val_ids):,} unique secrets")
+        print("  No secret leakage detected.")
+    
+    return (train, train_ids), (val, val_ids)

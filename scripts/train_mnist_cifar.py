@@ -203,6 +203,11 @@ def main():
     parser.add_argument(
         "--grayscale", action="store_true", help="Convert RGB to grayscale"
     )
+    parser.add_argument(
+        "--no-attention",
+        action="store_true",
+        help="Disable attention (use simpler bias projection and SwiGLU)",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -220,11 +225,13 @@ def main():
     conv_groups = max(1, min(4, args.width // 4))
 
     in_channels = 1 if args.grayscale else ds_config.channels
+    use_attention = not args.no_attention
     layer_config = LayerConfig2d(
         embed_width=args.width,
         in_channels=in_channels,
         dropout=0.1,
         conv_groups=conv_groups,
+        use_attention=use_attention,
         attn_heads=attn_heads,
         attn_ffn_mult=4,
         attn_window_size=16,
@@ -264,6 +271,7 @@ def main():
         f"  Adaptive: {args.adaptive}"
         + (f" ({args.n_branches} branches)" if args.adaptive else "")
     )
+    print(f"  Attention: {use_attention}")
 
     print(f"\nLoading {args.dataset}..." + (" (grayscale)" if args.grayscale else ""))
     train_dataset = load_vision_dataset(

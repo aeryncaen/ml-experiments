@@ -2,10 +2,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NamedTuple, Sequence
 import random
+import time
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.profiler import profile, ProfilerActivity
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from tqdm import tqdm
@@ -74,7 +76,7 @@ class TrainConfig:
     curriculum_start_epoch: int = 2
     curriculum_end_epoch: int | None = None
 
-    threshold_search: bool = True
+    threshold_search: bool = False
     threshold_search_steps: int = 50
     threshold_optimize_for: Literal["f1", "recall", "gmean_r_f1"] = "gmean_r_f1"
     threshold_min_precision: float = 0.5
@@ -103,6 +105,8 @@ class Metrics:
     accuracy: float = 0.0
     fp_rate: float = 0.0
     fn_rate: float = 0.0
+    eval_time: float = 0.0
+    eval_tokens_per_sec: float = 0.0
 
     def __str__(self) -> str:
         parts = [f"loss={self.loss:.4f}"]
@@ -119,6 +123,8 @@ class Metrics:
         if self.fp_rate > 0 or self.fn_rate > 0:
             parts.append(f"FP%={self.fp_rate * 100:.1f}")
             parts.append(f"FN%={self.fn_rate * 100:.1f}")
+        if self.eval_time > 0:
+            parts.append(f"[{self.eval_time:.2f}s {self.eval_tokens_per_sec:.0f}tok/s]")
         return " ".join(parts)
 
 
@@ -166,6 +172,10 @@ class Trainer:
         self.best_state: dict | None = None
         self.optimal_threshold = 0.5
         self._batch_losses: list[float] = [0.0] * len(train_data)
+        self._batch_times: list[tuple[int, float]] = []
+        # (epoch, loop_idx, batch_idx, ms_per_token, mean, stddev)
+        self._slow_batches: list[tuple[int, int, int, float, float, float]] = []
+        self._ms_per_token_history: list[float] = []
 
     def _get_param_groups(self, model: Model) -> tuple[list, list]:
         no_decay_keywords = {
@@ -368,7 +378,7 @@ class Trainer:
             return batch
         return self._move_batch_to_device(batch)
 
-    def train_epoch(self, epoch: int = 0) -> Metrics:
+    def train_epoch(self, epoch: int = 0, profile_slow: bool = False) -> Metrics:
         self.model.train()
         cfg = self.config
 
@@ -401,14 +411,25 @@ class Trainer:
         total_samples = 0
 
         desc = "Training (SWA)" if self.swa_active else "Training"
-        pbar = tqdm(batch_indices, desc=desc, leave=False)
+        pbar = tqdm(batch_indices, desc=desc, leave=False, smoothing=0)
+        
+        self._batch_times = []
+        self._ms_per_token_history = []
 
-        for batch_idx in pbar:
-            batch = self._to_device(self.train_data[batch_idx])
+        for loop_idx, batch_idx in enumerate(pbar):
+            batch_start = time.perf_counter()
+            
+            batch = self.train_data[batch_idx]
+
+            if profile_slow:
+                self._profile_slow_batch(batch, batch_idx)
 
             self.optimizer.zero_grad()
+            
             logits, aux_losses = self._forward_batch(batch)
+            
             loss = self._compute_loss(logits, batch, aux_losses)
+            
             loss.backward()
 
             if cfg.grad_clip > 0:
@@ -423,6 +444,7 @@ class Trainer:
                 self._scheduler_steps += 1
 
             loss_val = loss.item()
+            
             total_loss += loss_val
             self._batch_losses[batch_idx] = loss_val
 
@@ -434,13 +456,32 @@ class Trainer:
                 total_tn += tn
                 total_samples += n
 
+            batch_time = time.perf_counter() - batch_start
+            self._batch_times.append((batch_idx, batch_time))
+            
+            total_tokens = int(batch.lengths.sum()) if batch.lengths is not None else batch.bytes.numel()
+            ms_per_token = (batch_time * 1000) / total_tokens
+            self._ms_per_token_history.append(ms_per_token)
+            
+            if len(self._ms_per_token_history) >= 50:
+                hist = self._ms_per_token_history
+                mean_mpt = sum(hist) / len(hist)
+                variance = sum((x - mean_mpt) ** 2 for x in hist) / len(hist)
+                std_mpt = variance ** 0.5
+                threshold = mean_mpt + std_mpt
+                
+                if ms_per_token > threshold:
+                    self._slow_batches.append((epoch, loop_idx, batch_idx, ms_per_token, mean_mpt, std_mpt))
+                    if profile_slow:
+                        self._profile_slow_batch(batch, batch_idx)
+
             sched = (
                 self.swa_scheduler
                 if self.swa_active and self.swa_scheduler
                 else self.scheduler
             )
             lr = sched.get_last_lr()[0]
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}")
+            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", t=f"{batch_time:.2f}s")
 
         if self.swa_active and self.swa_model is not None:
             self.swa_model.update_parameters(self.model)
@@ -454,6 +495,128 @@ class Trainer:
             total_tn,
             total_samples,
         )
+
+    def _profile_slow_batch(self, batch: "Batch", batch_idx: int) -> None:
+        activities = [ProfilerActivity.CPU]
+        if self.device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        
+        with profile(activities=activities, record_shapes=True, with_stack=True, with_modules=True) as prof:
+            self.optimizer.zero_grad()
+            logits, aux = self._forward_batch(batch)
+            loss = self._compute_loss(logits, batch, aux)
+            loss.backward()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+        
+        sort_key = "cuda_time_total" if self.device.type == "cuda" else "cpu_time_total"
+        B, L = batch.bytes.shape
+        tokens = int(batch.lengths.sum()) if batch.lengths is not None else B * L
+        tqdm.write(f"\n  Profiler for batch {batch_idx}: shape=({B}, {L}), tokens={tokens}")
+        tqdm.write(prof.key_averages(group_by_input_shape=True).table(sort_by=sort_key, row_limit=30))
+        
+        tqdm.write("\n  Stack traces for aten::item calls:")
+        events = list(prof.events() or [])
+        item_events = [e for e in events if "item" in e.name.lower()]
+        tqdm.write(f"  Found {len(item_events)} item events")
+        for i, event in enumerate(item_events[:5]):
+            tqdm.write(f"  [{i}] {event.name}: thread={event.thread}, time={event.cpu_time_total}us")
+            if hasattr(event, 'stack') and event.stack:
+                for frame in event.stack[:5]:
+                    tqdm.write(f"      {frame}")
+        
+        prof.export_chrome_trace(f"/tmp/profile_batch_{batch_idx}.json")
+        tqdm.write(f"\n  Full trace exported to /tmp/profile_batch_{batch_idx}.json")
+
+    def profile_batch(self, batch_idx: int, warmup: int = 2, runs: int = 5) -> dict:
+        """Profile a specific batch with torch profiler."""
+        batch = self._to_device(self.train_data[batch_idx])
+        
+        for _ in range(warmup):
+            self.optimizer.zero_grad()
+            logits, aux = self._forward_batch(batch)
+            loss = self._compute_loss(logits, batch, aux)
+            loss.backward()
+        
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        
+        times = []
+        for _ in range(runs):
+            start = time.perf_counter()
+            self.optimizer.zero_grad()
+            logits, aux = self._forward_batch(batch)
+            loss = self._compute_loss(logits, batch, aux)
+            loss.backward()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.perf_counter() - start)
+        
+        result = {
+            "batch_idx": batch_idx,
+            "batch_size": batch.bytes.shape[0],
+            "seq_len": batch.bytes.shape[1],
+            "mean_time": sum(times) / len(times),
+            "min_time": min(times),
+            "max_time": max(times),
+            "times": times,
+        }
+        
+        try:
+            from torch.profiler import profile, ProfilerActivity
+            activities = [ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(ProfilerActivity.CUDA)
+            
+            with profile(activities=activities, record_shapes=True) as prof:
+                self.optimizer.zero_grad()
+                logits, aux = self._forward_batch(batch)
+                loss = self._compute_loss(logits, batch, aux)
+                loss.backward()
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+            
+            result["profile_table"] = prof.key_averages().table(
+                sort_by="cpu_time_total" if self.device.type != "cuda" else "cuda_time_total",
+                row_limit=20
+            )
+        except Exception as e:
+            result["profile_error"] = str(e)
+        
+        return result
+
+    def get_batch_time_stats(self) -> dict:
+        """Get statistics about batch execution times from the last epoch."""
+        if not self._batch_times:
+            return {}
+        times = [t for _, t in self._batch_times]
+        sorted_times = sorted(times)
+        n = len(sorted_times)
+        
+        mpt_stats = {}
+        if self._ms_per_token_history:
+            sorted_mpt = sorted(self._ms_per_token_history)
+            m = len(sorted_mpt)
+            mean_mpt = sum(sorted_mpt) / m
+            variance = sum((x - mean_mpt) ** 2 for x in sorted_mpt) / m
+            mpt_stats = {
+                "ms_per_token_mean": mean_mpt,
+                "ms_per_token_std": variance ** 0.5,
+                "ms_per_token_median": sorted_mpt[m // 2],
+                "ms_per_token_p95": sorted_mpt[int(m * 0.95)],
+            }
+        
+        return {
+            "count": n,
+            "mean": sum(times) / n,
+            "median": sorted_times[n // 2],
+            "p95": sorted_times[int(n * 0.95)],
+            "p99": sorted_times[int(n * 0.99)],
+            "min": sorted_times[0],
+            "max": sorted_times[-1],
+            "slow_batches": len(self._slow_batches),
+            **mpt_stats,
+        }
 
     def _compute_confusion(
         self, logits: torch.Tensor, batch: Batch, threshold: float = 0.5
@@ -564,9 +727,13 @@ class Trainer:
         all_preds: list[torch.Tensor] = []
         all_targets: list[torch.Tensor] = []
         total_loss = 0.0
+        total_tokens = 0
 
-        for batch in self.val_data:
+        eval_start = time.perf_counter()
+
+        for batch in tqdm(self.val_data, desc="Validating", leave=False, smoothing=0):
             batch = self._to_device(batch)
+            total_tokens += int(batch.lengths.sum()) if batch.lengths is not None else batch.bytes.numel()
             logits, aux_losses = self._forward_batch(batch)
             loss = self._compute_loss(logits, batch, aux_losses)
             total_loss += loss.item()
@@ -578,23 +745,23 @@ class Trainer:
                 pos_mask = torch.arange(L, device=self.device).unsqueeze(
                     0
                 ) < batch.lengths.unsqueeze(1)
-                all_probs.append(probs[pos_mask].cpu())
-                all_targets.append(batch.masks[pos_mask].cpu())
+                all_probs.append(probs[pos_mask])
+                all_targets.append(batch.masks[pos_mask])
             elif self.n_classes > 2:
                 assert isinstance(batch, BinaryBatch)
                 preds = logits.argmax(dim=-1)
-                all_preds.append(preds.cpu())
-                all_targets.append(batch.labels.cpu())
+                all_preds.append(preds)
+                all_targets.append(batch.labels)
             else:
                 assert isinstance(batch, BinaryBatch)
                 probs = torch.sigmoid(logits)
-                all_probs.append(probs.view(-1).cpu())
-                all_targets.append(batch.labels.cpu())
+                all_probs.append(probs.view(-1))
+                all_targets.append(batch.labels)
 
-        all_targets_t = torch.cat(all_targets)
+        all_targets_t = torch.cat(all_targets).cpu()
 
         if self.n_classes > 2 and self.head_type != "mask":
-            all_preds_t = torch.cat(all_preds)
+            all_preds_t = torch.cat(all_preds).cpu()
             correct = (all_preds_t == all_targets_t.long()).sum().item()
             total = len(all_targets_t)
             accuracy = correct / total if total > 0 else 0.0
@@ -606,18 +773,19 @@ class Trainer:
                 f1=0.0,
             )
         else:
-            all_probs_t = torch.cat(all_probs)
+            all_probs_np = torch.cat(all_probs).cpu().numpy()
+            all_targets_np = all_targets_t.numpy()
 
             if optimize_threshold and self.config.threshold_search:
-                self.optimal_threshold = self._find_optimal_threshold(
-                    all_probs_t, all_targets_t
+                self.optimal_threshold = self._find_optimal_threshold_np(
+                    all_probs_np, all_targets_np
                 )
 
-            preds = (all_probs_t >= self.optimal_threshold).float()
-            tp = ((preds == 1) & (all_targets_t == 1)).sum().item()
-            fp = ((preds == 1) & (all_targets_t == 0)).sum().item()
-            fn = ((preds == 0) & (all_targets_t == 1)).sum().item()
-            tn = ((preds == 0) & (all_targets_t == 0)).sum().item()
+            preds = (all_probs_np >= self.optimal_threshold).astype(np.float32)
+            tp = int(((preds == 1) & (all_targets_np == 1)).sum())
+            fp = int(((preds == 1) & (all_targets_np == 0)).sum())
+            fn = int(((preds == 0) & (all_targets_np == 1)).sum())
+            tn = int(((preds == 0) & (all_targets_np == 0)).sum())
 
             metrics = self._build_metrics(
                 total_loss,
@@ -629,6 +797,10 @@ class Trainer:
                 len(all_targets_t),
             )
 
+        eval_time = time.perf_counter() - eval_start
+        metrics.eval_time = eval_time
+        metrics.eval_tokens_per_sec = total_tokens / eval_time if eval_time > 0 else 0.0
+
         target_metric = (
             metrics.accuracy
             if self.n_classes > 2
@@ -638,27 +810,26 @@ class Trainer:
                 else metrics.f1
             )
         )
-        if target_metric > self.best_metric:
+        if target_metric > self.best_metric + 0.001:
             self.best_metric = target_metric
-            self.best_state = {
-                k: v.cpu().clone() for k, v in self.model.state_dict().items()
-            }
+            self.best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
 
         return metrics
 
-    def _find_optimal_threshold(
-        self, probs: torch.Tensor, targets: torch.Tensor
+    def _find_optimal_threshold_np(
+        self, probs: np.ndarray, targets: np.ndarray
     ) -> float:
         cfg = self.config
         best_score = 0.0
         best_threshold = 0.5
 
-        for t in torch.linspace(0.1, 0.9, cfg.threshold_search_steps):
-            threshold = t.item()
-            preds = (probs >= threshold).float()
-            tp = ((preds == 1) & (targets == 1)).sum().item()
-            fp = ((preds == 1) & (targets == 0)).sum().item()
-            fn = ((preds == 0) & (targets == 1)).sum().item()
+        thresholds = np.linspace(0.1, 0.9, cfg.threshold_search_steps)
+
+        for threshold in thresholds:
+            preds = (probs >= threshold).astype(np.float32)
+            tp = ((preds == 1) & (targets == 1)).sum()
+            fp = ((preds == 1) & (targets == 0)).sum()
+            fn = ((preds == 0) & (targets == 1)).sum()
 
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -725,17 +896,16 @@ class Trainer:
         return model, trainer, data
 
 
-def compute_length_bins(lengths: list[int], n_bins: int = 8) -> list[int]:
+def compute_length_bins(lengths: list[int]) -> list[int]:
+    """Bins tuned for typical line-level secret detection data.
+    
+    Distribution has dense core at 0-70, sparse middle, then long tail clusters.
+    """
     if not lengths:
         return [512]
-    sorted_lens = sorted(lengths)
-    n = len(sorted_lens)
-    bins = []
-    for i in range(1, n_bins):
-        idx = int(n * i / n_bins)
-        bins.append(sorted_lens[idx])
-    bins.append(sorted_lens[-1])
-    return sorted(set(bins))
+    max_len = max(lengths)
+    bins = [48, 80, 128, 288, 384, 512]
+    return [b for b in bins if b <= max_len] or [max_len]
 
 
 def create_mask_batches(
@@ -769,13 +939,12 @@ def create_mask_batches(
 
     total = sum((len(b) + batch_size - 1) // batch_size for b in bins.values() if b)
     batches: list[MaskBatch] = []
-    pbar = tqdm(total=total, desc="Creating batches", disable=not show_progress)
+    pbar = tqdm(total=total, desc="Creating batches", disable=not show_progress, smoothing=0)
 
     for bin_indices in bins.values():
         if not bin_indices:
             continue
-        if shuffle:
-            random.shuffle(bin_indices)
+        bin_indices.sort(key=lambda i: lengths[i])
 
         for i in range(0, len(bin_indices), batch_size):
             batch_idx = bin_indices[i : i + batch_size]
@@ -830,13 +999,12 @@ def create_binary_batches(
 
     total = sum((len(b) + batch_size - 1) // batch_size for b in bins.values() if b)
     batches: list[BinaryBatch] = []
-    pbar = tqdm(total=total, desc="Creating batches", disable=not show_progress)
+    pbar = tqdm(total=total, desc="Creating batches", disable=not show_progress, smoothing=0)
 
     for bin_indices in bins.values():
         if not bin_indices:
             continue
-        if shuffle:
-            random.shuffle(bin_indices)
+        bin_indices.sort(key=lambda i: lengths[i])
 
         for i in range(0, len(bin_indices), batch_size):
             batch_idx = bin_indices[i : i + batch_size]

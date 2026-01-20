@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
-DEBUG_NAN = True
+DEBUG_NAN = False
 
 
 def check_nan(t: torch.Tensor, name: str) -> None:
@@ -859,6 +859,71 @@ class ContextualAttentionBlock2d(nn.Module):
         return x, biases, context
 
 
+class BiasProjection2d(nn.Module):
+    def __init__(
+        self,
+        width: int,
+        n_branches: int,
+        context_dim: int = 0,
+    ):
+        super().__init__()
+        self.width = width
+        self.n_branches = n_branches
+        self.context_dim = context_dim
+
+        self.sigma_h_proj = nn.Linear(width, n_branches)
+        self.sigma_w_proj = nn.Linear(width, n_branches)
+        self.offset_scale_h_proj = nn.Linear(width, n_branches)
+        self.offset_scale_w_proj = nn.Linear(width, n_branches)
+        self.omega_h_proj = nn.Linear(width, n_branches)
+        self.omega_w_proj = nn.Linear(width, n_branches)
+        self.se_bias_proj = nn.Linear(width, n_branches * width)
+
+        for proj in [
+            self.sigma_h_proj,
+            self.sigma_w_proj,
+            self.offset_scale_h_proj,
+            self.offset_scale_w_proj,
+            self.omega_h_proj,
+            self.omega_w_proj,
+        ]:
+            nn.init.zeros_(proj.weight)
+            nn.init.zeros_(proj.bias)
+        nn.init.zeros_(self.se_bias_proj.weight)
+        nn.init.zeros_(self.se_bias_proj.bias)
+
+        if context_dim > 0:
+            self.context_proj = nn.Linear(width, context_dim)
+
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[AdaptiveConvBiases2d, torch.Tensor | None]:
+        B, H, W, C = x.shape
+
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).float()
+            x_masked = x * (1 - mask_expanded)
+            valid_count = (1 - mask_expanded).sum(dim=(1, 2)).clamp(min=1)
+            pooled = x_masked.sum(dim=(1, 2)) / valid_count
+        else:
+            pooled = x.mean(dim=(1, 2))
+
+        se_bias = self.se_bias_proj(pooled).view(B, self.n_branches, self.width)
+        biases = AdaptiveConvBiases2d(
+            sigma_h=self.sigma_h_proj(pooled),
+            sigma_w=self.sigma_w_proj(pooled),
+            offset_scale_h=self.offset_scale_h_proj(pooled),
+            offset_scale_w=self.offset_scale_w_proj(pooled),
+            omega_h=self.omega_h_proj(pooled),
+            omega_w=self.omega_w_proj(pooled),
+            se_bias=se_bias,
+        )
+
+        context = self.context_proj(pooled) if self.context_dim > 0 else None
+
+        return biases, context
+
+
 class SSMBlock3_2d(nn.Module):
     def __init__(
         self,
@@ -1223,11 +1288,13 @@ class MultiKernelSSMBlock2d(nn.Module):
         max_sigma: float = 0.5,
         attn_window_size: int = 64,
         attn_use_rope: bool = True,
+        use_merge_attention: bool = True,
     ):
         super().__init__()
         self.width = width
         self.adaptive_conv = adaptive_conv
         self.context_dim = context_dim
+        self.use_merge_attention = use_merge_attention
 
         if adaptive_conv and init_sigmas is not None:
             self.n_branches = len(init_sigmas)
@@ -1285,14 +1352,17 @@ class MultiKernelSSMBlock2d(nn.Module):
         self.proj_down = nn.Linear(self.total_width, width)
         self.norm_merge = RMSNorm(width)
 
-        self.merge_attn = AttentionBlock2d(
-            width,
-            num_heads=max(1, width // 8),
-            ffn_mult=4,
-            dropout=dropout,
-            window_size=attn_window_size,
-            use_rope=attn_use_rope,
-        )
+        if use_merge_attention:
+            self.merge_attn = AttentionBlock2d(
+                width,
+                num_heads=max(1, width // 8),
+                ffn_mult=4,
+                dropout=dropout,
+                window_size=attn_window_size,
+                use_rope=attn_use_rope,
+            )
+        else:
+            self.merge_proj = SwiGLU(width, mult=4, dropout=dropout)
 
         self.ssm = SSMBlock3_2d(
             width,
@@ -1380,8 +1450,11 @@ class MultiKernelSSMBlock2d(nn.Module):
         h = self.norm_merge(h + residual)
         check_nan(h, "mkssm2d_norm_merge")
 
-        h = self.merge_attn(h, mask)
-        check_nan(h, "mkssm2d_merge_attn")
+        if self.use_merge_attention:
+            h = self.merge_attn(h, mask)
+        else:
+            h = h + self.merge_proj(h)
+        check_nan(h, "mkssm2d_merge")
 
         h_res = h
         h, ssm_aux = self.ssm(h, mask)

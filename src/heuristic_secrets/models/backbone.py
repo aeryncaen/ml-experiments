@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
-DEBUG_NAN = True
+DEBUG_NAN = False
 
 
 def check_nan(t: torch.Tensor, name: str) -> None:
@@ -122,6 +122,7 @@ class DeformConv1d(nn.Module):
         kernel_size: int = 7,
         groups: int = 4,
         offset_scale: float = 2.0,
+        max_seq_len: int = 8192,
     ):
         super().__init__()
         if channels % groups != 0:
@@ -134,6 +135,7 @@ class DeformConv1d(nn.Module):
         self.groups = groups
         self.group_channels = channels // groups
         self.offset_scale = offset_scale
+        self.max_seq_len = max_seq_len
 
         self.dw_conv = nn.Sequential(
             nn.Conv1d(channels, channels, kernel_size=3, padding=1, groups=channels),
@@ -145,6 +147,12 @@ class DeformConv1d(nn.Module):
         self.mask_net = nn.Linear(channels, groups * kernel_size)
         self.input_proj = nn.Linear(channels, channels)
         self.output_proj = nn.Linear(channels, channels)
+
+        # Register fixed buffers
+        ref_offsets = torch.linspace(-(kernel_size // 2), kernel_size // 2, kernel_size)
+        self.register_buffer("ref_offsets", ref_offsets)
+        pos_indices = torch.arange(max_seq_len, dtype=torch.float32).view(1, max_seq_len, 1, 1)
+        self.register_buffer("pos_indices", pos_indices)
 
         self._reset_parameters()
 
@@ -176,12 +184,9 @@ class DeformConv1d(nn.Module):
         mask = F.softmax(self.mask_net(x_dw).view(N, L, G, K), dim=-1)
         mask = torch.nan_to_num(mask, nan=0.0)
 
-        ref_offsets = torch.linspace(-(K // 2), K // 2, K, device=x.device)
-        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)
-
         x_grouped = x_proj.view(N, L, G, gc)
 
-        abs_pos = pos_indices + ref_offsets.view(1, 1, 1, K) + offsets
+        abs_pos = self.pos_indices[:, :L] + self.ref_offsets.view(1, 1, 1, K) + offsets
         abs_pos_clamped = abs_pos.clamp(0, L - 1)
 
         p_floor = abs_pos_clamped.long().clamp(0, L - 1)
@@ -210,9 +215,9 @@ class DeformConv1d(nn.Module):
 
 
 class AdaptiveConvBiases:
-    """Container for all adaptive convolution biases from attention."""
+    """Container for all adaptive convolution biases."""
 
-    __slots__ = ("sigma", "offset_scale", "omega", "se_bias")
+    __slots__ = ("sigma", "offset_scale", "omega", "se_bias", "context")
 
     def __init__(
         self,
@@ -220,11 +225,70 @@ class AdaptiveConvBiases:
         offset_scale: torch.Tensor | None = None,
         omega: torch.Tensor | None = None,
         se_bias: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
     ):
         self.sigma = sigma
         self.offset_scale = offset_scale
         self.omega = omega
         self.se_bias = se_bias
+        self.context = context
+
+
+class BiasProjection(nn.Module):
+    def __init__(
+        self,
+        width: int,
+        n_branches: int,
+        context_dim: int = 0,
+        bias_ffn_mult: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.width = width
+        self.n_branches = n_branches
+        self.context_dim = context_dim
+
+        self.bias_mlp = SwiGLU(width, bias_ffn_mult, dropout, output_dim=width, zero_init=True)
+
+        self.sigma_head = nn.Linear(width, n_branches)
+        self.offset_scale_head = nn.Linear(width, n_branches)
+        self.omega_head = nn.Linear(width, n_branches)
+        self.se_bias_head = nn.Linear(width, n_branches * width)
+
+        for head in [self.sigma_head, self.offset_scale_head, self.omega_head, self.se_bias_head]:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+        if context_dim > 0:
+            self.context_proj = nn.Linear(width, context_dim)
+
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[AdaptiveConvBiases, torch.Tensor | None]:
+        B, L, C = x.shape
+
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).float()
+            x_masked = x * (1 - mask_expanded)
+            valid_count = (1 - mask_expanded).sum(dim=1).clamp(min=1)
+            pooled = x_masked.sum(dim=1) / valid_count
+        else:
+            pooled = x.mean(dim=1)
+
+        h = self.bias_mlp(pooled)
+
+        se_bias = self.se_bias_head(h).view(B, self.n_branches, self.width)
+        biases = AdaptiveConvBiases(
+            sigma=self.sigma_head(h),
+            offset_scale=self.offset_scale_head(h),
+            omega=self.omega_head(h),
+            se_bias=se_bias,
+            context=h,
+        )
+
+        context = self.context_proj(pooled) if self.context_dim > 0 else None
+
+        return biases, context
 
 
 class AdaptiveDeformConv1d(nn.Module):
@@ -251,13 +315,15 @@ class AdaptiveDeformConv1d(nn.Module):
         min_sigma: float = 0.05,
         max_sigma: float = 0.5,
         depthwise: bool = False,
-        se_reduction: int = 4,
+        context_dim: int | None = None,
+        bias_ffn_mult: int = 2,
         kernel_hidden: int = 32,
         kernel_layers: int = 3,
         omega_0: float = 30.0,
         min_kernel_size: int = 3,
         max_kernel_size: int = 31,
         dynamic_kernel: bool = True,
+        max_seq_len: int = 8192,
     ):
         super().__init__()
         if not depthwise and channels % groups != 0:
@@ -280,10 +346,42 @@ class AdaptiveDeformConv1d(nn.Module):
         self.dynamic_kernel = dynamic_kernel
 
         init_raw = math.log(math.exp(init_sigma) - 1.0) if init_sigma > 0 else 0.0
-        self.raw_sigma = nn.Parameter(torch.tensor(init_raw))
+        ctx_dim = context_dim or channels
+
+        if depthwise:
+            self.raw_sigma = nn.Parameter(torch.full((channels,), init_raw))
+            self.base_offset_scale_per_channel = nn.Parameter(
+                torch.full((channels,), offset_scale)
+            )
+            self.base_omega_per_channel = nn.Parameter(torch.zeros(channels))
+            self.sigma_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=channels, zero_init=True)
+            self.offset_scale_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=channels, zero_init=True)
+            self.omega_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=channels, zero_init=True)
+            self.se_bias_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=channels, zero_init=True)
+        else:
+            self.raw_sigma = nn.Parameter(torch.tensor(init_raw))
+            self.sigma_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=1, zero_init=True)
+            self.offset_scale_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=1, zero_init=True)
+            self.omega_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=1, zero_init=True)
+            self.se_bias_proj = SwiGLU(ctx_dim, bias_ffn_mult, 0.0, output_dim=channels, zero_init=True)
 
         grid = torch.linspace(-0.5, 0.5, kernel_size)
         self.register_buffer("grid", grid)
+
+        max_grid = torch.linspace(-0.5, 0.5, max_kernel_size)
+        self.register_buffer("max_grid", max_grid)
+        ref_offsets = torch.linspace(-(max_kernel_size // 2), max_kernel_size // 2, max_kernel_size)
+        self.register_buffer("ref_offsets", ref_offsets)
+
+        # Pre-allocate index buffers for max sequence length
+        G = channels if depthwise else groups
+        gc = 1 if depthwise else channels // groups
+        pos_indices = torch.arange(max_seq_len, dtype=torch.float32).view(1, max_seq_len, 1)
+        self.register_buffer("pos_indices", pos_indices)
+        group_idx = torch.arange(G).view(1, 1, G)
+        self.register_buffer("group_idx", group_idx)
+        group_offsets = torch.arange(gc).view(1, 1, 1, 1, gc)
+        self.register_buffer("group_offsets", group_offsets)
 
         kernel_out = self.groups * self.group_channels
         self.kernel_net = KernelNet1d(
@@ -304,8 +402,6 @@ class AdaptiveDeformConv1d(nn.Module):
 
         self.input_proj = nn.Linear(channels, channels)
         self.output_proj = nn.Linear(channels, channels)
-
-        self.se = SEBlock(channels, se_reduction)
 
         self._reset_parameters()
 
@@ -345,7 +441,7 @@ class AdaptiveDeformConv1d(nn.Module):
         positions = (grid * 2).view(1, 1, -1)
 
         if omega_bias is not None:
-            omega_scale = 1.0 + torch.tanh(omega_bias.mean()) * self.omega_max
+            omega_scale = 1.0 + torch.sigmoid(omega_bias.mean()) * self.omega_max
             positions = positions * omega_scale
 
         weights = self.kernel_net(positions)
@@ -356,25 +452,48 @@ class AdaptiveDeformConv1d(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         biases: AdaptiveConvBiases | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """x: (N, L, C) -> (output, aux_losses). aux_losses has offset_reg and entropy_reg."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
+        """x: (N, L, C) -> (output, aux_losses, se_bias)."""
         N, L, C = x.shape
         G = self.groups
         gc = self.group_channels
-        max_K = self.max_kernel_size
+        K = self.max_kernel_size
 
-        sigma_bias = biases.sigma if biases else None
-        offset_scale_bias = biases.offset_scale if biases else None
-        omega_bias = biases.omega if biases else None
+        context = biases.context if biases else None
 
-        raw = self.raw_sigma
-        if sigma_bias is not None:
-            raw = raw + torch.nan_to_num(sigma_bias, nan=0.0)
-        sigma = F.softplus(raw).clamp(min=1e-3, max=self.max_sigma)
+        if self.depthwise:
+            if context is not None:
+                sigma = F.softplus(
+                    self.raw_sigma.unsqueeze(0) + self.sigma_proj(context)
+                ).clamp(min=1e-3, max=self.max_sigma)
+                offset_scale = self.base_offset_scale_per_channel.unsqueeze(0) * (
+                    1.0 + 0.2 * torch.tanh(self.offset_scale_proj(context))
+                )
+                omega = self.base_omega_per_channel.unsqueeze(0) + self.omega_proj(context)
+                se_bias = self.se_bias_proj(context)
+            else:
+                sigma = F.softplus(self.raw_sigma).clamp(min=1e-3, max=self.max_sigma)
+                offset_scale = self.base_offset_scale_per_channel.unsqueeze(0).expand(N, -1)
+                omega = self.base_omega_per_channel.unsqueeze(0).expand(N, -1)
+                se_bias = None
+        else:
+            if context is not None:
+                sigma = F.softplus(
+                    self.raw_sigma + self.sigma_proj(context).squeeze(-1)
+                ).clamp(min=1e-3, max=self.max_sigma)
+                offset_scale = self.base_offset_scale * (
+                    1.0 + 0.2 * torch.tanh(self.offset_scale_proj(context).squeeze(-1))
+                )
+                omega = self.omega_proj(context).squeeze(-1)
+                se_bias = self.se_bias_proj(context)
+            else:
+                sigma = F.softplus(self.raw_sigma).clamp(min=1e-3, max=self.max_sigma)
+                offset_scale = None
+                omega = None
+                se_bias = None
 
-        K = max_K
-
-        grid = torch.linspace(-0.5, 0.5, K, device=x.device)
+        grid: torch.Tensor = self.max_grid  # type: ignore[assignment]
+        ref_offsets: torch.Tensor = self.ref_offsets  # type: ignore[assignment]
 
         x_proj = self.input_proj(x)
 
@@ -385,37 +504,36 @@ class AdaptiveDeformConv1d(nn.Module):
         x_dw = self.dw_conv[2](x_dw)
 
         envelope = self._compute_envelope(grid, sigma)
-        kernel_weights = self._get_kernel_weights(grid, omega_bias)
+        kernel_weights = self._get_kernel_weights(grid, omega)
 
-        offset_scale = self.base_offset_scale
-        if offset_scale_bias is not None:
-            offset_scale = offset_scale * (1.0 + 0.2 * offset_scale_bias.mean())
+        offsets = torch.tanh(self.offset_net(x_dw).view(N, L, G, K))
+        if self.depthwise and offset_scale is not None:
+            offsets = offsets * offset_scale.view(N, 1, G, 1)
+        elif offset_scale is not None:
+            offsets = offsets * offset_scale.view(N, 1, 1, 1)
+        else:
+            offsets = offsets * self.base_offset_scale
 
-        offsets = self.offset_net(x_dw).view(N, L, G, K) * offset_scale
         raw_mask = self.mask_net(x_dw).view(N, L, G, K)
 
         if envelope.dim() == 1:
             raw_mask = raw_mask * envelope.view(1, 1, 1, K)
+        elif envelope.dim() == 2:
+            if self.depthwise:
+                raw_mask = raw_mask * envelope.view(N, 1, G, K)
+            else:
+                raw_mask = raw_mask * envelope.view(N, 1, 1, K)
         else:
-            raw_mask = raw_mask * envelope.view(N, 1, 1, K)
+            raw_mask = raw_mask * envelope.view(N, 1, G, K)
 
         attn_mask = F.softmax(raw_mask, dim=-1)
         attn_mask = torch.nan_to_num(attn_mask, nan=0.0)
 
-        ref_offsets = torch.linspace(-(K // 2), K // 2, K, device=x.device)
-        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
-
         x_grouped = x_proj.view(N, L, G, gc)
-        output = torch.zeros(N, L, G, gc, device=x.device, dtype=x.dtype)
-
-        batch_idx = torch.arange(N, device=x.device).view(N, 1, 1)
-        group_idx = torch.arange(G, device=x.device).view(1, 1, G)
 
         kw = kernel_weights.view(G, gc, K)
 
-        # Vectorized: compute all K positions at once
-        # abs_pos: [N, L, G, K]
-        abs_pos = pos_indices.unsqueeze(-1) + ref_offsets.view(1, 1, 1, K) + offsets
+        abs_pos = self.pos_indices[:, :L].unsqueeze(-1) + ref_offsets.view(1, 1, 1, K) + offsets
         abs_pos_clamped = abs_pos.clamp(0, L - 1)
 
         p_floor = abs_pos_clamped.long().clamp(0, L - 1)
@@ -427,59 +545,31 @@ class AdaptiveDeformConv1d(nn.Module):
         w_floor = w_floor * (~oob).float()
         w_ceil = w_ceil * (~oob).float()
 
-        # Gather all values at once using advanced indexing
-        # Expand indices for [N, L, G, K] -> need to sample from [N, L, G, gc]
-        batch_idx_exp = batch_idx.unsqueeze(-1).expand(N, L, G, K)
-        group_idx_exp = group_idx.unsqueeze(-1).expand(N, L, G, K)
+        group_base = self.group_idx.unsqueeze(-1).unsqueeze(-1) * gc
 
-        # Flatten for gather, then reshape
-        # x_grouped: [N, L, G, gc] -> we need x_grouped[n, p_floor[n,l,g,k], g, :]
-        # Use gather on flattened version
-        p_floor_flat = p_floor.reshape(N, -1)  # [N, L*G*K]
-        p_ceil_flat = p_ceil.reshape(N, -1)
+        gather_idx_floor = p_floor.unsqueeze(-1) * (G * gc) + group_base + self.group_offsets
+        gather_idx_ceil = p_ceil.unsqueeze(-1) * (G * gc) + group_base + self.group_offsets
 
-        # For each (n, l, g, k), we need x_grouped[n, p, g, :] where p = p_floor[n,l,g,k]
-        # Reshape x_grouped for easier indexing: [N, L, G*gc] -> gather on dim 1
-        x_grouped_flat = x_grouped.reshape(N, L, G * gc)
-
-        # Create indices for gathering: for position p, group g, we want indices [g*gc : (g+1)*gc]
-        # Shape: [N, L, G, K, gc]
-        group_offsets = torch.arange(gc, device=x.device).view(1, 1, 1, 1, gc)
-        group_base = group_idx.unsqueeze(-1).unsqueeze(-1) * gc  # [1, 1, G, 1, 1]
-
-        gather_idx_floor = (
-            p_floor.unsqueeze(-1) * (G * gc) + group_base + group_offsets
-        )  # [N, L, G, K, gc]
-        gather_idx_ceil = p_ceil.unsqueeze(-1) * (G * gc) + group_base + group_offsets
-
-        # Flatten x_grouped to [N, L*G*gc] for gather
-        x_flat = x_grouped.reshape(N, -1)  # [N, L*G*gc]
-        gather_idx_floor_flat = gather_idx_floor.reshape(N, -1)  # [N, L*G*K*gc]
+        x_flat = x_grouped.reshape(N, -1)
+        gather_idx_floor_flat = gather_idx_floor.reshape(N, -1)
         gather_idx_ceil_flat = gather_idx_ceil.reshape(N, -1)
 
         v_floor = x_flat.gather(1, gather_idx_floor_flat).reshape(N, L, G, K, gc)
         v_ceil = x_flat.gather(1, gather_idx_ceil_flat).reshape(N, L, G, K, gc)
 
-        # Interpolate: [N, L, G, K, gc]
         sampled = v_floor * w_floor.unsqueeze(-1) + v_ceil * w_ceil.unsqueeze(-1)
 
-        # Apply kernel weights: kw is [G, gc, K] -> [1, 1, G, K, gc]
-        kernel_weights_exp = (
-            kw.permute(0, 2, 1).unsqueeze(0).unsqueeze(0)
-        )  # [1, 1, G, K, gc]
+        kernel_weights_exp = kw.permute(0, 2, 1).unsqueeze(0).unsqueeze(0)
         sampled = sampled * kernel_weights_exp
 
-        # Apply attention mask and sum over K: attn_mask is [N, L, G, K]
-        output = (sampled * attn_mask.unsqueeze(-1)).sum(dim=3)  # [N, L, G, gc]
-
+        output = (sampled * attn_mask.unsqueeze(-1)).sum(dim=3)
         output = output.reshape(N, L, C)
-        output = self.se(output, mask)
 
         offset_reg = (offsets**2).mean()
         entropy = -(attn_mask * (attn_mask + 1e-8).log()).sum(dim=-1).mean()
         aux_losses = {"offset_reg": offset_reg, "entropy_reg": -entropy}
 
-        return self.output_proj(output), aux_losses
+        return self.output_proj(output), aux_losses, se_bias
 
 
 class AdaptiveConvBranch(nn.Module):
@@ -493,7 +583,9 @@ class AdaptiveConvBranch(nn.Module):
         kernel_size: int = 15,
         max_kernel_size: int = 31,
         se_reduction: int = 4,
-        se_bias_dim: int | None = None,
+        depthwise: bool = False,
+        context_dim: int | None = None,
+        bias_ffn_mult: int = 2,
     ):
         super().__init__()
         self.width = width
@@ -506,14 +598,11 @@ class AdaptiveConvBranch(nn.Module):
             min_sigma=min_sigma,
             max_sigma=max_sigma,
             max_kernel_size=max_kernel_size,
+            depthwise=depthwise,
+            context_dim=context_dim,
+            bias_ffn_mult=bias_ffn_mult,
         )
         self.se = SEBlock(width, reduction=se_reduction)
-        if se_bias_dim is not None and se_bias_dim != width:
-            self.se_bias_proj = nn.Linear(se_bias_dim, width)
-            nn.init.zeros_(self.se_bias_proj.weight)
-            nn.init.zeros_(self.se_bias_proj.bias)
-        else:
-            self.se_bias_proj = None
 
     def forward(
         self,
@@ -521,13 +610,8 @@ class AdaptiveConvBranch(nn.Module):
         mask: torch.Tensor | None = None,
         biases: AdaptiveConvBiases | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        out, aux = self.conv(x, mask, biases)
+        out, aux, se_bias = self.conv(x, mask, biases)
         out = self.norm(F.silu(out))
-        se_bias = None
-        if biases is not None and biases.se_bias is not None:
-            se_bias = biases.se_bias
-            if self.se_bias_proj is not None:
-                se_bias = self.se_bias_proj(se_bias)
         out = self.se(out, mask, se_bias)
         return out, aux
 
@@ -683,21 +767,22 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(dtype)
+        return self.weight * x
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, width: int, ffn_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, ffn_mult: int = 4, dropout: float = 0.1, output_dim: int | None = None, zero_init: bool = False):
         super().__init__()
+        output_dim = output_dim or width
         hidden = width * ffn_mult
         self.gate = nn.Linear(width, hidden, bias=False)
         self.up = nn.Linear(width, hidden, bias=False)
-        self.down = nn.Linear(hidden, width, bias=False)
+        self.down = nn.Linear(hidden, output_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+        if zero_init:
+            nn.init.zeros_(self.down.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
@@ -1124,7 +1209,7 @@ class SSMMixer(nn.Module):
         dt = F.softplus(dt)  # [B, L, intermediate]
 
         # 5. SSM scan
-        A = -torch.exp(self.A_log.float())  # [intermediate, state_size]
+        A = -torch.exp(self.A_log)  # [intermediate, state_size]
 
         # Discretize A and B
         # dA = exp(A * dt)
@@ -1133,39 +1218,31 @@ class SSMMixer(nn.Module):
             A[None, None, :, :] * dt[:, :, :, None]
         )  # [B, L, intermediate, state_size]
         dB = (
-            dt[:, :, :, None] * B_param[:, None, :, :].float()
+            dt[:, :, :, None] * B_param[:, None, :, :]
         )  # [B, L, intermediate, state_size]
 
         # Input-weighted B
-        dB_x = dB * x_conv[:, :, :, None].float()  # [B, L, intermediate, state_size]
+        dB_x = dB * x_conv[:, :, :, None]  # [B, L, intermediate, state_size]
 
-        # Sequential scan (pure PyTorch, works on all devices)
         ssm_state = torch.zeros(
             B,
             self.intermediate_size,
             self.state_size,
             device=x.device,
-            dtype=torch.float32,
+            dtype=x.dtype,
         )
-        outputs = []
+        y = torch.empty(B, L, self.intermediate_size, device=x.device, dtype=x.dtype)
 
         for i in range(L):
-            ssm_state = (
-                dA[:, i] * ssm_state + dB_x[:, i]
-            )  # [B, intermediate, state_size]
-            y_i = torch.einsum(
-                "bis,bs->bi", ssm_state, C_param[:, i].float()
-            )  # [B, intermediate]
-            outputs.append(y_i)
-
-        y = torch.stack(outputs, dim=1)  # [B, L, intermediate]
+            ssm_state = dA[:, i] * ssm_state + dB_x[:, i]
+            y[:, i] = torch.einsum("bis,bs->bi", ssm_state, C_param[:, i])
 
         # 6. Skip connection and gating
         y = y + x_conv * self.D[None, None, :]
         y = y * F.silu(z)  # Gate with z branch
 
         # 7. Output projection
-        out = self.out_proj(y.to(x.dtype))
+        out = self.out_proj(y)
         return self.dropout(out)
 
 
@@ -1337,6 +1414,11 @@ class SSMMixer3(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, width, bias=False)
         self.dropout = nn.Dropout(dropout)
 
+        # Pre-allocate causal mask for decay matrix (max chunk size)
+        self.max_chunk_size = 64
+        causal_mask = torch.tril(torch.ones(self.max_chunk_size, self.max_chunk_size, dtype=torch.bool))
+        self.register_buffer("causal_mask", causal_mask)
+
         self._init_params()
 
     def _init_params(self):
@@ -1396,7 +1478,7 @@ class SSMMixer3(nn.Module):
         check_nan(C_param, "ssm3_C_param")
 
         dt = F.softplus(self.dt_proj(x_ssm))
-        A = -torch.exp(self.A_log.float())
+        A = -torch.exp(self.A_log)
         check_nan(dt, "ssm3_dt")
         check_nan(A, "ssm3_A")
 
@@ -1447,20 +1529,13 @@ class SSMMixer3(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        B_rot = B_rot.float()
-        C_rot = C_rot.float()
-        x = x.float()
-        alpha = alpha.float()
-        beta = beta.float()
-        gamma = gamma.float()
-
         Bx = torch.einsum("blhn,blhp->blhnp", B_rot, x)
         Bx_prev = F.pad(Bx[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
         u = gamma[:, :, :, None, None] * Bx + beta[:, :, :, None, None] * Bx_prev
         check_nan(u, "scan_u")
 
-        outputs = torch.empty(batch, L, H, P, device=device, dtype=torch.float32)
-        state = torch.zeros(batch, H, N, P, device=device, dtype=torch.float32)
+        outputs = torch.empty(batch, L, H, P, device=device, dtype=dtype)
+        state = torch.zeros(batch, H, N, P, device=device, dtype=dtype)
 
         for chunk_start in range(0, L, chunk_size):
             chunk_end = min(chunk_start + chunk_size, L)
@@ -1476,7 +1551,7 @@ class SSMMixer3(nn.Module):
             h_from_input = torch.einsum("bijh,bjhnp->bihnp", decay_matrix, u_chunk)
             check_nan(h_from_input, f"scan_h_from_input_chunk{chunk_start}")
 
-            carry = torch.cumprod(alpha_chunk, dim=1)
+            carry = torch.exp(torch.cumsum(torch.log(alpha_chunk.clamp(min=1e-8)), dim=1))
             check_nan(carry, f"scan_carry_chunk{chunk_start}")
             h_from_state = torch.einsum("bih,bhnp->bihnp", carry, state)
 
@@ -1492,7 +1567,7 @@ class SSMMixer3(nn.Module):
         if mask is not None:
             outputs = outputs.masked_fill(mask[:, :, None, None], 0.0)
 
-        return outputs.to(dtype)
+        return outputs
 
     def _build_decay_matrix(
         self, alpha: torch.Tensor, K: int, device: torch.device
@@ -1511,9 +1586,8 @@ class SSMMixer3(nn.Module):
         log_decay = cumsum_i - cumsum_j
         check_nan(log_decay, "decay_log_decay_pre_mask")
 
-        causal_mask = torch.tril(torch.ones(K, K, device=device, dtype=torch.bool))
         log_decay = log_decay.masked_fill(
-            ~causal_mask.unsqueeze(0).unsqueeze(-1), float("-inf")
+            ~self.causal_mask[:K, :K].unsqueeze(0).unsqueeze(-1), float("-inf")
         )
 
         result = torch.exp(log_decay)
@@ -1620,12 +1694,14 @@ class MultiKernelSSMBlock(nn.Module):
         adaptive_conv: bool = False,
         depthwise_conv: bool = False,
         context_dim: int = 0,
+        bias_ffn_mult: int = 2,
         adaptive_kernel_size: int = 15,
         init_sigmas: tuple[float, ...] | None = None,
         min_sigma: float = 0.05,
         max_sigma: float = 0.5,
         attn_window_size: int = 512,
         attn_use_rope: bool = True,
+        use_merge_attention: bool = True,
     ):
         super().__init__()
         self.width = width
@@ -1665,7 +1741,9 @@ class MultiKernelSSMBlock(nn.Module):
                         max_sigma=max_sigma,
                         groups=branch_groups,
                         kernel_size=adaptive_kernel_size,
-                        se_bias_dim=width,
+                        depthwise=depthwise_conv,
+                        context_dim=width,
+                        bias_ffn_mult=bias_ffn_mult,
                     )
                     for sigma in init_sigmas
                 ]
@@ -1680,7 +1758,9 @@ class MultiKernelSSMBlock(nn.Module):
                         max_sigma=max_sigma,
                         groups=branch_groups,
                         kernel_size=max(ks, 3) if ks != 0 else 7,
-                        se_bias_dim=width,
+                        depthwise=depthwise_conv,
+                        context_dim=width,
+                        bias_ffn_mult=bias_ffn_mult,
                     )
                     for ks in kernel_sizes
                 ]
@@ -1754,6 +1834,7 @@ class MultiKernelSSMBlock(nn.Module):
                     se_bias=biases.se_bias[:, i, :]
                     if biases.se_bias is not None
                     else None,
+                    context=biases.context,
                 )
                 out, aux = branch(chunk, mask, branch_bias)
             else:
@@ -1799,3 +1880,4 @@ class MultiKernelSSMBlock(nn.Module):
         features = self.feature_proj(pooled)
 
         return self.dropout(h), features, aux_losses
+
