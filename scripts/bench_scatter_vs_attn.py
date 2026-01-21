@@ -19,6 +19,8 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
+from heuristic_secrets.models.backbone import SSMMixer3
+from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.data.synthetic import load_task, TASKS
 
 
@@ -96,31 +98,45 @@ class SDPAttention(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.attn = SDPAttention(width, num_heads, dropout)
         self.attn_norm = RMSNorm(width)
+        self.use_ssm = use_ssm
+        if use_ssm:
+            self.ssm_norm = RMSNorm(width)
+            self.ssm = SSMMixer3(width, n_heads=num_heads, use_conv=False, dropout=dropout)
+            self.ssm_out_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.attn(self.norm1(x)))
+        if self.use_ssm:
+            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels)
         self.attn_norm = RMSNorm(width)
+        self.use_ssm = use_ssm
+        if use_ssm:
+            self.ssm_norm = RMSNorm(width)
+            self.ssm = SSMMixer3(width, n_heads=num_channels, use_conv=False, dropout=dropout)
+            self.ssm_out_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
+        if self.use_ssm:
+            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -176,46 +192,67 @@ class SDPAttention2D(nn.Module):
 
 
 class AttentionBlock2D(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.attn = SDPAttention2D(width, num_heads, dropout)
         self.attn_norm = RMSNorm(width)
+        self.use_ssm = use_ssm
+        if use_ssm:
+            self.ssm_norm = RMSNorm(width)
+            self.ssm = SSMBlock3_2d(width, n_heads=num_heads, use_conv=False, dropout=dropout)
+            self.ssm_out_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.attn(self.norm1(x)))
+        if self.use_ssm:
+            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class LocalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.local_attn = LocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
         self.attn_norm = RMSNorm(width)
+        self.use_ssm = use_ssm
+        if use_ssm:
+            self.ssm_norm = RMSNorm(width)
+            self.ssm = SSMBlock3_2d(width, n_heads=num_channels, use_conv=False, dropout=dropout)
+            self.ssm_out_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.local_attn(self.norm1(x)))
+        if self.use_ssm:
+            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class HierarchicalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
         self.attn_norm = RMSNorm(width)
+        self.use_ssm = use_ssm
+        if use_ssm:
+            self.ssm_norm = RMSNorm(width)
+            self.ssm = SSMBlock3_2d(width, n_heads=num_channels, use_conv=False, dropout=dropout)
+            self.ssm_out_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
+        if self.use_ssm:
+            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -567,16 +604,16 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
     
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -589,20 +626,20 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4):
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
     
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
+        block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'local':
-        block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, num_channels=num_channels, mlp_mult=4)
+        block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7, mlp_mult=4)
@@ -641,16 +678,16 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_CONV = 140
 
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -663,16 +700,16 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
 
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -790,6 +827,7 @@ def main():
     parser.add_argument('--swa-lr', type=float, default=1e-5, help='Learning rate for SWA phase (default: 1e-5)')
     parser.add_argument('--checkpoint-dir', type=str, default=None, help='Directory to save checkpoints (default: no checkpoints)')
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
+    parser.add_argument('--ssm', action='store_true', help='Add SSM block between attention and MLP')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -809,14 +847,14 @@ def main():
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels)
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels)
+        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
         print(f'Task type: Audio Classification')
@@ -826,18 +864,18 @@ def main():
         builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels)
         shape_str = f'vol_size={img_size}'
         flatten = False
-        print(f'Task type: 3D Classification')
+        print(f'Task type: 3D Classification (SSM not supported)')
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
