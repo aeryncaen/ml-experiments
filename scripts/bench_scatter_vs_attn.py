@@ -458,9 +458,10 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3, flatten=True, task_type='classification'):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', track_sample_loss=False):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+    sample_losses = [] if track_sample_loss else None
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for inputs, labels in pbar:
@@ -481,13 +482,17 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ra
             preds = logits_flat.argmax(dim=-1)
             correct += (preds[mask] == labels_flat[mask]).sum().item()
             total += mask.sum().item()
+            if track_sample_loss:
+                per_seq_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction='none')
+                per_seq_loss = per_seq_loss.view(logits.size(0), -1).mean(dim=-1)
+                sample_losses.append(per_seq_loss.detach().cpu())
         else:
             per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
-            k = max(1, int(len(per_sample_loss) * hard_mining_ratio))
-            hard_indices = per_sample_loss.topk(k).indices
-            loss = per_sample_loss[hard_indices].mean()
+            loss = per_sample_loss.mean()
             correct += (logits.argmax(dim=-1) == labels).sum().item()
             total += labels.size(0)
+            if track_sample_loss:
+                sample_losses.append(per_sample_loss.detach().cpu())
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -498,7 +503,9 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ra
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
 
-    return total_loss / len(loader), correct / max(total, 1)
+    if track_sample_loss:
+        sample_losses = torch.cat(sample_losses)
+    return total_loss / len(loader), correct / max(total, 1), sample_losses
 
 
 @torch.no_grad()
@@ -535,8 +542,10 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
     import os
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+    
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -563,6 +572,10 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     swa_epoch = int(epochs * swa_start) if swa else None
     swa_scheduler = SWALR(optimizer, swa_lr=swa_lr) if swa else None
     in_swa_phase = False
+    
+    current_loader = train_loader
+    train_dataset = train_loader.dataset
+    batch_size = train_loader.batch_size
 
     for epoch in range(epochs):
         use_swa_sched = swa and epoch >= swa_epoch
@@ -570,7 +583,16 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             in_swa_phase = True
         
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, active_scheduler, flatten=flatten, task_type=task_type)
+        train_loss, train_acc, sample_losses = train_epoch(
+            model, current_loader, optimizer, device, active_scheduler, 
+            flatten=flatten, task_type=task_type, track_sample_loss=hard_mining
+        )
+        
+        if hard_mining and sample_losses is not None:
+            weights = sample_losses - sample_losses.min() + 1e-6
+            weights = weights / weights.sum() * len(weights)
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            current_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
         
         if use_swa_sched:
             swa_model.update_parameters(model)
@@ -586,7 +608,8 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             current_lr = optimizer.param_groups[0]['lr']
             swa_str = f' swa_acc={swa_acc:.4f}' if swa_acc is not None else ''
             phase_str = ' [SWA]' if in_swa_phase else ''
-            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}')
+            mine_str = ' [HEM]' if hard_mining else ''
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}')
         
         if checkpoint_dir:
             ckpt = {
@@ -833,6 +856,7 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default=None, help='Directory to save checkpoints (default: no checkpoints)')
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block between attention and MLP')
+    parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -911,7 +935,8 @@ def main():
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
-                swa_lr=args.swa_lr, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
+                swa_lr=args.swa_lr, hard_mining=args.hard_mining,
+                checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                 verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
             results[mt].append(acc)
