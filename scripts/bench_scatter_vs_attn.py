@@ -491,6 +491,126 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+class DuoModel(nn.Module):
+    """Two models trained with inverse curriculum, merged at inference."""
+    
+    MERGE_STRATEGIES = ['mean', 'max', 'logsum', 'harmonic']
+    
+    def __init__(self, model_hard: nn.Module, model_easy: nn.Module, merge: str = 'mean'):
+        super().__init__()
+        self.model_hard = model_hard  # Trains on hardest X%
+        self.model_easy = model_easy  # Trains on easiest (100-X)%
+        self.merge = merge
+        assert merge in self.MERGE_STRATEGIES, f"Unknown merge: {merge}"
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returns merged logits."""
+        logits_hard = self.model_hard(x)
+        logits_easy = self.model_easy(x)
+        return self.merge_logits(logits_hard, logits_easy)
+    
+    def forward_both(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass returning (merged, hard, easy) logits for training."""
+        logits_hard = self.model_hard(x)
+        logits_easy = self.model_easy(x)
+        merged = self.merge_logits(logits_hard, logits_easy)
+        return merged, logits_hard, logits_easy
+    
+    def merge_logits(self, l1: torch.Tensor, l2: torch.Tensor) -> torch.Tensor:
+        if self.merge == 'mean':
+            return (l1 + l2) / 2
+        elif self.merge == 'max':
+            return torch.max(l1, l2)
+        elif self.merge == 'logsum':
+            # Product of probabilities in log space
+            return F.log_softmax(l1, dim=-1) + F.log_softmax(l2, dim=-1)
+        elif self.merge == 'harmonic':
+            # Harmonic mean: 2*a*b / (a+b)
+            eps = 1e-8
+            return 2 * l1 * l2 / (l1 + l2 + eps)
+        else:
+            raise ValueError(f"Unknown merge strategy: {self.merge}")
+
+
+def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', duo_split=0.3):
+    """Train duo model with inverse curriculum: hard model on top duo_split%, easy model on bottom (1-duo_split)%."""
+    duo_model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    
+    desc = f"Train [DUO h{int(duo_split*100)}%/e{int((1-duo_split)*100)}%]"
+    pbar = tqdm(loader, desc=desc, leave=False)
+    
+    for inputs, labels in pbar:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        
+        if flatten and task_type == 'classification':
+            inputs = inputs.view(inputs.size(0), -1)
+        
+        optimizer.zero_grad()
+        
+        # Forward both models
+        merged, logits_hard, logits_easy = duo_model.forward_both(inputs)
+        
+        if task_type == 'lm':
+            # Language modeling: per-token losses
+            merged_flat = merged.view(-1, merged.size(-1))
+            hard_flat = logits_hard.view(-1, logits_hard.size(-1))
+            easy_flat = logits_easy.view(-1, logits_easy.size(-1))
+            labels_flat = labels.view(-1)
+            
+            # Compute per-token loss from merged output for difficulty ranking
+            per_token_loss = F.cross_entropy(merged_flat, labels_flat, ignore_index=-100, reduction='none')
+            valid_mask = labels_flat != -100
+            valid_losses = per_token_loss[valid_mask]
+            valid_indices = torch.where(valid_mask)[0]
+            
+            # Sort by difficulty (descending)
+            k_hard = max(1, int(duo_split * valid_losses.size(0)))
+            _, sorted_idx = valid_losses.sort(descending=True)
+            hard_token_idx = valid_indices[sorted_idx[:k_hard]]
+            easy_token_idx = valid_indices[sorted_idx[k_hard:]]
+            
+            # Compute losses for each model on their respective tokens
+            loss_hard = F.cross_entropy(hard_flat[hard_token_idx], labels_flat[hard_token_idx]) if len(hard_token_idx) > 0 else merged.new_zeros(())
+            loss_easy = F.cross_entropy(easy_flat[easy_token_idx], labels_flat[easy_token_idx]) if len(easy_token_idx) > 0 else merged.new_zeros(())
+            loss = loss_hard + loss_easy
+            
+            # Accuracy on merged output
+            preds = merged_flat.argmax(dim=-1)
+            correct += (preds[valid_mask] == labels_flat[valid_mask]).sum().item()
+            total += valid_mask.sum().item()
+        else:
+            # Classification: per-sample losses
+            per_sample_loss = F.cross_entropy(merged, labels, reduction='none')
+            
+            # Sort by difficulty (descending = hardest first)
+            k_hard = max(1, int(duo_split * per_sample_loss.size(0)))
+            _, sorted_idx = per_sample_loss.sort(descending=True)
+            hard_idx = sorted_idx[:k_hard]
+            easy_idx = sorted_idx[k_hard:]
+            
+            # Compute losses for each model on their respective samples
+            loss_hard = F.cross_entropy(logits_hard[hard_idx], labels[hard_idx]) if len(hard_idx) > 0 else merged.new_zeros(())
+            loss_easy = F.cross_entropy(logits_easy[easy_idx], labels[easy_idx]) if len(easy_idx) > 0 else merged.new_zeros(())
+            loss = loss_hard + loss_easy
+            
+            # Accuracy on merged output
+            correct += (merged.argmax(dim=-1) == labels).sum().item()
+            total += labels.size(0)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(duo_model.parameters(), 1.0)
+        optimizer.step()
+        if scheduler:
+            scheduler.step()
+        
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
+    
+    return total_loss / len(loader), correct / max(total, 1)
+
+
 def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -637,7 +757,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', duo_split=0.3):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -693,14 +813,23 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
         # First epoch uses first_epoch_pct if set, otherwise use cosine hard mining
-        if epoch == 0 and first_epoch_pct is not None:
-            hard_pct = first_epoch_pct
+        is_duo = isinstance(model, DuoModel)
+        if is_duo:
+            # Duo mode: use inverse curriculum training
+            train_loss, train_acc = train_epoch_duo(
+                model, current_loader, optimizer, device, active_scheduler,
+                flatten=flatten, task_type=task_type, duo_split=duo_split
+            )
         else:
-            hard_pct = get_hard_pct(epoch) if hard_mining else None
-        train_loss, train_acc = train_epoch(
-            model, current_loader, optimizer, device, active_scheduler, 
-            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, hard_pct=hard_pct
-        )
+            # Standard training
+            if epoch == 0 and first_epoch_pct is not None:
+                hard_pct = first_epoch_pct
+            else:
+                hard_pct = get_hard_pct(epoch) if hard_mining else None
+            train_loss, train_acc = train_epoch(
+                model, current_loader, optimizer, device, active_scheduler, 
+                flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, hard_pct=hard_pct
+            )
         
         if use_swa_sched:
             swa_model.update_parameters(model)
@@ -717,7 +846,8 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             swa_str = f' swa_acc={swa_acc:.4f}' if swa_acc is not None else ''
             phase_str = ' [SWA]' if in_swa_phase else ''
             mine_str = ' [HEM]' if hard_mining else ''
-            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}')
+            duo_str = f' [DUO h{int(duo_split*100)}%]' if is_duo else ''
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}{duo_str}')
         
         if checkpoint_dir:
             ckpt = {
@@ -973,6 +1103,9 @@ def main():
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
     parser.add_argument('--first-epoch-pct', type=float, default=None, help='First epoch: only backprop hardest N%% of samples (e.g. 0.3 for 30%%)')
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
+    parser.add_argument('--duo', action='store_true', help='Duo mode: train two models with inverse curriculum, merge at inference')
+    parser.add_argument('--duo-merge', type=str, default='mean', choices=DuoModel.MERGE_STRATEGIES, help='Duo merge strategy (default: mean)')
+    parser.add_argument('--duo-split', type=float, default=0.3, help='Duo split: hard model gets top X%%, easy model gets bottom (1-X)%% (default: 0.3)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1042,7 +1175,11 @@ def main():
     print(f'\nModel parameters ({args.layers} layers, {shape_str}):')
     for mt in model_types:
         model = builder(mt)
-        print(f'  {mt:12s}: {count_params(model):,} params')
+        params = count_params(model)
+        if args.duo:
+            print(f'  {mt:12s}: {params:,} params x2 (duo) = {params*2:,} total')
+        else:
+            print(f'  {mt:12s}: {params:,} params')
 
     results = {mt: [] for mt in model_types}
 
@@ -1057,16 +1194,26 @@ def main():
 
         for mt in model_types:
             seed_everything(seed)
-            model = builder(mt)
-
-            print(f'\nTraining {mt}...')
+            
+            if args.duo:
+                # Create two independent models with inverse curriculum
+                model_hard = builder(mt)
+                seed_everything(seed + 1)  # Different init for model_easy
+                model_easy = builder(mt)
+                model = DuoModel(model_hard, model_easy, merge=args.duo_merge)
+                print(f'\nTraining {mt} [DUO: h{int(args.duo_split*100)}%/e{int((1-args.duo_split)*100)}%, merge={args.duo_merge}]...')
+            else:
+                model = builder(mt)
+                print(f'\nTraining {mt}...')
+            
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
                 swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                 hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=flatten, task_type=task_type
+                verbose=(args.runs == 1), flatten=flatten, task_type=task_type,
+                duo_split=args.duo_split
             )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
