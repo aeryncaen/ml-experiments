@@ -409,12 +409,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         if not self.poolable_dims:
             return 1
         min_poolable = min(spatial_shape[d] for d in self.poolable_dims)
-        n_levels = 1
-        size = min_poolable
-        while size >= self.min_size * 2:
-            size //= 2
-            n_levels += 1
-        return n_levels
+        return max(1, (min_poolable // self.min_size).bit_length())
     
     def _pool_selective(self, h: torch.Tensor, spatial_shape: tuple[int, ...]) -> torch.Tensor:
         B, C = h.shape[:2]
