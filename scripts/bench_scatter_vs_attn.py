@@ -643,7 +643,7 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None):
         task_type = 'lm'
         sl = seq_len_override or 256
         train_loader, test_loader, config = load_task(
-            name, seq_len=sl, num_train=10000, num_test=2000, batch_size=batch_size
+            name, seq_len=sl, num_train=100000, num_test=10000, batch_size=batch_size
         )
         vocab_size = config.get('vocab_size', 2)
         return train_loader, test_loader, vocab_size, sl, None, task_type
