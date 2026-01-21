@@ -187,28 +187,43 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
-def apply_rope(x: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
-    B, L, C = x.shape
+def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
+    """Apply rotary position embedding.
+    
+    Args:
+        x: (..., C) tensor
+        positions: (...) integer positions. If None, uses [0, 1, ..., L-1] for dim -2.
+        base: RoPE base frequency
+    """
+    C = x.shape[-1]
     half_c = C // 2
     device = x.device
     dtype = x.dtype
     
-    pos = torch.arange(L, device=device, dtype=dtype)
+    if positions is None:
+        L = x.shape[-2]
+        positions = torch.arange(L, device=device)
+        for _ in range(x.ndim - 2):
+            positions = positions.unsqueeze(0)
+    
     dim_idx = torch.arange(half_c, device=device, dtype=dtype)
     freqs = 1.0 / (base ** (dim_idx / half_c))
     
-    angles = pos.unsqueeze(1) * freqs.unsqueeze(0)
+    angles = positions.unsqueeze(-1).float() * freqs
     cos = angles.cos()
     sin = angles.sin()
     
-    x1, x2 = x[..., :half_c], x[..., half_c:]
+    x1, x2 = x[..., :half_c], x[..., half_c:half_c * 2]
     
-    x_rope = torch.cat([
+    x_rotated = torch.cat([
         x1 * cos - x2 * sin,
         x1 * sin + x2 * cos,
     ], dim=-1)
     
-    return x_rope
+    if C % 2 == 1:
+        x_rotated = torch.cat([x_rotated, x[..., -1:]], dim=-1)
+    
+    return x_rotated
 
 
 def sinusoidal_pos_embed(L: int, C: int, device: torch.device, dtype: torch.dtype, base: float = 10000.0) -> torch.Tensor:
@@ -312,6 +327,12 @@ class LocalAttentionND(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
+        q_flat = q.reshape(B, L, C)
+        k_flat = k.reshape(B, L, C)
+        q_flat = apply_rope(q_flat)
+        k_flat = apply_rope(k_flat)
+        k = k_flat.reshape(*k.shape)
+        
         width = self.width_proj(x).sigmoid() * self.max_dist + 0.5
         
         k_win = self._unfold_nd(k)
@@ -321,7 +342,6 @@ class LocalAttentionND(nn.Module):
         k_win = k_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
         v_win = v_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
         
-        q_flat = q.reshape(B, L, C)
         width_flat = width.reshape(B, L, 1)
         
         scores = torch.einsum('blc,blcw->blw', q_flat, k_win) * self.scale
@@ -364,9 +384,6 @@ class HierarchicalLocalAttentionND(nn.Module):
             kernel_size = (kernel_size,) * ndim
         self.kernel_size = kernel_size
         
-        conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
-        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
-        
         self.attn = LocalAttentionND(embed_dim, kernel_size, ndim)
         self.query = nn.Parameter(torch.randn(embed_dim * n_levels) * 0.02)
         self.film = nn.Linear(embed_dim * n_levels, embed_dim * 2)
@@ -382,13 +399,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         for s in spatial_shape:
             L *= s
         
-        h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
-        conv_out = self.stem_conv(h)
-        for dim, size in enumerate(spatial_shape):
-            conv_out = conv_out.narrow(dim + 2, 0, size)
-        h = h + conv_out
-        h = h.reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
-        
+        h = x
         levels = []
         
         for i in range(self.n_levels):

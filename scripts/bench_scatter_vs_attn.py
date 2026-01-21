@@ -12,6 +12,7 @@ from heuristic_secrets.models.scatter_attention import (
     HierarchicalLocalAttention,
     LocalAttentionND,
     RMSNorm,
+    apply_rope,
     sinusoidal_pos_embed_nd,
 )
 
@@ -45,6 +46,9 @@ class SDPAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
+        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
         
         dropout_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
@@ -117,6 +121,9 @@ class SDPAttention2D(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
+        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
+        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
+        
         dropout_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         
@@ -180,7 +187,7 @@ class SequenceClassifier(nn.Module):
         self.head = nn.Linear(width, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed(x.unsqueeze(-1)) + self.pos_embed
+        x = F.silu(self.embed(x.unsqueeze(-1))) + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=1)
@@ -203,7 +210,7 @@ class ImageClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         x = x.view(B, *self.img_size, 1)
-        x = self.patch_embed(x) + self.pos_embed
+        x = F.silu(self.patch_embed(x)) + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=(1, 2))
