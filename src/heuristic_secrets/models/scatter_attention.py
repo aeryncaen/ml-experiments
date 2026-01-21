@@ -399,6 +399,13 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
         self.conv_norm = RMSNorm(embed_dim)
         
+        if len(self.poolable_dims) == ndim:
+            self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, stride=2)
+        else:
+            reduce_stride = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
+            reduce_kernel = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
+            self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=reduce_kernel, stride=reduce_stride)
+        
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
         
         self.level_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
@@ -416,20 +423,8 @@ class HierarchicalLocalAttentionND(nn.Module):
         min_poolable = min(spatial_shape[d] for d in self.poolable_dims)
         return max(1, (min_poolable // self.min_size).bit_length())
     
-    def _pool_selective(self, h: torch.Tensor, spatial_shape: tuple[int, ...]) -> torch.Tensor:
-        B, C = h.shape[:2]
-        new_shape = list(spatial_shape)
-        for d in self.poolable_dims:
-            if new_shape[d] >= self.min_size * 2:
-                new_shape[d] //= 2
-        
-        if self.ndim == 1:
-            h = F.adaptive_avg_pool1d(h, new_shape[0])
-        elif self.ndim == 2:
-            h = F.adaptive_avg_pool2d(h, (new_shape[0], new_shape[1]))
-        else:
-            h = F.adaptive_avg_pool3d(h, (new_shape[0], new_shape[1], new_shape[2]))
-        return h
+    def _reduce(self, h: torch.Tensor) -> torch.Tensor:
+        return self.reduce_conv(h)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
@@ -458,9 +453,9 @@ class HierarchicalLocalAttentionND(nn.Module):
             levels.append(h)
             if i < n_levels - 1:
                 h_flat = h.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
-                h_pooled = self._pool_selective(h_flat, tuple(current_shape))
-                current_shape = list(h_pooled.shape[2:])
-                h = h_pooled.reshape(B, C, -1).mT.reshape(B, *current_shape, C)
+                h_reduced = self._reduce(h_flat)
+                current_shape = list(h_reduced.shape[2:])
+                h = h_reduced.reshape(B, C, -1).mT.reshape(B, *current_shape, C)
         
         level0_flat = levels[0].reshape(B, L, C)
         
