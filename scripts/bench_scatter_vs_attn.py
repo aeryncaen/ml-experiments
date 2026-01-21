@@ -458,7 +458,7 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, epoch=0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -492,7 +492,15 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 )
                 loss = (valid_losses * weights).sum() / mask.sum()
             else:
-                loss = per_token_loss.mean()
+                # Epoch 0: only backprop hardest 30% of tokens
+                if epoch == 0:
+                    valid_mask = labels_flat != -100
+                    valid_losses = per_token_loss[valid_mask]
+                    k = max(1, int(0.3 * valid_losses.size(0)))
+                    topk_losses, _ = valid_losses.topk(k)
+                    loss = topk_losses.mean()
+                else:
+                    loss = per_token_loss.mean()
             mask = labels_flat != -100
             preds = logits_flat.argmax(dim=-1)
             correct += (preds[mask] == labels_flat[mask]).sum().item()
@@ -512,7 +520,13 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 )
                 loss = (per_sample_loss * weights).mean()
             else:
-                loss = per_sample_loss.mean()
+                # Epoch 0: only backprop hardest 30% of samples
+                if epoch == 0:
+                    k = max(1, int(0.3 * per_sample_loss.size(0)))
+                    topk_losses, _ = per_sample_loss.topk(k)
+                    loss = topk_losses.mean()
+                else:
+                    loss = per_sample_loss.mean()
             correct += (logits.argmax(dim=-1) == labels).sum().item()
             total += labels.size(0)
 
@@ -630,12 +644,12 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
         train_loss, train_acc = train_epoch(
             model, current_loader, optimizer, device, active_scheduler, 
-            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode
+            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, epoch=epoch
         )
         
         if hard_mining:
             sample_losses = compute_sample_losses(model, train_loader, device, flatten=flatten, task_type=task_type)
-            weights = (sample_losses - sample_losses.min() + 1e-6) ** 2
+            weights = (sample_losses - sample_losses.min() + 1e-6) ** 3
             weights = weights / weights.sum() * len(weights)
             sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
             current_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
