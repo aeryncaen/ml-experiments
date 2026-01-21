@@ -400,7 +400,11 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.conv_norm = RMSNorm(embed_dim)
         
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
-        self.film = nn.Linear(self.channel_dim, embed_dim * 2)
+        
+        self.cross_q = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.cross_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
+        self.cross_scale = embed_dim ** -0.5
+        self.film = nn.Linear(embed_dim, embed_dim * 2)
         
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
@@ -459,8 +463,15 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         level0_flat = levels[0].reshape(B, L, C)
         
-        level_means = torch.stack([lvl.reshape(B, -1, H, D).mean(dim=1) for lvl in levels], dim=1)
-        global_ctx = level_means.mean(dim=1).reshape(B, H, D).mean(dim=1)
+        level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)
+        
+        q = self.cross_q(level_means[:, 0:1])
+        kv = self.cross_kv(level_means)
+        k, v = kv.chunk(2, dim=-1)
+        
+        attn_scores = torch.einsum('bqc,bkc->bqk', q, k) * self.cross_scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        global_ctx = torch.einsum('bqk,bkc->bqc', attn_weights, v).squeeze(1)
         
         film_params = self.film(global_ctx)
         scale, bias = film_params.chunk(2, dim=-1)

@@ -497,12 +497,18 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
+    post_warmup = total_steps - warmup_steps
+    static_steps = int(post_warmup * 0.4)
+    decay_steps = post_warmup - static_steps
 
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+        step_after_warmup = step - warmup_steps
+        if step_after_warmup < static_steps:
+            return 1.0
+        decay_progress = (step_after_warmup - static_steps) / decay_steps
+        return 0.5 * (1 + math.cos(math.pi * decay_progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
