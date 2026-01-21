@@ -383,9 +383,10 @@ class HierarchicalLocalAttentionND(nn.Module):
             L *= s
         
         h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
-        h = self.stem_conv(h)
+        conv_out = self.stem_conv(h)
         for dim, size in enumerate(spatial_shape):
-            h = h.narrow(dim + 2, 0, size)
+            conv_out = conv_out.narrow(dim + 2, 0, size)
+        h = h + conv_out
         h = h.reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
         
         levels = []
