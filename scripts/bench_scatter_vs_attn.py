@@ -164,27 +164,47 @@ def evaluate(model, loader, device, desc="Eval"):
     return total_loss / total, correct / total
 
 
-def train_model(name, model, train_loader, test_loader, device, epochs, lr):
-    print(f'\n{"="*60}')
-    print(f'Training {name} model...')
-    print('='*60)
-    
+def train_model(model, train_loader, test_loader, device, epochs, lr, verbose=True):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     for epoch in range(epochs):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
         test_loss, test_acc = evaluate(model, test_loader, device)
-        print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}')
+        if verbose:
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}')
     
-    return model
+    _, final_acc = evaluate(model, test_loader, device)
+    return final_acc
+
+
+def build_model(model_type, layers, n_classes, seq_len, device):
+    WIDTH_ATTN = 64
+    WIDTH_HIER = 53
+    WIDTH_CONV = 70
+    
+    if model_type == 'attention':
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        width = WIDTH_ATTN
+    elif model_type == 'hier':
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, kernel_size=17, n_levels=4, mlp_mult=4)
+        width = WIDTH_HIER
+    elif model_type == 'conv':
+        block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
+        width = WIDTH_CONV
+    else:
+        raise ValueError(f'Unknown model type: {model_type}')
+    
+    model = SequenceClassifier(block_fn(), width, layers, n_classes, seq_len)
+    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+    return model.to(device)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--layers', type=int, default=4)
+    parser.add_argument('--runs', type=int, default=1)
     parser.add_argument('--device', type=str, choices=['cpu', 'mps', 'cuda', 'auto'], default='auto')
-
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--model', type=str, choices=['attention', 'hier', 'conv', 'all'], default='all')
     parser.add_argument('--batch-size', type=int, default=128)
@@ -196,9 +216,6 @@ def main():
         device = torch.device(args.device)
     print(f'Device: {device}')
     
-    WIDTH_ATTN = 64
-    WIDTH_HIER = 54
-    WIDTH_CONV = 68
     N_CLASSES = 10
     SEQ_LEN = 784
     
@@ -213,46 +230,45 @@ def main():
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_data, batch_size=256, shuffle=False, num_workers=4)
     
-    attn_block = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
-    hier_block = lambda: HierarchicalBlock(WIDTH_HIER, kernel_size=17, n_levels=4, mlp_mult=4)
-    conv_block = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
+    model_types = ['attention', 'hier', 'conv'] if args.model == 'all' else [args.model]
     
-    attn_model = SequenceClassifier(attn_block(), WIDTH_ATTN, args.layers, N_CLASSES, SEQ_LEN)
-    hier_model = SequenceClassifier(hier_block(), WIDTH_HIER, args.layers, N_CLASSES, SEQ_LEN)
-    conv_model = SequenceClassifier(conv_block(), WIDTH_CONV, args.layers, N_CLASSES, SEQ_LEN)
+    print(f'\nModel parameters ({args.layers} layers):')
+    for mt in model_types:
+        model = build_model(mt, args.layers, N_CLASSES, SEQ_LEN, device)
+        print(f'  {mt:12s}: {count_params(model):,} params')
     
-    attn_model.layers = nn.ModuleList([attn_block() for _ in range(args.layers)])
-    hier_model.layers = nn.ModuleList([hier_block() for _ in range(args.layers)])
-    conv_model.layers = nn.ModuleList([conv_block() for _ in range(args.layers)])
-    attn_model = attn_model.to(device)
-    hier_model = hier_model.to(device)
-    conv_model = conv_model.to(device)
+    results = {mt: [] for mt in model_types}
     
-    print(f'\nAttention model:    {count_params(attn_model):,} params')
-    print(f'Hierarchical model: {count_params(hier_model):,} params')
-    print(f'Conv model:         {count_params(conv_model):,} params')
-    
-    all_models = {
-        'attention': ('Attention', attn_model),
-        'hier': ('Hierarchical', hier_model),
-        'conv': ('Conv', conv_model),
-    }
-    
-    if args.model == 'all':
-        models = list(all_models.values())
-    else:
-        models = [all_models[args.model]]
-    
-    for name, model in models:
-        train_model(name, model, train_loader, test_loader, device, args.epochs, args.lr)
+    for run in range(args.runs):
+        seed = run * 42
+        torch.manual_seed(seed)
+        
+        if args.runs > 1:
+            print(f'\n{"="*60}')
+            print(f'Run {run+1}/{args.runs} (seed={seed})')
+            print('='*60)
+        
+        for mt in model_types:
+            torch.manual_seed(seed)
+            model = build_model(mt, args.layers, N_CLASSES, SEQ_LEN, device)
+            
+            print(f'\nTraining {mt}...')
+            acc = train_model(model, train_loader, test_loader, device, args.epochs, args.lr, verbose=(args.runs == 1))
+            results[mt].append(acc)
+            print(f'{mt}: {acc:.4f}')
     
     print(f'\n{"="*60}')
     print('Final Results')
     print('='*60)
     
-    for name, model in models:
-        _, acc = evaluate(model, test_loader, device)
-        print(f'{name}:  {acc:.4f} ({count_params(model):,} params)')
+    for mt in model_types:
+        accs = results[mt]
+        mean_acc = sum(accs) / len(accs)
+        if len(accs) > 1:
+            std_acc = (sum((a - mean_acc)**2 for a in accs) / len(accs)) ** 0.5
+            print(f'{mt:12s}: {mean_acc:.4f} ± {std_acc:.4f} (n={len(accs)})')
+        else:
+            print(f'{mt:12s}: {mean_acc:.4f}')
 
 
 if __name__ == '__main__':
