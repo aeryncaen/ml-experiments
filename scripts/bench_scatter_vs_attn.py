@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -250,23 +251,30 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, desc="Train"):
+def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     
-    pbar = tqdm(loader, desc=desc, leave=False)
+    pbar = tqdm(loader, desc="Train", leave=False)
     for images, labels in pbar:
         images = images.view(images.size(0), -1).to(device)
         labels = labels.to(device)
         
         optimizer.zero_grad()
         logits = model(images)
-        loss = F.cross_entropy(logits, labels)
+        
+        per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
+        k = max(1, int(len(per_sample_loss) * hard_mining_ratio))
+        hard_indices = per_sample_loss.topk(k).indices
+        loss = per_sample_loss[hard_indices].mean()
+        
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler:
+            scheduler.step()
         
-        total_loss += loss.item() * labels.size(0)
+        total_loss += per_sample_loss.sum().item()
         correct += (logits.argmax(dim=-1) == labels).sum().item()
         total += labels.size(0)
         
@@ -297,14 +305,26 @@ def evaluate(model, loader, device, desc="Eval"):
     return total_loss / total, correct / total
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, verbose=True):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
+    total_steps = epochs * len(train_loader)
+    warmup_steps = warmup_epochs * len(train_loader)
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler)
         test_loss, test_acc = evaluate(model, test_loader, device)
         if verbose:
-            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}')
+            current_lr = scheduler.get_last_lr()[0]
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f} lr={current_lr:.2e}')
     
     _, final_acc = evaluate(model, test_loader, device)
     return final_acc
