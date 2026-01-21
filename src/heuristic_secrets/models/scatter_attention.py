@@ -33,16 +33,12 @@ class KernelNetND(nn.Module):
 
 class AdaptiveConvND(nn.Module):
     """
-    N-dimensional adaptive convolution using position cross-attention.
+    N-dimensional adaptive convolution with per-position learned kernel weights.
     
-    Design:
-    - Kernel built at max_kernel_size via position cross-attention
-    - Query: output position (origin in relative coords)
-    - Keys: relative input positions (within max kernel window)
-    - Values: input features at those positions
-    - Width/sharpness from content control effective receptive field
-    - Deformation from content warps coordinate space
-    - Depthwise operation with SE for channel mixing
+    - Per-position kernel weights from content projection
+    - Per-position deformation offsets via grid_sample
+    - Width/sharpness soft-mask controls effective receptive field
+    - Depthwise (per-head) with SE block for channel mixing
     """
     
     rel_pos: torch.Tensor
@@ -54,7 +50,6 @@ class AdaptiveConvND(nn.Module):
         ndim: int = 1,
         max_kernel_size: int = 7,
         num_channels: int = 1,
-        pos_dim: int = 16,
     ):
         super().__init__()
         self.channels = channels
@@ -62,44 +57,27 @@ class AdaptiveConvND(nn.Module):
         self.max_kernel_size = max_kernel_size
         self.num_channels = num_channels
         self.channel_dim = channels // num_channels
-        self.pos_dim = pos_dim
         
         self.half_k = max_kernel_size // 2
         self.kernel_numel = max_kernel_size ** ndim
+        K = self.kernel_numel
+        H = num_channels
         
-        # Position embeddings for cross-attention (the learned kernel)
-        # Query: always at origin (output position in relative coords)
-        # Key: relative input positions
-        self.query_embed = nn.Parameter(torch.randn(1, 1, num_channels, pos_dim) * 0.02)
-        self.key_proj = nn.Linear(ndim, pos_dim, bias=False)
+        self.kernel_proj = nn.Linear(channels, H * K)
+        self.adapt_proj = nn.Linear(channels, 2 * H)
+        self.deform_proj = nn.Linear(channels, H * ndim)
         
-        # Content projections for adaptive params (like LocalAttentionND)
-        # width ∈ [0.5, half_k + 0.5], sharpness ∈ [0.5, 10]
-        self.adapt_proj = nn.Linear(channels, 2 * num_channels)
-        
-        # Deformation: content-predicted offset per position (shared across kernel)
-        self.deform_proj = nn.Linear(channels, num_channels * ndim)
-        
-        # Output projection
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
-        # SE block for channel mixing
-        self.se_pool = nn.AdaptiveAvgPool1d(1)
         self.se_fc1 = nn.Linear(channels, channels // 4)
         self.se_fc2 = nn.Linear(channels // 4, channels)
         
-        # Pre-compute relative positions for max kernel
-        # Shape: (K, ndim) where K = max_kernel_size^ndim
         rel_coords = [torch.arange(max_kernel_size).float() - self.half_k for _ in range(ndim)]
         grids = torch.meshgrid(*rel_coords, indexing='ij')
         rel_pos = torch.stack([g.flatten() for g in grids], dim=-1)  # (K, ndim)
         self.register_buffer('rel_pos', rel_pos)
+        self.register_buffer('rel_dist', rel_pos.norm(dim=-1))
         
-        # Pre-compute L2 distance from origin for width/sharpness masking
-        rel_dist = rel_pos.norm(dim=-1)  # (K,)
-        self.register_buffer('rel_dist', rel_dist)
-        
-        # Init
         nn.init.zeros_(self.adapt_proj.weight)
         nn.init.zeros_(self.adapt_proj.bias)
         nn.init.zeros_(self.deform_proj.weight)
@@ -109,126 +87,73 @@ class AdaptiveConvND(nn.Module):
     def _gather_window(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         spatial = x.shape[1:-1]
-        H = self.num_channels
-        D = self.channel_dim
-        K = self.kernel_numel
-        L = reduce(mul, spatial, 1)
-        ndim = self.ndim
-        
-        # Use F.grid_sample for efficient bilinear interpolation
-        # x: (B, *spatial, C) -> (B, C, *spatial) for grid_sample
-        x_t = x.reshape(B, L, H * D).permute(0, 2, 1)  # (B, C, L)
-        
-        # Build sample grid: (B, L, K, ndim) normalized to [-1, 1]
-        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)  # (1, L, 1, 1)
-        
-        # offsets: (B, L, H, ndim) -> average across heads for shared deformation
-        offset_avg = offsets.mean(dim=2, keepdim=True)  # (B, L, 1, ndim)
-        
-        # abs_pos = center + rel_pos + offset
-        abs_pos = pos_indices + self.rel_pos[..., 0].view(1, 1, K, 1) + offset_avg  # (B, L, K, 1)
-        
-        # Normalize to [-1, 1] for grid_sample
-        grid = (abs_pos / (spatial[0] - 1)) * 2 - 1  # (B, L, K, 1)
-        
-        if ndim == 1:
-            # For 1D: grid_sample expects (B, C, H_in, W_in) and grid (B, H_out, W_out, 2)
-            # Treat L as W, K as H_out dimension
-            x_4d = x_t.unsqueeze(2)  # (B, C, 1, L)
-            grid_4d = torch.zeros(B, K, L, 2, device=x.device, dtype=x.dtype)
-            grid_4d[..., 0] = grid.squeeze(-1).permute(0, 2, 1)  # (B, K, L) - x coord
-            grid_4d[..., 1] = 0  # y coord = 0 (center of height=1)
-            
-            sampled = F.grid_sample(x_4d, grid_4d, mode='bilinear', padding_mode='border', align_corners=True)
-            # sampled: (B, C, K, L) -> (B, L, K, C)
-            sampled = sampled.permute(0, 3, 2, 1)
-        else:
-            # For nD: reshape spatial dims appropriately
-            x_nd = x_t.reshape(B, H * D, *spatial)
-            grid_nd = torch.zeros(B, *spatial, K, ndim, device=x.device, dtype=x.dtype)
-            # This path needs proper implementation for 2D/3D
-            raise NotImplementedError("grid_sample for ndim > 1 not yet implemented")
-        
-        # sampled: (B, L, K, C) -> (B, L, H, K, D)
-        result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
-        
-        return result
-    
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Args:
-            x: (B, *spatial, C) input tensor (channels-last)
-        
-        Returns:
-            output: (B, *spatial, C) 
-            aux: dict with regularization terms
-        """
-        B = x.shape[0]
-        spatial = x.shape[1:-1]
         C = x.shape[-1]
         H = self.num_channels
         D = self.channel_dim
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
-        # Project content to get adaptive params (SiLU before final nonlinearity)
-        adapt_params = F.silu(self.adapt_proj(x))  # (B, *spatial, 2*H)
-        adapt_params = adapt_params.reshape(B, L, 2, H).permute(0, 1, 3, 2)  # (B, L, H, 2)
+        if self.ndim == 1:
+            x_t = x.reshape(B, L, C).permute(0, 2, 1)  # (B, C, L)
+            
+            # offsets: (B, L, H) -> average across heads for shared spatial deformation
+            offset_avg = offsets.mean(dim=2)  # (B, L)
+            
+            # Build sampling grid: center positions + relative kernel positions + deformation
+            centers = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)  # (1, L, 1)
+            sample_pos = centers + self.rel_pos[:, 0].view(1, 1, K) + offset_avg.unsqueeze(-1)  # (B, L, K)
+            
+            # Normalize to [-1, 1] for grid_sample
+            grid = (sample_pos / (L - 1)) * 2 - 1  # (B, L, K)
+            grid = grid.unsqueeze(-1)  # (B, L, K, 1) - last dim is (x,) for 1D
+            
+            # grid_sample expects (B, C, H_in, W_in) and grid (B, H_out, W_out, 2)
+            # For 1D: treat as (B, C, 1, L) with grid (B, L, K, 2)
+            x_4d = x_t.unsqueeze(2)  # (B, C, 1, L)
+            grid_4d = torch.zeros(B, L, K, 2, device=x.device, dtype=x.dtype)
+            grid_4d[..., 0] = grid.squeeze(-1)  # x coord
+            grid_4d[..., 1] = 0  # y coord (center of height=1)
+            
+            sampled = F.grid_sample(x_4d, grid_4d, mode='bilinear', padding_mode='border', align_corners=True)
+            # sampled: (B, C, L, K) -> (B, L, K, C) -> (B, L, H, K, D)
+            result = sampled.permute(0, 2, 3, 1).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
+        else:
+            raise NotImplementedError(f"ndim={self.ndim} > 1 not yet implemented")
         
-        # Width and sharpness (like LocalAttentionND)
-        raw_width = adapt_params[..., 0]  # (B, L, H)
-        raw_sharpness = adapt_params[..., 1]  # (B, L, H)
+        return result
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        B = x.shape[0]
+        spatial = x.shape[1:-1]
+        C = x.shape[-1]
+        H = self.num_channels
+        K = self.kernel_numel
+        L = reduce(mul, spatial, 1)
         
-        width = torch.sigmoid(raw_width) * self.half_k + 0.5  # [0.5, half_k + 0.5]
-        sharpness = torch.sigmoid(raw_sharpness) * 9.5 + 0.5  # [0.5, 10]
+        adapt_params = F.silu(self.adapt_proj(x)).reshape(B, L, 2, H).permute(0, 1, 3, 2)
+        width = torch.sigmoid(adapt_params[..., 0]) * self.half_k + 0.5
+        sharpness = torch.sigmoid(adapt_params[..., 1]) * 9.5 + 0.5
         
-        # Deformation offsets (SiLU before tanh)
-        deform = torch.tanh(F.silu(self.deform_proj(x))) * (self.half_k * 0.5)  # (B, *spatial, H*ndim)
-        deform = deform.reshape(B, L, H, self.ndim)  # (B, L, H, ndim)
+        deform = torch.tanh(F.silu(self.deform_proj(x))).reshape(B, L, H, self.ndim) * self.half_k
         
-        # Gather values from input window (with deformation)
-        values = self._gather_window(x, deform)  # (B, L, H, K, D)
+        kernel_logits = F.silu(self.kernel_proj(x)).reshape(B, L, H, K)
         
-        # Build kernel via position cross-attention
-        # Query: learned embedding (1, 1, H, pos_dim)
-        # Keys: projected relative positions (K, pos_dim)
-        keys = self.key_proj(self.rel_pos)  # (K, pos_dim)
+        dist = self.rel_dist.view(1, 1, 1, K)
+        soft_mask = torch.sigmoid((width.unsqueeze(-1) - dist) * sharpness.unsqueeze(-1))
         
-        # Attention scores: query @ keys.T -> (1, 1, H, K)
-        attn_logits = torch.einsum('...hd,kd->...hk', self.query_embed, keys)  # (1, 1, H, K)
+        attn_weights = F.softmax(kernel_logits, dim=-1) * soft_mask
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Apply width/sharpness soft mask
-        # mask = sigmoid((width - dist) * sharpness)
-        # width: (B, L, H), rel_dist: (K,)
-        dist = self.rel_dist.reshape(1, 1, 1, K)  # (1, 1, 1, K)
-        width_exp = width.unsqueeze(-1)  # (B, L, H, 1)
-        sharpness_exp = sharpness.unsqueeze(-1)  # (B, L, H, 1)
+        values = self._gather_window(x, deform[..., 0] if self.ndim == 1 else deform)
+        output = torch.einsum('blhkd,blhk->blhd', values, attn_weights).reshape(B, L, C)
         
-        soft_mask = torch.sigmoid((width_exp - dist) * sharpness_exp)  # (B, L, H, K)
+        se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
+        output = output * se_weights
         
-        # Combine attention logits with soft mask
-        attn_weights = F.softmax(attn_logits, dim=-1) * soft_mask  # (B, L, H, K)
-        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)  # renormalize
+        output = self.out_proj(output).reshape(B, *spatial, C)
         
-        # Apply attention to values
-        # values: (B, L, H, K, D), attn_weights: (B, L, H, K)
-        output = torch.einsum('blhkd,blhk->blhd', values, attn_weights)  # (B, L, H, D)
-        output = output.reshape(B, L, C)  # (B, L, C)
-        
-        # SE block for channel mixing
-        se_input = output.permute(0, 2, 1)  # (B, C, L)
-        se_pooled = self.se_pool(se_input).squeeze(-1)  # (B, C)
-        se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(se_pooled))))  # (B, C)
-        output = output * se_weights.unsqueeze(1)  # (B, L, C)
-        
-        # Output projection and reshape
-        output = self.out_proj(output)
-        output = output.reshape(B, *spatial, C)
-        
-        # Regularization: encourage diverse attention, small deformations
         entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1).mean()
         deform_reg = (deform ** 2).mean()
-        
         return output, {"entropy_reg": -entropy, "deform_reg": deform_reg}
 
 
