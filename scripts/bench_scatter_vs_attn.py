@@ -645,10 +645,9 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     decay_epochs = post_warmup_epochs - static_epochs
     
     def get_hard_pct(ep):
-        """Cosine-annealed hard mining: 50% at max LR → 1% at min LR"""
-        if ep < warmup_epochs:
-            lr_mult = ep / warmup_epochs
-        elif ep < warmup_epochs + static_epochs:
+        """Cosine-annealed hard mining: 50% during warmup/static → 1% at end of decay"""
+        if ep < warmup_epochs + static_epochs:
+            # Stay at 50% during warmup and static phases
             lr_mult = 1.0
         else:
             decay_progress = (ep - warmup_epochs - static_epochs) / max(decay_epochs, 1)
