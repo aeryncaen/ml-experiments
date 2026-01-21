@@ -31,104 +31,138 @@ class KernelNetND(nn.Module):
         return self.net(positions * self.omega_0)
 
 
-class AdaptiveDeformConvND(nn.Module):
+class AdaptiveConvND(nn.Module):
+    """
+    N-dimensional adaptive convolution using position cross-attention.
+    
+    Design:
+    - Kernel built at max_kernel_size via position cross-attention
+    - Query: output position (origin in relative coords)
+    - Keys: relative input positions (within max kernel window)
+    - Values: input features at those positions
+    - Width/sharpness from content control effective receptive field
+    - Deformation from content warps coordinate space
+    - Depthwise operation with SE for channel mixing
+    """
+    
+    rel_pos: torch.Tensor
+    rel_dist: torch.Tensor
+    
     def __init__(
         self,
         channels: int,
         ndim: int = 1,
-        kernel_size: int = 7,
-        groups: int = 1,
-        init_sigma: float = 0.3,
-        min_sigma: float = 0.05,
-        max_sigma: float = 0.5,
-        offset_scale: float = 2.0,
-        depthwise: bool = True,
+        max_kernel_size: int = 7,
+        num_channels: int = 1,
+        pos_dim: int = 16,
     ):
         super().__init__()
         self.channels = channels
         self.ndim = ndim
-        self.kernel_size = kernel_size
-        self.groups = channels if depthwise else groups
-        self.group_channels = 1 if depthwise else channels // groups
-        self.min_sigma = min_sigma
-        self.max_sigma = max_sigma
-        self.offset_scale = offset_scale
-        self.depthwise = depthwise
+        self.max_kernel_size = max_kernel_size
+        self.num_channels = num_channels
+        self.channel_dim = channels // num_channels
+        self.pos_dim = pos_dim
         
-        self.kernel_numel = kernel_size ** ndim
+        self.half_k = max_kernel_size // 2
+        self.kernel_numel = max_kernel_size ** ndim
         
-        init_raw = math.log(math.exp(init_sigma) - 1.0) if init_sigma > 0 else 0.0
-        self.raw_sigma = nn.Parameter(torch.full((ndim,), init_raw))
+        # Position embeddings for cross-attention (the learned kernel)
+        # Query: always at origin (output position in relative coords)
+        # Key: relative input positions
+        self.query_embed = nn.Parameter(torch.randn(1, 1, num_channels, pos_dim) * 0.02)
+        self.key_proj = nn.Linear(ndim, pos_dim, bias=False)
         
-        self.input_proj = nn.Linear(channels, channels)
-        self.output_proj = nn.Linear(channels, channels)
+        # Content projections for adaptive params (like LocalAttentionND)
+        # width ∈ [0.5, half_k + 0.5], sharpness ∈ [0.5, 10]
+        self.adapt_proj = nn.Linear(channels, 2 * num_channels)
         
-        conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
-        self.dw_conv = nn.Sequential(
-            conv_cls(channels, channels, 3, padding=1, groups=channels),
-            nn.SiLU(),
-            conv_cls(channels, channels, 1),
-        )
+        # Deformation: content-predicted offset per position (shared across kernel)
+        self.deform_proj = nn.Linear(channels, num_channels * ndim)
         
-        self.offset_net = nn.Linear(channels, self.groups * self.kernel_numel * ndim)
-        self.mask_net = nn.Linear(channels, self.groups * self.kernel_numel)
+        # Output projection
+        self.out_proj = nn.Linear(channels, channels, bias=False)
         
-        kernel_out = self.groups * self.group_channels
-        self.kernel_net = KernelNetND(ndim, kernel_out, hidden=32, layers=3)
+        # SE block for channel mixing
+        self.se_pool = nn.AdaptiveAvgPool1d(1)
+        self.se_fc1 = nn.Linear(channels, channels // 4)
+        self.se_fc2 = nn.Linear(channels // 4, channels)
         
-        grid_1d = torch.linspace(-0.5, 0.5, kernel_size)
-        grids = torch.meshgrid(*[grid_1d] * ndim, indexing='ij')
-        grid = torch.stack([g.flatten() for g in grids], dim=-1)
-        self.register_buffer('grid', grid)
+        # Pre-compute relative positions for max kernel
+        # Shape: (K, ndim) where K = max_kernel_size^ndim
+        rel_coords = [torch.arange(max_kernel_size).float() - self.half_k for _ in range(ndim)]
+        grids = torch.meshgrid(*rel_coords, indexing='ij')
+        rel_pos = torch.stack([g.flatten() for g in grids], dim=-1)  # (K, ndim)
+        self.register_buffer('rel_pos', rel_pos)
         
-        ref_1d = torch.arange(kernel_size).float() - kernel_size // 2
-        refs = torch.meshgrid(*[ref_1d] * ndim, indexing='ij')
-        ref_offsets = torch.stack([r.flatten() for r in refs], dim=-1)
-        self.register_buffer('ref_offsets', ref_offsets)
+        # Pre-compute L2 distance from origin for width/sharpness masking
+        rel_dist = rel_pos.norm(dim=-1)  # (K,)
+        self.register_buffer('rel_dist', rel_dist)
         
-        self._reset_parameters()
+        # Init
+        nn.init.zeros_(self.adapt_proj.weight)
+        nn.init.zeros_(self.adapt_proj.bias)
+        nn.init.zeros_(self.deform_proj.weight)
+        nn.init.zeros_(self.deform_proj.bias)
+        nn.init.zeros_(self.out_proj.weight)
     
-    def _reset_parameters(self):
-        nn.init.zeros_(self.offset_net.weight)
-        nn.init.zeros_(self.offset_net.bias)
-        nn.init.zeros_(self.mask_net.weight)
-        nn.init.zeros_(self.mask_net.bias)
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-    
-    def _compute_envelope(self, sigma: torch.Tensor) -> torch.Tensor:
-        sigma = sigma.view(1, self.ndim)
-        dist_sq = (self.grid / sigma.clamp(min=1e-6)) ** 2
-        envelope = torch.exp(-0.5 * dist_sq.sum(dim=-1))
-        return envelope / envelope.sum().clamp(min=1e-8)
-    
-    def _sample_nd(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _gather_window(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """
+        Gather values from input at positions within the kernel window.
+        Uses N-linear interpolation for sub-pixel sampling.
+        
+        Args:
+            x: (B, *spatial, C) input tensor
+            offsets: (B, L, H, ndim) per-position deformation offsets
+        
+        Returns:
+            (B, L, H, K, D) gathered values where K=kernel_numel, D=channel_dim
+        """
         B = x.shape[0]
         spatial = x.shape[1:-1]
         C = x.shape[-1]
-        G = self.groups
-        gc = self.group_channels
+        H = self.num_channels
+        D = self.channel_dim
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
-        x_grouped = x.reshape(B, L, G, gc)
+        # Reshape x: (B, L, C) -> (B, L, H, D) for per-head channel slicing
+        x_flat = x.reshape(B, L, H, D)  # (B, L, H, D)
         
-        positions = positions.clamp(min=0)
-        for d in range(self.ndim):
-            positions[..., d] = positions[..., d].clamp(max=spatial[d] - 1)
+        # Compute absolute positions for each kernel element
+        # pos_indices: (L, ndim) - center positions
+        pos_indices = torch.stack(torch.meshgrid(
+            *[torch.arange(s, device=x.device, dtype=x.dtype) for s in spatial],
+            indexing='ij'
+        ), dim=-1).reshape(L, self.ndim)  # (L, ndim)
         
-        p_floor = positions.long()
-        p_ceil = (p_floor + 1).clamp(max=torch.tensor([s - 1 for s in spatial], device=x.device))
-        w_ceil = positions - p_floor.float()
+        # rel_pos: (K, ndim) - relative offsets in kernel
+        # offsets: (B, L, H, ndim) - content-predicted deformation
+        # Broadcast: (1, L, 1, 1, ndim) + (1, 1, 1, K, ndim) + (B, L, H, 1, ndim)
+        abs_pos_raw = (
+            pos_indices.reshape(1, L, 1, 1, self.ndim) +
+            self.rel_pos.reshape(1, 1, 1, K, self.ndim) +
+            offsets.unsqueeze(3)
+        )  # (B, L, H, K, ndim)
+        
+        # Clamp to valid range (out-of-place)
+        clamp_maxes = torch.tensor([s - 1 for s in spatial], device=x.device, dtype=abs_pos_raw.dtype)
+        abs_pos = abs_pos_raw.clamp(min=0)
+        abs_pos = torch.min(abs_pos, clamp_maxes.reshape(1, 1, 1, 1, self.ndim))
+        
+        # N-linear interpolation setup (all out-of-place)
+        p_floor = abs_pos.long()
+        p_ceil_raw = p_floor + 1
+        p_ceil = torch.min(p_ceil_raw, torch.tensor([s - 1 for s in spatial], device=x.device).reshape(1, 1, 1, 1, self.ndim))
+        w_ceil = abs_pos - p_floor.float()
         w_floor = 1.0 - w_ceil
         
-        result = torch.zeros(B, L, G, K, gc, device=x.device, dtype=x.dtype)
+        result = torch.zeros(B, L, H, K, D, device=x.device, dtype=x.dtype)
         
+        # Iterate over 2^ndim corners for N-linear interpolation
         for corner in range(2 ** self.ndim):
-            weight = torch.ones(B, L, G, K, device=x.device, dtype=x.dtype)
-            idx = torch.zeros(B, L, G, K, dtype=torch.long, device=x.device)
+            weight = torch.ones(B, L, H, K, device=x.device, dtype=x.dtype)
+            spatial_idx = torch.zeros(B, L, H, K, dtype=torch.long, device=x.device)
             stride = 1
             
             for d in range(self.ndim - 1, -1, -1):
@@ -136,65 +170,123 @@ class AdaptiveDeformConvND(nn.Module):
                 p = p_ceil[..., d] if use_ceil else p_floor[..., d]
                 w = w_ceil[..., d] if use_ceil else w_floor[..., d]
                 
-                p = p.clamp(0, spatial[d] - 1)
-                idx = idx + p * stride
+                spatial_idx = spatial_idx + p * stride
                 weight = weight * w
                 stride *= spatial[d]
             
-            idx_exp = idx.unsqueeze(-1).expand(-1, -1, -1, -1, gc)
-            x_flat = x_grouped.reshape(B, -1, gc).unsqueeze(2).expand(-1, -1, G, -1)
+            # spatial_idx: (B, L, H, K) - flat indices into spatial dim L
+            # For each (b, l, h, k), we want x_flat[b, spatial_idx[b,l,h,k], h, :]
+            # i.e., gather spatial position but keep the SAME head h
             
-            gathered = torch.gather(x_flat, 1, idx_exp.reshape(B, -1, G, gc)).reshape(B, L, G, K, gc)
+            # Reshape for batch gather: (B, L*H*K)
+            idx_flat = spatial_idx.reshape(B, -1)  # (B, L*H*K)
+            
+            # Gather from x_flat along spatial dimension
+            # x_flat: (B, L, H, D) -> we want (B, L*H*K, D) where each element
+            # gathers from the appropriate spatial position for its head
+            
+            # Expand idx to gather: (B, L*H*K, 1) -> index into dim 1
+            # But we also need to select the right head h for each entry
+            
+            # Heads are independent - each (l, h, k) entry should use head h
+            # Create head indices: (L*H*K) where entry [l*H*K + h*K + k] = h
+            head_idx = torch.arange(H, device=x.device).reshape(1, 1, H, 1).expand(B, L, H, K)
+            head_idx_flat = head_idx.reshape(B, -1)  # (B, L*H*K)
+            
+            # For advanced indexing: x_flat[b, spatial_idx, head_idx, :]
+            # Use gather with computed linear index into (L*H) space
+            combined_idx = idx_flat * H + head_idx_flat  # (B, L*H*K)
+            
+            # Reshape x_flat to (B, L*H, D) and gather
+            x_flat_2d = x_flat.reshape(B, L * H, D)  # (B, L*H, D)
+            combined_idx_exp = combined_idx.unsqueeze(-1).expand(-1, -1, D)  # (B, L*H*K, D)
+            gathered = torch.gather(x_flat_2d, 1, combined_idx_exp)  # (B, L*H*K, D)
+            gathered = gathered.reshape(B, L, H, K, D)  # (B, L, H, K, D)
+            
             result = result + gathered * weight.unsqueeze(-1)
         
         return result
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        spatial = x.shape[1:-1]
+        """
+        Args:
+            x: (B, *spatial, C) input tensor (channels-last)
+        
+        Returns:
+            output: (B, *spatial, C) 
+            aux: dict with regularization terms
+        """
         B = x.shape[0]
+        spatial = x.shape[1:-1]
         C = x.shape[-1]
-        G = self.groups
-        gc = self.group_channels
+        H = self.num_channels
+        D = self.channel_dim
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
-        sigma = F.softplus(self.raw_sigma).clamp(self.min_sigma, self.max_sigma)
+        # Project content to get adaptive params (SiLU before final nonlinearity)
+        adapt_params = F.silu(self.adapt_proj(x))  # (B, *spatial, 2*H)
+        adapt_params = adapt_params.reshape(B, L, 2, H).permute(0, 1, 3, 2)  # (B, L, H, 2)
         
-        x_proj = self.input_proj(x)
+        # Width and sharpness (like LocalAttentionND)
+        raw_width = adapt_params[..., 0]  # (B, L, H)
+        raw_sharpness = adapt_params[..., 1]  # (B, L, H)
         
-        x_conv = x.reshape(B, L, C).mT.reshape(B, C, *spatial)
-        x_conv = self.dw_conv(x_conv)
-        x_dw = x_conv.reshape(B, C, L).mT
+        width = torch.sigmoid(raw_width) * self.half_k + 0.5  # [0.5, half_k + 0.5]
+        sharpness = torch.sigmoid(raw_sharpness) * 9.5 + 0.5  # [0.5, 10]
         
-        envelope = self._compute_envelope(sigma)
-        kernel_weights = self.kernel_net(self.grid)
+        # Deformation offsets (SiLU before tanh)
+        deform = torch.tanh(F.silu(self.deform_proj(x))) * (self.half_k * 0.5)  # (B, *spatial, H*ndim)
+        deform = deform.reshape(B, L, H, self.ndim)  # (B, L, H, ndim)
         
-        offsets = torch.tanh(self.offset_net(x_dw)).reshape(B, L, G, K, self.ndim) * self.offset_scale
+        # Gather values from input window (with deformation)
+        values = self._gather_window(x, deform)  # (B, L, H, K, D)
         
-        pos_indices = torch.stack(torch.meshgrid(
-            *[torch.arange(s, device=x.device, dtype=torch.float32) for s in spatial],
-            indexing='ij'
-        ), dim=-1).reshape(1, L, 1, 1, self.ndim)
+        # Build kernel via position cross-attention
+        # Query: learned embedding (1, 1, H, pos_dim)
+        # Keys: projected relative positions (K, pos_dim)
+        keys = self.key_proj(self.rel_pos)  # (K, pos_dim)
         
-        abs_pos = pos_indices + self.ref_offsets.reshape(1, 1, 1, K, self.ndim) + offsets
+        # Attention scores: query @ keys.T -> (1, 1, H, K)
+        attn_logits = torch.einsum('...hd,kd->...hk', self.query_embed, keys)  # (1, 1, H, K)
         
-        sampled = self._sample_nd(x_proj, abs_pos)
+        # Apply width/sharpness soft mask
+        # mask = sigmoid((width - dist) * sharpness)
+        # width: (B, L, H), rel_dist: (K,)
+        dist = self.rel_dist.reshape(1, 1, 1, K)  # (1, 1, 1, K)
+        width_exp = width.unsqueeze(-1)  # (B, L, H, 1)
+        sharpness_exp = sharpness.unsqueeze(-1)  # (B, L, H, 1)
         
-        kw = kernel_weights.reshape(G, gc, K)
-        sampled = sampled * kw.permute(0, 2, 1).unsqueeze(0).unsqueeze(0)
+        soft_mask = torch.sigmoid((width_exp - dist) * sharpness_exp)  # (B, L, H, K)
         
-        raw_mask = self.mask_net(x_dw).reshape(B, L, G, K)
-        raw_mask = raw_mask * envelope.reshape(1, 1, 1, K)
-        attn_mask = F.softmax(raw_mask, dim=-1)
+        # Combine attention logits with soft mask
+        attn_weights = F.softmax(attn_logits, dim=-1) * soft_mask  # (B, L, H, K)
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)  # renormalize
         
-        output = (sampled * attn_mask.unsqueeze(-1)).sum(dim=3)
-        output = output.reshape(B, L, C)
+        # Apply attention to values
+        # values: (B, L, H, K, D), attn_weights: (B, L, H, K)
+        output = torch.einsum('blhkd,blhk->blhd', values, attn_weights)  # (B, L, H, D)
+        output = output.reshape(B, L, C)  # (B, L, C)
+        
+        # SE block for channel mixing
+        se_input = output.permute(0, 2, 1)  # (B, C, L)
+        se_pooled = self.se_pool(se_input).squeeze(-1)  # (B, C)
+        se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(se_pooled))))  # (B, C)
+        output = output * se_weights.unsqueeze(1)  # (B, L, C)
+        
+        # Output projection and reshape
+        output = self.out_proj(output)
         output = output.reshape(B, *spatial, C)
         
-        offset_reg = (offsets ** 2).mean()
-        entropy = -(attn_mask * (attn_mask + 1e-8).log()).sum(dim=-1).mean()
+        # Regularization: encourage diverse attention, small deformations
+        entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1).mean()
+        deform_reg = (deform ** 2).mean()
         
-        return self.output_proj(output), {"offset_reg": offset_reg, "entropy_reg": -entropy}
+        return output, {"entropy_reg": -entropy, "deform_reg": deform_reg}
+
+
+# Backward compatibility alias
+AdaptiveDeformConvND = AdaptiveConvND
 
 
 class ScatterAttention1d(nn.Module):
@@ -577,7 +669,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, adapt_stem: bool = False, adapt_reduce: bool = False):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -585,26 +677,18 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.channel_dim = embed_dim // num_channels
         self.poolable_dims = poolable_dims if poolable_dims is not None else tuple(range(ndim))
         self.min_size = min_size
-        self.adapt_stem = adapt_stem
-        self.adapt_reduce = adapt_reduce
         
         if isinstance(window_size, int):
             window_size = (window_size,) * ndim
         self.window_size = window_size
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
-        pool_cls = [nn.AvgPool1d, nn.AvgPool2d, nn.AvgPool3d][ndim - 1]
         
-        if self.adapt_stem:
-            self.stem_conv = AdaptiveDeformConvND(embed_dim, ndim=ndim, kernel_size=7, depthwise=True)
-        else:
-            self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
+        self.conv = AdaptiveConvND(embed_dim, ndim=ndim, max_kernel_size=window_size[0], num_channels=num_channels)
         self.conv_norm = RMSNorm(embed_dim)
         
-        if self.adapt_reduce:
-            self.reduce_conv = AdaptiveDeformConvND(embed_dim, ndim=ndim, kernel_size=7, depthwise=True)
-            self.reduce_pool = pool_cls(kernel_size=2, stride=2)
-        elif len(self.poolable_dims) == ndim:
+        self.reduce_norm = RMSNorm(embed_dim)
+        if len(self.poolable_dims) == ndim:
             self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, stride=2)
         else:
             reduce_stride = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
@@ -629,97 +713,78 @@ class HierarchicalLocalAttentionND(nn.Module):
         return max(1, (min_poolable // self.min_size).bit_length())
     
     def _reduce(self, h: torch.Tensor) -> torch.Tensor:
-        if self.adapt_reduce:
-            spatial = h.shape[2:]
-            B, C = h.shape[:2]
-            h_cl = h.reshape(B, C, -1).mT.reshape(B, *spatial, C)
-            out, _ = self.reduce_conv(h_cl)
-            out = out.reshape(B, -1, C).mT.reshape(B, C, *spatial)
-            out = self.reduce_pool(out)
-            return out
         return self.reduce_conv(h)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         C = x.shape[-1]
-        H = self.num_channels
-        D = self.channel_dim
         L = 1
         for s in spatial_shape:
             L *= s
         
         n_levels = self._compute_n_levels(spatial_shape)
         
-        if self.adapt_stem:
-            conv_out, _ = self.stem_conv(x)
-            conv_out = self.conv_norm(conv_out.reshape(B, L, C)).reshape(B, *spatial_shape, C)
-            h = x + conv_out
-        else:
-            h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
-            conv_out = self.stem_conv(h)
-            for dim, size in enumerate(spatial_shape):
-                conv_out = conv_out.narrow(dim + 2, 0, size)
-            conv_out = self.conv_norm(conv_out.reshape(B, C, L).mT).mT.reshape(B, C, *spatial_shape)
-            h = (h + conv_out).reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
-        
+        h = x
         levels = []
         current_shape = list(spatial_shape)
         
         for i in range(n_levels):
+            conv_out, _ = self.conv(h)
+            conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
+            h = h + conv_out
+            
             h = self.attn(h)
             levels.append(h)
+            
             if i < n_levels - 1:
-                h_flat = h.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
+                h_normed = self.reduce_norm(h.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
+                h_flat = h_normed.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
                 h_reduced = self._reduce(h_flat)
                 current_shape = list(h_reduced.shape[2:])
                 h = h_reduced.reshape(B, C, -1).mT.reshape(B, *current_shape, C)
         
         level0_flat = levels[0].reshape(B, L, C)
         
-        # 1. Learned query attends to level means -> global context
-        level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)  # (B, n_levels, C)
-        level_kv = self.level_kv(level_means)  # (B, n_levels, 2C)
-        level_k, level_v = level_kv.chunk(2, dim=-1)  # each (B, n_levels, C)
+        level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)
+        level_kv = self.level_kv(level_means)
+        level_k, level_v = level_kv.chunk(2, dim=-1)
         
-        # level_query: (1, 1, C) -> broadcast to (B, 1, C)
         ctx_scores = torch.einsum('bqc,bkc->bqk', self.level_query.expand(B, -1, -1), level_k) * self.level_scale
         ctx_weights = F.softmax(ctx_scores, dim=-1)
-        ctx = torch.einsum('bqk,bkc->bqc', ctx_weights, level_v)  # (B, 1, C)
+        ctx = torch.einsum('bqk,bkc->bqc', ctx_weights, level_v)
         
-        # 2. Context cross-attends to level0 hidden states
-        q = self.ctx_proj(ctx)  # (B, 1, C)
-        hidden_kv = self.hidden_kv(level0_flat)  # (B, L, 2C)
-        hidden_k, hidden_v = hidden_kv.chunk(2, dim=-1)  # each (B, L, C)
+        q = self.ctx_proj(ctx)
+        hidden_kv = self.hidden_kv(level0_flat)
+        hidden_k, hidden_v = hidden_kv.chunk(2, dim=-1)
         
         hidden_scores = torch.einsum('bqc,bkc->bqk', q, hidden_k) * self.level_scale
         hidden_weights = F.softmax(hidden_scores, dim=-1)
-        update = torch.einsum('bqk,bkc->bqc', hidden_weights, hidden_v)  # (B, 1, C)
+        update = torch.einsum('bqk,bkc->bqc', hidden_weights, hidden_v)
         
-        # 3. Project and add residual (broadcasts (B,1,C) to (B,L,C))
         out = level0_flat + self.out_proj(update)
         return out.reshape(B, *spatial_shape, C)
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, adapt_stem: bool = False, adapt_reduce: bool = False):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, adapt_stem: bool = False, adapt_reduce: bool = False):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, adapt_stem: bool = False, adapt_reduce: bool = False):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps)
 
 
 LocalKernelAttention = LocalAttention
