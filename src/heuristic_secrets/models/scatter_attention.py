@@ -396,7 +396,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.window_size = window_size
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
-        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1, groups=embed_dim)
+        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
         self.conv_norm = RMSNorm(embed_dim)
         
         if len(self.poolable_dims) == ndim:
