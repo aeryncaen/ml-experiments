@@ -255,10 +255,10 @@ class LocalBlock2D(nn.Module):
 
 
 class HierarchicalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False, no_mlp: bool = False):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, use_ssm: bool = False, no_mlp: bool = False, adapt_stem: bool = False, adapt_reduce: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
+        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
         self.attn_norm = RMSNorm(width)
         self.use_ssm = use_ssm
         self.no_mlp = no_mlp
@@ -449,11 +449,11 @@ class LocalBlock3D(nn.Module):
 
 
 class HierarchicalBlock3D(nn.Module):
-    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, no_mlp: bool = False):
+    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1, no_mlp: bool = False, adapt_stem: bool = False, adapt_reduce: bool = False):
         super().__init__()
         self.no_mlp = no_mlp
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1))
+        self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1), adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
         self.attn_norm = RMSNorm(width)
         if not no_mlp:
             self.norm2 = RMSNorm(width)
@@ -532,12 +532,12 @@ class DuoModel(nn.Module):
             raise ValueError(f"Unknown merge strategy: {self.merge}")
 
 
-def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', duo_split=0.3):
-    """Train duo model with inverse curriculum: hard model on top duo_split%, easy model on bottom (1-duo_split)%."""
+def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', hard_pct=0.5):
+    """Train duo model with inverse curriculum: hard model on top hard_pct%, easy model on bottom (1-hard_pct)%."""
     duo_model.train()
     total_loss, correct, total = 0.0, 0, 0
     
-    desc = f"Train [DUO h{int(duo_split*100)}%/e{int((1-duo_split)*100)}%]"
+    desc = f"Train [DUO h{int(hard_pct*100)}%/e{int((1-hard_pct)*100)}%]"
     pbar = tqdm(loader, desc=desc, leave=False)
     
     for inputs, labels in pbar:
@@ -566,7 +566,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             valid_indices = torch.where(valid_mask)[0]
             
             # Sort by difficulty (descending)
-            k_hard = max(1, int(duo_split * valid_losses.size(0)))
+            k_hard = max(1, int(hard_pct * valid_losses.size(0)))
             _, sorted_idx = valid_losses.sort(descending=True)
             hard_token_idx = valid_indices[sorted_idx[:k_hard]]
             easy_token_idx = valid_indices[sorted_idx[k_hard:]]
@@ -585,7 +585,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             per_sample_loss = F.cross_entropy(merged, labels, reduction='none')
             
             # Sort by difficulty (descending = hardest first)
-            k_hard = max(1, int(duo_split * per_sample_loss.size(0)))
+            k_hard = max(1, int(hard_pct * per_sample_loss.size(0)))
             _, sorted_idx = per_sample_loss.sort(descending=True)
             hard_idx = sorted_idx[:k_hard]
             easy_idx = sorted_idx[k_hard:]
@@ -757,7 +757,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', duo_split=0.3):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -814,21 +814,24 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
         # First epoch uses first_epoch_pct if set, otherwise use cosine hard mining
         is_duo = isinstance(model, DuoModel)
+        # Compute curriculum percentage (used by both duo and hard mining)
+        if epoch == 0 and first_epoch_pct is not None:
+            hard_pct = first_epoch_pct
+        else:
+            hard_pct = get_hard_pct(epoch)
+        
         if is_duo:
-            # Duo mode: use inverse curriculum training
+            # Duo mode: hard model gets top hard_pct%, easy model gets bottom (1-hard_pct)%
             train_loss, train_acc = train_epoch_duo(
                 model, current_loader, optimizer, device, active_scheduler,
-                flatten=flatten, task_type=task_type, duo_split=duo_split
+                flatten=flatten, task_type=task_type, hard_pct=hard_pct
             )
         else:
             # Standard training
-            if epoch == 0 and first_epoch_pct is not None:
-                hard_pct = first_epoch_pct
-            else:
-                hard_pct = get_hard_pct(epoch) if hard_mining else None
             train_loss, train_acc = train_epoch(
                 model, current_loader, optimizer, device, active_scheduler, 
-                flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, hard_pct=hard_pct
+                flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
+                hard_pct=hard_pct if hard_mining else None
             )
         
         if use_swa_sched:
@@ -846,7 +849,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             swa_str = f' swa_acc={swa_acc:.4f}' if swa_acc is not None else ''
             phase_str = ' [SWA]' if in_swa_phase else ''
             mine_str = ' [HEM]' if hard_mining else ''
-            duo_str = f' [DUO h{int(duo_split*100)}%]' if is_duo else ''
+            duo_str = f' [DUO h{int(hard_pct*100)}%/e{int((1-hard_pct)*100)}%]' if is_duo else ''
             print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}{duo_str}')
         
         if checkpoint_dir:
@@ -892,7 +895,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, no_mlp=False):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, no_mlp=False, adapt_stem=False, adapt_reduce=False):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
@@ -905,7 +908,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm, no_mlp=no_mlp)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm, no_mlp=no_mlp)
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, mlp_mult=4, use_ssm=use_ssm, no_mlp=no_mlp, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7, mlp_mult=4, no_mlp=no_mlp)
@@ -918,7 +921,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     return model.to(device)
 
 
-def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, no_mlp=False):
+def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, no_mlp=False, adapt_stem=False, adapt_reduce=False):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
     WIDTH_HIER = 48
@@ -931,7 +934,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
         block_fn = lambda: LocalBlock3D(WIDTH_LOCAL, kernel_size=5, num_channels=num_channels, mlp_mult=4, no_mlp=no_mlp)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, num_channels=num_channels, mlp_mult=4, no_mlp=no_mlp)
+        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, num_channels=num_channels, mlp_mult=4, no_mlp=no_mlp, adapt_stem=adapt_stem, adapt_reduce=adapt_reduce)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock3D(WIDTH_CONV, kernel_size=5, mlp_mult=4, no_mlp=no_mlp)
@@ -1103,9 +1106,8 @@ def main():
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
     parser.add_argument('--first-epoch-pct', type=float, default=None, help='First epoch: only backprop hardest N%% of samples (e.g. 0.3 for 30%%)')
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
-    parser.add_argument('--duo', action='store_true', help='Duo mode: train two models with inverse curriculum, merge at inference')
+    parser.add_argument('--duo', action='store_true', help='Duo mode: train two models with inverse curriculum (uses --hard-start/--hard-end), merge at inference')
     parser.add_argument('--duo-merge', type=str, default='mean', choices=DuoModel.MERGE_STRATEGIES, help='Duo merge strategy (default: mean)')
-    parser.add_argument('--duo-split', type=float, default=0.3, help='Duo split: hard model gets top X%%, easy model gets bottom (1-X)%% (default: 0.3)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1151,14 +1153,14 @@ def main():
     elif args.mode_3d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.no_mlp)
+        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.no_mlp, args.adapt_stem, args.adapt_reduce)
         shape_str = f'vol_size={img_size}'
         flatten = False
         print(f'Task type: 3D Classification (SSM not supported)')
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.no_mlp)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.no_mlp, args.adapt_stem, args.adapt_reduce)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
@@ -1201,7 +1203,7 @@ def main():
                 seed_everything(seed + 1)  # Different init for model_easy
                 model_easy = builder(mt)
                 model = DuoModel(model_hard, model_easy, merge=args.duo_merge)
-                print(f'\nTraining {mt} [DUO: h{int(args.duo_split*100)}%/e{int((1-args.duo_split)*100)}%, merge={args.duo_merge}]...')
+                print(f'\nTraining {mt} [DUO: curriculum {int(args.hard_start*100)}%→{int(args.hard_end*100)}%, merge={args.duo_merge}]...')
             else:
                 model = builder(mt)
                 print(f'\nTraining {mt}...')
@@ -1212,8 +1214,7 @@ def main():
                 swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                 hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=flatten, task_type=task_type,
-                duo_split=args.duo_split
+                verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
