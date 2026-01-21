@@ -296,7 +296,10 @@ class LocalAttentionND(nn.Module):
         self.scale = self.channel_dim ** -0.5
         
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.q_norm = RMSNorm(self.channel_dim)
+        self.k_norm = RMSNorm(self.channel_dim)
         self.width_proj = nn.Linear(embed_dim, num_channels)
+        self.out_norm = RMSNorm(embed_dim)
         self.out = nn.Linear(embed_dim, embed_dim, bias=False)
         
         nn.init.zeros_(self.width_proj.weight)
@@ -332,8 +335,8 @@ class LocalAttentionND(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
-        q_flat = q.reshape(B, L, H, D)
-        k_flat = k.reshape(B, L, H, D)
+        q_flat = self.q_norm(q.reshape(B, L, H, D))
+        k_flat = self.k_norm(k.reshape(B, L, H, D))
         q_flat = apply_rope(q_flat)
         k_flat = apply_rope(k_flat)
         k = k_flat.reshape(*k.shape)
@@ -357,7 +360,7 @@ class LocalAttentionND(nn.Module):
         attn = F.softmax(scores, dim=-1)
         out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
         
-        out = out.reshape(*x.shape[:-1], C)
+        out = self.out_norm(out.reshape(*x.shape[:-1], C))
         return self.out(out + v)
 
 
@@ -393,6 +396,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
         self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
+        self.conv_norm = RMSNorm(embed_dim)
         
         self.attn = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels)
         self.query = nn.Parameter(torch.randn(n_levels * num_channels) * 0.02)
@@ -415,6 +419,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         conv_out = self.stem_conv(h)
         for dim, size in enumerate(spatial_shape):
             conv_out = conv_out.narrow(dim + 2, 0, size)
+        conv_out = self.conv_norm(conv_out.reshape(B, C, L).mT).mT.reshape(B, C, *spatial_shape)
         h = (h + conv_out).reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
         
         levels = []

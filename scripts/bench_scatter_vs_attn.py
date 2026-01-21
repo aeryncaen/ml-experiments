@@ -38,6 +38,8 @@ class SDPAttention(nn.Module):
         self.dropout = dropout
         
         self.qkv = nn.Linear(width, 3 * width, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.out = nn.Linear(width, width, bias=False)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -47,6 +49,8 @@ class SDPAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
+        q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
+        k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
         q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
         k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
         
@@ -62,11 +66,12 @@ class AttentionBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.attn = SDPAttention(width, num_heads, dropout)
+        self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn_norm(self.attn(self.norm1(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -76,11 +81,12 @@ class HierarchicalBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttention(width, kernel_size, n_levels, num_channels)
+        self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.hier_attn(self.norm1(x))
+        x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -110,6 +116,8 @@ class SDPAttention2D(nn.Module):
         self.dropout = dropout
         
         self.qkv = nn.Linear(width, 3 * width, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.out = nn.Linear(width, width, bias=False)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,6 +129,8 @@ class SDPAttention2D(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
+        q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
+        k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
         q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
         k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
         
@@ -136,11 +146,12 @@ class AttentionBlock2D(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.attn = SDPAttention2D(width, num_heads, dropout)
+        self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn_norm(self.attn(self.norm1(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -150,11 +161,12 @@ class LocalBlock2D(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.local_attn = LocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
+        self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.local_attn(self.norm1(x))
+        x = x + self.attn_norm(self.local_attn(self.norm1(x)))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -181,13 +193,14 @@ class SequenceClassifier(nn.Module):
     def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, seq_len: int):
         super().__init__()
         self.embed = nn.Linear(1, width)
+        self.embed_norm = RMSNorm(width)
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.embed(x.unsqueeze(-1))) + self.pos_embed
+        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=1)
@@ -199,6 +212,7 @@ class ImageClassifier(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.patch_embed = nn.Linear(1, width)
+        self.embed_norm = RMSNorm(width)
         self.register_buffer(
             'pos_embed',
             sinusoidal_pos_embed_nd(img_size, width, torch.device('cpu'), torch.float32)
@@ -210,7 +224,7 @@ class ImageClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         x = x.view(B, *self.img_size, 1)
-        x = F.silu(self.patch_embed(x)) + self.pos_embed
+        x = self.embed_norm(F.silu(self.patch_embed(x))) + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=(1, 2))
