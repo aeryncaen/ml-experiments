@@ -347,13 +347,15 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3):
+def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3, flatten=True):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     
     pbar = tqdm(loader, desc="Train", leave=False)
     for images, labels in pbar:
-        images = images.view(images.size(0), -1).to(device)
+        images = images.to(device)
+        if flatten:
+            images = images.view(images.size(0), -1)
         labels = labels.to(device)
         
         optimizer.zero_grad()
@@ -380,13 +382,15 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ra
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, desc="Eval"):
+def evaluate(model, loader, device, desc="Eval", flatten=True):
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     
     pbar = tqdm(loader, desc=desc, leave=False)
     for images, labels in pbar:
-        images = images.view(images.size(0), -1).to(device)
+        images = images.to(device)
+        if flatten:
+            images = images.view(images.size(0), -1)
         labels = labels.to(device)
         
         logits = model(images)
@@ -401,7 +405,7 @@ def evaluate(model, loader, device, desc="Eval"):
     return total_loss / total, correct / total
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True, flatten=True):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     total_steps = epochs * len(train_loader)
@@ -416,13 +420,13 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler)
-        test_loss, test_acc = evaluate(model, test_loader, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler, flatten=flatten)
+        test_loss, test_acc = evaluate(model, test_loader, device, flatten=flatten)
         if verbose:
             current_lr = scheduler.get_last_lr()[0]
             print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f} lr={current_lr:.2e}')
     
-    _, final_acc = evaluate(model, test_loader, device)
+    _, final_acc = evaluate(model, test_loader, device, flatten=flatten)
     return final_acc
 
 
@@ -632,7 +636,7 @@ def main():
             model = builder(mt)
             
             print(f'\nTraining {mt}...')
-            acc = train_model(model, train_loader, test_loader, device, args.epochs, args.lr, verbose=(args.runs == 1))
+            acc = train_model(model, train_loader, test_loader, device, args.epochs, args.lr, verbose=(args.runs == 1), flatten=not args.mode_3d)
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
     
