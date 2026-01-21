@@ -79,10 +79,10 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttention(width, window_size, n_levels, num_channels)
+        self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels)
         self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
@@ -174,10 +174,10 @@ class LocalBlock2D(nn.Module):
 
 
 class HierarchicalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, n_levels, ndim=2, num_channels=num_channels)
+        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
         self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
@@ -245,6 +245,102 @@ class ImageClassifier(nn.Module):
             x = layer(x)
         x = self.norm(x).mean(dim=(1, 2))
         return self.head(x)
+
+
+class VolumeClassifier(nn.Module):
+    def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, vol_size: tuple[int, int, int]):
+        super().__init__()
+        self.vol_size = vol_size
+        self.patch_embed = nn.Linear(1, width)
+        self.embed_norm = RMSNorm(width)
+        self.pos_embed = nn.Parameter(torch.randn(1, *vol_size, width) * 0.02)
+        self.pos_norm = RMSNorm(width)
+        self.layers = nn.ModuleList([block for _ in range(n_layers)])
+        self.norm = RMSNorm(width)
+        self.head = nn.Linear(width, n_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        x = x.permute(0, 2, 3, 1).unsqueeze(-1)
+        x = self.embed_norm(F.silu(self.patch_embed(x))) + self.pos_norm(F.silu(self.pos_embed))
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x).mean(dim=(1, 2, 3))
+        return self.head(x)
+
+
+class AttentionBlock3D(nn.Module):
+    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.attn = SDPAttention2D(width, num_heads, dropout)
+        self.attn_norm = RMSNorm(width)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, D, C = x.shape
+        x_flat = x.reshape(B, H * W * D, C)
+        attn_out = self.attn.qkv(self.norm1(x_flat).reshape(B, H*W*D, C))
+        qkv = attn_out.reshape(B, H*W*D, 3, self.attn.num_heads, self.attn.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = self.attn.q_norm(q.transpose(1, 2)).transpose(1, 2)
+        k = self.attn.k_norm(k.transpose(1, 2)).transpose(1, 2)
+        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
+        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = self.attn.out(out.transpose(1, 2).reshape(B, H, W, D, C))
+        x = x + self.attn_norm(out)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class LocalBlock3D(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 5, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.local_attn = LocalAttentionND(width, kernel_size, ndim=3, num_channels=num_channels)
+        self.attn_norm = RMSNorm(width)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn_norm(self.local_attn(self.norm1(x)))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class HierarchicalBlock3D(nn.Module):
+    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1))
+        self.attn_norm = RMSNorm(width)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ConvBlock3D(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 5, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.depthwise = nn.Conv3d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
+        self.pointwise = nn.Conv3d(width, width, 1)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, D, C = x.shape
+        h = self.norm1(x).permute(0, 4, 1, 2, 3)
+        h = self.pointwise(self.depthwise(h)).permute(0, 2, 3, 4, 1)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 def count_params(model: nn.Module) -> int:
@@ -339,7 +435,7 @@ def build_model(model_type, layers, n_classes, seq_len, device):
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, n_levels=4, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -365,7 +461,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device):
         block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, mlp_mult=4)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, n_levels=4, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7, mlp_mult=4)
@@ -378,7 +474,33 @@ def build_model_2d(model_type, layers, n_classes, img_size, device):
     return model.to(device)
 
 
-def load_dataset(name, batch_size):
+def build_model_3d(model_type, layers, n_classes, vol_size, device):
+    WIDTH_ATTN = 48
+    WIDTH_LOCAL = 48
+    WIDTH_HIER = 48
+    WIDTH_CONV = 52
+    
+    if model_type == 'attention':
+        block_fn = lambda: AttentionBlock3D(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        width = WIDTH_ATTN
+    elif model_type == 'local':
+        block_fn = lambda: LocalBlock3D(WIDTH_LOCAL, kernel_size=5, mlp_mult=4)
+        width = WIDTH_LOCAL
+    elif model_type == 'hier':
+        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, mlp_mult=4)
+        width = WIDTH_HIER
+    elif model_type == 'conv':
+        block_fn = lambda: ConvBlock3D(WIDTH_CONV, kernel_size=5, mlp_mult=4)
+        width = WIDTH_CONV
+    else:
+        raise ValueError(f'Unknown model type: {model_type}')
+    
+    model = VolumeClassifier(block_fn(), width, layers, n_classes, vol_size)
+    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+    return model.to(device)
+
+
+def load_dataset(name, batch_size, mode_3d=False):
     if name == 'mnist':
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -398,24 +520,38 @@ def load_dataset(name, batch_size):
         n_classes, seq_len, img_size = 10, 784, (28, 28)
         
     elif name == 'cifar10':
-        transform = transforms.Compose([
-            transforms.Grayscale(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4734,), (0.2516,))
-        ])
+        if mode_3d:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+            ])
+            n_classes, seq_len, img_size = 10, 3072, (32, 32, 3)
+        else:
+            transform = transforms.Compose([
+                transforms.Grayscale(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4734,), (0.2516,))
+            ])
+            n_classes, seq_len, img_size = 10, 1024, (32, 32)
         train_data = datasets.CIFAR10('data', train=True, download=True, transform=transform)
         test_data = datasets.CIFAR10('data', train=False, download=True, transform=transform)
-        n_classes, seq_len, img_size = 10, 1024, (32, 32)
         
     elif name == 'cifar100':
-        transform = transforms.Compose([
-            transforms.Grayscale(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4734,), (0.2516,))
-        ])
+        if mode_3d:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+            ])
+            n_classes, seq_len, img_size = 100, 3072, (32, 32, 3)
+        else:
+            transform = transforms.Compose([
+                transforms.Grayscale(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4734,), (0.2516,))
+            ])
+            n_classes, seq_len, img_size = 100, 1024, (32, 32)
         train_data = datasets.CIFAR100('data', train=True, download=True, transform=transform)
         test_data = datasets.CIFAR100('data', train=False, download=True, transform=transform)
-        n_classes, seq_len, img_size = 100, 1024, (32, 32)
         
     else:
         raise ValueError(f'Unknown dataset: {name}')
@@ -438,6 +574,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--2d', dest='mode_2d', action='store_true', help='Use 2D models (image-native)')
+    parser.add_argument('--3d', dest='mode_3d', action='store_true', help='Use 3D models (RGB as depth)')
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
@@ -447,14 +584,23 @@ def main():
     else:
         device = torch.device(args.device)
     
-    mode = '2D' if args.mode_2d else '1D'
+    if args.mode_3d:
+        mode = '3D'
+    elif args.mode_2d:
+        mode = '2D'
+    else:
+        mode = '1D'
     print(f'Device: {device}')
     print(f'Dataset: {args.dataset}')
     print(f'Mode: {mode}')
     
-    train_loader, test_loader, n_classes, seq_len, img_size = load_dataset(args.dataset, args.batch_size)
+    train_loader, test_loader, n_classes, seq_len, img_size = load_dataset(args.dataset, args.batch_size, args.mode_3d)
     
-    if args.mode_2d:
+    if args.mode_3d:
+        all_model_types = ['attention', 'local', 'hier', 'conv']
+        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device)
+        shape_str = f'vol_size={img_size}'
+    elif args.mode_2d:
         all_model_types = ['attention', 'local', 'hier', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device)
         shape_str = f'img_size={img_size}'

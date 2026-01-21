@@ -382,13 +382,14 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4):
         super().__init__()
         self.embed_dim = embed_dim
-        self.n_levels = n_levels
         self.ndim = ndim
         self.num_channels = num_channels
         self.channel_dim = embed_dim // num_channels
+        self.poolable_dims = poolable_dims if poolable_dims is not None else tuple(range(ndim))
+        self.min_size = min_size
         
         if isinstance(window_size, int):
             window_size = (window_size,) * ndim
@@ -399,11 +400,36 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.conv_norm = RMSNorm(embed_dim)
         
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
-        self.query = nn.Parameter(torch.randn(n_levels * num_channels) * 0.02)
         self.film = nn.Linear(self.channel_dim, embed_dim * 2)
         
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
+    
+    def _compute_n_levels(self, spatial_shape: tuple[int, ...]) -> int:
+        if not self.poolable_dims:
+            return 1
+        min_poolable = min(spatial_shape[d] for d in self.poolable_dims)
+        n_levels = 1
+        size = min_poolable
+        while size >= self.min_size * 2:
+            size //= 2
+            n_levels += 1
+        return n_levels
+    
+    def _pool_selective(self, h: torch.Tensor, spatial_shape: tuple[int, ...]) -> torch.Tensor:
+        B, C = h.shape[:2]
+        new_shape = list(spatial_shape)
+        for d in self.poolable_dims:
+            if new_shape[d] >= self.min_size * 2:
+                new_shape[d] //= 2
+        
+        if self.ndim == 1:
+            h = F.adaptive_avg_pool1d(h, new_shape[0])
+        elif self.ndim == 2:
+            h = F.adaptive_avg_pool2d(h, tuple(new_shape))
+        else:
+            h = F.adaptive_avg_pool3d(h, tuple(new_shape))
+        return h
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
@@ -415,6 +441,8 @@ class HierarchicalLocalAttentionND(nn.Module):
         for s in spatial_shape:
             L *= s
         
+        n_levels = self._compute_n_levels(spatial_shape)
+        
         h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
         conv_out = self.stem_conv(h)
         for dim, size in enumerate(spatial_shape):
@@ -423,25 +451,21 @@ class HierarchicalLocalAttentionND(nn.Module):
         h = (h + conv_out).reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
         
         levels = []
+        current_shape = list(spatial_shape)
         
-        for i in range(self.n_levels):
+        for i in range(n_levels):
             h = self.attn(h)
             levels.append(h)
-            if i < self.n_levels - 1:
+            if i < n_levels - 1:
                 h_flat = h.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
-                pool_fn = [F.avg_pool1d, F.avg_pool2d, F.avg_pool3d][self.ndim - 1]
-                h_pooled = pool_fn(h_flat, 2)
-                new_shape = h_pooled.shape[2:]
-                h = h_pooled.reshape(B, C, -1).mT.reshape(B, *new_shape, C)
+                h_pooled = self._pool_selective(h_flat, tuple(current_shape))
+                current_shape = list(h_pooled.shape[2:])
+                h = h_pooled.reshape(B, C, -1).mT.reshape(B, *current_shape, C)
         
         level0_flat = levels[0].reshape(B, L, C)
         
-        stacked = torch.stack([lvl.reshape(B, -1, H, D).mean(dim=1) for lvl in levels], dim=1)
-        stacked = stacked.reshape(B, self.n_levels * H, D)
-        
-        scores = torch.einsum('bhd,h->bh', stacked, self.query)
-        attn = F.softmax(scores, dim=-1)
-        global_ctx = torch.einsum('bh,bhd->bd', attn, stacked)
+        level_means = torch.stack([lvl.reshape(B, -1, H, D).mean(dim=1) for lvl in levels], dim=1)
+        global_ctx = level_means.mean(dim=1).reshape(B, H, D).mean(dim=1)
         
         film_params = self.film(global_ctx)
         scale, bias = film_params.chunk(2, dim=-1)
@@ -453,24 +477,24 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 1):
-        super().__init__(embed_dim, window_size, n_levels, ndim=1, num_channels=num_channels)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, n_levels, ndim, num_channels)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 1, eps: float = 1e-6):
-        super().__init__(embed_dim, window_size, n_levels, ndim=1, num_channels=num_channels, eps=eps)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps)
 
 
 LocalKernelAttention = LocalAttention
