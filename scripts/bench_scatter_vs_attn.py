@@ -297,7 +297,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, verbose=Tr
 
 def build_model(model_type, layers, n_classes, seq_len, device):
     WIDTH_ATTN = 64
-    WIDTH_HIER = 54
+    WIDTH_HIER = 56
     WIDTH_CONV = 70
     
     if model_type == 'attention':
