@@ -225,47 +225,120 @@ def sinusoidal_pos_embed(L: int, C: int, device: torch.device, dtype: torch.dtyp
     return embed
 
 
-class LocalAttention(nn.Module):
+def sinusoidal_pos_embed_nd(
+    shape: tuple[int, ...],
+    embed_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    base: float = 10000.0,
+) -> torch.Tensor:
+    ndim = len(shape)
+    dim_per_axis = embed_dim // ndim
+    remainder = embed_dim % ndim
     
-    rel_pos: torch.Tensor
+    embeds = []
+    for axis, size in enumerate(shape):
+        axis_dim = dim_per_axis + (1 if axis < remainder else 0)
+        half_dim = axis_dim // 2
+        
+        pos = torch.arange(size, device=device, dtype=dtype)
+        dim_idx = torch.arange(half_dim, device=device, dtype=dtype)
+        freqs = 1.0 / (base ** (2 * dim_idx / max(axis_dim, 1)))
+        
+        angles = pos.unsqueeze(1) * freqs.unsqueeze(0)
+        
+        axis_embed = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        if axis_dim % 2 == 1:
+            axis_embed = torch.cat([axis_embed, torch.zeros(size, 1, device=device, dtype=dtype)], dim=-1)
+        
+        view_shape = [1] * axis + [size] + [1] * (ndim - axis - 1) + [axis_dim]
+        expand_shape = list(shape) + [axis_dim]
+        axis_embed = axis_embed.view(*view_shape).expand(*expand_shape)
+        embeds.append(axis_embed)
     
-    def __init__(self, embed_dim: int, kernel_size: int = 17):
+    return torch.cat(embeds, dim=-1)
+
+
+class LocalAttentionND(nn.Module):
+    
+    rel_dist: torch.Tensor
+    
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
+        self.ndim = ndim
+        
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,) * ndim
         self.kernel_size = kernel_size
-        self.half_k = kernel_size // 2
+        self.half_k = tuple(k // 2 for k in kernel_size)
+        self.window_size = 1
+        for k in kernel_size:
+            self.window_size *= k
+        
         self.scale = embed_dim ** -0.5
         
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.width_proj = nn.Linear(embed_dim, 1)
         self.out = nn.Linear(embed_dim, embed_dim, bias=False)
         
-        self.register_buffer('rel_pos', torch.abs(torch.arange(kernel_size).float() - kernel_size // 2))
+        nn.init.zeros_(self.width_proj.weight)
+        nn.init.zeros_(self.width_proj.bias)
+        
+        rel_coords = [torch.arange(k).float() - k // 2 for k in kernel_size]
+        grids = torch.meshgrid(*rel_coords, indexing='ij')
+        rel_dist = torch.sqrt(torch.stack([g**2 for g in grids]).sum(dim=0))
+        self.register_buffer('rel_dist', rel_dist.flatten())
+        self.max_dist = rel_dist.max().item()
+    
+    def _unfold_nd(self, x: torch.Tensor) -> torch.Tensor:
+        pad_dims = [0, 0]
+        for half in reversed(self.half_k):
+            pad_dims.extend([half, half])
+        x = F.pad(x, pad_dims)
+        
+        for dim in range(self.ndim):
+            x = x.unfold(dim + 1, self.kernel_size[dim], 1)
+        return x
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, C = x.shape
-        K = self.kernel_size
+        spatial_shape = x.shape[1:-1]
+        B = x.shape[0]
+        C = x.shape[-1]
+        L = 1
+        for s in spatial_shape:
+            L *= s
         
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
-        width = self.width_proj(x).sigmoid() * (K - 1) + 1
+        width = self.width_proj(x).sigmoid() * self.max_dist + 0.5
         
-        k_pad = F.pad(k, (0, 0, self.half_k, self.half_k))
-        v_pad = F.pad(v, (0, 0, self.half_k, self.half_k))
+        k_win = self._unfold_nd(k)
+        v_win = self._unfold_nd(v)
         
-        k_win = k_pad.unfold(1, K, 1)  # (B, L, C, K)
-        v_win = v_pad.unfold(1, K, 1)
+        perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
+        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
+        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
         
-        scores = torch.einsum('blc,blck->blk', q, k_win) * self.scale
+        q_flat = q.reshape(B, L, C)
+        width_flat = width.reshape(B, L, 1)
         
-        soft_mask = torch.sigmoid((width - self.rel_pos) * 5.0)
+        scores = torch.einsum('blc,blcw->blw', q_flat, k_win) * self.scale
+        
+        soft_mask = torch.sigmoid((width_flat - self.rel_dist) * 5.0)
         scores = scores - (1 - soft_mask) * 1e4
         
         attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('blk,blck->blc', attn, v_win)
+        out = torch.einsum('blw,blcw->blc', attn, v_win)
         
+        out = out.reshape(*x.shape[:-1], C)
         return self.out(out + v)
+
+
+class LocalAttention(LocalAttentionND):
+    def __init__(self, embed_dim: int, kernel_size: int = 17):
+        super().__init__(embed_dim, kernel_size, ndim=1)
 
 
 class LocalBlock(nn.Module):
@@ -289,6 +362,9 @@ class HierarchicalLocalAttention(nn.Module):
         self.attn = LocalAttention(embed_dim, kernel_size)
         self.query = nn.Parameter(torch.randn(embed_dim * n_levels) * 0.02)
         self.film = nn.Linear(embed_dim * n_levels, embed_dim * 2)
+        
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
