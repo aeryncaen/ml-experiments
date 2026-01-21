@@ -401,13 +401,14 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
         
-        self.cross_q = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.cross_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
-        self.cross_scale = embed_dim ** -0.5
-        self.film = nn.Linear(embed_dim, embed_dim * 2)
+        self.level_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.level_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
+        self.level_scale = embed_dim ** -0.5
+        self.ctx_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.hidden_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
+        nn.init.zeros_(self.out_proj.weight)
     
     def _compute_n_levels(self, spatial_shape: tuple[int, ...]) -> int:
         if not self.poolable_dims:
@@ -425,9 +426,9 @@ class HierarchicalLocalAttentionND(nn.Module):
         if self.ndim == 1:
             h = F.adaptive_avg_pool1d(h, new_shape[0])
         elif self.ndim == 2:
-            h = F.adaptive_avg_pool2d(h, tuple(new_shape))
+            h = F.adaptive_avg_pool2d(h, (new_shape[0], new_shape[1]))
         else:
-            h = F.adaptive_avg_pool3d(h, tuple(new_shape))
+            h = F.adaptive_avg_pool3d(h, (new_shape[0], new_shape[1], new_shape[2]))
         return h
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -463,22 +464,27 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         level0_flat = levels[0].reshape(B, L, C)
         
-        level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)
+        # 1. Learned query attends to level means -> global context
+        level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)  # (B, n_levels, C)
+        level_kv = self.level_kv(level_means)  # (B, n_levels, 2C)
+        level_k, level_v = level_kv.chunk(2, dim=-1)  # each (B, n_levels, C)
         
-        q = self.cross_q(level_means[:, 0:1])
-        kv = self.cross_kv(level_means)
-        k, v = kv.chunk(2, dim=-1)
+        # level_query: (1, 1, C) -> broadcast to (B, 1, C)
+        ctx_scores = torch.einsum('bqc,bkc->bqk', self.level_query.expand(B, -1, -1), level_k) * self.level_scale
+        ctx_weights = F.softmax(ctx_scores, dim=-1)
+        ctx = torch.einsum('bqk,bkc->bqc', ctx_weights, level_v)  # (B, 1, C)
         
-        attn_scores = torch.einsum('bqc,bkc->bqk', q, k) * self.cross_scale
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        global_ctx = torch.einsum('bqk,bkc->bqc', attn_weights, v).squeeze(1)
+        # 2. Context cross-attends to level0 hidden states
+        q = self.ctx_proj(ctx)  # (B, 1, C)
+        hidden_kv = self.hidden_kv(level0_flat)  # (B, L, 2C)
+        hidden_k, hidden_v = hidden_kv.chunk(2, dim=-1)  # each (B, L, C)
         
-        film_params = self.film(global_ctx)
-        scale, bias = film_params.chunk(2, dim=-1)
-        scale = scale.unsqueeze(1)
-        bias = bias.unsqueeze(1)
+        hidden_scores = torch.einsum('bqc,bkc->bqk', q, hidden_k) * self.level_scale
+        hidden_weights = F.softmax(hidden_scores, dim=-1)
+        update = torch.einsum('bqk,bkc->bqc', hidden_weights, hidden_v)  # (B, 1, C)
         
-        out = level0_flat * (1 + scale) + bias
+        # 3. Project and add residual (broadcasts (B,1,C) to (B,L,C))
+        out = level0_flat + self.out_proj(update)
         return out.reshape(B, *spatial_shape, C)
 
 
