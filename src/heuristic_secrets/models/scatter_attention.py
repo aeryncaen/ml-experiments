@@ -107,103 +107,50 @@ class AdaptiveConvND(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
     
     def _gather_window(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-        """
-        Gather values from input at positions within the kernel window.
-        Uses N-linear interpolation for sub-pixel sampling.
-        
-        Args:
-            x: (B, *spatial, C) input tensor
-            offsets: (B, L, H, ndim) per-position deformation offsets
-        
-        Returns:
-            (B, L, H, K, D) gathered values where K=kernel_numel, D=channel_dim
-        """
         B = x.shape[0]
         spatial = x.shape[1:-1]
-        C = x.shape[-1]
         H = self.num_channels
         D = self.channel_dim
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
+        ndim = self.ndim
         
-        # Reshape x: (B, L, C) -> (B, L, H, D) for per-head channel slicing
-        x_flat = x.reshape(B, L, H, D)  # (B, L, H, D)
+        # Use F.grid_sample for efficient bilinear interpolation
+        # x: (B, *spatial, C) -> (B, C, *spatial) for grid_sample
+        x_t = x.reshape(B, L, H * D).permute(0, 2, 1)  # (B, C, L)
         
-        # Compute absolute positions for each kernel element
-        # pos_indices: (L, ndim) - center positions
-        pos_indices = torch.stack(torch.meshgrid(
-            *[torch.arange(s, device=x.device, dtype=x.dtype) for s in spatial],
-            indexing='ij'
-        ), dim=-1).reshape(L, self.ndim)  # (L, ndim)
+        # Build sample grid: (B, L, K, ndim) normalized to [-1, 1]
+        pos_indices = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)  # (1, L, 1, 1)
         
-        # rel_pos: (K, ndim) - relative offsets in kernel
-        # offsets: (B, L, H, ndim) - content-predicted deformation
-        # Broadcast: (1, L, 1, 1, ndim) + (1, 1, 1, K, ndim) + (B, L, H, 1, ndim)
-        abs_pos_raw = (
-            pos_indices.reshape(1, L, 1, 1, self.ndim) +
-            self.rel_pos.reshape(1, 1, 1, K, self.ndim) +
-            offsets.unsqueeze(3)
-        )  # (B, L, H, K, ndim)
+        # offsets: (B, L, H, ndim) -> average across heads for shared deformation
+        offset_avg = offsets.mean(dim=2, keepdim=True)  # (B, L, 1, ndim)
         
-        # Clamp to valid range (out-of-place)
-        clamp_maxes = torch.tensor([s - 1 for s in spatial], device=x.device, dtype=abs_pos_raw.dtype)
-        abs_pos = abs_pos_raw.clamp(min=0)
-        abs_pos = torch.min(abs_pos, clamp_maxes.reshape(1, 1, 1, 1, self.ndim))
+        # abs_pos = center + rel_pos + offset
+        abs_pos = pos_indices + self.rel_pos[..., 0].view(1, 1, K, 1) + offset_avg  # (B, L, K, 1)
         
-        # N-linear interpolation setup (all out-of-place)
-        p_floor = abs_pos.long()
-        p_ceil_raw = p_floor + 1
-        p_ceil = torch.min(p_ceil_raw, torch.tensor([s - 1 for s in spatial], device=x.device).reshape(1, 1, 1, 1, self.ndim))
-        w_ceil = abs_pos - p_floor.float()
-        w_floor = 1.0 - w_ceil
+        # Normalize to [-1, 1] for grid_sample
+        grid = (abs_pos / (spatial[0] - 1)) * 2 - 1  # (B, L, K, 1)
         
-        result = torch.zeros(B, L, H, K, D, device=x.device, dtype=x.dtype)
+        if ndim == 1:
+            # For 1D: grid_sample expects (B, C, H_in, W_in) and grid (B, H_out, W_out, 2)
+            # Treat L as W, K as H_out dimension
+            x_4d = x_t.unsqueeze(2)  # (B, C, 1, L)
+            grid_4d = torch.zeros(B, K, L, 2, device=x.device, dtype=x.dtype)
+            grid_4d[..., 0] = grid.squeeze(-1).permute(0, 2, 1)  # (B, K, L) - x coord
+            grid_4d[..., 1] = 0  # y coord = 0 (center of height=1)
+            
+            sampled = F.grid_sample(x_4d, grid_4d, mode='bilinear', padding_mode='border', align_corners=True)
+            # sampled: (B, C, K, L) -> (B, L, K, C)
+            sampled = sampled.permute(0, 3, 2, 1)
+        else:
+            # For nD: reshape spatial dims appropriately
+            x_nd = x_t.reshape(B, H * D, *spatial)
+            grid_nd = torch.zeros(B, *spatial, K, ndim, device=x.device, dtype=x.dtype)
+            # This path needs proper implementation for 2D/3D
+            raise NotImplementedError("grid_sample for ndim > 1 not yet implemented")
         
-        # Iterate over 2^ndim corners for N-linear interpolation
-        for corner in range(2 ** self.ndim):
-            weight = torch.ones(B, L, H, K, device=x.device, dtype=x.dtype)
-            spatial_idx = torch.zeros(B, L, H, K, dtype=torch.long, device=x.device)
-            stride = 1
-            
-            for d in range(self.ndim - 1, -1, -1):
-                use_ceil = (corner >> d) & 1
-                p = p_ceil[..., d] if use_ceil else p_floor[..., d]
-                w = w_ceil[..., d] if use_ceil else w_floor[..., d]
-                
-                spatial_idx = spatial_idx + p * stride
-                weight = weight * w
-                stride *= spatial[d]
-            
-            # spatial_idx: (B, L, H, K) - flat indices into spatial dim L
-            # For each (b, l, h, k), we want x_flat[b, spatial_idx[b,l,h,k], h, :]
-            # i.e., gather spatial position but keep the SAME head h
-            
-            # Reshape for batch gather: (B, L*H*K)
-            idx_flat = spatial_idx.reshape(B, -1)  # (B, L*H*K)
-            
-            # Gather from x_flat along spatial dimension
-            # x_flat: (B, L, H, D) -> we want (B, L*H*K, D) where each element
-            # gathers from the appropriate spatial position for its head
-            
-            # Expand idx to gather: (B, L*H*K, 1) -> index into dim 1
-            # But we also need to select the right head h for each entry
-            
-            # Heads are independent - each (l, h, k) entry should use head h
-            # Create head indices: (L*H*K) where entry [l*H*K + h*K + k] = h
-            head_idx = torch.arange(H, device=x.device).reshape(1, 1, H, 1).expand(B, L, H, K)
-            head_idx_flat = head_idx.reshape(B, -1)  # (B, L*H*K)
-            
-            # For advanced indexing: x_flat[b, spatial_idx, head_idx, :]
-            # Use gather with computed linear index into (L*H) space
-            combined_idx = idx_flat * H + head_idx_flat  # (B, L*H*K)
-            
-            # Reshape x_flat to (B, L*H, D) and gather
-            x_flat_2d = x_flat.reshape(B, L * H, D)  # (B, L*H, D)
-            combined_idx_exp = combined_idx.unsqueeze(-1).expand(-1, -1, D)  # (B, L*H*K, D)
-            gathered = torch.gather(x_flat_2d, 1, combined_idx_exp)  # (B, L*H*K, D)
-            gathered = gathered.reshape(B, L, H, K, D)  # (B, L, H, K, D)
-            
-            result = result + gathered * weight.unsqueeze(-1)
+        # sampled: (B, L, K, C) -> (B, L, H, K, D)
+        result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
         
         return result
     
