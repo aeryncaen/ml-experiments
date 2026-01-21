@@ -335,7 +335,7 @@ def build_model(model_type, layers, n_classes, seq_len, device):
 def build_model_2d(model_type, layers, n_classes, img_size, device):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
-    WIDTH_HIER = 56
+    WIDTH_HIER = 64
     WIDTH_CONV = 70
     
     if model_type == 'attention':
