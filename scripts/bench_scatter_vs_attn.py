@@ -825,7 +825,7 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     return model.to(device)
 
 
-def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None):
+def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0):
     task_type = 'classification'
     vocab_size = None
 
@@ -843,8 +843,8 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None):
         train_data = SpeechCommandsDataset('data', 'training', seq_len=sl)
         test_data = SpeechCommandsDataset('data', 'testing', seq_len=sl)
         n_classes = len(SPEECHCOMMANDS_LABELS)
-        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
-        test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=num_workers)
         return train_loader, test_loader, n_classes, sl, None, 'audio'
 
     if name == 'mnist':
@@ -902,8 +902,8 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None):
     else:
         raise ValueError(f'Unknown dataset: {name}. Available: {list(TASKS.keys()) + ["speech", "mnist", "fashion", "cifar10", "cifar100"]}')
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_data, batch_size=256, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    test_loader = DataLoader(test_data, batch_size=256, shuffle=False, num_workers=num_workers)
 
     return train_loader, test_loader, n_classes, seq_len, img_size, task_type
 
@@ -921,6 +921,7 @@ def main():
     parser.add_argument('--model', type=str, default='all')
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--workers', type=int, default=0, help='DataLoader workers (0 for reproducibility)')
     parser.add_argument('--seq-len', type=int, default=None, help='Override sequence length')
     parser.add_argument('--2d', dest='mode_2d', action='store_true', help='Use 2D models (image-native)')
     parser.add_argument('--3d', dest='mode_3d', action='store_true', help='Use 3D models (RGB as depth)')
@@ -938,7 +939,19 @@ def main():
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    def seed_everything(seed):
+        import random
+        import numpy as np
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        # For full determinism (slower)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    seed_everything(args.seed)
 
     if args.device == 'auto':
         device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -949,7 +962,7 @@ def main():
     print(f'Dataset: {args.dataset}')
 
     train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
-        args.dataset, args.batch_size, args.mode_3d, args.seq_len
+        args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers
     )
 
     if task_type == 'lm':
@@ -999,7 +1012,7 @@ def main():
 
     for run in range(args.runs):
         seed = args.seed + run * 42
-        torch.manual_seed(seed)
+        seed_everything(seed)
 
         if args.runs > 1:
             print(f'\n{"="*60}')
@@ -1007,7 +1020,7 @@ def main():
             print('='*60)
 
         for mt in model_types:
-            torch.manual_seed(seed)
+            seed_everything(seed)
             model = builder(mt)
 
             print(f'\nTraining {mt}...')
