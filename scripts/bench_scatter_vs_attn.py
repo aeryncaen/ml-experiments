@@ -567,16 +567,16 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
     
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -589,20 +589,20 @@ def build_model(model_type, layers, n_classes, seq_len, device):
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
     
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'local':
-        block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, mlp_mult=4)
+        block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7, mlp_mult=4)
@@ -615,20 +615,20 @@ def build_model_2d(model_type, layers, n_classes, img_size, device):
     return model.to(device)
 
 
-def build_model_3d(model_type, layers, n_classes, vol_size, device):
+def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
     WIDTH_HIER = 48
     WIDTH_CONV = 52
     
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock3D(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        block_fn = lambda: AttentionBlock3D(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'local':
-        block_fn = lambda: LocalBlock3D(WIDTH_LOCAL, kernel_size=5, mlp_mult=4)
+        block_fn = lambda: LocalBlock3D(WIDTH_LOCAL, kernel_size=5, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock3D(WIDTH_CONV, kernel_size=5, mlp_mult=4)
@@ -641,16 +641,16 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device):
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_CONV = 140
 
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -663,16 +663,16 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device):
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
 
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
@@ -789,6 +789,7 @@ def main():
     parser.add_argument('--swa-start', type=float, default=0.8, help='Fraction of training before SWA kicks in (default: 0.8)')
     parser.add_argument('--swa-lr', type=float, default=1e-5, help='Learning rate for SWA phase (default: 1e-5)')
     parser.add_argument('--checkpoint-dir', type=str, default=None, help='Directory to save checkpoints (default: no checkpoints)')
+    parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -808,35 +809,35 @@ def main():
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device)
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device)
+        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
         print(f'Task type: Audio Classification')
     elif args.mode_3d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device)
+        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels)
         shape_str = f'vol_size={img_size}'
         flatten = False
         print(f'Task type: 3D Classification')
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
