@@ -98,32 +98,63 @@ class AdaptiveConvND(nn.Module):
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
+        offset_avg = offsets.mean(dim=-1) if offsets.dim() > 3 else offsets.mean(dim=2)
+        
         if self.ndim == 1:
-            x_t = x.reshape(B, L, C).permute(0, 2, 1)  # (B, C, L)
+            x_t = x.reshape(B, L, C).permute(0, 2, 1)
+            centers = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
+            sample_pos = centers + self.rel_pos[:, 0].view(1, 1, K) + offset_avg.unsqueeze(-1)
+            grid = (sample_pos / max(L - 1, 1)) * 2 - 1
             
-            # offsets: (B, L, H) -> average across heads for shared spatial deformation
-            offset_avg = offsets.mean(dim=2)  # (B, L)
-            
-            # Build sampling grid: center positions + relative kernel positions + deformation
-            centers = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)  # (1, L, 1)
-            sample_pos = centers + self.rel_pos[:, 0].view(1, 1, K) + offset_avg.unsqueeze(-1)  # (B, L, K)
-            
-            # Normalize to [-1, 1] for grid_sample
-            grid = (sample_pos / (L - 1)) * 2 - 1  # (B, L, K)
-            grid = grid.unsqueeze(-1)  # (B, L, K, 1) - last dim is (x,) for 1D
-            
-            # grid_sample expects (B, C, H_in, W_in) and grid (B, H_out, W_out, 2)
-            # For 1D: treat as (B, C, 1, L) with grid (B, L, K, 2)
-            x_4d = x_t.unsqueeze(2)  # (B, C, 1, L)
+            x_4d = x_t.unsqueeze(2)
             grid_4d = torch.zeros(B, L, K, 2, device=x.device, dtype=x.dtype)
-            grid_4d[..., 0] = grid.squeeze(-1)  # x coord
-            grid_4d[..., 1] = 0  # y coord (center of height=1)
-            
+            grid_4d[..., 0] = grid
             sampled = F.grid_sample(x_4d, grid_4d, mode='bilinear', padding_mode='border', align_corners=True)
-            # sampled: (B, C, L, K) -> (B, L, K, C) -> (B, L, H, K, D)
             result = sampled.permute(0, 2, 3, 1).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
+            
+        elif self.ndim == 2:
+            Sh, Sw = spatial
+            x_t = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+            
+            h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
+            w_coords = torch.arange(Sw, device=x.device, dtype=x.dtype)
+            grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing='ij')
+            centers = torch.stack([grid_w, grid_h], dim=-1).view(1, Sh, Sw, 1, 2)
+            
+            sample_pos = centers + self.rel_pos.view(1, 1, 1, K, 2).flip(-1)
+            
+            grid = torch.zeros_like(sample_pos).expand(B, -1, -1, -1, -1).clone()
+            grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
+            grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
+            
+            grid = grid.view(B, Sh, Sw * K, 2)
+            sampled = F.grid_sample(x_t, grid, mode='bilinear', padding_mode='border', align_corners=True)
+            sampled = sampled.view(B, C, Sh, Sw, K).permute(0, 2, 3, 4, 1)
+            result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
+            
+        elif self.ndim == 3:
+            Sd, Sh, Sw = spatial
+            x_t = x.permute(0, 4, 1, 2, 3)  # (B, C, D, H, W)
+            
+            d_coords = torch.arange(Sd, device=x.device, dtype=x.dtype)
+            h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
+            w_coords = torch.arange(Sw, device=x.device, dtype=x.dtype)
+            grid_d, grid_h, grid_w = torch.meshgrid(d_coords, h_coords, w_coords, indexing='ij')
+            centers = torch.stack([grid_w, grid_h, grid_d], dim=-1).view(1, Sd, Sh, Sw, 1, 3)
+            
+            sample_pos = centers + self.rel_pos.view(1, 1, 1, 1, K, 3).flip(-1)
+            
+            grid = torch.zeros_like(sample_pos).expand(B, -1, -1, -1, -1, -1).clone()
+            grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
+            grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
+            grid[..., 2] = (sample_pos[..., 2] / max(Sd - 1, 1)) * 2 - 1
+            
+            grid = grid.view(B, Sd, Sh, Sw * K, 3)
+            sampled = F.grid_sample(x_t, grid, mode='bilinear', padding_mode='border', align_corners=True)
+            sampled = sampled.view(B, C, Sd, Sh, Sw, K).permute(0, 2, 3, 4, 5, 1)
+            result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
         else:
-            raise NotImplementedError(f"ndim={self.ndim} > 1 not yet implemented")
+            raise ValueError(f"ndim must be 1, 2, or 3, got {self.ndim}")
         
         return result
     
