@@ -480,9 +480,16 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             if wtf_mode:
                 mask = labels_flat != -100
                 valid_losses = per_token_loss[mask]
-                # Normalize weights to [-1, +1]: easiest=-1, hardest=+1
+                # Normalize weights to [-1, +1] centered on median
+                # Below median: [min, median] -> [-1, 0]
+                # Above median: [median, max] -> [0, +1]
+                median = valid_losses.median()
                 min_l, max_l = valid_losses.min(), valid_losses.max()
-                weights = 2 * (valid_losses - min_l) / (max_l - min_l + 1e-8) - 1
+                weights = torch.where(
+                    valid_losses < median,
+                    (valid_losses - median) / (median - min_l + 1e-8),
+                    (valid_losses - median) / (max_l - median + 1e-8)
+                )
                 loss = (valid_losses * weights).sum() / mask.sum()
             else:
                 loss = per_token_loss.mean()
@@ -493,9 +500,16 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         else:
             per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
             if wtf_mode:
-                # Normalize weights to [-1, +1]: easiest=-1, hardest=+1
+                # Normalize weights to [-1, +1] centered on median
+                # Below median: [min, median] -> [-1, 0]
+                # Above median: [median, max] -> [0, +1]
+                median = per_sample_loss.median()
                 min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
-                weights = 2 * (per_sample_loss - min_l) / (max_l - min_l + 1e-8) - 1
+                weights = torch.where(
+                    per_sample_loss < median,
+                    (per_sample_loss - median) / (median - min_l + 1e-8),
+                    (per_sample_loss - median) / (max_l - median + 1e-8)
+                )
                 loss = (per_sample_loss * weights).mean()
             else:
                 loss = per_sample_loss.mean()
