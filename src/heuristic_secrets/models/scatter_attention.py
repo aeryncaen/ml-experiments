@@ -278,10 +278,12 @@ class LocalAttentionND(nn.Module):
     
     rel_dist: torch.Tensor
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1, num_channels: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
+        self.num_channels = num_channels
+        self.channel_dim = embed_dim // num_channels
         
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size,) * ndim
@@ -291,10 +293,10 @@ class LocalAttentionND(nn.Module):
         for k in kernel_size:
             self.window_size *= k
         
-        self.scale = embed_dim ** -0.5
+        self.scale = self.channel_dim ** -0.5
         
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.width_proj = nn.Linear(embed_dim, 1)
+        self.width_proj = nn.Linear(embed_dim, num_channels)
         self.out = nn.Linear(embed_dim, embed_dim, bias=False)
         
         nn.init.zeros_(self.width_proj.weight)
@@ -324,11 +326,14 @@ class LocalAttentionND(nn.Module):
         for s in spatial_shape:
             L *= s
         
+        H = self.num_channels
+        D = self.channel_dim
+        
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
-        q_flat = q.reshape(B, L, C)
-        k_flat = k.reshape(B, L, C)
+        q_flat = q.reshape(B, L, H, D)
+        k_flat = k.reshape(B, L, H, D)
         q_flat = apply_rope(q_flat)
         k_flat = apply_rope(k_flat)
         k = k_flat.reshape(*k.shape)
@@ -339,26 +344,26 @@ class LocalAttentionND(nn.Module):
         v_win = self._unfold_nd(v)
         
         perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
-        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
-        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, C).transpose(-1, -2)
+        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
+        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
         
-        width_flat = width.reshape(B, L, 1)
+        width_flat = width.reshape(B, L, H, 1)
         
-        scores = torch.einsum('blc,blcw->blw', q_flat, k_win) * self.scale
+        scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
         
         soft_mask = torch.sigmoid((width_flat - self.rel_dist) * 5.0)
         scores = scores - (1 - soft_mask) * 1e4
         
         attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('blw,blcw->blc', attn, v_win)
+        out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
         
         out = out.reshape(*x.shape[:-1], C)
         return self.out(out + v)
 
 
 class LocalAttention(LocalAttentionND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17):
-        super().__init__(embed_dim, kernel_size, ndim=1)
+    def __init__(self, embed_dim: int, kernel_size: int = 17, num_channels: int = 1):
+        super().__init__(embed_dim, kernel_size, ndim=1, num_channels=num_channels)
 
 
 class LocalBlock(nn.Module):
@@ -374,19 +379,24 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_levels = n_levels
         self.ndim = ndim
+        self.num_channels = num_channels
+        self.channel_dim = embed_dim // num_channels
         
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size,) * ndim
         self.kernel_size = kernel_size
         
-        self.attn = LocalAttentionND(embed_dim, kernel_size, ndim)
-        self.query = nn.Parameter(torch.randn(embed_dim * n_levels) * 0.02)
-        self.film = nn.Linear(embed_dim * n_levels, embed_dim * 2)
+        conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
+        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
+        
+        self.attn = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.query = nn.Parameter(torch.randn(n_levels * num_channels) * 0.02)
+        self.film = nn.Linear(self.channel_dim, embed_dim * 2)
         
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
@@ -395,11 +405,18 @@ class HierarchicalLocalAttentionND(nn.Module):
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         C = x.shape[-1]
+        H = self.num_channels
+        D = self.channel_dim
         L = 1
         for s in spatial_shape:
             L *= s
         
-        h = x
+        h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
+        conv_out = self.stem_conv(h)
+        for dim, size in enumerate(spatial_shape):
+            conv_out = conv_out.narrow(dim + 2, 0, size)
+        h = (h + conv_out).reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
+        
         levels = []
         
         for i in range(self.n_levels):
@@ -413,16 +430,13 @@ class HierarchicalLocalAttentionND(nn.Module):
                 h = h_pooled.reshape(B, C, -1).mT.reshape(B, *new_shape, C)
         
         level0_flat = levels[0].reshape(B, L, C)
-        upsampled = [level0_flat]
-        for lvl in levels[1:]:
-            lvl_flat = lvl.reshape(B, -1, C)
-            lvl_up = F.interpolate(lvl_flat.mT, size=L, mode='nearest').mT
-            upsampled.append(lvl_up)
-        concat = torch.cat(upsampled, dim=-1)
         
-        scores = concat @ self.query
+        stacked = torch.stack([lvl.reshape(B, -1, H, D).mean(dim=1) for lvl in levels], dim=1)
+        stacked = stacked.reshape(B, self.n_levels * H, D)
+        
+        scores = torch.einsum('bhd,h->bh', stacked, self.query)
         attn = F.softmax(scores, dim=-1)
-        global_ctx = torch.einsum('bl,blc->bc', attn, concat)
+        global_ctx = torch.einsum('bh,bhd->bd', attn, stacked)
         
         film_params = self.film(global_ctx)
         scale, bias = film_params.chunk(2, dim=-1)
@@ -434,24 +448,24 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4):
-        super().__init__(embed_dim, kernel_size, n_levels, ndim=1)
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 1):
+        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, num_channels=num_channels)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, kernel_size, n_levels, ndim)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, kernel_size, n_levels, ndim, num_channels)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, eps: float = 1e-6):
-        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, eps=eps)
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 1, eps: float = 1e-6):
+        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, num_channels=num_channels, eps=eps)
 
 
 LocalKernelAttention = LocalAttention

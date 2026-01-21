@@ -72,10 +72,10 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 17, n_levels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttention(width, kernel_size, n_levels)
+        self.hier_attn = HierarchicalLocalAttention(width, kernel_size, n_levels, num_channels)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
@@ -146,10 +146,10 @@ class AttentionBlock2D(nn.Module):
 
 
 class LocalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.local_attn = LocalAttentionND(width, kernel_size, ndim=2)
+        self.local_attn = LocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
@@ -283,7 +283,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, verbose=Tr
 
 def build_model(model_type, layers, n_classes, seq_len, device):
     WIDTH_ATTN = 64
-    WIDTH_HIER = 53
+    WIDTH_HIER = 52
     WIDTH_CONV = 70
     
     if model_type == 'attention':
