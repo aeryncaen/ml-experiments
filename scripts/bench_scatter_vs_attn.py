@@ -210,7 +210,8 @@ class AttentionBlock2D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.attn(self.norm1(x)))
         if self.use_ssm:
-            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
+            ssm_out, _ = self.ssm(self.ssm_norm(x))
+            x = x + self.ssm_out_norm(ssm_out)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -232,7 +233,8 @@ class LocalBlock2D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.local_attn(self.norm1(x)))
         if self.use_ssm:
-            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
+            ssm_out, _ = self.ssm(self.ssm_norm(x))
+            x = x + self.ssm_out_norm(ssm_out)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -254,7 +256,8 @@ class HierarchicalBlock2D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
         if self.use_ssm:
-            x = x + self.ssm_out_norm(self.ssm(self.ssm_norm(x)))
+            ssm_out, _ = self.ssm(self.ssm_norm(x))
+            x = x + self.ssm_out_norm(ssm_out)
         x = x + self.mlp(self.norm2(x))
         return x
 
