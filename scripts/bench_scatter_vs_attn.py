@@ -452,11 +452,10 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ra
         if scheduler:
             scheduler.step()
 
-        total_loss += loss.item() * inputs.size(0)
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
 
-        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1)/inputs.size(0):.4f}", acc=f"{correct/max(total,1):.4f}")
-
-    return total_loss / max(len(loader), 1), correct / max(total, 1)
+    return total_loss / len(loader), correct / max(total, 1)
 
 
 @torch.no_grad()
@@ -487,11 +486,10 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
             correct += (logits.argmax(dim=-1) == labels).sum().item()
             total += labels.size(0)
 
-        total_loss += loss.item() * inputs.size(0)
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
 
-        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1)/inputs.size(0):.4f}", acc=f"{correct/max(total,1):.4f}")
-
-    return total_loss / max(len(loader), 1), correct / max(total, 1)
+    return total_loss / len(loader), correct / max(total, 1)
 
 
 def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True, flatten=True, task_type='classification'):
@@ -594,9 +592,9 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device):
 
 
 def build_model_lm(model_type, layers, vocab_size, seq_len, device):
-    WIDTH_ATTN = 64
-    WIDTH_HIER = 64
-    WIDTH_CONV = 70
+    WIDTH_ATTN = 128
+    WIDTH_HIER = 128
+    WIDTH_CONV = 140
 
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
