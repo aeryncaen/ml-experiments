@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from heuristic_secrets.models.scatter_attention import (
     HierarchicalLocalAttention,
+    HierarchicalLocalAttentionND,
     LocalAttentionND,
     RMSNorm,
     apply_rope,
@@ -171,6 +172,21 @@ class LocalBlock2D(nn.Module):
         return x
 
 
+class HierarchicalBlock2D(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 7, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, n_levels, ndim=2, num_channels=num_channels)
+        self.attn_norm = RMSNorm(width)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn_norm(self.hier_attn(self.norm1(x)))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class ConvBlock2D(nn.Module):
     def __init__(self, width: int, kernel_size: int = 7, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -320,6 +336,7 @@ def build_model(model_type, layers, n_classes, seq_len, device):
 def build_model_2d(model_type, layers, n_classes, img_size, device):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
+    WIDTH_HIER = 48
     WIDTH_CONV = 52
     
     if model_type == 'attention':
@@ -328,6 +345,9 @@ def build_model_2d(model_type, layers, n_classes, img_size, device):
     elif model_type == 'local':
         block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, mlp_mult=4)
         width = WIDTH_LOCAL
+    elif model_type == 'hier':
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, n_levels=4, mlp_mult=4)
+        width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7, mlp_mult=4)
         width = WIDTH_CONV
@@ -413,7 +433,7 @@ def main():
     train_loader, test_loader, n_classes, seq_len, img_size = load_dataset(args.dataset, args.batch_size)
     
     if args.mode_2d:
-        all_model_types = ['attention', 'local', 'conv']
+        all_model_types = ['attention', 'local', 'hier', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device)
         shape_str = f'img_size={img_size}'
     else:
