@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
@@ -492,13 +493,17 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+    import os
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
     post_warmup = total_steps - warmup_steps
-    static_steps = int(post_warmup * 0.4)
+    static_steps = int(post_warmup * cosine_start)
     decay_steps = post_warmup - static_steps
 
     def lr_lambda(step):
@@ -511,15 +516,54 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         return 0.5 * (1 + math.cos(math.pi * decay_progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    swa_model = AveragedModel(model) if swa else None
+    swa_epoch = int(epochs * swa_start) if swa else None
+    swa_scheduler = SWALR(optimizer, swa_lr=swa_lr) if swa else None
+    in_swa_phase = False
 
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler, flatten=flatten, task_type=task_type)
+        use_swa_sched = swa and epoch >= swa_epoch
+        if use_swa_sched and not in_swa_phase:
+            in_swa_phase = True
+        
+        active_scheduler = swa_scheduler if in_swa_phase else scheduler
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, active_scheduler, flatten=flatten, task_type=task_type)
+        
+        if use_swa_sched:
+            swa_model.update_parameters(model)
+        
         test_loss, test_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
+        
+        swa_acc = None
+        if use_swa_sched:
+            update_bn(train_loader, swa_model, device=device)
+            _, swa_acc = evaluate(swa_model, test_loader, device, flatten=flatten, task_type=task_type)
+        
         if verbose:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f} lr={current_lr:.2e}')
+            current_lr = optimizer.param_groups[0]['lr']
+            swa_str = f' swa_acc={swa_acc:.4f}' if swa_acc is not None else ''
+            phase_str = ' [SWA]' if in_swa_phase else ''
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}')
+        
+        if checkpoint_dir:
+            ckpt = {
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'test_acc': test_acc,
+            }
+            if swa and epoch >= swa_epoch:
+                ckpt['swa_model'] = swa_model.state_dict()
+                ckpt['swa_acc'] = swa_acc
+            torch.save(ckpt, os.path.join(checkpoint_dir, f'{model_name}_epoch{epoch+1:03d}.pt'))
 
-    _, final_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
+    if swa:
+        update_bn(train_loader, swa_model, device=device)
+        _, final_acc = evaluate(swa_model, test_loader, device, flatten=flatten, task_type=task_type)
+    else:
+        _, final_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
     return final_acc
 
 
@@ -740,6 +784,11 @@ def main():
     parser.add_argument('--seq-len', type=int, default=None, help='Override sequence length')
     parser.add_argument('--2d', dest='mode_2d', action='store_true', help='Use 2D models (image-native)')
     parser.add_argument('--3d', dest='mode_3d', action='store_true', help='Use 3D models (RGB as depth)')
+    parser.add_argument('--cosine-start', type=float, default=0.1, help='Fraction of post-warmup before cosine decay (default: 0.1)')
+    parser.add_argument('--swa', action='store_true', help='Enable Stochastic Weight Averaging')
+    parser.add_argument('--swa-start', type=float, default=0.8, help='Fraction of training before SWA kicks in (default: 0.8)')
+    parser.add_argument('--swa-lr', type=float, default=1e-5, help='Learning rate for SWA phase (default: 1e-5)')
+    parser.add_argument('--checkpoint-dir', type=str, default=None, help='Directory to save checkpoints (default: no checkpoints)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -817,6 +866,8 @@ def main():
             print(f'\nTraining {mt}...')
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
+                cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
+                swa_lr=args.swa_lr, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                 verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
             results[mt].append(acc)
