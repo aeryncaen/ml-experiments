@@ -436,8 +436,11 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--model', type=str, default='all')
     parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--2d', dest='mode_2d', action='store_true', help='Use 2D models (image-native)')
     args = parser.parse_args()
+    
+    torch.manual_seed(args.seed)
     
     if args.device == 'auto':
         device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -470,7 +473,7 @@ def main():
     results = {mt: [] for mt in model_types}
     
     for run in range(args.runs):
-        seed = run * 42
+        seed = args.seed + run * 42
         torch.manual_seed(seed)
         
         if args.runs > 1:
