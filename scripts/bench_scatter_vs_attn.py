@@ -5,9 +5,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
+import torchaudio
 
 from heuristic_secrets.models.scatter_attention import (
     HierarchicalLocalAttention,
@@ -17,6 +18,36 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
+from heuristic_secrets.data.synthetic import load_task, TASKS
+
+
+SPEECHCOMMANDS_LABELS = [
+    'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five', 'follow',
+    'forward', 'four', 'go', 'happy', 'house', 'learn', 'left', 'marvin', 'nine',
+    'no', 'off', 'on', 'one', 'right', 'seven', 'sheila', 'six', 'stop', 'three',
+    'tree', 'two', 'up', 'visual', 'wow', 'yes', 'zero',
+]
+
+
+class SpeechCommandsDataset(Dataset):
+    def __init__(self, root: str, subset: str, seq_len: int = 16000):
+        self.dataset = torchaudio.datasets.SPEECHCOMMANDS(root, download=True, subset=subset)
+        self.seq_len = seq_len
+        self.label_to_idx = {label: i for i, label in enumerate(SPEECHCOMMANDS_LABELS)}
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        waveform, sample_rate, label, *_ = self.dataset[idx]
+        waveform = waveform.squeeze(0)
+
+        if waveform.shape[0] < self.seq_len:
+            waveform = F.pad(waveform, (0, self.seq_len - waveform.shape[0]))
+        else:
+            waveform = waveform[:self.seq_len]
+
+        return waveform, self.label_to_idx[label]
 
 
 class SwiGLU(nn.Module):
@@ -269,6 +300,43 @@ class VolumeClassifier(nn.Module):
         return self.head(x)
 
 
+class SequenceLM(nn.Module):
+    def __init__(self, block: nn.Module, width: int, n_layers: int, vocab_size: int, seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, width)
+        self.embed_norm = RMSNorm(width)
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+        self.pos_norm = RMSNorm(width)
+        self.layers = nn.ModuleList([block for _ in range(n_layers)])
+        self.norm = RMSNorm(width)
+        self.head = nn.Linear(width, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed_norm(self.embed(x)) + self.pos_norm(F.silu(self.pos_embed))
+        for layer in self.layers:
+            x = layer(x)
+        return self.head(self.norm(x))
+
+
+class AudioClassifier(nn.Module):
+    def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, seq_len: int):
+        super().__init__()
+        self.embed = nn.Linear(1, width)
+        self.embed_norm = RMSNorm(width)
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+        self.pos_norm = RMSNorm(width)
+        self.layers = nn.ModuleList([block for _ in range(n_layers)])
+        self.norm = RMSNorm(width)
+        self.head = nn.Linear(width, n_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x).mean(dim=1)
+        return self.head(x)
+
+
 class AttentionBlock3D(nn.Module):
     def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -347,86 +415,107 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3, flatten=True):
+def train_epoch(model, loader, optimizer, device, scheduler=None, hard_mining_ratio=0.3, flatten=True, task_type='classification'):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    
+
     pbar = tqdm(loader, desc="Train", leave=False)
-    for images, labels in pbar:
-        images = images.to(device)
-        if flatten:
-            images = images.view(images.size(0), -1)
+    for inputs, labels in pbar:
+        inputs = inputs.to(device)
         labels = labels.to(device)
-        
+
+        if flatten and task_type == 'classification':
+            inputs = inputs.view(inputs.size(0), -1)
+
         optimizer.zero_grad()
-        logits = model(images)
-        
-        per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
-        k = max(1, int(len(per_sample_loss) * hard_mining_ratio))
-        hard_indices = per_sample_loss.topk(k).indices
-        loss = per_sample_loss[hard_indices].mean()
-        
+        logits = model(inputs)
+
+        if task_type == 'lm':
+            logits_flat = logits.view(-1, logits.size(-1))
+            labels_flat = labels.view(-1)
+            loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+            mask = labels_flat != -100
+            preds = logits_flat.argmax(dim=-1)
+            correct += (preds[mask] == labels_flat[mask]).sum().item()
+            total += mask.sum().item()
+        else:
+            per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
+            k = max(1, int(len(per_sample_loss) * hard_mining_ratio))
+            hard_indices = per_sample_loss.topk(k).indices
+            loss = per_sample_loss[hard_indices].mean()
+            correct += (logits.argmax(dim=-1) == labels).sum().item()
+            total += labels.size(0)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         if scheduler:
             scheduler.step()
-        
-        total_loss += per_sample_loss.sum().item()
-        correct += (logits.argmax(dim=-1) == labels).sum().item()
-        total += labels.size(0)
-        
-        pbar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{correct/total:.4f}")
-    
-    return total_loss / total, correct / total
+
+        total_loss += loss.item() * inputs.size(0)
+
+        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1)/inputs.size(0):.4f}", acc=f"{correct/max(total,1):.4f}")
+
+    return total_loss / max(len(loader), 1), correct / max(total, 1)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, desc="Eval", flatten=True):
+def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classification'):
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
-    
+
     pbar = tqdm(loader, desc=desc, leave=False)
-    for images, labels in pbar:
-        images = images.to(device)
-        if flatten:
-            images = images.view(images.size(0), -1)
+    for inputs, labels in pbar:
+        inputs = inputs.to(device)
         labels = labels.to(device)
-        
-        logits = model(images)
-        loss = F.cross_entropy(logits, labels)
-        
-        total_loss += loss.item() * labels.size(0)
-        correct += (logits.argmax(dim=-1) == labels).sum().item()
-        total += labels.size(0)
-        
-        pbar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{correct/total:.4f}")
-    
-    return total_loss / total, correct / total
+
+        if flatten and task_type == 'classification':
+            inputs = inputs.view(inputs.size(0), -1)
+
+        logits = model(inputs)
+
+        if task_type == 'lm':
+            logits_flat = logits.view(-1, logits.size(-1))
+            labels_flat = labels.view(-1)
+            loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+            mask = labels_flat != -100
+            preds = logits_flat.argmax(dim=-1)
+            correct += (preds[mask] == labels_flat[mask]).sum().item()
+            total += mask.sum().item()
+        else:
+            loss = F.cross_entropy(logits, labels)
+            correct += (logits.argmax(dim=-1) == labels).sum().item()
+            total += labels.size(0)
+
+        total_loss += loss.item() * inputs.size(0)
+
+        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1)/inputs.size(0):.4f}", acc=f"{correct/max(total,1):.4f}")
+
+    return total_loss / max(len(loader), 1), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True, flatten=True):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, verbose=True, flatten=True, task_type='classification'):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    
+
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
-    
+
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * progress))
-    
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
+
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler, flatten=flatten)
-        test_loss, test_acc = evaluate(model, test_loader, device, flatten=flatten)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scheduler, flatten=flatten, task_type=task_type)
+        test_loss, test_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
         if verbose:
             current_lr = scheduler.get_last_lr()[0]
             print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f} lr={current_lr:.2e}')
-    
-    _, final_acc = evaluate(model, test_loader, device, flatten=flatten)
+
+    _, final_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
     return final_acc
 
 
@@ -504,7 +593,72 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device):
     return model.to(device)
 
 
-def load_dataset(name, batch_size, mode_3d=False):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device):
+    WIDTH_ATTN = 64
+    WIDTH_HIER = 64
+    WIDTH_CONV = 70
+
+    if model_type == 'attention':
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        width = WIDTH_ATTN
+    elif model_type == 'hier':
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
+        width = WIDTH_HIER
+    elif model_type == 'conv':
+        block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
+        width = WIDTH_CONV
+    else:
+        raise ValueError(f'Unknown model type: {model_type}')
+
+    model = SequenceLM(block_fn(), width, layers, vocab_size, seq_len)
+    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+    return model.to(device)
+
+
+def build_model_audio(model_type, layers, n_classes, seq_len, device):
+    WIDTH_ATTN = 64
+    WIDTH_HIER = 64
+    WIDTH_CONV = 70
+
+    if model_type == 'attention':
+        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+        width = WIDTH_ATTN
+    elif model_type == 'hier':
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, mlp_mult=4)
+        width = WIDTH_HIER
+    elif model_type == 'conv':
+        block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
+        width = WIDTH_CONV
+    else:
+        raise ValueError(f'Unknown model type: {model_type}')
+
+    model = AudioClassifier(block_fn(), width, layers, n_classes, seq_len)
+    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+    return model.to(device)
+
+
+def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None):
+    task_type = 'classification'
+    vocab_size = None
+
+    if name in TASKS:
+        task_type = 'lm'
+        sl = seq_len_override or 256
+        train_loader, test_loader, config = load_task(
+            name, seq_len=sl, num_train=50000, num_test=10000, batch_size=batch_size
+        )
+        vocab_size = config.get('vocab_size', 2)
+        return train_loader, test_loader, vocab_size, sl, None, task_type
+
+    if name == 'speech':
+        sl = seq_len_override or 16000
+        train_data = SpeechCommandsDataset('data', 'training', seq_len=sl)
+        test_data = SpeechCommandsDataset('data', 'testing', seq_len=sl)
+        n_classes = len(SPEECHCOMMANDS_LABELS)
+        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
+        test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
+        return train_loader, test_loader, n_classes, sl, None, 'audio'
+
     if name == 'mnist':
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -513,7 +667,7 @@ def load_dataset(name, batch_size, mode_3d=False):
         train_data = datasets.MNIST('data', train=True, download=True, transform=transform)
         test_data = datasets.MNIST('data', train=False, download=True, transform=transform)
         n_classes, seq_len, img_size = 10, 784, (28, 28)
-        
+
     elif name == 'fashion':
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -522,7 +676,7 @@ def load_dataset(name, batch_size, mode_3d=False):
         train_data = datasets.FashionMNIST('data', train=True, download=True, transform=transform)
         test_data = datasets.FashionMNIST('data', train=False, download=True, transform=transform)
         n_classes, seq_len, img_size = 10, 784, (28, 28)
-        
+
     elif name == 'cifar10':
         if mode_3d:
             transform = transforms.Compose([
@@ -539,7 +693,7 @@ def load_dataset(name, batch_size, mode_3d=False):
             n_classes, seq_len, img_size = 10, 1024, (32, 32)
         train_data = datasets.CIFAR10('data', train=True, download=True, transform=transform)
         test_data = datasets.CIFAR10('data', train=False, download=True, transform=transform)
-        
+
     elif name == 'cifar100':
         if mode_3d:
             transform = transforms.Compose([
@@ -556,94 +710,118 @@ def load_dataset(name, batch_size, mode_3d=False):
             n_classes, seq_len, img_size = 100, 1024, (32, 32)
         train_data = datasets.CIFAR100('data', train=True, download=True, transform=transform)
         test_data = datasets.CIFAR100('data', train=False, download=True, transform=transform)
-        
+
     else:
-        raise ValueError(f'Unknown dataset: {name}')
-    
+        raise ValueError(f'Unknown dataset: {name}. Available: {list(TASKS.keys()) + ["speech", "mnist", "fashion", "cifar10", "cifar100"]}')
+
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_data, batch_size=256, shuffle=False, num_workers=4)
-    
-    return train_loader, test_loader, n_classes, seq_len, img_size
+
+    return train_loader, test_loader, n_classes, seq_len, img_size, task_type
 
 
 def main():
+    all_datasets = ['mnist', 'fashion', 'cifar10', 'cifar100', 'speech'] + list(TASKS.keys())
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--layers', type=int, default=4)
     parser.add_argument('--runs', type=int, default=1)
-    parser.add_argument('--dataset', type=str, choices=['mnist', 'fashion', 'cifar10', 'cifar100'], default='mnist')
+    parser.add_argument('--dataset', type=str, default='mnist', help=f'Available: {all_datasets}')
     parser.add_argument('--device', type=str, choices=['cpu', 'mps', 'cuda', 'auto'], default='auto')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--model', type=str, default='all')
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seq-len', type=int, default=None, help='Override sequence length')
     parser.add_argument('--2d', dest='mode_2d', action='store_true', help='Use 2D models (image-native)')
     parser.add_argument('--3d', dest='mode_3d', action='store_true', help='Use 3D models (RGB as depth)')
     args = parser.parse_args()
-    
+
     torch.manual_seed(args.seed)
-    
+
     if args.device == 'auto':
         device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
-    
-    if args.mode_3d:
-        mode = '3D'
-    elif args.mode_2d:
-        mode = '2D'
-    else:
-        mode = '1D'
+
     print(f'Device: {device}')
     print(f'Dataset: {args.dataset}')
-    print(f'Mode: {mode}')
-    
-    train_loader, test_loader, n_classes, seq_len, img_size = load_dataset(args.dataset, args.batch_size, args.mode_3d)
-    
-    if args.mode_3d:
+
+    train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
+        args.dataset, args.batch_size, args.mode_3d, args.seq_len
+    )
+
+    if task_type == 'lm':
+        vocab_size = n_classes_or_vocab
+        all_model_types = ['attention', 'hier', 'conv']
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device)
+        shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
+        flatten = False
+        print(f'Task type: Language Modeling (token prediction)')
+    elif task_type == 'audio':
+        n_classes = n_classes_or_vocab
+        all_model_types = ['attention', 'hier', 'conv']
+        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device)
+        shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
+        flatten = False
+        print(f'Task type: Audio Classification')
+    elif args.mode_3d:
+        n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
         builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device)
         shape_str = f'vol_size={img_size}'
+        flatten = False
+        print(f'Task type: 3D Classification')
     elif args.mode_2d:
+        n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device)
         shape_str = f'img_size={img_size}'
+        flatten = True
+        print(f'Task type: 2D Classification')
     else:
+        n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
         builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device)
         shape_str = f'seq_len={seq_len}'
-    
+        flatten = True
+        print(f'Task type: 1D Classification')
+
     model_types = all_model_types if args.model == 'all' else [args.model]
-    
-    print(f'\nModel parameters ({args.layers} layers, {shape_str}, n_classes={n_classes}):')
+
+    print(f'\nModel parameters ({args.layers} layers, {shape_str}):')
     for mt in model_types:
         model = builder(mt)
         print(f'  {mt:12s}: {count_params(model):,} params')
-    
+
     results = {mt: [] for mt in model_types}
-    
+
     for run in range(args.runs):
         seed = args.seed + run * 42
         torch.manual_seed(seed)
-        
+
         if args.runs > 1:
             print(f'\n{"="*60}')
             print(f'Run {run+1}/{args.runs} (seed={seed})')
             print('='*60)
-        
+
         for mt in model_types:
             torch.manual_seed(seed)
             model = builder(mt)
-            
+
             print(f'\nTraining {mt}...')
-            acc = train_model(model, train_loader, test_loader, device, args.epochs, args.lr, verbose=(args.runs == 1), flatten=not args.mode_3d)
+            acc = train_model(
+                model, train_loader, test_loader, device, args.epochs, args.lr,
+                verbose=(args.runs == 1), flatten=flatten, task_type=task_type
+            )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
-    
+
     print(f'\n{"="*60}')
     print('Final Results')
     print('='*60)
-    
+
     for mt in model_types:
         accs = results[mt]
         mean_acc = sum(accs) / len(accs)
