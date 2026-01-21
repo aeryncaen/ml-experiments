@@ -458,11 +458,11 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification'):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
-    pbar = tqdm(loader, desc="Train", leave=False)
+    pbar = tqdm(loader, desc="Train" + (" [WTF]" if wtf_mode else ""), leave=False)
     for inputs, labels in pbar:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -476,14 +476,29 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         if task_type == 'lm':
             logits_flat = logits.view(-1, logits.size(-1))
             labels_flat = labels.view(-1)
-            loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+            per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
+            if wtf_mode:
+                mask = labels_flat != -100
+                valid_losses = per_token_loss[mask]
+                # Normalize weights to [-1, +1]: easiest=-1, hardest=+1
+                min_l, max_l = valid_losses.min(), valid_losses.max()
+                weights = 2 * (valid_losses - min_l) / (max_l - min_l + 1e-8) - 1
+                loss = (valid_losses * weights).sum() / mask.sum()
+            else:
+                loss = per_token_loss.mean()
             mask = labels_flat != -100
             preds = logits_flat.argmax(dim=-1)
             correct += (preds[mask] == labels_flat[mask]).sum().item()
             total += mask.sum().item()
         else:
             per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
-            loss = per_sample_loss.mean()
+            if wtf_mode:
+                # Normalize weights to [-1, +1]: easiest=-1, hardest=+1
+                min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
+                weights = 2 * (per_sample_loss - min_l) / (max_l - min_l + 1e-8) - 1
+                loss = (per_sample_loss * weights).mean()
+            else:
+                loss = per_sample_loss.mean()
             correct += (logits.argmax(dim=-1) == labels).sum().item()
             total += labels.size(0)
 
@@ -558,7 +573,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -601,7 +616,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
         train_loss, train_acc = train_epoch(
             model, current_loader, optimizer, device, active_scheduler, 
-            flatten=flatten, task_type=task_type
+            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode
         )
         
         if hard_mining:
@@ -874,6 +889,7 @@ def main():
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block between attention and MLP')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
+    parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -952,7 +968,7 @@ def main():
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
-                swa_lr=args.swa_lr, hard_mining=args.hard_mining,
+                swa_lr=args.swa_lr, hard_mining=args.hard_mining, wtf_mode=args.wtf_mode,
                 checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                 verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
