@@ -480,15 +480,15 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             if wtf_mode:
                 mask = labels_flat != -100
                 valid_losses = per_token_loss[mask]
-                # Normalize weights to [-1, +1] centered on median
-                # Below median: [min, median] -> [-1, 0]
-                # Above median: [median, max] -> [0, +1]
+                # Normalize weights to [-1, +2] centered on median
+                # Below median: [min, median] -> [-1, 0] (detrain easy)
+                # Above median: [median, max] -> [0, +2] (push hard)
                 median = valid_losses.median()
                 min_l, max_l = valid_losses.min(), valid_losses.max()
                 weights = torch.where(
                     valid_losses < median,
                     (valid_losses - median) / (median - min_l + 1e-8),
-                    (valid_losses - median) / (max_l - median + 1e-8)
+                    2 * (valid_losses - median) / (max_l - median + 1e-8)
                 )
                 loss = (valid_losses * weights).sum() / mask.sum()
             else:
@@ -500,15 +500,15 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         else:
             per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
             if wtf_mode:
-                # Normalize weights to [-1, +1] centered on median
-                # Below median: [min, median] -> [-1, 0]
-                # Above median: [median, max] -> [0, +1]
+                # Normalize weights to [-1, +2] centered on median
+                # Below median: [min, median] -> [-1, 0] (detrain easy)
+                # Above median: [median, max] -> [0, +2] (push hard)
                 median = per_sample_loss.median()
                 min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
                 weights = torch.where(
                     per_sample_loss < median,
                     (per_sample_loss - median) / (median - min_l + 1e-8),
-                    (per_sample_loss - median) / (max_l - median + 1e-8)
+                    2 * (per_sample_loss - median) / (max_l - median + 1e-8)
                 )
                 loss = (per_sample_loss * weights).mean()
             else:
