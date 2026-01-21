@@ -458,11 +458,16 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, epoch=0):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
-    pbar = tqdm(loader, desc="Train" + (" [WTF]" if wtf_mode else ""), leave=False)
+    desc = "Train"
+    if wtf_mode:
+        desc += " [WTF]"
+    if hard_pct is not None:
+        desc += f" [H{int(hard_pct*100)}%]"
+    pbar = tqdm(loader, desc=desc, leave=False)
     for inputs, labels in pbar:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -492,11 +497,10 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 )
                 loss = (valid_losses * weights).sum() / mask.sum()
             else:
-                # Epoch 0: only backprop hardest 30% of tokens
-                if epoch == 0:
+                if hard_pct is not None:
                     valid_mask = labels_flat != -100
                     valid_losses = per_token_loss[valid_mask]
-                    k = max(1, int(0.3 * valid_losses.size(0)))
+                    k = max(1, int(hard_pct * valid_losses.size(0)))
                     topk_losses, _ = valid_losses.topk(k)
                     loss = topk_losses.mean()
                 else:
@@ -520,9 +524,8 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 )
                 loss = (per_sample_loss * weights).mean()
             else:
-                # Epoch 0: only backprop hardest 30% of samples
-                if epoch == 0:
-                    k = max(1, int(0.3 * per_sample_loss.size(0)))
+                if hard_pct is not None:
+                    k = max(1, int(hard_pct * per_sample_loss.size(0)))
                     topk_losses, _ = per_sample_loss.topk(k)
                     loss = topk_losses.mean()
                 else:
@@ -601,7 +604,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -636,23 +639,37 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     train_dataset = train_loader.dataset
     batch_size = train_loader.batch_size
 
+    # Compute epoch-level cosine schedule for hard mining %
+    post_warmup_epochs = epochs - warmup_epochs
+    static_epochs = int(post_warmup_epochs * cosine_start)
+    decay_epochs = post_warmup_epochs - static_epochs
+    
+    def get_hard_pct(ep):
+        """Cosine-annealed hard mining: 50% at max LR → 1% at min LR"""
+        if ep < warmup_epochs:
+            lr_mult = ep / warmup_epochs
+        elif ep < warmup_epochs + static_epochs:
+            lr_mult = 1.0
+        else:
+            decay_progress = (ep - warmup_epochs - static_epochs) / max(decay_epochs, 1)
+            lr_mult = 0.5 * (1 + math.cos(math.pi * decay_progress))
+        return 0.01 + 0.49 * lr_mult  # 50% → 1%
+
     for epoch in range(epochs):
         use_swa_sched = swa and epoch >= swa_epoch
         if use_swa_sched and not in_swa_phase:
             in_swa_phase = True
         
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
+        # First epoch uses first_epoch_pct if set, otherwise use cosine hard mining
+        if epoch == 0 and first_epoch_pct is not None:
+            hard_pct = first_epoch_pct
+        else:
+            hard_pct = get_hard_pct(epoch) if hard_mining else None
         train_loss, train_acc = train_epoch(
             model, current_loader, optimizer, device, active_scheduler, 
-            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, epoch=epoch
+            flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, hard_pct=hard_pct
         )
-        
-        if hard_mining:
-            sample_losses = compute_sample_losses(model, train_loader, device, flatten=flatten, task_type=task_type)
-            weights = (sample_losses - sample_losses.min() + 1e-6) ** 3
-            weights = weights / weights.sum() * len(weights)
-            sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
-            current_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
         
         if use_swa_sched:
             swa_model.update_parameters(model)
@@ -917,6 +934,7 @@ def main():
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block between attention and MLP')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
+    parser.add_argument('--first-epoch-pct', type=float, default=None, help='First epoch: only backprop hardest N%% of samples (e.g. 0.3 for 30%%)')
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
     args = parser.parse_args()
 
@@ -996,8 +1014,8 @@ def main():
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
-                swa_lr=args.swa_lr, hard_mining=args.hard_mining, wtf_mode=args.wtf_mode,
-                checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
+                swa_lr=args.swa_lr, hard_mining=args.hard_mining, first_epoch_pct=args.first_epoch_pct,
+                wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                 verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
             results[mt].append(acc)
