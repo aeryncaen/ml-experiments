@@ -211,12 +211,13 @@ class SequenceClassifier(nn.Module):
         self.embed = nn.Linear(1, width)
         self.embed_norm = RMSNorm(width)
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+        self.pos_norm = RMSNorm(width)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_embed
+        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=1)
