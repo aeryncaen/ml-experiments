@@ -225,293 +225,109 @@ def sinusoidal_pos_embed(L: int, C: int, device: torch.device, dtype: torch.dtyp
     return embed
 
 
-class InceptionScatterAttention(nn.Module):
+class LocalAttention(nn.Module):
     
-    k_indices: torch.Tensor
-    inception_k: torch.Tensor
+    rel_pos: torch.Tensor
     
-    def __init__(
-        self,
-        embed_dim: int,
-        scatter_channels: int = 4,
-        num_samples: int = 16,
-        expand_factor: int = 1,
-        max_offset: float = 32.0,
-        inception_kernel_size: int = 17,
-        se_reduction: int = 4,
-        rope_base: float = 10000.0,
-    ):
+    def __init__(self, embed_dim: int, kernel_size: int = 17):
         super().__init__()
         self.embed_dim = embed_dim
-        self.scatter_channels = scatter_channels
-        self.expand_factor = expand_factor
-        self.inner_dim = embed_dim * expand_factor
-        self.channel_dim = self.inner_dim // scatter_channels
-        self.num_samples = num_samples
-        self.max_offset = max_offset
-        self.inception_kernel_size = inception_kernel_size
-        self.rope_base = rope_base
+        self.kernel_size = kernel_size
+        self.half_k = kernel_size // 2
+        self.scale = embed_dim ** -0.5
         
-        assert self.inner_dim % scatter_channels == 0, \
-            f"inner_dim ({self.inner_dim}) must be divisible by scatter_channels ({scatter_channels})"
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.width_proj = nn.Linear(embed_dim, 1)
+        self.out = nn.Linear(embed_dim, embed_dim, bias=False)
         
-        K = num_samples
-        SC = scatter_channels
-        IK = inception_kernel_size
-        
-        if expand_factor > 1:
-            self.up_proj = nn.Linear(embed_dim, self.inner_dim, bias=False)
-            self.down_proj = nn.Linear(self.inner_dim, embed_dim, bias=False)
-        else:
-            self.up_proj = None
-            self.down_proj = None
-        
-        self.base_deformation = nn.Parameter(torch.randn(SC) * 0.1)
-        self.base_stride = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.base_beta_fwd = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.base_beta_bwd = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.base_strength = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.base_alpha_fwd = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.base_alpha_bwd = nn.Parameter(torch.ones(SC) + torch.randn(SC) * 0.1)
-        self.sample_bias = nn.Parameter(torch.randn(SC, num_samples) * 0.1)
-        
-        k_indices = torch.arange(num_samples, dtype=torch.float32) - num_samples // 2
-        self.register_buffer('k_indices', k_indices)
-        
-        inception_k = torch.arange(IK, dtype=torch.float32) - IK // 2
-        self.register_buffer('inception_k', inception_k)
-        
-        self.num_film_params = 7 + K
-        film_hidden = SC * 4
-        film_out = nn.Linear(film_hidden, SC * self.num_film_params)
-        nn.init.normal_(film_out.weight, std=0.02)
-        nn.init.normal_(film_out.bias, std=0.02)
-        self.film_encoder = nn.Sequential(
-            nn.Linear(self.inner_dim, film_hidden),
-            nn.SiLU(),
-            nn.Linear(film_hidden, film_hidden),
-            nn.SiLU(),
-            film_out,
-        )
-        
-        self.value_proj = nn.Conv1d(self.inner_dim, self.inner_dim, 1, groups=SC, bias=False)
-        
-        self.se_scatter = SEBlock2d(SC, K, se_reduction)
-        self.se_output = SEBlock1d(self.inner_dim, se_reduction)
-    
-    def _build_inception_kernel(self) -> torch.Tensor:
-        SC = self.scatter_channels
-        CD = self.channel_dim
-        ik = self.inception_k
-        
-        stride = F.softplus(self.base_stride)
-        beta_fwd = F.softplus(self.base_beta_fwd)
-        beta_bwd = F.softplus(self.base_beta_bwd)
-        
-        sigma_fwd = (stride * beta_fwd).clamp(min=0.5)
-        sigma_bwd = (stride * beta_bwd).clamp(min=0.5)
-        
-        ik_sq = ik ** 2
-        gauss_fwd = torch.exp(-ik_sq / (2 * sigma_fwd.unsqueeze(1) ** 2))
-        gauss_bwd = torch.exp(-ik_sq / (2 * sigma_bwd.unsqueeze(1) ** 2))
-        
-        kernel = torch.where(ik >= 0, gauss_fwd, gauss_bwd)
-        kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        
-        kernel = kernel.unsqueeze(1).repeat_interleave(CD, dim=0)
-        return kernel
+        self.register_buffer('rel_pos', torch.abs(torch.arange(kernel_size).float() - kernel_size // 2))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, _ = x.shape
-        SC = self.scatter_channels
-        CD = self.channel_dim
-        K = self.num_samples
+        B, L, C = x.shape
+        K = self.kernel_size
         
-        residual = x
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
         
-        if self.up_proj is not None:
-            x = self.up_proj(x)
+        width = self.width_proj(x).sigmoid() * (K - 1) + 1
         
-        x = x + sinusoidal_pos_embed(L, self.inner_dim, x.device, x.dtype, self.rope_base)
+        k_pad = F.pad(k, (0, 0, self.half_k, self.half_k))
+        v_pad = F.pad(v, (0, 0, self.half_k, self.half_k))
         
-        kernel = self._build_inception_kernel()
-        x_t = x.transpose(1, 2)
-        inception_ctx = F.conv1d(
-            x_t, kernel, padding=self.inception_kernel_size // 2, groups=self.inner_dim
-        ).transpose(1, 2)
+        k_win = k_pad.unfold(1, K, 1)  # (B, L, C, K)
+        v_win = v_pad.unfold(1, K, 1)
         
-        inception_ctx_rope = apply_rope(inception_ctx, self.rope_base)
-        film_flat = self.film_encoder(inception_ctx_rope)
-        film = film_flat.reshape(B, L, SC, self.num_film_params)
+        scores = torch.einsum('blc,blck->blk', q, k_win) * self.scale
         
-        d_deform = film[..., 0]
-        d_stride = film[..., 1]
-        d_beta_fwd = film[..., 2]
-        d_beta_bwd = film[..., 3]
-        d_strength = film[..., 4]
-        d_alpha_fwd = film[..., 5]
-        d_alpha_bwd = film[..., 6]
-        d_sample = film[..., 7:]
+        soft_mask = torch.sigmoid((width - self.rel_pos) * 5.0)
+        scores = scores - (1 - soft_mask) * 1e4
         
-        deformation_biased = (self.base_deformation + d_deform).clamp(-self.max_offset, self.max_offset)
-        stride_biased = F.softplus(self.base_stride + d_stride)
-        beta_fwd_biased = F.softplus(self.base_beta_fwd + d_beta_fwd)
-        beta_bwd_biased = F.softplus(self.base_beta_bwd + d_beta_bwd)
-        strength_biased = F.softplus(self.base_strength + d_strength)
-        alpha_fwd_biased = F.softplus(self.base_alpha_fwd + d_alpha_fwd)
-        alpha_bwd_biased = F.softplus(self.base_alpha_bwd + d_alpha_bwd)
-        sample_bias_biased = (self.sample_bias + d_sample).tanh()
-        sample_bias_biased = self.se_scatter(sample_bias_biased)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('blk,blck->blc', attn, v_win)
         
-        positions, envelope = self._compute_positions_and_envelope(
-            L, deformation_biased, stride_biased, beta_fwd_biased, beta_bwd_biased,
-            strength_biased, alpha_fwd_biased, alpha_bwd_biased, sample_bias_biased
-        )
-        
-        receiver_ctx = self._gather_at_positions(inception_ctx_rope, positions)
-        sender_ctx = inception_ctx_rope.reshape(B, L, 1, 1, self.inner_dim).expand(B, L, SC, K, self.inner_dim)
-        value_bias = (receiver_ctx * sender_ctx).sum(dim=-1, keepdim=True)
-        
-        x_rope = apply_rope(x, self.rope_base)
-        values = self.value_proj(x_rope.transpose(1, 2)).transpose(1, 2)
-        values = values.reshape(B, L, SC, 1, CD).expand(B, L, SC, K, CD)
-        values = values + value_bias
-        values = values * envelope.unsqueeze(-1)
-        
-        out = self._scatter_values_direct(positions, values.contiguous(), envelope, L)
-        out = out.reshape(B, L, self.inner_dim)
-        
-        out = self.se_output(out, None)
-        
-        if self.down_proj is not None:
-            out = self.down_proj(out)
-        
-        out = out + residual
-        
-        return out
-    
-    def _compute_positions_and_envelope(
-        self,
-        L: int,
-        deformation: torch.Tensor,
-        stride: torch.Tensor,
-        beta_fwd: torch.Tensor,
-        beta_bwd: torch.Tensor,
-        strength: torch.Tensor,
-        alpha_fwd: torch.Tensor,
-        alpha_bwd: torch.Tensor,
-        sample_bias: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B = deformation.shape[0]
-        SC = self.scatter_channels
-        K = self.num_samples
-        device = deformation.device
-        dtype = deformation.dtype
-        
-        k = self.k_indices
-        k_abs = k.abs()
-        
-        warp_fwd = (k_abs.reshape(1, 1, 1, K) ** beta_fwd.unsqueeze(-1)) * stride.unsqueeze(-1)
-        warp_bwd = (k_abs.reshape(1, 1, 1, K) ** beta_bwd.unsqueeze(-1)) * stride.unsqueeze(-1)
-        warp = torch.where(k >= 0, warp_fwd, -warp_bwd)
-        
-        l_idx = torch.arange(L, device=device, dtype=dtype).reshape(1, L, 1)
-        centers = l_idx + deformation
-        
-        positions = centers.unsqueeze(-1) + warp
-        positions = positions.clamp(0, L - 1)
-        
-        env_fwd = strength.unsqueeze(-1) / (1 + k_abs.reshape(1, 1, 1, K)) ** alpha_fwd.unsqueeze(-1)
-        env_bwd = strength.unsqueeze(-1) / (1 + k_abs.reshape(1, 1, 1, K)) ** alpha_bwd.unsqueeze(-1)
-        envelope = torch.where(k >= 0, env_fwd, env_bwd)
-        
-        envelope = envelope * (1 + sample_bias)
-        
-        return positions, envelope
-    
-    def _gather_at_positions(
-        self,
-        ctx: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        B, L, SC, K = positions.shape
-        C = ctx.shape[-1]
-        
-        grid_x = (positions / (L - 1)) * 2 - 1
-        grid = torch.stack([grid_x, torch.zeros_like(grid_x)], dim=-1)
-        grid = grid.reshape(B, L * SC * K, 1, 2)
-        
-        ctx_2d = ctx.transpose(1, 2).unsqueeze(-1)
-        
-        gathered = F.grid_sample(ctx_2d, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        gathered = gathered.squeeze(-1).transpose(1, 2).reshape(B, L, SC, K, C)
-        
-        return gathered
-    
-    def _scatter_values_direct(
-        self,
-        positions: torch.Tensor,
-        values: torch.Tensor,
-        envelope: torch.Tensor,
-        L: int,
-    ) -> torch.Tensor:
-        B, _, SC, K, CD = values.shape
-        device = positions.device
-        dtype = values.dtype
-        
-        pos_floor = positions.floor().long().clamp(0, L - 1)
-        pos_ceil = (pos_floor + 1).clamp(0, L - 1)
-        frac = positions - pos_floor.float()
-        
-        w_floor = (1 - frac) * envelope
-        w_ceil = frac * envelope
-        
-        batch_idx = torch.arange(B, device=device).reshape(B, 1, 1, 1)
-        chan_idx = torch.arange(SC, device=device).reshape(1, 1, SC, 1)
-        
-        idx_floor = (batch_idx * (L * SC) + pos_floor * SC + chan_idx).reshape(-1)
-        idx_ceil = (batch_idx * (L * SC) + pos_ceil * SC + chan_idx).reshape(-1)
-        
-        values_flat = values.reshape(B * L * SC * K, CD)
-        
-        out = torch.zeros(B * L * SC, CD, device=device, dtype=dtype)
-        weight_sum = torch.zeros(B * L * SC, 1, device=device, dtype=dtype)
-        
-        out.index_add_(0, idx_floor, values_flat * w_floor.reshape(-1, 1))
-        out.index_add_(0, idx_ceil, values_flat * w_ceil.reshape(-1, 1))
-        weight_sum.index_add_(0, idx_floor, w_floor.reshape(-1, 1))
-        weight_sum.index_add_(0, idx_ceil, w_ceil.reshape(-1, 1))
-        
-        out = out / weight_sum.clamp(min=1e-6)
-        return out.reshape(B, L, SC, CD)
+        return self.out(out + v)
 
 
-class InceptionScatterBlock(nn.Module):
+class LocalBlock(nn.Module):
     
-    def __init__(
-        self,
-        embed_dim: int,
-        scatter_channels: int = 4,
-        num_samples: int = 16,
-        expand_factor: int = 1,
-        max_offset: float = 32.0,
-        inception_kernel_size: int = 17,
-        se_reduction: int = 4,
-        rope_base: float = 10000.0,
-        eps: float = 1e-6,
-    ):
+    def __init__(self, embed_dim: int, kernel_size: int = 17, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = InceptionScatterAttention(
-            embed_dim=embed_dim,
-            scatter_channels=scatter_channels,
-            num_samples=num_samples,
-            expand_factor=expand_factor,
-            max_offset=max_offset,
-            inception_kernel_size=inception_kernel_size,
-            se_reduction=se_reduction,
-            rope_base=rope_base,
-        )
+        self.attn = LocalAttention(embed_dim, kernel_size)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.attn(self.norm(x))
+        return x + self.attn(self.norm(x))
+
+
+class HierarchicalLocalAttention(nn.Module):
+    
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.n_levels = n_levels
+        
+        self.attn = LocalAttention(embed_dim, kernel_size)
+        self.query = nn.Parameter(torch.randn(embed_dim * n_levels) * 0.02)
+        self.film = nn.Linear(embed_dim * n_levels, embed_dim * 2)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, C = x.shape
+        levels = []
+        h = x
+        
+        for i in range(self.n_levels):
+            h = self.attn(h)
+            levels.append(h)
+            if i < self.n_levels - 1:
+                h = F.avg_pool1d(h.mT, 2).mT
+        
+        upsampled = [levels[0]]
+        for lvl in levels[1:]:
+            upsampled.append(F.interpolate(lvl.mT, size=L, mode='nearest').mT)
+        concat = torch.cat(upsampled, dim=-1)
+        
+        scores = concat @ self.query
+        attn = F.softmax(scores, dim=-1)
+        global_ctx = torch.einsum('bl,blc->bc', attn, concat)
+        
+        film_params = self.film(global_ctx)
+        scale, bias = film_params.chunk(2, dim=-1)
+        scale = scale.unsqueeze(1)
+        bias = bias.unsqueeze(1)
+        
+        return levels[0] * (1 + scale) + bias
+
+
+class HierarchicalLocalBlock(nn.Module):
+    
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, eps: float = 1e-6):
+        super().__init__()
+        self.norm = RMSNorm(embed_dim, eps)
+        self.attn = HierarchicalLocalAttention(embed_dim, kernel_size, n_levels)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.attn(self.norm(x))
+
+
+LocalKernelAttention = LocalAttention
+LocalKernelBlock = LocalBlock

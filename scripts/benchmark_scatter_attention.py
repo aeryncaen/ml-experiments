@@ -3,40 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from tqdm import tqdm
-from heuristic_secrets.models.scatter_attention import (
-    InceptionScatterAttention,
-    RMSNorm,
-)
+from heuristic_secrets.models.scatter_attention import LocalAttention, RMSNorm
 
 
-class SimpleAttention(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 4):
+class FullAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int = 4):
         super().__init__()
-        self.channels = channels
         self.num_heads = num_heads
-        self.head_dim = channels // num_heads
+        self.head_dim = embed_dim // num_heads
         
-        self.norm = RMSNorm(channels)
-        self.qkv = nn.Linear(channels, channels * 3, bias=False)
-        self.out = nn.Linear(channels, channels, bias=False)
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.out = nn.Linear(embed_dim, embed_dim, bias=False)
     
     def forward(self, x):
         B, L, C = x.shape
-        x_norm = self.norm(x)
         
-        qkv = self.qkv(x_norm).reshape(B, L, 3, self.num_heads, self.head_dim)
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        scale = self.head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        out = attn @ v
-        
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L, C)
-        return self.out(out) + x
+        return self.out(out)
 
 
 def count_params(m):
@@ -59,7 +49,7 @@ def benchmark(model, x, n_warmup=5, n_iters=20):
     
     t0 = time.perf_counter()
     for _ in range(n_iters):
-        out = model(x)
+        _ = model(x)
     sync_device(device)
     fwd_time = (time.perf_counter() - t0) / n_iters * 1000
     
@@ -76,37 +66,44 @@ def benchmark(model, x, n_warmup=5, n_iters=20):
     return fwd_time, fwd_bwd_time
 
 
-device = torch.device('cpu')#'mps' if torch.backends.mps.is_available() else 'cpu')
-print(f'Device: {device}')
-print('=' * 80)
-print('INCEPTION SCATTER vs STANDARD ATTENTION')
-print('=' * 80)
+def main():
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+    print('=' * 80)
+    print('LOCAL ATTENTION vs FULL ATTENTION')
+    print('=' * 80)
 
-B = 16
-C = 32
+    B = 16
+    C = 64
+    K = 17
 
-inception = InceptionScatterAttention(embed_dim=C, scatter_channels=4, num_samples=16).to(device)
-attn = SimpleAttention(channels=C, num_heads=4).to(device)
+    local = LocalAttention(embed_dim=C, kernel_size=K).to(device)
+    full = FullAttention(embed_dim=C, num_heads=4).to(device)
 
-print(f'Inception (SC=4, K=16):   {count_params(inception):>8,} params')
-print(f'Attention (C={C}, H=4):   {count_params(attn):>8,} params')
-print()
+    print(f'Local (K={K}):      {count_params(local):>8,} params')
+    print(f'Full (H=4):         {count_params(full):>8,} params')
+    print()
 
-print('Sequence Length Scaling:')
-print('-' * 60)
-print(f'{"L":>6} | {"Inception":>12} | {"Attention":>12} | {"Speedup":>10}')
-print('-' * 60)
+    print('Sequence Length Scaling:')
+    print('-' * 70)
+    print(f'{"L":>6} | {"Local":>12} | {"Full":>12} | {"Speedup":>10} | {"Complexity"}')
+    print('-' * 70)
 
-seq_lengths = [128, 256, 512, 1024]
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096]
 
-for L in tqdm(seq_lengths, desc="Benchmarking"):
-    x = torch.randn(B, L, C, device=device)
-    
-    try:
-        i_fwd, _ = benchmark(inception, x, n_warmup=3, n_iters=10)
-        a_fwd, _ = benchmark(attn, x, n_warmup=3, n_iters=10)
+    for L in tqdm(seq_lengths, desc="Benchmarking"):
+        x = torch.randn(B, L, C, device=device)
         
-        speedup = a_fwd / i_fwd
-        tqdm.write(f'{L:>6} | {i_fwd:>10.2f}ms | {a_fwd:>10.2f}ms | {speedup:>9.2f}x')
-    except Exception as e:
-        tqdm.write(f'{L:>6} | Error: {e}')
+        try:
+            local_fwd, _ = benchmark(local, x, n_warmup=3, n_iters=10)
+            full_fwd, _ = benchmark(full, x, n_warmup=3, n_iters=10)
+            
+            speedup = full_fwd / local_fwd
+            complexity = f'O({L}*{K}) vs O({L}^2)'
+            tqdm.write(f'{L:>6} | {local_fwd:>10.2f}ms | {full_fwd:>10.2f}ms | {speedup:>9.2f}x | {complexity}')
+        except Exception as e:
+            tqdm.write(f'{L:>6} | Error: {e}')
+
+
+if __name__ == '__main__':
+    main()

@@ -9,10 +9,8 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 
 from heuristic_secrets.models.scatter_attention import (
-    InceptionScatterAttention,
+    HierarchicalLocalAttention,
     RMSNorm,
-    apply_rope,
-    sinusoidal_pos_embed,
 )
 
 
@@ -30,11 +28,10 @@ class SwiGLU(nn.Module):
 
 
 class SDPAttention(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = width // num_heads
-        self.rope_base = rope_base
         self.dropout = dropout
         
         self.qkv = nn.Linear(width, 3 * width, bias=False)
@@ -43,10 +40,7 @@ class SDPAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
         
-        x_pos = x + sinusoidal_pos_embed(L, C, x.device, x.dtype, self.rope_base)
-        x_rope = apply_rope(x_pos, self.rope_base)
-        
-        qkv = self.qkv(x_rope).reshape(B, L, 3, self.num_heads, self.head_dim)
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
@@ -58,10 +52,10 @@ class SDPAttention(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, width: int, num_heads: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.attn = SDPAttention(width, num_heads, dropout, rope_base)
+        self.attn = SDPAttention(width, num_heads, dropout)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
@@ -71,20 +65,33 @@ class AttentionBlock(nn.Module):
         return x
 
 
-class ScatterBlock(nn.Module):
-    def __init__(self, width: int, scatter_channels: int = 4, num_samples: int = 16, mlp_mult: int = 4, dropout: float = 0.1):
+class HierarchicalBlock(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 17, n_levels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.scatter = InceptionScatterAttention(
-            embed_dim=width,
-            scatter_channels=scatter_channels,
-            num_samples=num_samples,
-        )
+        self.hier_attn = HierarchicalLocalAttention(width, kernel_size, n_levels)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.scatter(self.norm1(x))
+        x = x + self.hier_attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 17, mlp_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.depthwise = nn.Conv1d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
+        self.pointwise = nn.Conv1d(width, width, 1)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_mult, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x).transpose(1, 2)
+        h = self.pointwise(self.depthwise(h)).transpose(1, 2)
+        x = x + h
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -93,12 +100,13 @@ class SequenceClassifier(nn.Module):
     def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, seq_len: int):
         super().__init__()
         self.embed = nn.Linear(1, width)
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed(x.unsqueeze(-1))
+        x = self.embed(x.unsqueeze(-1)) + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=1)
@@ -176,8 +184,9 @@ def main():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--layers', type=int, default=4)
     parser.add_argument('--device', type=str, choices=['cpu', 'mps', 'cuda', 'auto'], default='auto')
-    parser.add_argument('--scatter-first', action='store_true', help='Train scatter model first')
+
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--model', type=str, choices=['attention', 'hier', 'conv', 'all'], default='all')
     parser.add_argument('--batch-size', type=int, default=128)
     args = parser.parse_args()
     
@@ -187,7 +196,9 @@ def main():
         device = torch.device(args.device)
     print(f'Device: {device}')
     
-    WIDTH = 64
+    WIDTH_ATTN = 64
+    WIDTH_HIER = 54
+    WIDTH_CONV = 68
     N_CLASSES = 10
     SEQ_LEN = 784
     
@@ -202,28 +213,35 @@ def main():
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_data, batch_size=256, shuffle=False, num_workers=4)
     
-    attn_block = lambda: AttentionBlock(WIDTH, num_heads=4, mlp_mult=4)
-    scatter_block = lambda: ScatterBlock(WIDTH, scatter_channels=4, num_samples=16, mlp_mult=4)
+    attn_block = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
+    hier_block = lambda: HierarchicalBlock(WIDTH_HIER, kernel_size=17, n_levels=4, mlp_mult=4)
+    conv_block = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)
     
-    attn_model = SequenceClassifier(attn_block(), WIDTH, args.layers, N_CLASSES, SEQ_LEN)
-    scatter_model = SequenceClassifier(scatter_block(), WIDTH, args.layers, N_CLASSES, SEQ_LEN)
+    attn_model = SequenceClassifier(attn_block(), WIDTH_ATTN, args.layers, N_CLASSES, SEQ_LEN)
+    hier_model = SequenceClassifier(hier_block(), WIDTH_HIER, args.layers, N_CLASSES, SEQ_LEN)
+    conv_model = SequenceClassifier(conv_block(), WIDTH_CONV, args.layers, N_CLASSES, SEQ_LEN)
     
     attn_model.layers = nn.ModuleList([attn_block() for _ in range(args.layers)])
-    scatter_model.layers = nn.ModuleList([scatter_block() for _ in range(args.layers)])
+    hier_model.layers = nn.ModuleList([hier_block() for _ in range(args.layers)])
+    conv_model.layers = nn.ModuleList([conv_block() for _ in range(args.layers)])
     attn_model = attn_model.to(device)
-    scatter_model = scatter_model.to(device)
+    hier_model = hier_model.to(device)
+    conv_model = conv_model.to(device)
     
-    print(f'\nAttention model:  {count_params(attn_model):,} params')
-    print(f'Scatter model:    {count_params(scatter_model):,} params')
-    print(f'Param ratio:      {count_params(scatter_model) / count_params(attn_model):.2f}x')
+    print(f'\nAttention model:    {count_params(attn_model):,} params')
+    print(f'Hierarchical model: {count_params(hier_model):,} params')
+    print(f'Conv model:         {count_params(conv_model):,} params')
     
-    models = [
-        ('Scatter', scatter_model),
-        ('Attention', attn_model),
-    ] if args.scatter_first else [
-        ('Attention', attn_model),
-        ('Scatter', scatter_model),
-    ]
+    all_models = {
+        'attention': ('Attention', attn_model),
+        'hier': ('Hierarchical', hier_model),
+        'conv': ('Conv', conv_model),
+    }
+    
+    if args.model == 'all':
+        models = list(all_models.values())
+    else:
+        models = [all_models[args.model]]
     
     for name, model in models:
         train_model(name, model, train_loader, test_loader, device, args.epochs, args.lr)
@@ -232,11 +250,9 @@ def main():
     print('Final Results')
     print('='*60)
     
-    _, attn_final = evaluate(attn_model, test_loader, device)
-    _, scatter_final = evaluate(scatter_model, test_loader, device)
-    
-    print(f'Attention:  {attn_final:.4f} ({count_params(attn_model):,} params)')
-    print(f'Scatter:    {scatter_final:.4f} ({count_params(scatter_model):,} params)')
+    for name, model in models:
+        _, acc = evaluate(model, test_loader, device)
+        print(f'{name}:  {acc:.4f} ({count_params(model):,} params)')
 
 
 if __name__ == '__main__':
