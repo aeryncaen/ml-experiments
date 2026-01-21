@@ -604,7 +604,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -645,14 +645,13 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     decay_epochs = post_warmup_epochs - static_epochs
     
     def get_hard_pct(ep):
-        """Cosine-annealed hard mining: 50% at warmup end → 5% at training end"""
+        """Cosine-annealed hard mining: hard_start at warmup end → hard_end at training end"""
         if ep < warmup_epochs:
-            return 0.50  # 50% during warmup
-        # Cosine decay from 50% to 5% over post-warmup phase
+            return hard_start
+        # Cosine decay from hard_start to hard_end over post-warmup phase
         progress = (ep - warmup_epochs) / max(epochs - warmup_epochs, 1)
-        # Cosine: starts at 1, ends at 0
         cosine_mult = 0.5 * (1 + math.cos(math.pi * progress))
-        return 0.05 + 0.45 * cosine_mult  # 50% → 5%
+        return hard_end + (hard_start - hard_end) * cosine_mult
 
     for epoch in range(epochs):
         use_swa_sched = swa and epoch >= swa_epoch
@@ -933,6 +932,8 @@ def main():
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block between attention and MLP')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
+    parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
+    parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
     parser.add_argument('--first-epoch-pct', type=float, default=None, help='First epoch: only backprop hardest N%% of samples (e.g. 0.3 for 30%%)')
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
     args = parser.parse_args()
@@ -1013,7 +1014,8 @@ def main():
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
-                swa_lr=args.swa_lr, hard_mining=args.hard_mining, first_epoch_pct=args.first_epoch_pct,
+                swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
+                hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                 verbose=(args.runs == 1), flatten=flatten, task_type=task_type
             )
