@@ -396,6 +396,9 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.window_size = window_size
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
+        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1, groups=embed_dim)
+        self.conv_norm = RMSNorm(embed_dim)
+        
         if len(self.poolable_dims) == ndim:
             self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, stride=2)
         else:
@@ -435,7 +438,13 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         n_levels = self._compute_n_levels(spatial_shape)
         
-        h = x
+        h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
+        conv_out = self.stem_conv(h)
+        for dim, size in enumerate(spatial_shape):
+            conv_out = conv_out.narrow(dim + 2, 0, size)
+        conv_out = self.conv_norm(conv_out.reshape(B, C, L).mT).mT.reshape(B, C, *spatial_shape)
+        h = (h + conv_out).reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
+        
         levels = []
         current_shape = list(spatial_shape)
         
