@@ -606,7 +606,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         if hard_mining:
             sample_losses = compute_sample_losses(model, train_loader, device, flatten=flatten, task_type=task_type)
-            weights = sample_losses - sample_losses.min() + 1e-6
+            weights = (sample_losses - sample_losses.min() + 1e-6) ** 2
             weights = weights / weights.sum() * len(weights)
             sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
             current_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
