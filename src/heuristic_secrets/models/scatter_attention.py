@@ -63,9 +63,14 @@ class AdaptiveConvND(nn.Module):
         K = self.kernel_numel
         H = num_channels
         
-        self.kernel_proj = nn.Linear(channels, H * K)
         self.adapt_proj = nn.Linear(channels, 2 * H)
         self.deform_proj = nn.Linear(channels, H * ndim)
+        
+        pos_dim = 16
+        self.pos_dim = pos_dim
+        self.query_proj = nn.Linear(channels, H * pos_dim)
+        self.key_proj = nn.Linear(ndim, pos_dim, bias=False)
+        self.scale = pos_dim ** -0.5
         
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
@@ -136,15 +141,18 @@ class AdaptiveConvND(nn.Module):
         
         deform = torch.tanh(F.silu(self.deform_proj(x))).reshape(B, L, H, self.ndim) * self.half_k
         
-        kernel_logits = F.silu(self.kernel_proj(x)).reshape(B, L, H, K)
-        
-        dist = self.rel_dist.view(1, 1, 1, K)
-        soft_mask = torch.sigmoid((width.unsqueeze(-1) - dist) * sharpness.unsqueeze(-1))
-        
-        attn_weights = F.softmax(kernel_logits, dim=-1) * soft_mask
-        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
-        
         values = self._gather_window(x, deform[..., 0] if self.ndim == 1 else deform)
+        
+        # Position cross-attention: Q from content, K from scaled positions, V from gathered values
+        queries = F.silu(self.query_proj(x)).reshape(B, L, H, self.pos_dim)
+        
+        scaled_pos = self.rel_pos.view(1, 1, 1, K, self.ndim) / width.view(B, L, H, 1, 1).clamp(min=0.5)
+        keys = self.key_proj(scaled_pos)
+        
+        # Cross-attention: Q @ K^T, with sharpness as inverse temperature
+        attn_logits = torch.einsum('blhd,blhkd->blhk', queries, keys) * self.scale * sharpness.unsqueeze(-1)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        
         output = torch.einsum('blhkd,blhk->blhd', values, attn_weights).reshape(B, L, C)
         
         se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
