@@ -458,10 +458,9 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', track_sample_loss=False):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification'):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    sample_losses = [] if track_sample_loss else None
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for inputs, labels in pbar:
@@ -482,17 +481,11 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             preds = logits_flat.argmax(dim=-1)
             correct += (preds[mask] == labels_flat[mask]).sum().item()
             total += mask.sum().item()
-            if track_sample_loss:
-                per_seq_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction='none')
-                per_seq_loss = per_seq_loss.view(logits.size(0), -1).mean(dim=-1)
-                sample_losses.append(per_seq_loss.detach().cpu())
         else:
             per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
             loss = per_sample_loss.mean()
             correct += (logits.argmax(dim=-1) == labels).sum().item()
             total += labels.size(0)
-            if track_sample_loss:
-                sample_losses.append(per_sample_loss.detach().cpu())
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -503,9 +496,32 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
 
-    if track_sample_loss:
-        sample_losses = torch.cat(sample_losses)
-    return total_loss / len(loader), correct / max(total, 1), sample_losses
+    return total_loss / len(loader), correct / max(total, 1)
+
+
+@torch.no_grad()
+def compute_sample_losses(model, loader, device, flatten=True, task_type='classification'):
+    model.eval()
+    all_losses = []
+    
+    for inputs, labels in tqdm(loader, desc="Computing sample losses", leave=False):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        
+        if flatten and task_type == 'classification':
+            inputs = inputs.view(inputs.size(0), -1)
+        
+        logits = model(inputs)
+        
+        if task_type == 'lm':
+            per_seq_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction='none')
+            per_seq_loss = per_seq_loss.view(logits.size(0), -1).mean(dim=-1)
+            all_losses.append(per_seq_loss.cpu())
+        else:
+            per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
+            all_losses.append(per_sample_loss.cpu())
+    
+    return torch.cat(all_losses)
 
 
 @torch.no_grad()
@@ -583,15 +599,16 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             in_swa_phase = True
         
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
-        train_loss, train_acc, sample_losses = train_epoch(
+        train_loss, train_acc = train_epoch(
             model, current_loader, optimizer, device, active_scheduler, 
-            flatten=flatten, task_type=task_type, track_sample_loss=hard_mining
+            flatten=flatten, task_type=task_type
         )
         
-        if hard_mining and sample_losses is not None:
+        if hard_mining:
+            sample_losses = compute_sample_losses(model, train_loader, device, flatten=flatten, task_type=task_type)
             weights = sample_losses - sample_losses.min() + 1e-6
             weights = weights / weights.sum() * len(weights)
-            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
             current_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
         
         if use_swa_sched:
