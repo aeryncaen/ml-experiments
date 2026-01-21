@@ -352,14 +352,22 @@ class LocalBlock(nn.Module):
         return x + self.attn(self.norm(x))
 
 
-class HierarchicalLocalAttention(nn.Module):
+class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_levels = n_levels
+        self.ndim = ndim
         
-        self.attn = LocalAttention(embed_dim, kernel_size)
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,) * ndim
+        self.kernel_size = kernel_size
+        
+        conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
+        self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
+        
+        self.attn = LocalAttentionND(embed_dim, kernel_size, ndim)
         self.query = nn.Parameter(torch.randn(embed_dim * n_levels) * 0.02)
         self.film = nn.Linear(embed_dim * n_levels, embed_dim * 2)
         
@@ -367,19 +375,37 @@ class HierarchicalLocalAttention(nn.Module):
         nn.init.zeros_(self.film.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, C = x.shape
+        spatial_shape = x.shape[1:-1]
+        B = x.shape[0]
+        C = x.shape[-1]
+        L = 1
+        for s in spatial_shape:
+            L *= s
+        
+        h = x.reshape(B, L, C).mT.reshape(B, C, *spatial_shape)
+        h = self.stem_conv(h)
+        for dim, size in enumerate(spatial_shape):
+            h = h.narrow(dim + 2, 0, size)
+        h = h.reshape(B, C, L).mT.reshape(B, *spatial_shape, C)
+        
         levels = []
-        h = x
         
         for i in range(self.n_levels):
             h = self.attn(h)
             levels.append(h)
             if i < self.n_levels - 1:
-                h = F.avg_pool1d(h.mT, 2).mT
+                h_flat = h.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
+                pool_fn = [F.avg_pool1d, F.avg_pool2d, F.avg_pool3d][self.ndim - 1]
+                h_pooled = pool_fn(h_flat, 2)
+                new_shape = h_pooled.shape[2:]
+                h = h_pooled.reshape(B, C, -1).mT.reshape(B, *new_shape, C)
         
-        upsampled = [levels[0]]
+        level0_flat = levels[0].reshape(B, L, C)
+        upsampled = [level0_flat]
         for lvl in levels[1:]:
-            upsampled.append(F.interpolate(lvl.mT, size=L, mode='nearest').mT)
+            lvl_flat = lvl.reshape(B, -1, C)
+            lvl_up = F.interpolate(lvl_flat.mT, size=L, mode='nearest').mT
+            upsampled.append(lvl_up)
         concat = torch.cat(upsampled, dim=-1)
         
         scores = concat @ self.query
@@ -391,18 +417,29 @@ class HierarchicalLocalAttention(nn.Module):
         scale = scale.unsqueeze(1)
         bias = bias.unsqueeze(1)
         
-        return levels[0] * (1 + scale) + bias
+        out = level0_flat * (1 + scale) + bias
+        return out.reshape(B, *spatial_shape, C)
 
 
-class HierarchicalLocalBlock(nn.Module):
+class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4):
+        super().__init__(embed_dim, kernel_size, n_levels, ndim=1)
+
+
+class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttention(embed_dim, kernel_size, n_levels)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, kernel_size, n_levels, ndim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
+
+
+class HierarchicalLocalBlock(HierarchicalLocalBlockND):
+    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, eps: float = 1e-6):
+        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, eps=eps)
 
 
 LocalKernelAttention = LocalAttention
