@@ -78,10 +78,10 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 4, mlp_mult: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttention(width, kernel_size, n_levels, num_channels)
+        self.hier_attn = HierarchicalLocalAttention(width, window_size, n_levels, num_channels)
         self.attn_norm = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.mlp = SwiGLU(width, mlp_mult, dropout)
@@ -229,10 +229,8 @@ class ImageClassifier(nn.Module):
         self.img_size = img_size
         self.patch_embed = nn.Linear(1, width)
         self.embed_norm = RMSNorm(width)
-        self.register_buffer(
-            'pos_embed',
-            sinusoidal_pos_embed_nd(img_size, width, torch.device('cpu'), torch.float32)
-        )
+        self.pos_embed = nn.Parameter(torch.randn(1, *img_size, width) * 0.02)
+        self.pos_norm = RMSNorm(width)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, n_classes)
@@ -240,7 +238,7 @@ class ImageClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         x = x.view(B, *self.img_size, 1)
-        x = self.embed_norm(F.silu(self.patch_embed(x))) + self.pos_embed
+        x = self.embed_norm(F.silu(self.patch_embed(x))) + self.pos_norm(F.silu(self.pos_embed))
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x).mean(dim=(1, 2))
@@ -320,7 +318,7 @@ def build_model(model_type, layers, n_classes, seq_len, device):
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=4, mlp_mult=4)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, kernel_size=17, n_levels=4, mlp_mult=4)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, n_levels=4, mlp_mult=4)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17, mlp_mult=4)

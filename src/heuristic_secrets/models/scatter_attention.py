@@ -382,7 +382,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_levels = n_levels
@@ -390,15 +390,15 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.num_channels = num_channels
         self.channel_dim = embed_dim // num_channels
         
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size,) * ndim
-        self.kernel_size = kernel_size
+        if isinstance(window_size, int):
+            window_size = (window_size,) * ndim
+        self.window_size = window_size
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
         self.stem_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, padding=1)
         self.conv_norm = RMSNorm(embed_dim)
         
-        self.attn = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
         self.query = nn.Parameter(torch.randn(n_levels * num_channels) * 0.02)
         self.film = nn.Linear(self.channel_dim, embed_dim * 2)
         
@@ -453,24 +453,24 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 1):
-        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, num_channels=num_channels)
+    def __init__(self, embed_dim: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 1):
+        super().__init__(embed_dim, window_size, n_levels, ndim=1, num_channels=num_channels)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, n_levels: int = 4, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, kernel_size, n_levels, ndim, num_channels)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, n_levels, ndim, num_channels)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17, n_levels: int = 4, num_channels: int = 1, eps: float = 1e-6):
-        super().__init__(embed_dim, kernel_size, n_levels, ndim=1, num_channels=num_channels, eps=eps)
+    def __init__(self, embed_dim: int, window_size: int = 17, n_levels: int = 4, num_channels: int = 1, eps: float = 1e-6):
+        super().__init__(embed_dim, window_size, n_levels, ndim=1, num_channels=num_channels, eps=eps)
 
 
 LocalKernelAttention = LocalAttention
