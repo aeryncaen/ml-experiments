@@ -504,13 +504,46 @@ class LowRankAttentionMerge(nn.Module):
         embed_down = avg_pool_nd(embed, (r,))
         processed_down = avg_pool_nd(processed, (r,))
         
-        q = self.q_proj(processed_down)
-        k = self.k_proj(embed_down)
-        v = self.v_proj(embed_down)
+        q = F.silu(self.q_proj(processed_down))
+        k = F.silu(self.k_proj(embed_down))
+        v = F.silu(self.v_proj(embed_down))
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
         out = interpolate_nd(out, (L,))
+        
+        return processed + out
+
+
+class LowRankAttentionMergeND(nn.Module):
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+    
+    def forward(self, embed: torch.Tensor, processed: torch.Tensor) -> torch.Tensor:
+        spatial_shape = embed.shape[1:-1]
+        B, C = embed.shape[0], embed.shape[-1]
+        
+        target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
+        L = 1
+        for t in target_shape:
+            L *= t
+        
+        embed_down = avg_pool_nd(embed, target_shape).reshape(B, L, C)
+        processed_down = avg_pool_nd(processed, target_shape).reshape(B, L, C)
+        
+        q = F.silu(self.q_proj(processed_down))
+        k = F.silu(self.k_proj(embed_down))
+        v = F.silu(self.v_proj(embed_down))
+        
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.silu(self.out_proj(out))
+        out = out.reshape(B, *target_shape, C)
+        out = interpolate_nd(out, spatial_shape)
         
         return processed + out
 
@@ -884,7 +917,6 @@ class LocalBlock(nn.Module):
 
 
 class SGSBAttentionND(nn.Module):
-    """Scatter-Gather-Scatter-Broadcast attention. Full pipeline: adaptive conv → local attn → adaptive conv → low-rank full attn."""
     
     def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, chunk_size: int = 2048):
         super().__init__()
@@ -897,14 +929,12 @@ class SGSBAttentionND(nn.Module):
             kernel_size = (kernel_size,) * ndim
         self.kernel_size = kernel_size
         
-        self.scatter_pre = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels, chunk_size=chunk_size)
-        self.scatter_pre_norm = RMSNorm(embed_dim)
+        self.scatter = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels, chunk_size=chunk_size)
+        self.scatter_norm1 = RMSNorm(embed_dim)
+        self.scatter_norm2 = RMSNorm(embed_dim)
         
         self.gather = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels, chunk_size=chunk_size)
         self.gather_norm = RMSNorm(embed_dim)
-        
-        self.scatter_post = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels, chunk_size=chunk_size)
-        self.scatter_post_norm = RMSNorm(embed_dim)
         
         self.broadcast = LowRankAttention(embed_dim)
         self.broadcast_norm = RMSNorm(embed_dim)
@@ -920,13 +950,13 @@ class SGSBAttentionND(nn.Module):
         
         h = x
         
-        conv_out, _ = self.scatter_pre(h)
-        h = h + self.scatter_pre_norm(conv_out)
+        conv_out, _ = self.scatter(h)
+        h = h + self.scatter_norm1(conv_out)
         
         h = h + self.gather_norm(self.gather(h))
         
-        conv_out, _ = self.scatter_post(h)
-        h = h + self.scatter_post_norm(conv_out)
+        conv_out, _ = self.scatter(h)
+        h = h + self.scatter_norm2(conv_out)
         
         h_flat = h.reshape(B, L, C)
         broadcast_out, _ = self.broadcast(h_flat)
@@ -1052,6 +1082,284 @@ class SGSBClassifier(SGSBClassifierND):
         num_channels: int = 4,
     ):
         super().__init__(embed_dim, n_classes, n_layers, kernel_size, ndim=1, num_channels=num_channels)
+
+
+class MIMOJacobiSSM_ND(nn.Module):
+    
+    def __init__(
+        self,
+        dim: int,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        iterations: int = 4,
+        ndim: int = 2,
+    ):
+        super().__init__()
+        self.D = dim
+        self.N = state_dim
+        self.R = mimo_rank
+        self.K = iterations
+        self.ndim = ndim
+        
+        self.to_B = nn.Linear(dim, state_dim * mimo_rank)
+        self.to_C = nn.Linear(dim, state_dim * mimo_rank)
+        self.to_X = nn.Linear(dim, mimo_rank)
+        self.to_decay = nn.Linear(dim, state_dim)
+        self.to_theta = nn.Linear(dim, state_dim // 2)
+        
+        self.diffuse = nn.ModuleList([
+            AdaptiveConvND(state_dim, ndim=ndim)
+            for _ in range(mimo_rank)
+        ])
+        
+        self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
+        
+    def _apply_rotation(self, H: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        H1, H2 = H[..., ::2, :], H[..., 1::2, :]
+        cos = theta.cos().unsqueeze(-1)
+        sin = theta.sin().unsqueeze(-1)
+        return torch.cat([H1 * cos - H2 * sin, H1 * sin + H2 * cos], dim=-2)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = x.shape[1:-1]
+        B = x.shape[0]
+        
+        B_mat = F.silu(self.to_B(x)).reshape(B, *spatial_shape, self.N, self.R)
+        C_mat = F.silu(self.to_C(x)).reshape(B, *spatial_shape, self.N, self.R)
+        X_r = F.silu(self.to_X(x))
+        decay = torch.sigmoid(self.to_decay(x))
+        theta = self.to_theta(x)
+        
+        inject = B_mat * X_r.unsqueeze(-2)
+        
+        H = inject.clone()
+        
+        for _ in range(self.K):
+            H = self._apply_rotation(H, theta)
+            
+            H_out = []
+            for r in range(self.R):
+                H_r, _ = self.diffuse[r](H[..., r])
+                H_out.append(H_r)
+            H = torch.stack(H_out, dim=-1)
+            
+            H = decay.unsqueeze(-1) * H + inject
+        
+        Y = (H * C_mat).sum(dim=-2)
+        Y_full = H.reshape(B, *spatial_shape, self.N * self.R)
+        
+        return F.silu(self.out_proj(Y_full))
+
+
+class MIMOJacobiSSM(MIMOJacobiSSM_ND):
+    
+    def __init__(
+        self,
+        dim: int,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        iterations: int = 4,
+    ):
+        super().__init__(dim, state_dim, mimo_rank, iterations, ndim=1)
+
+
+class MIMOJacobiBlock_ND(nn.Module):
+    
+    def __init__(
+        self,
+        dim: int,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        iterations: int = 4,
+        ndim: int = 2,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.norm = RMSNorm(dim, eps)
+        self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, iterations, ndim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.ssm(self.norm(x))
+
+
+class MIMOJacobiBlock(MIMOJacobiBlock_ND):
+    
+    def __init__(
+        self,
+        dim: int,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        iterations: int = 4,
+        eps: float = 1e-6,
+    ):
+        super().__init__(dim, state_dim, mimo_rank, iterations, ndim=1, eps=eps)
+
+
+class RippleLayerND(nn.Module):
+    
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(dim, eps)
+        self.norm2 = RMSNorm(dim, eps)
+        self.norm3 = RMSNorm(dim, eps)
+        
+        self.attn = SGSBAttentionND(dim, kernel_size, ndim, num_channels)
+        self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, ssm_iterations, ndim)
+        self.merge = LowRankAttentionMergeND(dim)
+    
+    def forward(self, x: torch.Tensor, embed: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ssm(self.norm2(x))
+        x = x + self.attn(self.norm3(x))
+        x = self.merge(embed, x)
+        return x
+
+
+class RippleLayer(RippleLayerND):
+    
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+        eps: float = 1e-6,
+    ):
+        super().__init__(dim, kernel_size, ndim=1, num_channels=num_channels,
+                         state_dim=state_dim, mimo_rank=mimo_rank,
+                         ssm_iterations=ssm_iterations, eps=eps)
+
+
+class RippleModelND(nn.Module):
+    
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        n_layers: int = 4,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        
+        self.embed = nn.Linear(input_dim, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.layers = nn.ModuleList([
+            RippleLayerND(embed_dim, kernel_size, ndim, num_channels,
+                          state_dim, mimo_rank, ssm_iterations)
+            for _ in range(n_layers)
+        ])
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, output_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        embed = self.embed_norm(F.silu(self.embed(x)))
+        
+        x = embed
+        for layer in self.layers:
+            x = layer(x, embed)
+        
+        x = self.out_norm(x)
+        return self.head(x)
+
+
+class RippleModel(RippleModelND):
+    
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        n_layers: int = 4,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+    ):
+        super().__init__(input_dim, embed_dim, output_dim, n_layers, kernel_size,
+                         ndim=1, num_channels=num_channels, state_dim=state_dim,
+                         mimo_rank=mimo_rank, ssm_iterations=ssm_iterations)
+
+
+class RippleClassifierND(nn.Module):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        n_layers: int = 4,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        
+        self.embed = nn.Linear(1, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.layers = nn.ModuleList([
+            RippleLayerND(embed_dim, kernel_size, ndim, num_channels,
+                          state_dim, mimo_rank, ssm_iterations)
+            for _ in range(n_layers)
+        ])
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, n_classes)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.unsqueeze(-1)
+        embed = self.embed_norm(F.silu(self.embed(x)))
+        
+        x = embed
+        for layer in self.layers:
+            x = layer(x, embed)
+        
+        pool_dims = tuple(range(1, self.ndim + 1))
+        x = self.out_norm(x).mean(dim=pool_dims)
+        return self.head(x)
+
+
+class RippleClassifier(RippleClassifierND):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        n_layers: int = 4,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+        ssm_iterations: int = 4,
+    ):
+        super().__init__(embed_dim, n_classes, n_layers, kernel_size, ndim=1,
+                         num_channels=num_channels, state_dim=state_dim,
+                         mimo_rank=mimo_rank, ssm_iterations=ssm_iterations)
 
 
 class HierarchicalLocalAttentionND(nn.Module):

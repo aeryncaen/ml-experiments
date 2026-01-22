@@ -16,6 +16,7 @@ from heuristic_secrets.models.scatter_attention import (
     HierarchicalLocalAttentionND,
     LocalAttentionND,
     RMSNorm,
+    RippleClassifierND,
     SGSBBlockND,
     apply_rope,
     sinusoidal_pos_embed_nd,
@@ -826,6 +827,11 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'ripple':
+        return RippleClassifierND(
+            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
+            kernel_size=kernel_size, ndim=1, num_channels=num_channels,
+        ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
     
@@ -856,6 +862,11 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'ripple':
+        return RippleClassifierND(
+            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
+            kernel_size=kernel_size, ndim=2, num_channels=num_channels,
+        ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
     
@@ -886,6 +897,11 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock3D(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'ripple':
+        return RippleClassifierND(
+            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
+            kernel_size=kernel_size, ndim=3, num_channels=num_channels,
+        ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
     
@@ -938,6 +954,11 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'ripple':
+        return RippleClassifierND(
+            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
+            kernel_size=kernel_size, ndim=1, num_channels=num_channels,
+        ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
@@ -1140,7 +1161,7 @@ def main():
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'conv']
+        all_model_types = ['attention', 'sgsb', 'ripple', 'conv']
         builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
@@ -1148,7 +1169,7 @@ def main():
     elif args.mode_3d:
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 5
-        all_model_types = ['attention', 'local', 'sgsb', 'conv']
+        all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'conv']
         builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'vol_size={img_size}'
         flatten = False
@@ -1156,7 +1177,7 @@ def main():
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
-        all_model_types = ['attention', 'local', 'sgsb', 'conv']
+        all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'img_size={img_size}'
         flatten = True
@@ -1164,7 +1185,7 @@ def main():
     else:
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'conv']
+        all_model_types = ['attention', 'sgsb', 'ripple', 'conv']
         builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'seq_len={seq_len}'
         flatten = True
