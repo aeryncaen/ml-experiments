@@ -1122,14 +1122,12 @@ class MIMOJacobiSSM_ND(nn.Module):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        iterations: int = 4,
         ndim: int = 2,
     ):
         super().__init__()
         self.D = dim
         self.N = state_dim
         self.R = mimo_rank
-        self.K = iterations
         self.ndim = ndim
         
         self.to_B = nn.Linear(dim, state_dim * mimo_rank)
@@ -1147,8 +1145,13 @@ class MIMOJacobiSSM_ND(nn.Module):
         cos = theta.cos().unsqueeze(-1)
         sin = theta.sin().unsqueeze(-1)
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-2)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    
+    def init_state(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = x.shape[1:-1]
+        B = x.shape[0]
+        return torch.zeros(B, *spatial_shape, self.N, self.R, device=x.device, dtype=x.dtype)
+    
+    def step(self, x: torch.Tensor, H: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         
@@ -1158,30 +1161,29 @@ class MIMOJacobiSSM_ND(nn.Module):
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         
-        H = torch.zeros_like(B_base)
+        theta_k = theta * (layer_idx + 1)
+        B_rot = self._apply_rope(B_base, theta_k)
+        inject = B_rot * X_r.unsqueeze(-2)
         
         ndim = len(spatial_shape)
         batch_perm = (0, ndim + 2) + tuple(range(1, ndim + 2))
         unbatch_perm = (0,) + tuple(range(2, ndim + 2)) + (ndim + 2, 1)
         
-        for k in range(self.K):
-            theta_k = theta * (k + 1)
-            B_rot = self._apply_rope(B_base, theta_k)
-            C_rot = self._apply_rope(C_base, theta_k)
-            
-            inject = B_rot * X_r.unsqueeze(-2)
-            
-            H = H.permute(*batch_perm).reshape(B * self.R, *spatial_shape, self.N)
-            H, _ = self.diffuse(H)
-            H = H.reshape(B, self.R, *spatial_shape, self.N).permute(*unbatch_perm)
-            
-            H = decay.unsqueeze(-1) * H + inject
+        H = H.permute(*batch_perm).reshape(B * self.R, *spatial_shape, self.N)
+        H, _ = self.diffuse(H)
+        H = H.reshape(B, self.R, *spatial_shape, self.N).permute(*unbatch_perm)
+        H = decay.unsqueeze(-1) * H + inject
         
-        C_final = self._apply_rope(C_base, theta * self.K)
-        Y = (H * C_final).sum(dim=-2)
+        C_rot = self._apply_rope(C_base, theta_k)
         Y_full = H.reshape(B, *spatial_shape, self.N * self.R)
+        out = F.silu(self.out_proj(Y_full))
         
-        return F.silu(self.out_proj(Y_full))
+        return H, out
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H = self.init_state(x)
+        H, out = self.step(x, H, 0)
+        return out
 
 
 class MIMOJacobiSSM(MIMOJacobiSSM_ND):
@@ -1191,9 +1193,8 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        iterations: int = 4,
     ):
-        super().__init__(dim, state_dim, mimo_rank, iterations, ndim=1)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1)
 
 
 class MIMOJacobiBlock_ND(nn.Module):
@@ -1203,13 +1204,12 @@ class MIMOJacobiBlock_ND(nn.Module):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        iterations: int = 4,
         ndim: int = 2,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.norm = RMSNorm(dim, eps)
-        self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, iterations, ndim)
+        self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, ndim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.ssm(self.norm(x))
@@ -1222,10 +1222,9 @@ class MIMOJacobiBlock(MIMOJacobiBlock_ND):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        iterations: int = 4,
         eps: float = 1e-6,
     ):
-        super().__init__(dim, state_dim, mimo_rank, iterations, ndim=1, eps=eps)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, eps=eps)
 
 
 class RippleLayerND(nn.Module):
@@ -1236,26 +1235,32 @@ class RippleLayerND(nn.Module):
         kernel_size: int | tuple[int, ...] = 17,
         ndim: int = 1,
         num_channels: int = 4,
-        state_dim: int = 64,
-        mimo_rank: int = 4,
-        ssm_iterations: int = 4,
         eps: float = 1e-6,
         checkpoint_merges: bool = True,
     ):
         super().__init__()
+        self.dim = dim
         self.ndim = ndim
         self.checkpoint_merges = checkpoint_merges
         
         self.norm1 = RMSNorm(dim, eps)
         self.norm2 = RMSNorm(dim, eps)
+        self.state_norm = RMSNorm(dim, eps)
         
         self.attn = SGSBAttentionND(dim, kernel_size, ndim, num_channels)
-        self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, ssm_iterations, ndim)
         self.merge = LowRankAttentionMergeND(dim)
         
         self.accum_attn = LowRankAttentionMergeND(dim)
         self.reduce_norm = RMSNorm(dim, eps)
         self.downsample = SIRENDownsampleND(dim, ndim=ndim)
+        
+        self.state_gate = nn.Linear(dim, dim)
+        nn.init.zeros_(self.state_gate.weight)
+        nn.init.constant_(self.state_gate.bias, -2.0)
+    
+    def init_state(self, x: torch.Tensor) -> torch.Tensor:
+        """Initialize per-layer hidden state (zeros, same shape as x)."""
+        return torch.zeros_like(x)
     
     def _merge_fn(self, embed: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         return self.merge(embed, x)
@@ -1267,8 +1272,10 @@ class RippleLayerND(nn.Module):
         self,
         x: torch.Tensor,
         embed: torch.Tensor,
+        ssm_out: torch.Tensor,
         accumulated: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(accumulated) > 1:
             if self.checkpoint_merges and self.training:
                 x = grad_checkpoint(self._accum_fn, x, *accumulated, use_reentrant=False)  # type: ignore[assignment]
@@ -1276,18 +1283,22 @@ class RippleLayerND(nn.Module):
                 x = self.accum_attn.forward_accumulated(x, accumulated)
         
         x = x + self.attn(self.norm1(x))
-        x = x + self.ssm(self.norm2(x))
+        x = x + ssm_out
         
         if self.checkpoint_merges and self.training:
             x = grad_checkpoint(self._merge_fn, embed, x, use_reentrant=False)  # type: ignore[assignment]
         else:
             x = self.merge(embed, x)
         
+        gate = torch.sigmoid(self.state_gate(x))
+        layer_state = self.state_norm(layer_state + x)
+        x = gate * layer_state + (1 - gate) * x
+        
         spatial_shape = x.shape[1:-1]
         target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
         x_reduced = self.downsample(self.reduce_norm(x), target_shape)
         
-        return x, x_reduced
+        return x, x_reduced, layer_state
 
 
 class RippleLayer(RippleLayerND):
@@ -1297,14 +1308,9 @@ class RippleLayer(RippleLayerND):
         dim: int,
         kernel_size: int = 17,
         num_channels: int = 4,
-        state_dim: int = 64,
-        mimo_rank: int = 4,
-        ssm_iterations: int = 4,
         eps: float = 1e-6,
     ):
-        super().__init__(dim, kernel_size, ndim=1, num_channels=num_channels,
-                         state_dim=state_dim, mimo_rank=mimo_rank,
-                         ssm_iterations=ssm_iterations, eps=eps)
+        super().__init__(dim, kernel_size, ndim=1, num_channels=num_channels, eps=eps)
 
 
 class RippleModelND(nn.Module):
@@ -1320,7 +1326,6 @@ class RippleModelND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        ssm_iterations: int = 4,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1328,9 +1333,11 @@ class RippleModelND(nn.Module):
         self.embed = nn.Linear(input_dim, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm_norm = RMSNorm(embed_dim)
+        
         self.layers = nn.ModuleList([
-            RippleLayerND(embed_dim, kernel_size, ndim, num_channels,
-                          state_dim, mimo_rank, ssm_iterations)
+            RippleLayerND(embed_dim, kernel_size, ndim, num_channels)
             for _ in range(n_layers)
         ])
         
@@ -1341,9 +1348,13 @@ class RippleModelND(nn.Module):
         embed = self.embed_norm(F.silu(self.embed(x)))
         
         x = embed
+        H = self.ssm.init_state(x)
+        layer_states = [layer.init_state(x) for layer in self.layers]
         accumulated: list[torch.Tensor] = []
-        for layer in self.layers:
-            x, x_reduced = layer(x, embed, accumulated)
+        
+        for i, layer in enumerate(self.layers):
+            H, ssm_out = self.ssm.step(self.ssm_norm(x), H, i)
+            x, x_reduced, layer_states[i] = layer(x, embed, ssm_out, accumulated, layer_states[i])
             accumulated.append(x_reduced)
         
         x = self.out_norm(x)
@@ -1362,11 +1373,10 @@ class RippleModel(RippleModelND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        ssm_iterations: int = 4,
     ):
         super().__init__(input_dim, embed_dim, output_dim, n_layers, kernel_size,
                          ndim=1, num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank, ssm_iterations=ssm_iterations)
+                         mimo_rank=mimo_rank)
 
 
 class RippleClassifierND(nn.Module):
@@ -1381,7 +1391,6 @@ class RippleClassifierND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        ssm_iterations: int = 4,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1389,9 +1398,11 @@ class RippleClassifierND(nn.Module):
         self.embed = nn.Linear(1, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm_norm = RMSNorm(embed_dim)
+        
         self.layers = nn.ModuleList([
-            RippleLayerND(embed_dim, kernel_size, ndim, num_channels,
-                          state_dim, mimo_rank, ssm_iterations)
+            RippleLayerND(embed_dim, kernel_size, ndim, num_channels)
             for _ in range(n_layers)
         ])
         
@@ -1403,9 +1414,13 @@ class RippleClassifierND(nn.Module):
         embed = self.embed_norm(F.silu(self.embed(x)))
         
         x = embed
+        H = self.ssm.init_state(x)
+        layer_states = [layer.init_state(x) for layer in self.layers]
         accumulated: list[torch.Tensor] = []
-        for layer in self.layers:
-            x, x_reduced = layer(x, embed, accumulated)
+        
+        for i, layer in enumerate(self.layers):
+            H, ssm_out = self.ssm.step(self.ssm_norm(x), H, i)
+            x, x_reduced, layer_states[i] = layer(x, embed, ssm_out, accumulated, layer_states[i])
             accumulated.append(x_reduced)
         
         pool_dims = tuple(range(1, self.ndim + 1))
@@ -1424,11 +1439,10 @@ class RippleClassifier(RippleClassifierND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        ssm_iterations: int = 4,
     ):
         super().__init__(embed_dim, n_classes, n_layers, kernel_size, ndim=1,
                          num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank, ssm_iterations=ssm_iterations)
+                         mimo_rank=mimo_rank)
 
 
 class HierarchicalLocalAttentionND(nn.Module):
