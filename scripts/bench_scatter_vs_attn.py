@@ -1145,6 +1145,7 @@ def main():
     parser.add_argument('--ssm', action='store_true', help='Add SSM block after attention')
     parser.add_argument('--amp', action='store_true', help='Enable automatic mixed precision (fp16)')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for kernel fusion')
+    parser.add_argument('--profile', action='store_true', help='Profile 1 batch after 10 warmup, then exit')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
@@ -1269,6 +1270,57 @@ def main():
             
             if args.compile:
                 model = torch.compile(model)
+            
+            if args.profile:
+                print(f'\nProfiling {mt}...')
+                model.train()
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+                
+                # Get a batch
+                inputs, labels = next(iter(train_loader))
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                if model_flatten:
+                    inputs = inputs.view(inputs.size(0), -1)
+                elif not model_flatten and inputs.dim() == 4:
+                    inputs = inputs.squeeze(1)
+                
+                # Warmup
+                print('Warming up 10 batches...')
+                for _ in range(10):
+                    optimizer.zero_grad()
+                    logits = model(inputs)
+                    loss = F.cross_entropy(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+                torch.cuda.synchronize()
+                
+                # Profile
+                print('Profiling 1 batch...')
+                from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                    with_flops=True,
+                ) as prof:
+                    optimizer.zero_grad()
+                    logits = model(inputs)
+                    loss = F.cross_entropy(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+                    torch.cuda.synchronize()
+                
+                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=50))
+                print(f'\nMemory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB')
+                
+                # Export for chrome://tracing
+                prof.export_chrome_trace(f'profile_{mt}.json')
+                print(f'Trace exported to profile_{mt}.json')
+                print('Open chrome://tracing and load the JSON file for detailed view')
+                
+                continue  # Skip training for this model
             
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
