@@ -409,7 +409,7 @@ class LowRankAttentionMerge(nn.Module):
         v_down = F.adaptive_avg_pool1d(v.mT, r).mT
         
         out = F.scaled_dot_product_attention(q, k_down, v_down)
-        return processed + self.out_proj(out)
+        return processed + F.silu(self.out_proj(out))
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
