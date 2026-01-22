@@ -466,6 +466,80 @@ if HAS_TRITON:
 
 
     @triton.jit
+    def _local_window_attn_bwd_kernel(
+        grad_out_ptr,       # [B, L, H, D]
+        q_ptr,              # [B, L, H, D]
+        k_ptr,              # [B, L + K - 1, C]
+        v_ptr,              # [B, L + K - 1, C]
+        attn_ptr,           # [B, L, H, K]
+        grad_q_ptr,         # [B, L, H, D] output
+        grad_k_ptr,         # [B, L + K - 1, C] output (use atomic)
+        grad_v_ptr,         # [B, L + K - 1, C] output (use atomic)
+        B: tl.constexpr,
+        L: tl.constexpr,
+        C: tl.constexpr,
+        H: tl.constexpr,
+        D: tl.constexpr,
+        K: tl.constexpr,
+        scale: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+            return
+        
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < D
+        head_start = pid_h * D
+        
+        grad_out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        grad_out = tl.load(grad_out_ptr + grad_out_base + d_offsets, mask=d_mask, other=0.0)
+        
+        q_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        q = tl.load(q_ptr + q_base + d_offsets, mask=d_mask, other=0.0)
+        
+        attn_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        
+        k_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
+        v_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
+        
+        grad_attn_dot_attn = 0.0
+        for w in range(K):
+            attn_w = tl.load(attn_ptr + attn_base + w)
+            v_offset = v_row_start + w * C
+            v_w = tl.load(v_ptr + v_offset + d_offsets, mask=d_mask, other=0.0)
+            grad_attn_w = tl.sum(grad_out * v_w)
+            grad_attn_dot_attn += grad_attn_w * attn_w
+        
+        grad_q_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        
+        for w in range(K):
+            attn_w = tl.load(attn_ptr + attn_base + w)
+            
+            v_offset = v_row_start + w * C
+            v_w = tl.load(v_ptr + v_offset + d_offsets, mask=d_mask, other=0.0)
+            grad_attn_w = tl.sum(grad_out * v_w)
+            
+            grad_score_w = attn_w * (grad_attn_w - grad_attn_dot_attn) * scale
+            
+            grad_v_w = grad_out * attn_w
+            tl.atomic_add(grad_v_ptr + v_offset + d_offsets, grad_v_w, mask=d_mask)
+            
+            k_offset = k_row_start + w * C
+            k_w = tl.load(k_ptr + k_offset + d_offsets, mask=d_mask, other=0.0)
+            grad_q_acc += grad_score_w * k_w
+            
+            grad_k_w = grad_score_w * q
+            tl.atomic_add(grad_k_ptr + k_offset + d_offsets, grad_k_w, mask=d_mask)
+        
+        grad_q_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        tl.store(grad_q_ptr + grad_q_base + d_offsets, grad_q_acc, mask=d_mask)
+
+
+    @triton.jit
     def _ssm_fused_step_kernel(
         H_ptr,              # [B, R, L, N] - state (in/out)
         B_rot_ptr,          # [B, R, L, N] - rotated input projection
@@ -587,30 +661,19 @@ class LocalWindowAttnFunc(Function):
         
         grad_output = grad_output.contiguous()
         
-        grad_q = torch.zeros_like(q)
+        grad_q = torch.empty_like(q)
         grad_k_padded = torch.zeros_like(k_padded)
         grad_v_padded = torch.zeros_like(v_padded)
         
-        grad_attn = torch.zeros(B, L, H, K, device=q.device, dtype=q.dtype)
-        for w in range(K):
-            v_w = v_padded[:, w:w+L, :].reshape(B, L, H, D)
-            grad_attn[:, :, :, w] = (grad_output * v_w).sum(dim=-1)
+        BLOCK_D = triton.next_power_of_2(D)
+        grid = (B, L, H)
         
-        grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True)) * scale
-        
-        for w in range(K):
-            k_w = k_padded[:, w:w+L, :].reshape(B, L, H, D)
-            v_w = v_padded[:, w:w+L, :].reshape(B, L, H, D)
-            attn_w = attn[:, :, :, w:w+1]
-            grad_scores_w = grad_scores[:, :, :, w:w+1]
-            
-            grad_v_w = (grad_output * attn_w).reshape(B, L, C)
-            grad_v_padded[:, w:w+L, :] += grad_v_w
-            
-            grad_q += (grad_scores_w * k_w)
-            
-            grad_k_w = (grad_scores_w * q).reshape(B, L, C)
-            grad_k_padded[:, w:w+L, :] += grad_k_w
+        _local_window_attn_bwd_kernel[grid](
+            grad_output, q, k_padded, v_padded, attn,
+            grad_q, grad_k_padded, grad_v_padded,
+            B, L, C, H, D, K, scale,
+            BLOCK_D=BLOCK_D,
+        )
         
         return grad_q, grad_k_padded, grad_v_padded, None, None, None, None, None
 
@@ -704,78 +767,59 @@ class TritonLocalWindowAttn(nn.Module):
         return out
 
 
-class RoPEFunc(Function):
-    """Autograd function for RoPE rotation."""
-    
+class FusedRoPESSMFunc(Function):
     @staticmethod
-    def forward(ctx, x, theta, layer_idx):
-        # x: [B, R, L, N], theta: [B, L, N//2]
-        B, R, L, N = x.shape
-        
-        # Clone to avoid in-place modification issues
-        out = x.clone()
-        
-        if HAS_TRITON and x.is_cuda:
-            BLOCK_N2 = triton.next_power_of_2(N // 2)
-            grid = (B, R, L)
-            _rope_kernel[grid](
-                out, theta, layer_idx,
-                B, R, L, N, BLOCK_N2,
-            )
-        else:
-            theta_k = theta * (layer_idx + 1)
-            theta_k = theta_k.unsqueeze(1)  # [B, 1, L, N//2]
-            cos = theta_k.cos()
-            sin = theta_k.sin()
-            out[..., ::2] = x[..., ::2] * cos - x[..., 1::2] * sin
-            out[..., 1::2] = x[..., ::2] * sin + x[..., 1::2] * cos
-        
-        ctx.save_for_backward(theta)
-        ctx.layer_idx = layer_idx
-        ctx.shapes = (B, R, L, N)
-        
+    def _apply_rope(x, theta, layer_idx):
+        theta_k = theta * (layer_idx + 1)
+        theta_k = theta_k.unsqueeze(1)
+        cos = theta_k.cos()
+        sin = theta_k.sin()
+        out = torch.empty_like(x)
+        out[..., ::2] = x[..., ::2] * cos - x[..., 1::2] * sin
+        out[..., 1::2] = x[..., ::2] * sin + x[..., 1::2] * cos
         return out
     
     @staticmethod
-    def backward(ctx, grad_output):
-        theta, = ctx.saved_tensors
-        layer_idx = ctx.layer_idx
-        B, R, L, N = ctx.shapes
-        
-        # RoPE backward is just reverse rotation (negate sin)
+    def _apply_rope_bwd(grad, theta, layer_idx):
         theta_k = theta * (layer_idx + 1)
-        theta_k = theta_k.unsqueeze(1)  # [B, 1, L, N//2]
+        theta_k = theta_k.unsqueeze(1)
         cos = theta_k.cos()
         sin = theta_k.sin()
-        
-        grad_x = torch.empty_like(grad_output)
-        # Reverse rotation: multiply by conjugate (cos, -sin)
-        grad_x[..., ::2] = grad_output[..., ::2] * cos + grad_output[..., 1::2] * sin
-        grad_x[..., 1::2] = -grad_output[..., ::2] * sin + grad_output[..., 1::2] * cos
-        
-        # grad_theta would be complex, skip for now (theta comes from learned projection anyway)
-        return grad_x, None, None
-
-
-class SSMStepFunc(Function):
+        grad_x = torch.empty_like(grad)
+        grad_x[..., ::2] = grad[..., ::2] * cos + grad[..., 1::2] * sin
+        grad_x[..., 1::2] = -grad[..., ::2] * sin + grad[..., 1::2] * cos
+        return grad_x
+    
     @staticmethod
-    def forward(ctx, H, B_rot, X_r, decay):
+    def forward(ctx, B_proj, theta, layer_idx, H, X_r, decay):
         B, R, L, N = H.shape
+        
+        if HAS_TRITON and B_proj.is_cuda:
+            B_rot = B_proj.clone()
+            BLOCK_N2 = triton.next_power_of_2(N // 2)
+            grid = (B, R, L)
+            _rope_kernel[grid](B_rot, theta, layer_idx, B, R, L, N, BLOCK_N2)
+        else:
+            B_rot = FusedRoPESSMFunc._apply_rope(B_proj, theta, layer_idx)
+        
         decay_exp = decay.unsqueeze(1)
         X_r_exp = X_r.unsqueeze(-1)
-        
         H_new = decay_exp * H + B_rot * X_r_exp
         out_flat = H_new.permute(0, 2, 1, 3).reshape(B, L, N * R)
         
-        ctx.save_for_backward(H, B_rot, X_r_exp, decay_exp)
+        ctx.save_for_backward(B_proj, theta, H, X_r_exp, decay_exp)
+        ctx.layer_idx = layer_idx
         ctx.shapes = (B, R, L, N)
         
         return H_new, out_flat
     
     @staticmethod
     def backward(ctx, grad_H_new, grad_out_flat):
-        H, B_rot, X_r_exp, decay_exp = ctx.saved_tensors
+        B_proj, theta, H, X_r_exp, decay_exp = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
         B, R, L, N = ctx.shapes
+        
+        B_rot = FusedRoPESSMFunc._apply_rope(B_proj, theta, layer_idx)
         
         grad_from_out = grad_out_flat.reshape(B, L, R, N).permute(0, 2, 1, 3)
         grad_total = grad_H_new + grad_from_out
@@ -785,12 +829,12 @@ class SSMStepFunc(Function):
         grad_X_r = (grad_total * B_rot).sum(dim=-1)
         grad_decay = (grad_total * H).sum(dim=1)
         
-        return grad_H, grad_B_rot, grad_X_r, grad_decay
+        grad_B_proj = FusedRoPESSMFunc._apply_rope_bwd(grad_B_rot, theta, layer_idx)
+        
+        return grad_B_proj, None, None, grad_H, grad_X_r, grad_decay
 
 
 class TritonSSMStep(nn.Module):
-    """Fused SSM step operations using Triton."""
-    
     def __init__(self, dim: int, state_dim: int = 64, mimo_rank: int = 4):
         super().__init__()
         self.D = dim
@@ -815,26 +859,10 @@ class TritonSSMStep(nn.Module):
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         
-        # Use autograd-wrapped functions for training support
-        # RoPE rotation (uses Triton kernel internally if available)
-        B_rot = RoPEFunc.apply(B_proj, theta, layer_idx)
-        
-        # SSM step (PyTorch for now - Triton SSM kernel needs work for proper backward)
-        H, out_flat = SSMStepFunc.apply(H, B_rot, X_r, decay)
+        H, out_flat = FusedRoPESSMFunc.apply(B_proj, theta, layer_idx, H, X_r, decay)
         
         out = F.silu(self.out_proj(out_flat))
         return H, out
-    
-    def _apply_rope_pytorch(self, x: torch.Tensor, theta: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        theta_k = theta * (layer_idx + 1)
-        theta_k = theta_k.unsqueeze(1)
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        cos = theta_k.cos()
-        sin = theta_k.sin()
-        out = torch.empty_like(x)
-        out[..., ::2] = x1 * cos - x2 * sin
-        out[..., 1::2] = x1 * sin + x2 * cos
-        return out
 
 
 class TritonScatterConv(nn.Module):

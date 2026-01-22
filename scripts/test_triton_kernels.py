@@ -196,7 +196,12 @@ def benchmark_triton_vs_pytorch(B, L, C, device):
         X_r = F.silu(self.to_X(x)).permute(0, 2, 1).contiguous()
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
-        B_rot = self._apply_rope_pytorch(B_proj, theta, layer_idx)
+        theta_k = theta * (layer_idx + 1)
+        theta_k = theta_k.unsqueeze(1)
+        cos, sin = theta_k.cos(), theta_k.sin()
+        B_rot = torch.empty_like(B_proj)
+        B_rot[..., ::2] = B_proj[..., ::2] * cos - B_proj[..., 1::2] * sin
+        B_rot[..., 1::2] = B_proj[..., ::2] * sin + B_proj[..., 1::2] * cos
         inject = B_rot * X_r.unsqueeze(-1)
         H = decay.unsqueeze(1) * H + inject
         out_flat = H.permute(0, 2, 1, 3).reshape(B, L, self.N * self.R)
