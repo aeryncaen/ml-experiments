@@ -63,8 +63,8 @@ if HAS_TRITON:
         
         head_start = pid_h * D
         
-        max_score = -float('inf')
-        sum_exp = 0.0
+        max_score = -1e9
+        sum_exp = 1e-8
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
         
         for s in range(S):
@@ -83,7 +83,7 @@ if HAS_TRITON:
             
             decay_factor = tl.exp(-rel_dist / tl.maximum(decay, 0.1))
             
-            score = tl.where(valid, score, -float('inf'))
+            score = tl.where(valid, score, -1e9)
             
             new_max = tl.maximum(max_score, score)
             exp_old = tl.exp(max_score - new_max)
@@ -93,7 +93,7 @@ if HAS_TRITON:
             sum_exp = sum_exp * exp_old + exp_new * decay_factor
             max_score = new_max
         
-        out = acc / (sum_exp + 1e-8)
+        out = acc / sum_exp
         
         out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
         tl.store(out_ptr + out_base + d_offsets, out, mask=d_mask)
