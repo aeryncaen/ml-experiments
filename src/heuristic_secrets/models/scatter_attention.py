@@ -357,7 +357,7 @@ class GatedMerge(nn.Module):
         nn.init.constant_(self.gate_proj.bias, 2.0)
     
     def forward(self, embed: torch.Tensor, processed: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.gate_proj(embed))
+        gate = torch.sigmoid(F.silu(self.gate_proj(embed)))
         return gate * embed + (1 - gate) * processed
 
 
@@ -567,7 +567,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn'):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -707,33 +707,33 @@ class HierarchicalLocalAttentionND(nn.Module):
         level0_flat = levels[0].reshape(B, L, C)
         
         level_means = torch.stack([lvl.reshape(B, -1, C).mean(dim=1) for lvl in levels], dim=1)
-        level_kv = self.level_kv(level_means)
+        level_kv = F.silu(self.level_kv(level_means))
         level_k, level_v = level_kv.chunk(2, dim=-1)
         
         ctx_scores = torch.einsum('bqc,bkc->bqk', self.level_query.expand(B, -1, -1), level_k) * self.level_scale
         ctx_weights = F.softmax(ctx_scores, dim=-1)
         ctx = torch.einsum('bqk,bkc->bqc', ctx_weights, level_v)
         
-        q = self.ctx_proj(ctx)
-        hidden_kv = self.hidden_kv(level0_flat)
+        q = F.silu(self.ctx_proj(ctx))
+        hidden_kv = F.silu(self.hidden_kv(level0_flat))
         hidden_k, hidden_v = hidden_kv.chunk(2, dim=-1)
         
         hidden_scores = torch.einsum('bqc,bkc->bqk', q, hidden_k) * self.level_scale
         hidden_weights = F.softmax(hidden_scores, dim=-1)
         update = torch.einsum('bqk,bkc->bqc', hidden_weights, hidden_v)
         
-        out = self.out_gate(level0_flat, self.out_proj(update))
+        out = self.out_gate(level0_flat, F.silu(self.out_proj(update)))
         return out.reshape(B, *spatial_shape, C)
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn'):
         super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn'):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
         self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
@@ -743,7 +743,7 @@ class HierarchicalLocalBlockND(nn.Module):
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn'):
         super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
