@@ -118,10 +118,10 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
+    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         self.attn_norm = RMSNorm(width)
         self.use_ssm = use_ssm
         if use_ssm:
@@ -1042,6 +1042,7 @@ def main():
     parser.add_argument('--conv-position', type=str, default='post', choices=['pre', 'post', 'both'], help='Where to run conv relative to attention (default: post)')
     parser.add_argument('--reduce-mode', type=str, default='cross_attn', choices=['conv', 'cross_attn'], help='Level reduction mode (default: cross_attn)')
     parser.add_argument('--merge-mode', type=str, default='gate', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: gate)')
+    parser.add_argument('--lowrank-hier', action='store_true', help='Use low-rank full attention instead of windowed attention at each hierarchy level')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     args = parser.parse_args()
 

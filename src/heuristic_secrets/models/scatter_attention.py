@@ -400,16 +400,58 @@ class LowRankAttentionMerge(nn.Module):
         if processed.shape[1] == 1 and L > 1:
             processed = processed.expand_as(embed)
         
-        q = self.q_proj(processed)
-        k = self.k_proj(embed)
-        v = self.v_proj(embed)
-        
         r = max(1, int(L ** 0.5))
-        k_down = F.adaptive_avg_pool1d(k.mT, r).mT
-        v_down = F.adaptive_avg_pool1d(v.mT, r).mT
+        embed_down = F.adaptive_avg_pool1d(embed.mT, r).mT
+        processed_down = F.adaptive_avg_pool1d(processed.mT, r).mT
         
-        out = F.scaled_dot_product_attention(q, k_down, v_down)
-        return processed + F.silu(self.out_proj(out))
+        q = self.q_proj(processed_down)
+        k = self.k_proj(embed_down)
+        v = self.v_proj(embed_down)
+        
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.silu(self.out_proj(out))
+        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
+        
+        return processed + out
+
+
+class LowRankAttentionND(nn.Module):
+    """Full attention with sqrt(L) rank reduction. Drop-in replacement for LocalAttentionND."""
+    
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ndim = ndim
+        self.num_channels = num_channels
+        self.channel_dim = embed_dim // num_channels
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = x.shape[1:-1]
+        B, C = x.shape[0], x.shape[-1]
+        L = 1
+        for s in spatial_shape:
+            L *= s
+        
+        x_flat = x.reshape(B, L, C)
+        r = max(1, int(L ** 0.5))
+        
+        x_down = F.adaptive_avg_pool1d(x_flat.mT, r).mT
+        
+        q = self.q_proj(x_down)
+        k = self.k_proj(x_down)
+        v = self.v_proj(x_down)
+        
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.silu(self.out_proj(out))
+        
+        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
+        
+        return out.reshape(B, *spatial_shape, C)
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
@@ -618,7 +660,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -630,6 +672,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.attn_residual = attn_residual
         self.reduce_mode = reduce_mode
         self.merge_mode = merge_mode
+        self.lowrank_hier = lowrank_hier
         
         if isinstance(window_size, int):
             window_size = (window_size,) * ndim
@@ -666,7 +709,8 @@ class HierarchicalLocalAttentionND(nn.Module):
             self.reduce_scale = embed_dim ** -0.5
             self.reduce_gate = merge_cls(embed_dim)
         
-        self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
+        attn_cls = LowRankAttentionND if lowrank_hier else LocalAttentionND
+        self.attn = attn_cls(embed_dim, window_size, ndim, num_channels)
         
         self.level_q = nn.Linear(embed_dim, embed_dim, bias=False)
         self.level_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
@@ -795,24 +839,24 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
 
 
 LocalKernelAttention = LocalAttention
