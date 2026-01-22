@@ -194,29 +194,18 @@ if HAS_TRITON:
     @triton.jit
     def _scatter_attn_bwd_kernel(
         grad_out_ptr,       # [B, L, H, D]
-        x_ptr,              # [B, L, C]
-        q_ptr,              # [B, L, H, pos_dim]
-        freq_ptr,           # [B, L, H]
-        phase_ptr,          # [B, L, H]
-        decay_ptr,          # [B, L, H]
-        key_weight_ptr,     # [pos_dim]
-        stride_grid_ptr,    # [S]
         attn_ptr,           # [B, L, H, S] - saved from forward
-        grad_x_ptr,         # [B, L, C]
-        grad_q_ptr,         # [B, L, H, pos_dim]
-        grad_freq_ptr,      # [B, L, H]
-        grad_phase_ptr,     # [B, L, H]
-        grad_decay_ptr,     # [B, L, H]
+        sample_idx_ptr,     # [B, L, H, S] - saved from forward
+        grad_x_ptr,         # [B, L, C] - output
         B: tl.constexpr,
         L: tl.constexpr,
         C: tl.constexpr,
         H: tl.constexpr,
         D: tl.constexpr,
         S: tl.constexpr,
-        pos_dim: tl.constexpr,
-        scale: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
+        """Fused backward kernel using saved sample_idx and attn weights."""
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
@@ -224,32 +213,29 @@ if HAS_TRITON:
         if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
             return
         
-        freq_offset = pid_b * L * H + pid_l * H + pid_h
-        freq = tl.load(freq_ptr + freq_offset)
-        phase = tl.load(phase_ptr + freq_offset)
-        decay = tl.load(decay_ptr + freq_offset)
-        
         d_offsets = tl.arange(0, BLOCK_D)
         d_mask = d_offsets < D
         head_start = pid_h * D
         
+        # Load grad_out for this position
         grad_out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
         grad_out = tl.load(grad_out_ptr + grad_out_base + d_offsets, mask=d_mask, other=0.0)
         
+        attn_base = pid_b * L * H * S + pid_l * H * S + pid_h * S
+        idx_base = pid_b * L * H * S + pid_l * H * S + pid_h * S
+        
+        # For each sample, scatter gradient to the source position
         for s in range(S):
-            offset = tl.load(stride_grid_ptr + s)
-            sample_pos = pid_l + offset * freq + phase
-            sample_idx = tl.minimum(tl.maximum(sample_pos.to(tl.int32), 0), L - 1)
-            valid = (sample_pos >= 0) & (sample_pos < L)
+            # Load saved attention weight and sample index
+            attn_weight = tl.load(attn_ptr + attn_base + s)
+            sample_idx = tl.load(sample_idx_ptr + idx_base + s)
             
-            attn_base = pid_b * L * H * S + pid_l * H * S + pid_h * S + s
-            attn_weight = tl.load(attn_ptr + attn_base)
-            attn_weight = tl.where(valid, attn_weight, 0.0)
-            
+            # grad_v = grad_out * attn_weight
             grad_v = grad_out * attn_weight
             
+            # Atomic add to grad_x at the sampled position
             x_base = pid_b * L * C + sample_idx * C + head_start
-            tl.atomic_add(grad_x_ptr + x_base + d_offsets, grad_v, mask=d_mask & valid)
+            tl.atomic_add(grad_x_ptr + x_base + d_offsets, grad_v, mask=d_mask)
 
 
 class ScatterAttentionFunc(Function):
@@ -282,15 +268,17 @@ class ScatterAttentionFunc(Function):
         attn, sample_idx = ctx.saved_tensors
         B, L, C, H, D, S = ctx.shapes
         
-        grad_output = grad_output.reshape(B, L, H, D)
+        grad_output = grad_output.reshape(B, L, H, D).contiguous()
         grad_x = torch.zeros(B, L, C, device=grad_output.device, dtype=grad_output.dtype)
         
-        for s in range(S):
-            idx_s = sample_idx[:, :, :, s].long()
-            attn_s = attn[:, :, :, s:s+1]
-            grad_v_s = (grad_output * attn_s).reshape(B, L, C)
-            idx_expanded = idx_s.unsqueeze(-1).expand(-1, -1, -1, D).reshape(B, L, C)
-            grad_x.scatter_add_(1, idx_expanded, grad_v_s)
+        BLOCK_D = triton.next_power_of_2(D)
+        grid = (B, L, H)
+        
+        _scatter_attn_bwd_kernel[grid](
+            grad_output, attn, sample_idx, grad_x,
+            B, L, C, H, D, S,
+            BLOCK_D=BLOCK_D,
+        )
         
         return grad_x, None, None, None, None, None, None, None
 
