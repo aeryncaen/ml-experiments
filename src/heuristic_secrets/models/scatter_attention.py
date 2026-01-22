@@ -599,7 +599,7 @@ class LocalAttentionND(nn.Module):
     
     rel_dist: torch.Tensor
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1, num_channels: int = 1, checkpoint: bool = True):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1, num_channels: int = 1, checkpoint: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -635,8 +635,6 @@ class LocalAttentionND(nn.Module):
         self.max_dist = rel_dist.max().item()
     
     def _unfold_nd(self, x: torch.Tensor) -> torch.Tensor:
-        # Asymmetric padding to handle even kernel sizes correctly
-        # Total pad = k-1, so after unfold we get original size back
         pad_dims = [0, 0]
         for k in reversed(self.kernel_size):
             pad_left = (k - 1) // 2
@@ -648,37 +646,7 @@ class LocalAttentionND(nn.Module):
             x = x.unfold(dim + 1, self.kernel_size[dim], 1)
         return x
     
-    def _attention_fn(self, x: torch.Tensor, q_flat: torch.Tensor, k: torch.Tensor, v: torch.Tensor, width: torch.Tensor, sharpness: torch.Tensor) -> torch.Tensor:
-        spatial_shape = x.shape[1:-1]
-        B = x.shape[0]
-        C = x.shape[-1]
-        L = q_flat.shape[1]
-        H = self.num_channels
-        D = self.channel_dim
-        
-        k_win = self._unfold_nd(k)
-        v_win = self._unfold_nd(v)
-        
-        perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
-        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
-        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
-        
-        width_flat = width.reshape(B, L, H, 1)
-        sharpness_flat = sharpness.reshape(B, L, H, 1)
-        
-        scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
-        
-        soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
-        scores = scores - (1 - soft_mask) * 1e4
-        
-        attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
-        
-        out = self.out_norm(out.reshape(*x.shape[:-1], C))
-        merged = self.v_gate(v, out)
-        return F.silu(self.out(merged))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         C = x.shape[-1]
@@ -703,11 +671,32 @@ class LocalAttentionND(nn.Module):
         width = width_raw.sigmoid() * self.max_dist + 0.5
         sharpness = sharpness_raw.sigmoid() * 9.5 + 0.5
         
+        k_win = self._unfold_nd(k)
+        v_win = self._unfold_nd(v)
+        
+        perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
+        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
+        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
+        
+        width_flat = width.reshape(B, L, H, 1)
+        sharpness_flat = sharpness.reshape(B, L, H, 1)
+        
+        scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
+        
+        soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
+        scores = scores - (1 - soft_mask) * 1e4
+        
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
+        
+        out = self.out_norm(out.reshape(*x.shape[:-1], C))
+        merged = self.v_gate(v, out)
+        return F.silu(self.out(merged))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.checkpoint and self.training:
-            return grad_checkpoint(  # type: ignore[return-value]
-                self._attention_fn, x, q_flat, k, v, width, sharpness, use_reentrant=False
-            )
-        return self._attention_fn(x, q_flat, k, v, width, sharpness)
+            return grad_checkpoint(self._forward_impl, x, use_reentrant=False)  # type: ignore[return-value]
+        return self._forward_impl(x)
 
 
 class LocalAttention(LocalAttentionND):

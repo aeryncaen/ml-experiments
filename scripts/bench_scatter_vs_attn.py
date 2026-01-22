@@ -948,56 +948,90 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         return train_loader, test_loader, n_classes, sl, None, 'audio'
 
     if name == 'mnist':
-        transform = transforms.Compose([
+        train_transform = transforms.Compose([
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
-        train_data = datasets.MNIST('data', train=True, download=True, transform=transform)
-        test_data = datasets.MNIST('data', train=False, download=True, transform=transform)
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        train_data = datasets.MNIST('data', train=True, download=True, transform=train_transform)
+        test_data = datasets.MNIST('data', train=False, download=True, transform=test_transform)
         n_classes, seq_len, img_size = 10, 784, (28, 28)
 
     elif name == 'fashion':
-        transform = transforms.Compose([
+        train_transform = transforms.Compose([
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
             transforms.ToTensor(),
             transforms.Normalize((0.2860,), (0.3530,))
         ])
-        train_data = datasets.FashionMNIST('data', train=True, download=True, transform=transform)
-        test_data = datasets.FashionMNIST('data', train=False, download=True, transform=transform)
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.2860,), (0.3530,))
+        ])
+        train_data = datasets.FashionMNIST('data', train=True, download=True, transform=train_transform)
+        test_data = datasets.FashionMNIST('data', train=False, download=True, transform=test_transform)
         n_classes, seq_len, img_size = 10, 784, (28, 28)
 
     elif name == 'cifar10':
         if mode_3d:
-            transform = transforms.Compose([
+            train_transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+            ])
+            test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
             ])
             n_classes, seq_len, img_size = 10, 3072, (32, 32, 3)
         else:
-            transform = transforms.Compose([
+            train_transform = transforms.Compose([
+                transforms.Grayscale(),
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4734,), (0.2516,))
+            ])
+            test_transform = transforms.Compose([
                 transforms.Grayscale(),
                 transforms.ToTensor(),
                 transforms.Normalize((0.4734,), (0.2516,))
             ])
             n_classes, seq_len, img_size = 10, 1024, (32, 32)
-        train_data = datasets.CIFAR10('data', train=True, download=True, transform=transform)
-        test_data = datasets.CIFAR10('data', train=False, download=True, transform=transform)
+        train_data = datasets.CIFAR10('data', train=True, download=True, transform=train_transform)
+        test_data = datasets.CIFAR10('data', train=False, download=True, transform=test_transform)
 
     elif name == 'cifar100':
         if mode_3d:
-            transform = transforms.Compose([
+            train_transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+            ])
+            test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
             ])
             n_classes, seq_len, img_size = 100, 3072, (32, 32, 3)
         else:
-            transform = transforms.Compose([
+            train_transform = transforms.Compose([
+                transforms.Grayscale(),
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4734,), (0.2516,))
+            ])
+            test_transform = transforms.Compose([
                 transforms.Grayscale(),
                 transforms.ToTensor(),
                 transforms.Normalize((0.4734,), (0.2516,))
             ])
             n_classes, seq_len, img_size = 100, 1024, (32, 32)
-        train_data = datasets.CIFAR100('data', train=True, download=True, transform=transform)
-        test_data = datasets.CIFAR100('data', train=False, download=True, transform=transform)
+        train_data = datasets.CIFAR100('data', train=True, download=True, transform=train_transform)
+        test_data = datasets.CIFAR100('data', train=False, download=True, transform=test_transform)
 
     else:
         raise ValueError(f'Unknown dataset: {name}. Available: {list(TASKS.keys()) + ["speech", "mnist", "fashion", "cifar10", "cifar100"]}')
@@ -1170,84 +1204,5 @@ def main():
             print(f'{mt:12s}: {mean_acc:.4f}')
 
 
-def benchmark_memory():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--width', type=int, default=64)
-    parser.add_argument('--batch', type=int, default=2)
-    parser.add_argument('--heads', type=int, default=4)
-    args = parser.parse_args()
-    
-    if not torch.cuda.is_available():
-        print("CUDA not available")
-        return
-    
-    device = torch.device(args.device)
-    
-    from heuristic_secrets.models.scatter_attention import LocalAttentionND, LowRankAttentionND
-    
-    seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    
-    print(f"\nSequence Length Scaling (forward pass time, peak memory):")
-    print("-" * 80)
-    print(f"{'L':>6} | {'Local (K=17)':>20} | {'LowRank':>20} | {'Full Attn':>20}")
-    print("-" * 80)
-    
-    for L in seq_lens:
-        results = {}
-        
-        for name, model_fn in [
-            ('local', lambda: LocalAttentionND(args.width, kernel_size=17, ndim=1, num_channels=args.heads, checkpoint=False)),
-            ('lowrank', lambda: LowRankAttentionND(args.width, window_size=17, ndim=1, num_channels=args.heads)),
-            ('full', lambda: SDPAttention(args.width, num_heads=args.heads, dropout=0.0)),
-        ]:
-            model = model_fn().to(device)
-            x = torch.randn(args.batch, L, args.width, device=device)
-            
-            torch.cuda.reset_peak_memory_stats(device)
-            torch.cuda.synchronize()
-            
-            for _ in range(3):
-                if name == 'full':
-                    _ = model(x)
-                else:
-                    _ = model(x)
-            torch.cuda.synchronize()
-            
-            torch.cuda.reset_peak_memory_stats(device)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            
-            start.record()
-            if name == 'full':
-                out = model(x)
-            else:
-                out = model(x)
-            end.record()
-            torch.cuda.synchronize()
-            
-            time_ms = start.elapsed_time(end)
-            peak_mb = torch.cuda.max_memory_allocated(device) / 1024 / 1024
-            
-            results[name] = (time_ms, peak_mb)
-            
-            del model, x, out
-            torch.cuda.empty_cache()
-        
-        local_t, local_m = results['local']
-        lr_t, lr_m = results['lowrank']
-        full_t, full_m = results['full']
-        
-        print(f"{L:>6} | {local_t:>7.2f}ms {local_m:>7.1f}MB | {lr_t:>7.2f}ms {lr_m:>7.1f}MB | {full_t:>7.2f}ms {full_m:>7.1f}MB")
-    
-    print("-" * 80)
-
-
 if __name__ == '__main__':
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == 'memory':
-        sys.argv.pop(1)
-        benchmark_memory()
-    else:
-        main()
+    main()

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from tqdm import tqdm
-from heuristic_secrets.models.scatter_attention import LocalAttention, RMSNorm
+from heuristic_secrets.models.scatter_attention import LocalAttention, LocalAttentionND, LowRankAttentionND, RMSNorm
 
 
 class FullAttention(nn.Module):
@@ -40,69 +40,105 @@ def sync_device(device):
         torch.cuda.synchronize()
 
 
-def benchmark(model, x, n_warmup=5, n_iters=20):
+def get_peak_memory_mb(device):
+    if device.type == 'cuda':
+        return torch.cuda.max_memory_allocated(device) / 1024 / 1024
+    elif device.type == 'mps':
+        return torch.mps.current_allocated_memory() / 1024 / 1024
+    return 0.0
+
+
+def reset_memory_stats(device):
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        torch.mps.empty_cache()
+
+
+def benchmark(model, x, n_warmup=5, n_iters=20, backward=False):
     device = x.device
     
     for _ in range(n_warmup):
-        _ = model(x)
+        out = model(x)
+        if backward:
+            out.sum().backward()
     sync_device(device)
+    
+    reset_memory_stats(device)
+    
+    if backward:
+        x = x.detach().requires_grad_(True)
     
     t0 = time.perf_counter()
     for _ in range(n_iters):
-        _ = model(x)
+        out = model(x)
+        if backward:
+            out.sum().backward()
+            if x.grad is not None:
+                x.grad = None
     sync_device(device)
-    fwd_time = (time.perf_counter() - t0) / n_iters * 1000
+    time_ms = (time.perf_counter() - t0) / n_iters * 1000
+    peak_mem = get_peak_memory_mb(device)
     
-    x_grad = x.detach().requires_grad_(True)
-    sync_device(device)
-    t0 = time.perf_counter()
-    for _ in range(n_iters):
-        out = model(x_grad)
-        out.sum().backward()
-        x_grad.grad = None
-    sync_device(device)
-    fwd_bwd_time = (time.perf_counter() - t0) / n_iters * 1000
-    
-    return fwd_time, fwd_bwd_time
+    return time_ms, peak_mem
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', action='store_true', help='Enable gradient checkpointing for LocalAttentionND')
+    args = parser.parse_args()
+    
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
-    print('=' * 80)
-    print('LOCAL ATTENTION vs FULL ATTENTION')
-    print('=' * 80)
+    print('=' * 100)
+    print(f'LOCAL ATTENTION vs LOWRANK vs FULL ATTENTION (checkpoint={args.checkpoint})')
+    print('=' * 100)
 
-    B = 16
+    B = 2
     C = 64
     K = 17
+    H = 4
 
-    local = LocalAttention(embed_dim=C, kernel_size=K).to(device)
-    full = FullAttention(embed_dim=C, num_heads=4).to(device)
+    local = LocalAttentionND(embed_dim=C, kernel_size=K, ndim=1, num_channels=H, checkpoint=args.checkpoint).to(device)
+    lowrank = LowRankAttentionND(embed_dim=C, window_size=K, ndim=1, num_channels=H).to(device)
+    full = FullAttention(embed_dim=C, num_heads=H).to(device)
 
-    print(f'Local (K={K}):      {count_params(local):>8,} params')
-    print(f'Full (H=4):         {count_params(full):>8,} params')
+    print(f'Local (K={K}):         {count_params(local):>8,} params')
+    print(f'LowRank (sqrt(L)):     {count_params(lowrank):>8,} params')
+    print(f'Full (H={H}):           {count_params(full):>8,} params')
     print()
 
-    print('Sequence Length Scaling:')
-    print('-' * 70)
-    print(f'{"L":>6} | {"Local":>12} | {"Full":>12} | {"Speedup":>10} | {"Complexity"}')
-    print('-' * 70)
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
-    seq_lengths = [128, 256, 512, 1024, 2048, 4096]
+    for mode, backward in [('Forward', False), ('Fwd+Bwd', True)]:
+        print(f'\n{mode} pass (time, peak memory):')
+        print('-' * 100)
+        print(f'{"L":>6} | {"Local":>20} | {"LowRank":>20} | {"Full":>20}')
+        print('-' * 100)
 
-    for L in tqdm(seq_lengths, desc="Benchmarking"):
-        x = torch.randn(B, L, C, device=device)
-        
-        try:
-            local_fwd, _ = benchmark(local, x, n_warmup=3, n_iters=10)
-            full_fwd, _ = benchmark(full, x, n_warmup=3, n_iters=10)
+        for L in tqdm(seq_lengths, desc=mode):
+            x = torch.randn(B, L, C, device=device)
+            results = {}
             
-            speedup = full_fwd / local_fwd
-            complexity = f'O({L}*{K}) vs O({L}^2)'
-            tqdm.write(f'{L:>6} | {local_fwd:>10.2f}ms | {full_fwd:>10.2f}ms | {speedup:>9.2f}x | {complexity}')
-        except Exception as e:
-            tqdm.write(f'{L:>6} | Error: {e}')
+            for name, model in [('local', local), ('lowrank', lowrank), ('full', full)]:
+                try:
+                    model.train()
+                    reset_memory_stats(device)
+                    time_ms, peak_mem = benchmark(model, x, n_warmup=3, n_iters=10, backward=backward)
+                    results[name] = (time_ms, peak_mem)
+                except Exception as e:
+                    results[name] = (float('inf'), float('inf'))
+                    tqdm.write(f'{name} failed at L={L}: {e}')
+            
+            local_t, local_m = results['local']
+            lr_t, lr_m = results['lowrank']
+            full_t, full_m = results['full']
+            
+            tqdm.write(f'{L:>6} | {local_t:>7.2f}ms {local_m:>7.1f}MB | {lr_t:>7.2f}ms {lr_m:>7.1f}MB | {full_t:>7.2f}ms {full_m:>7.1f}MB')
+
+        print('-' * 100)
 
 
 if __name__ == '__main__':
