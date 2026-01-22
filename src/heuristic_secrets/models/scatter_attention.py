@@ -546,6 +546,37 @@ class LowRankAttentionMergeND(nn.Module):
         out = interpolate_nd(out, spatial_shape)
         
         return processed + out
+    
+    def forward_accumulated(
+        self,
+        x_full: torch.Tensor,
+        accumulated: list[torch.Tensor],
+    ) -> torch.Tensor:
+        if len(accumulated) < 2:
+            return x_full
+        
+        spatial_shape = x_full.shape[1:-1]
+        B, C = x_full.shape[0], x_full.shape[-1]
+        
+        q_reduced = accumulated[-1]
+        reduced_shape = q_reduced.shape[1:-1]
+        r = 1
+        for s in reduced_shape:
+            r *= s
+        
+        kv_list = accumulated[:-1]
+        kv_cat = torch.cat([t.reshape(B, r, C) for t in kv_list], dim=1)
+        
+        q = F.silu(self.q_proj(q_reduced.reshape(B, r, C)))
+        k = F.silu(self.k_proj(kv_cat))
+        v = F.silu(self.v_proj(kv_cat))
+        
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.silu(self.out_proj(out))
+        out = out.reshape(B, *reduced_shape, C)
+        out = interpolate_nd(out, spatial_shape)
+        
+        return x_full + out
 
 
 class LowRankAttention(nn.Module):
@@ -1209,6 +1240,8 @@ class RippleLayerND(nn.Module):
         eps: float = 1e-6,
     ):
         super().__init__()
+        self.ndim = ndim
+        
         self.norm1 = RMSNorm(dim, eps)
         self.norm2 = RMSNorm(dim, eps)
         self.norm3 = RMSNorm(dim, eps)
@@ -1216,13 +1249,30 @@ class RippleLayerND(nn.Module):
         self.attn = SGSBAttentionND(dim, kernel_size, ndim, num_channels)
         self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, ssm_iterations, ndim)
         self.merge = LowRankAttentionMergeND(dim)
+        
+        self.accum_attn = LowRankAttentionMergeND(dim)
+        self.reduce_norm = RMSNorm(dim, eps)
+        self.downsample = SIRENDownsampleND(dim, ndim=ndim)
     
-    def forward(self, x: torch.Tensor, embed: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        embed: torch.Tensor,
+        accumulated: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(accumulated) > 1:
+            x = self.accum_attn.forward_accumulated(x, accumulated)
+        
         x = x + self.attn(self.norm1(x))
         x = x + self.ssm(self.norm2(x))
         x = x + self.attn(self.norm3(x))
         x = self.merge(embed, x)
-        return x
+        
+        spatial_shape = x.shape[1:-1]
+        target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
+        x_reduced = self.downsample(self.reduce_norm(x), target_shape)
+        
+        return x, x_reduced
 
 
 class RippleLayer(RippleLayerND):
@@ -1276,8 +1326,10 @@ class RippleModelND(nn.Module):
         embed = self.embed_norm(F.silu(self.embed(x)))
         
         x = embed
+        accumulated: list[torch.Tensor] = []
         for layer in self.layers:
-            x = layer(x, embed)
+            x, x_reduced = layer(x, embed, accumulated)
+            accumulated.append(x_reduced)
         
         x = self.out_norm(x)
         return self.head(x)
@@ -1336,8 +1388,10 @@ class RippleClassifierND(nn.Module):
         embed = self.embed_norm(F.silu(self.embed(x)))
         
         x = embed
+        accumulated: list[torch.Tensor] = []
         for layer in self.layers:
-            x = layer(x, embed)
+            x, x_reduced = layer(x, embed, accumulated)
+            accumulated.append(x_reduced)
         
         pool_dims = tuple(range(1, self.ndim + 1))
         x = self.out_norm(x).mean(dim=pool_dims)
