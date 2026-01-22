@@ -1144,6 +1144,7 @@ def main():
     parser.add_argument('--kernel-size', type=int, default=None, help='Kernel/window size for attention (default: 17 for 1D, 7 for 2D, 5 for 3D)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block after attention')
     parser.add_argument('--amp', action='store_true', help='Enable automatic mixed precision (fp16)')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile for kernel fusion')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
@@ -1265,6 +1266,9 @@ def main():
             # RippleClassifierND/FlatRippleClassifierND in 2D/3D mode expects spatial input, not flattened
             # In 1D mode, ripple/flat needs flattened 1D sequence input
             model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
+            
+            if args.compile:
+                model = torch.compile(model)
             
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
