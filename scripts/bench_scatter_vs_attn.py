@@ -1287,10 +1287,10 @@ def main():
                 
                 # Warmup
                 import time
-                print('Warming up 10 batches...')
+                print('Warming up 100 batches...')
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                for _ in range(10):
+                for _ in range(100):
                     optimizer.zero_grad()
                     logits = model(inputs)
                     loss = F.cross_entropy(logits, labels)
@@ -1298,7 +1298,7 @@ def main():
                     optimizer.step()
                 torch.cuda.synchronize()
                 t1 = time.perf_counter()
-                print(f'Warmup: {10/(t1-t0):.2f} batches/sec ({(t1-t0)/10*1000:.1f} ms/batch)')
+                print(f'Warmup: {100/(t1-t0):.2f} batches/sec ({(t1-t0)/100*1000:.1f} ms/batch)')
                 
                 # Profile
                 print('Profiling 1 batch...')
