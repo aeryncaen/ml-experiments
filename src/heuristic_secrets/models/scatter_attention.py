@@ -18,6 +18,39 @@ if TYPE_CHECKING:
     from .backbone import AdaptiveDeformConv1d
 
 
+def avg_pool_nd(x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+    """Average pool spatial dimensions to target shape. Input: (B, *spatial, C)."""
+    spatial = x.shape[1:-1]
+    ndim = len(spatial)
+    
+    if spatial == target_shape:
+        return x
+    
+    x = x.movedim(-1, 1)
+    
+    kernel_size = tuple(max(1, s // t) for s, t in zip(spatial, target_shape))
+    stride = kernel_size
+    
+    pool_fn = [F.avg_pool1d, F.avg_pool2d, F.avg_pool3d][ndim - 1]
+    x = pool_fn(x, kernel_size, stride)
+    
+    current = x.shape[2:]
+    if current != target_shape:
+        mode = ['linear', 'bilinear', 'trilinear'][ndim - 1]
+        x = F.interpolate(x, size=target_shape, mode=mode, align_corners=False)
+    
+    return x.movedim(1, -1)
+
+
+def interpolate_nd(x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+    """Interpolate spatial dimensions to target shape. Input: (B, *spatial, C)."""
+    ndim = len(x.shape) - 2
+    x = x.movedim(-1, 1)
+    mode = ['linear', 'bilinear', 'trilinear'][ndim - 1]
+    x = F.interpolate(x, size=target_shape, mode=mode, align_corners=False)
+    return x.movedim(1, -1)
+
+
 class KernelNetND(nn.Module):
     def __init__(self, ndim: int, out_channels: int, hidden: int = 32, layers: int = 3, omega_0: float = 30.0):
         super().__init__()
@@ -402,8 +435,8 @@ class LowRankAttentionMerge(nn.Module):
             processed = processed.expand_as(embed)
         
         r = max(1, int(L ** 0.5))
-        embed_down = F.adaptive_avg_pool1d(embed.mT, r).mT
-        processed_down = F.adaptive_avg_pool1d(processed.mT, r).mT
+        embed_down = avg_pool_nd(embed, (r,))
+        processed_down = avg_pool_nd(processed, (r,))
         
         q = self.q_proj(processed_down)
         k = self.k_proj(embed_down)
@@ -411,7 +444,7 @@ class LowRankAttentionMerge(nn.Module):
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
-        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
+        out = interpolate_nd(out, (L,))
         
         return processed + out
 
@@ -431,7 +464,7 @@ class LowRankAttention(nn.Module):
         B, L, C = x.shape
         r = max(1, int(L ** 0.5))
         
-        x_down = F.adaptive_avg_pool1d(x.mT, r).mT
+        x_down = avg_pool_nd(x, (r,))
         
         q = self.q_proj(x_down)
         k = self.k_proj(x_down)
@@ -440,7 +473,7 @@ class LowRankAttention(nn.Module):
         lowrank_out = F.scaled_dot_product_attention(q, k, v)
         lowrank_out = F.silu(self.out_proj(lowrank_out))
         
-        full_out = F.interpolate(lowrank_out.mT, size=L, mode='linear', align_corners=False).mT
+        full_out = interpolate_nd(lowrank_out, (L,))
         
         return full_out, lowrank_out
 
@@ -456,9 +489,9 @@ class LowRankCollapseMerge(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
     
     def forward(self, finer: torch.Tensor, coarser: torch.Tensor) -> torch.Tensor:
-        r_fine = finer.shape[1]
+        target_shape = finer.shape[1:-1]
         
-        coarser_up = F.interpolate(coarser.mT, size=r_fine, mode='linear', align_corners=False).mT
+        coarser_up = interpolate_nd(coarser, target_shape)
         
         q = self.q_proj(coarser_up)
         k = self.k_proj(finer)
@@ -471,7 +504,7 @@ class LowRankCollapseMerge(nn.Module):
 
 
 class LowRankAttentionND(nn.Module):
-    """Full attention with sqrt(L) rank reduction. Drop-in replacement for LocalAttentionND."""
+    """Full attention with sqrt per-dim reduction. Drop-in replacement for LocalAttentionND."""
     
     def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1):
         super().__init__()
@@ -488,24 +521,27 @@ class LowRankAttentionND(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B, C = x.shape[0], x.shape[-1]
-        L = 1
-        for s in spatial_shape:
-            L *= s
         
-        x_flat = x.reshape(B, L, C)
-        r = max(1, int(L ** 0.5))
+        target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
         
-        x_down = F.adaptive_avg_pool1d(x_flat.mT, r).mT
+        x_down = avg_pool_nd(x, target_shape)
         
-        q = self.q_proj(x_down)
-        k = self.k_proj(x_down)
-        v = self.v_proj(x_down)
+        r = 1
+        for t in target_shape:
+            r *= t
+        x_flat = x_down.reshape(B, r, C)
+        
+        q = self.q_proj(x_flat)
+        k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
-        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
         
-        return out.reshape(B, *spatial_shape, C)
+        out = out.reshape(B, *target_shape, C)
+        out = interpolate_nd(out, spatial_shape)
+        
+        return out
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
