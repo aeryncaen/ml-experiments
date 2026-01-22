@@ -386,6 +386,37 @@ class LearnedMerge(nn.Module):
         return F.silu(self.out_proj(out))
 
 
+class LowRankAttentionMerge(nn.Module):
+    
+    def __init__(self, dim: int, rank: int = 32):
+        super().__init__()
+        self.rank = rank
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.gate_proj = nn.Linear(dim, 1)
+    
+    def forward(self, embed: torch.Tensor, processed: torch.Tensor) -> torch.Tensor:
+        B, L, C = embed.shape
+        if processed.shape[1] == 1 and L > 1:
+            processed = processed.expand_as(embed)
+        
+        q = self.q_proj(processed)
+        k = self.k_proj(embed)
+        v = self.v_proj(embed)
+        
+        r = min(self.rank, L)
+        k_down = F.adaptive_avg_pool1d(k.mT, r).mT
+        v_down = F.adaptive_avg_pool1d(v.mT, r).mT
+        
+        out = F.scaled_dot_product_attention(q, k_down, v_down)
+        out = self.out_proj(out)
+        
+        gate = torch.sigmoid(self.gate_proj(embed))
+        return gate * embed + (1 - gate) * out
+
+
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
     """Apply rotary position embedding.
     
@@ -611,7 +642,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
         
-        merge_cls = GatedMerge if merge_mode == 'gate' else LearnedMerge
+        merge_cls = {'gate': GatedMerge, 'learned': LearnedMerge, 'lowrank': LowRankAttentionMerge}[merge_mode]
         
         if conv_position in ('pre', 'post'):
             self.conv = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=window_size[0], num_channels=num_channels)
