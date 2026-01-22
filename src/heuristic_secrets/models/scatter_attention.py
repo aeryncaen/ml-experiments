@@ -708,13 +708,14 @@ class LocalAttentionND(nn.Module):
     
     rel_dist: torch.Tensor
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1, num_channels: int = 1, checkpoint: bool = False):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 7, ndim: int = 1, num_channels: int = 1, checkpoint: bool = False, chunk_size: int = 2048):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
         self.num_channels = num_channels
         self.channel_dim = embed_dim // num_channels
         self.checkpoint = checkpoint
+        self.chunk_size = chunk_size
         
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size,) * ndim
@@ -755,6 +756,31 @@ class LocalAttentionND(nn.Module):
             x = x.unfold(dim + 1, self.kernel_size[dim], 1)
         return x
     
+    def _forward_chunk_1d(self, q_chunk: torch.Tensor, k_padded: torch.Tensor, v_padded: torch.Tensor,
+                          width_chunk: torch.Tensor, sharpness_chunk: torch.Tensor,
+                          chunk_start: int) -> torch.Tensor:
+        B, chunk_len, H, D = q_chunk.shape
+        C = H * D
+        K = self.kernel_size[0]
+        
+        k_win = k_padded[:, chunk_start:chunk_start + chunk_len + K - 1].unfold(1, K, 1)
+        v_win = v_padded[:, chunk_start:chunk_start + chunk_len + K - 1].unfold(1, K, 1)
+        
+        k_win = k_win.reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
+        v_win = v_win.reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
+        
+        width_flat = width_chunk.reshape(B, chunk_len, H, 1)
+        sharpness_flat = sharpness_chunk.reshape(B, chunk_len, H, 1)
+        
+        scores = torch.einsum('blhd,blhdw->blhw', q_chunk, k_win) * self.scale
+        
+        soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
+        scores = scores - (1 - soft_mask) * 1e4
+        
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, chunk_len, C)
+        return out
+    
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
@@ -780,23 +806,46 @@ class LocalAttentionND(nn.Module):
         width = width_raw.sigmoid() * self.max_dist + 0.5
         sharpness = sharpness_raw.sigmoid() * 9.5 + 0.5
         
-        k_win = self._unfold_nd(k)
-        v_win = self._unfold_nd(v)
-        
-        perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
-        k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
-        v_win = v_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
-        
-        width_flat = width.reshape(B, L, H, 1)
-        sharpness_flat = sharpness.reshape(B, L, H, 1)
-        
-        scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
-        
-        soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
-        scores = scores - (1 - soft_mask) * 1e4
-        
-        attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
+        if self.ndim == 1 and L > self.chunk_size:
+            K = self.kernel_size[0]
+            pad_left = (K - 1) // 2
+            pad_right = K // 2
+            k_padded = F.pad(k.reshape(B, L, C), (0, 0, pad_left, pad_right))
+            v_padded = F.pad(v.reshape(B, L, C), (0, 0, pad_left, pad_right))
+            
+            width_flat = width.reshape(B, L, H)
+            sharpness_flat = sharpness.reshape(B, L, H)
+            
+            outputs = []
+            for start in range(0, L, self.chunk_size):
+                end = min(start + self.chunk_size, L)
+                chunk_out = self._forward_chunk_1d(
+                    q_flat[:, start:end],
+                    k_padded, v_padded,
+                    width_flat[:, start:end],
+                    sharpness_flat[:, start:end],
+                    start
+                )
+                outputs.append(chunk_out)
+            out = torch.cat(outputs, dim=1)
+        else:
+            k_win = self._unfold_nd(k)
+            v_win = self._unfold_nd(v)
+            
+            perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
+            k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
+            v_win = v_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
+            
+            width_flat = width.reshape(B, L, H, 1)
+            sharpness_flat = sharpness.reshape(B, L, H, 1)
+            
+            scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
+            
+            soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
+            scores = scores - (1 - soft_mask) * 1e4
+            
+            attn = F.softmax(scores, dim=-1)
+            out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
         
         out = self.out_norm(out.reshape(*x.shape[:-1], C))
         merged = self.v_gate(v, out)
