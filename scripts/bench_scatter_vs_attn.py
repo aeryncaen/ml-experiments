@@ -482,6 +482,9 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
         
         if flatten and task_type == 'classification':
             inputs = inputs.view(inputs.size(0), -1)
+        elif not flatten and task_type == 'classification' and inputs.dim() == 4:
+            # For ND models: squeeze channel dim (B, 1, H, W) -> (B, H, W)
+            inputs = inputs.squeeze(1)
         
         optimizer.zero_grad()
         
@@ -563,6 +566,9 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
 
         if flatten and task_type == 'classification':
             inputs = inputs.view(inputs.size(0), -1)
+        elif not flatten and task_type == 'classification' and inputs.dim() == 4:
+            # For ND models: squeeze channel dim (B, 1, H, W) -> (B, H, W)
+            inputs = inputs.squeeze(1)
 
         optimizer.zero_grad()
         logits = model(inputs)
@@ -671,6 +677,9 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
 
         if flatten and task_type == 'classification':
             inputs = inputs.view(inputs.size(0), -1)
+        elif not flatten and task_type == 'classification' and inputs.dim() == 4:
+            # For ND models: squeeze channel dim (B, 1, H, W) -> (B, H, W)
+            inputs = inputs.squeeze(1)
 
         logits = model(inputs)
 
@@ -1227,13 +1236,16 @@ def main():
                 model = builder(mt)
                 print(f'\nTraining {mt}...')
             
+            # RippleClassifierND expects spatial input (B, H, W), not flattened
+            model_flatten = flatten and mt != 'ripple'
+            
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
                 cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
                 swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                 hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=flatten, task_type=task_type
+                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type
             )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')

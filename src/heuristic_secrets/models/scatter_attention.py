@@ -1138,14 +1138,14 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_decay = nn.Linear(dim, state_dim)
         self.to_theta = nn.Linear(dim, state_dim // 2)
         
-        self.diffuse = nn.ModuleList([
-            AdaptiveConvND(state_dim, ndim=ndim)
-            for _ in range(mimo_rank)
-        ])
+        # Single diffuse module - all R ranks batched together
+        self.diffuse = AdaptiveConvND(state_dim, ndim=ndim)
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
         
     def _apply_rotation(self, H: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        # H: (B*R, *spatial, N) or (B, *spatial, N, R)
+        # theta: (B, *spatial, N//2)
         H1, H2 = H[..., ::2, :], H[..., 1::2, :]
         cos = theta.cos().unsqueeze(-1)
         sin = theta.sin().unsqueeze(-1)
@@ -1165,14 +1165,22 @@ class MIMOJacobiSSM_ND(nn.Module):
         
         H = inject.clone()
         
+        ndim = len(spatial_shape)
+        # Permute indices: (B, *spatial, N, R) -> (B, R, *spatial, N)
+        batch_perm = (0, ndim + 2) + tuple(range(1, ndim + 2))
+        # Permute indices: (B, R, *spatial, N) -> (B, *spatial, N, R)
+        unbatch_perm = (0,) + tuple(range(2, ndim + 2)) + (ndim + 2, 1)
+        
         for _ in range(self.K):
             H = self._apply_rotation(H, theta)
             
-            H_out = []
-            for r in range(self.R):
-                H_r, _ = self.diffuse[r](H[..., r])
-                H_out.append(H_r)
-            H = torch.stack(H_out, dim=-1)
+            # (B, *spatial, N, R) -> (B, R, *spatial, N) -> (B*R, *spatial, N)
+            H = H.permute(*batch_perm).reshape(B * self.R, *spatial_shape, self.N)
+            
+            H, _ = self.diffuse(H)
+            
+            # (B*R, *spatial, N) -> (B, R, *spatial, N) -> (B, *spatial, N, R)
+            H = H.reshape(B, self.R, *spatial_shape, self.N).permute(*unbatch_perm)
             
             H = decay.unsqueeze(-1) * H + inject
         
