@@ -118,10 +118,10 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate', lowrank_hier: bool = False):
+    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
+        self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         self.attn_norm = RMSNorm(width)
         self.use_ssm = use_ssm
         if use_ssm:
@@ -225,10 +225,10 @@ class LocalBlock2D(nn.Module):
 
 
 class HierarchicalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         self.attn_norm = RMSNorm(width)
         self.use_ssm = use_ssm
         if use_ssm:
@@ -395,10 +395,10 @@ class LocalBlock3D(nn.Module):
 
 
 class HierarchicalBlock3D(nn.Module):
-    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, dropout: float = 0.1, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'cross_attn', merge_mode: str = 'gate'):
+    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, dropout: float = 0.1, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1), conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1), conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         self.attn_norm = RMSNorm(width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -807,7 +807,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='post', attn_residual=True, reduce_mode='cross_attn', merge_mode='gate'):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
@@ -816,7 +816,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17)
@@ -829,7 +829,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, reduce_mode='cross_attn', merge_mode='gate'):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
@@ -842,7 +842,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         block_fn = lambda: LocalBlock2D(WIDTH_LOCAL, kernel_size=7, num_channels=num_channels, use_ssm=use_ssm)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        block_fn = lambda: HierarchicalBlock2D(WIDTH_HIER, kernel_size=7, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=7)
@@ -855,7 +855,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     return model.to(device)
 
 
-def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='post', attn_residual=True, reduce_mode='cross_attn', merge_mode='gate'):
+def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
     WIDTH_HIER = 48
@@ -868,7 +868,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
         block_fn = lambda: LocalBlock3D(WIDTH_LOCAL, kernel_size=5, num_channels=num_channels)
         width = WIDTH_LOCAL
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, num_channels=num_channels, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        block_fn = lambda: HierarchicalBlock3D(WIDTH_HIER, window_size=5, num_channels=num_channels, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock3D(WIDTH_CONV, kernel_size=5)
@@ -881,7 +881,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, reduce_mode='cross_attn', merge_mode='gate'):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_CONV = 140
@@ -890,7 +890,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17)
@@ -903,7 +903,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, reduce_mode='cross_attn', merge_mode='gate'):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
@@ -912,7 +912,7 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
         width = WIDTH_ATTN
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode, merge_mode=merge_mode)
+        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=17, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
         width = WIDTH_HIER
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=17)
@@ -1040,9 +1040,8 @@ def main():
     parser.add_argument('--duo', action='store_true', help='Duo mode: train two models with inverse curriculum (uses --hard-start/--hard-end), merge at inference')
     parser.add_argument('--duo-merge', type=str, default='mean', choices=DuoModel.MERGE_STRATEGIES, help='Duo merge strategy (default: mean)')
     parser.add_argument('--conv-position', type=str, default='post', choices=['pre', 'post', 'both'], help='Where to run conv relative to attention (default: post)')
-    parser.add_argument('--reduce-mode', type=str, default='cross_attn', choices=['conv', 'cross_attn'], help='Level reduction mode (default: cross_attn)')
-    parser.add_argument('--merge-mode', type=str, default='gate', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: gate)')
-    parser.add_argument('--lowrank-hier', action='store_true', help='Use low-rank full attention instead of windowed attention at each hierarchy level')
+    parser.add_argument('--merge-mode', type=str, default='lowrank', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: lowrank)')
+    parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     args = parser.parse_args()
 
@@ -1077,35 +1076,35 @@ def main():
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.reduce_mode, args.merge_mode)
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.reduce_mode, args.merge_mode)
+        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
         print(f'Task type: Audio Classification')
     elif args.mode_3d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.reduce_mode, args.merge_mode)
+        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'vol_size={img_size}'
         flatten = False
         print(f'Task type: 3D Classification (SSM not supported)')
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'local', 'hier', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.reduce_mode, args.merge_mode)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
         all_model_types = ['attention', 'hier', 'conv']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.reduce_mode, args.merge_mode)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
