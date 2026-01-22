@@ -745,7 +745,6 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     in_swa_phase = False
     
     current_loader = train_loader
-    train_dataset = train_loader.dataset
     batch_size = train_loader.batch_size
 
     # Compute epoch-level cosine schedule for hard mining %
