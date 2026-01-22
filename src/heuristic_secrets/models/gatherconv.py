@@ -159,18 +159,19 @@ class GatherConvND(nn.Module):
         output = torch.zeros(B, chunk_len, C, device=x_flat.device, dtype=x_flat.dtype)
         
         for h in range(H):
-            x_head = x_flat[..., h * D : (h + 1) * D]
-            values_h = x_head[batch_idx, sample_idx]
-            
             km_h = kernel_max[:, :, h, :]
             k_floor_h = km_h.gather(-1, idx_floor)
             k_ceil_h = km_h.gather(-1, idx_ceil)
             kernel_h = k_floor_h * w_floor + k_ceil_h * w_ceil
-            
             kernel_h = kernel_h * valid_mask_f
             kernel_h = kernel_h / (kernel_h.sum(dim=-1, keepdim=True) + 1e-8)
             
-            output[:, :, h * D : (h + 1) * D] = torch.einsum('bls,blsd->bld', kernel_h, values_h)
+            x_head = x_flat[..., h * D : (h + 1) * D]
+            out_h = output[:, :, h * D : (h + 1) * D]
+            
+            for s in range(S):
+                val_s = x_head[batch_idx[:, :, s], sample_idx[:, :, s]]
+                out_h.addcmul_(kernel_h[:, :, s : s + 1], val_s)
         
         return output
     
