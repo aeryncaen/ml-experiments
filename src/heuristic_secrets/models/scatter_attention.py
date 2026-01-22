@@ -225,7 +225,7 @@ class AdaptiveConvND(nn.Module):
         valid_mask = valid_mask.unsqueeze(2).expand(B, chunk_len, H, S)
         
         rel_dist = (self.stride_grid.norm(dim=-1).view(1, 1, 1, S) * freq.unsqueeze(-1)).abs()
-        keys = self.key_proj(rel_dist.unsqueeze(-1))
+        keys = F.silu(self.key_proj(rel_dist.unsqueeze(-1)))
         
         attn_logits = torch.einsum('blhd,blhsd->blhs', queries, keys) * self.scale
         
@@ -260,7 +260,7 @@ class AdaptiveConvND(nn.Module):
                 outputs.append(chunk_out)
             output = torch.cat(outputs, dim=1)
         
-        output = self.out_proj(output).reshape(B, *spatial, C)
+        output = F.silu(self.out_proj(output)).reshape(B, *spatial, C)
         
         return output, {}
 
@@ -533,9 +533,9 @@ class LowRankAttention(nn.Module):
         
         x_down = self.downsample(x, (r,))
         
-        q = self.q_proj(x_down)
-        k = self.k_proj(x_down)
-        v = self.v_proj(x_down)
+        q = F.silu(self.q_proj(x_down))
+        k = F.silu(self.k_proj(x_down))
+        v = F.silu(self.v_proj(x_down))
         
         lowrank_out = F.scaled_dot_product_attention(q, k, v)
         lowrank_out = F.silu(self.out_proj(lowrank_out))
@@ -599,9 +599,9 @@ class LowRankAttentionND(nn.Module):
             r *= t
         x_flat = x_down.reshape(B, r, C)
         
-        q = self.q_proj(x_flat)
-        k = self.k_proj(x_flat)
-        v = self.v_proj(x_flat)
+        q = F.silu(self.q_proj(x_flat))
+        k = F.silu(self.k_proj(x_flat))
+        v = F.silu(self.v_proj(x_flat))
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
@@ -928,7 +928,7 @@ class SGSBAttentionND(nn.Module):
         broadcast_out, _ = self.broadcast(h_flat)
         h = h + self.broadcast_norm(broadcast_out).reshape(B, *spatial_shape, C)
         
-        return self.out_proj(h)
+        return F.silu(self.out_proj(h))
 
 
 class SGSBAttention(SGSBAttentionND):
