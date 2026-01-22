@@ -1075,35 +1075,35 @@ def main():
     
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
-        all_model_types = ['attention', 'hier', 'conv']
+        all_model_types = ['attention', 'conv']
         builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
-        all_model_types = ['attention', 'hier', 'conv']
+        all_model_types = ['attention', 'conv']
         builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
         print(f'Task type: Audio Classification')
     elif args.mode_3d:
         n_classes = n_classes_or_vocab
-        all_model_types = ['attention', 'local', 'hier', 'conv']
+        all_model_types = ['attention', 'local', 'conv']
         builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'vol_size={img_size}'
         flatten = False
         print(f'Task type: 3D Classification (SSM not supported)')
     elif args.mode_2d:
         n_classes = n_classes_or_vocab
-        all_model_types = ['attention', 'local', 'hier', 'conv']
+        all_model_types = ['attention', 'local', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
-        all_model_types = ['attention', 'hier', 'conv']
+        all_model_types = ['attention', 'conv']
         builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier)
         shape_str = f'seq_len={seq_len}'
         flatten = True
