@@ -201,15 +201,18 @@ if __name__ == "__main__":
     import time
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    B, L, C = 4, 8192, 256
+    B, C = 4, 256
     num_heads = 8
     max_samples = 32
-    warmup_iters = 10
-    bench_iters = 50
+    warmup_iters = 5
+    bench_iters = 20
+    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384]
     
     print(f"Device: {device}")
-    print(f"Shape: ({B}, {L}, {C}), heads={num_heads}, max_samples={max_samples}")
-    print("-" * 60)
+    print(f"Batch={B}, Channels={C}, Heads={num_heads}, MaxSamples={max_samples}")
+    print("-" * 70)
+    print(f"{'SeqLen':>8} | {'Fwd (ms)':>10} | {'Fwd+Bwd (ms)':>12} | {'Fwd Mem':>10} | {'F+B Mem':>10}")
+    print("-" * 70)
     
     conv = GatherConvND(
         channels=C,
@@ -218,63 +221,76 @@ if __name__ == "__main__":
         num_heads=num_heads,
     ).to(device)
     
-    x = torch.randn(B, L, C, device=device)
+    for L in seq_lengths:
+        try:
+            x = torch.randn(B, L, C, device=device)
+            
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+            
+            for _ in range(warmup_iters):
+                out, _ = conv(x)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+            
+            start = time.perf_counter()
+            for _ in range(bench_iters):
+                out, _ = conv(x)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            fwd_time = (time.perf_counter() - start) / bench_iters * 1000
+            
+            fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
+            
+            del x
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            
+            x_grad = torch.randn(B, L, C, device=device, requires_grad=True)
+            
+            for _ in range(warmup_iters):
+                out, _ = conv(x_grad)
+                loss = out.sum()
+                loss.backward()
+                conv.zero_grad()
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+            
+            start = time.perf_counter()
+            for _ in range(bench_iters):
+                out, _ = conv(x_grad)
+                loss = out.sum()
+                loss.backward()
+                conv.zero_grad()
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            fwd_bwd_time = (time.perf_counter() - start) / bench_iters * 1000
+            
+            fwd_bwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
+            
+            del x_grad
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            
+            print(f"{L:>8} | {fwd_time:>10.2f} | {fwd_bwd_time:>12.2f} | {fwd_mem:>8.1f} MB | {fwd_bwd_mem:>8.1f} MB")
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"{L:>8} | {'OOM':>10} | {'OOM':>12} | {'OOM':>10} | {'OOM':>10}")
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                raise
     
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-    
-    for _ in range(warmup_iters):
-        out, _ = conv(x)
-        if device == "cuda":
-            torch.cuda.synchronize()
-    
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-    
-    start = time.perf_counter()
-    for _ in range(bench_iters):
-        out, _ = conv(x)
-        if device == "cuda":
-            torch.cuda.synchronize()
-    fwd_time = (time.perf_counter() - start) / bench_iters * 1000
-    
-    if device == "cuda":
-        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2
-        torch.cuda.reset_peak_memory_stats()
-    else:
-        fwd_mem = 0
-    
-    x_grad = torch.randn(B, L, C, device=device, requires_grad=True)
-    
-    for _ in range(warmup_iters):
-        out, _ = conv(x_grad)
-        loss = out.sum()
-        loss.backward()
-        if device == "cuda":
-            torch.cuda.synchronize()
-    
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-    
-    start = time.perf_counter()
-    for _ in range(bench_iters):
-        out, _ = conv(x_grad)
-        loss = out.sum()
-        loss.backward()
-        if device == "cuda":
-            torch.cuda.synchronize()
-    fwd_bwd_time = (time.perf_counter() - start) / bench_iters * 1000
-    
-    if device == "cuda":
-        fwd_bwd_mem = torch.cuda.max_memory_allocated() / 1024**2
-    else:
-        fwd_bwd_mem = 0
-    
-    params = sum(p.numel() for p in conv.parameters())
-    
-    print(f"Parameters: {params:,}")
-    print(f"Forward:     {fwd_time:.2f} ms | {fwd_mem:.1f} MB peak")
-    print(f"Fwd+Bwd:     {fwd_bwd_time:.2f} ms | {fwd_bwd_mem:.1f} MB peak")
+    print("-" * 70)
+    print(f"Parameters: {sum(p.numel() for p in conv.parameters()):,}")
