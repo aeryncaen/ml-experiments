@@ -33,45 +33,41 @@ class KernelNetND(nn.Module):
 
 class AdaptiveConvND(nn.Module):
     """
-    N-dimensional adaptive convolution with per-position learned kernel weights.
+    Learned stride convolution: samples full sequence at learned frequency intervals.
     
-    - Per-position kernel weights from content projection
-    - Per-position deformation offsets via grid_sample
-    - Width/sharpness soft-mask controls effective receptive field
-    - Depthwise (per-head) with SE block for channel mixing
+    For each position, samples at: center, center±freq, center±2*freq, ...
+    across the entire sequence. Decay weights distant samples, output normalized
+    by valid sample count.
     """
     
-    rel_pos: torch.Tensor
-    rel_dist: torch.Tensor
+    stride_grid: torch.Tensor
     
     def __init__(
         self,
         channels: int,
         ndim: int = 1,
-        max_kernel_size: int = 7,
+        max_samples: int = 32,
         num_channels: int = 1,
+        max_freq: float = 16.0,
+        min_freq: float = 1.0,
     ):
         super().__init__()
         self.channels = channels
         self.ndim = ndim
-        self.max_kernel_size = max_kernel_size
+        self.max_samples = max_samples
         self.num_channels = num_channels
         self.channel_dim = channels // num_channels
-        
-        self.half_k = max_kernel_size // 2
-        self.kernel_numel = max_kernel_size ** ndim
-        K = self.kernel_numel
         H = num_channels
         
-        self.max_freq = 8.0
-        self.min_freq = 0.25
+        self.max_freq = max_freq
+        self.min_freq = min_freq
         
-        self.wave_proj = nn.Linear(channels, 3 * H)  # freq, phase, decay per head
+        self.wave_proj = nn.Linear(channels, 3 * H)
         
         pos_dim = 16
         self.pos_dim = pos_dim
         self.query_proj = nn.Linear(channels, H * pos_dim)
-        self.key_proj = nn.Linear(ndim, pos_dim, bias=False)
+        self.key_proj = nn.Linear(1, pos_dim, bias=False)
         self.scale = pos_dim ** -0.5
         
         self.out_proj = nn.Linear(channels, channels, bias=False)
@@ -79,122 +75,86 @@ class AdaptiveConvND(nn.Module):
         self.se_fc1 = nn.Linear(channels, channels // 4)
         self.se_fc2 = nn.Linear(channels // 4, channels)
         
-        rel_coords = [torch.arange(max_kernel_size).float() - self.half_k for _ in range(ndim)]
-        grids = torch.meshgrid(*rel_coords, indexing='ij')
-        rel_pos = torch.stack([g.flatten() for g in grids], dim=-1)  # (K, ndim)
-        self.register_buffer('rel_pos', rel_pos)
-        self.register_buffer('rel_dist', rel_pos.norm(dim=-1))
+        samples_per_dim = max(3, int(max_samples ** (1.0 / ndim)))
+        half_s = samples_per_dim // 2
+        offsets_1d = torch.arange(-half_s, half_s + 1).float()
+        
+        if ndim == 1:
+            stride_grid = offsets_1d.unsqueeze(-1)
+        else:
+            grids = torch.meshgrid(*[offsets_1d] * ndim, indexing='ij')
+            stride_grid = torch.stack([g.flatten() for g in grids], dim=-1)
+        
+        self.register_buffer('stride_grid', stride_grid)
+        self.num_samples = stride_grid.shape[0]
         
         nn.init.zeros_(self.wave_proj.weight)
         nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
-    
-    def _gather_window(self, x: torch.Tensor, freq: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        spatial = x.shape[1:-1]
-        C = x.shape[-1]
-        H = self.num_channels
-        D = self.channel_dim
-        K = self.kernel_numel
-        L = reduce(mul, spatial, 1)
-        
-        freq_avg = freq.mean(dim=2)
-        phase_avg = phase.mean(dim=2)
-        
-        if self.ndim == 1:
-            x_t = x.reshape(B, L, C).permute(0, 2, 1)
-            centers = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
-            scaled_rel = self.rel_pos[:, 0].view(1, 1, K) * freq_avg.unsqueeze(-1)
-            sample_pos = centers + scaled_rel + phase_avg.unsqueeze(-1)
-            grid = (sample_pos / max(L - 1, 1)) * 2 - 1
-            
-            x_4d = x_t.unsqueeze(2)
-            grid_4d = torch.zeros(B, L, K, 2, device=x.device, dtype=x.dtype)
-            grid_4d[..., 0] = grid
-            sampled = F.grid_sample(x_4d, grid_4d, mode='bilinear', padding_mode='border', align_corners=True)
-            result = sampled.permute(0, 2, 3, 1).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
-            
-        elif self.ndim == 2:
-            Sh, Sw = spatial
-            x_t = x.permute(0, 3, 1, 2)
-            
-            h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
-            w_coords = torch.arange(Sw, device=x.device, dtype=x.dtype)
-            grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing='ij')
-            centers = torch.stack([grid_w, grid_h], dim=-1).view(1, Sh, Sw, 1, 2)
-            
-            freq_2d = freq_avg.view(B, Sh, Sw, 1, 1)
-            phase_2d = phase_avg.view(B, Sh, Sw, 1, 1)
-            scaled_rel = self.rel_pos.view(1, 1, 1, K, 2).flip(-1) * freq_2d
-            sample_pos = centers + scaled_rel + phase_2d
-            
-            grid = torch.zeros(B, Sh, Sw, K, 2, device=x.device, dtype=x.dtype)
-            grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
-            grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
-            
-            grid = grid.view(B, Sh, Sw * K, 2)
-            sampled = F.grid_sample(x_t, grid, mode='bilinear', padding_mode='border', align_corners=True)
-            sampled = sampled.view(B, C, Sh, Sw, K).permute(0, 2, 3, 4, 1)
-            result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
-            
-        elif self.ndim == 3:
-            Sd, Sh, Sw = spatial
-            x_t = x.permute(0, 4, 1, 2, 3)
-            
-            d_coords = torch.arange(Sd, device=x.device, dtype=x.dtype)
-            h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
-            w_coords = torch.arange(Sw, device=x.device, dtype=x.dtype)
-            grid_d, grid_h, grid_w = torch.meshgrid(d_coords, h_coords, w_coords, indexing='ij')
-            centers = torch.stack([grid_w, grid_h, grid_d], dim=-1).view(1, Sd, Sh, Sw, 1, 3)
-            
-            freq_3d = freq_avg.view(B, Sd, Sh, Sw, 1, 1)
-            phase_3d = phase_avg.view(B, Sd, Sh, Sw, 1, 1)
-            scaled_rel = self.rel_pos.view(1, 1, 1, 1, K, 3).flip(-1) * freq_3d
-            sample_pos = centers + scaled_rel + phase_3d
-            
-            grid = torch.zeros(B, Sd, Sh, Sw, K, 3, device=x.device, dtype=x.dtype)
-            grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
-            grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
-            grid[..., 2] = (sample_pos[..., 2] / max(Sd - 1, 1)) * 2 - 1
-            
-            grid = grid.view(B, Sd, Sh, Sw * K, 3)
-            sampled = F.grid_sample(x_t, grid, mode='bilinear', padding_mode='border', align_corners=True)
-            sampled = sampled.view(B, C, Sd, Sh, Sw, K).permute(0, 2, 3, 4, 5, 1)
-            result = sampled.reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)
-        else:
-            raise ValueError(f"ndim must be 1, 2, or 3, got {self.ndim}")
-        
-        return result
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B = x.shape[0]
         spatial = x.shape[1:-1]
         C = x.shape[-1]
         H = self.num_channels
-        K = self.kernel_numel
+        D = self.channel_dim
         L = reduce(mul, spatial, 1)
+        S = self.num_samples
         
-        wave_params = F.silu(self.wave_proj(x)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
+        x_flat = x.reshape(B, L, C)
+        
+        wave_params = F.silu(self.wave_proj(x_flat)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
         freq = torch.sigmoid(wave_params[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
-        phase = torch.tanh(wave_params[..., 1]) * self.half_k * freq
+        phase = torch.tanh(wave_params[..., 1]) * self.max_freq
         decay = torch.sigmoid(wave_params[..., 2]) * 9.5 + 0.5
         
-        values = self._gather_window(x, freq, phase)
+        freq_avg = freq.mean(dim=2)
+        phase_avg = phase.mean(dim=2)
         
-        queries = F.silu(self.query_proj(x)).reshape(B, L, H, self.pos_dim)
+        if self.ndim == 1:
+            centers = torch.arange(L, device=x.device, dtype=x.dtype)
+            sample_pos = centers.view(1, L, 1) + self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
+            valid_mask = (sample_pos >= 0) & (sample_pos < L)
+            sample_idx = sample_pos.long().clamp(0, L - 1)
+        else:
+            coords = [torch.arange(s, device=x.device, dtype=x.dtype) for s in spatial]
+            mesh = torch.meshgrid(*coords, indexing='ij')
+            centers = torch.stack([m.flatten() for m in mesh], dim=-1)
+            
+            sample_pos = centers.view(1, L, 1, self.ndim) + self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, L, 1, 1) + phase_avg.view(B, L, 1, 1)
+            
+            valid_mask = torch.ones(B, L, S, dtype=torch.bool, device=x.device)
+            for dim in range(self.ndim):
+                valid_mask = valid_mask & (sample_pos[..., dim] >= 0) & (sample_pos[..., dim] < spatial[dim])
+            
+            sample_coords = sample_pos.long()
+            for dim in range(self.ndim):
+                sample_coords[..., dim] = sample_coords[..., dim].clamp(0, spatial[dim] - 1)
+            
+            strides = [1]
+            for dim in range(self.ndim - 1, 0, -1):
+                strides.insert(0, strides[0] * spatial[dim])
+            sample_idx = sum(sample_coords[..., dim] * strides[dim] for dim in range(self.ndim))
         
-        scaled_rel = self.rel_pos.view(1, 1, 1, K, self.ndim) * freq.view(B, L, H, 1, 1)
-        keys = self.key_proj(scaled_rel)
+        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(B, L, S)
+        values = x_flat[batch_idx, sample_idx].reshape(B, L, S, H, D).permute(0, 1, 3, 2, 4)
         
-        attn_logits = torch.einsum('blhd,blhkd->blhk', queries, keys) * self.scale
+        valid_mask = valid_mask.unsqueeze(2).expand(B, L, H, S)
         
-        scaled_dist = self.rel_dist.view(1, 1, 1, K) * freq.unsqueeze(-1)
-        decay_envelope = torch.exp(-scaled_dist / decay.unsqueeze(-1).clamp(min=0.1))
+        queries = F.silu(self.query_proj(x_flat)).reshape(B, L, H, self.pos_dim)
         
-        attn_weights = F.softmax(attn_logits, dim=-1) * decay_envelope
+        rel_dist = (self.stride_grid.norm(dim=-1).view(1, 1, 1, S) * freq.unsqueeze(-1)).abs()
+        keys = self.key_proj(rel_dist.unsqueeze(-1))
+        
+        attn_logits = torch.einsum('blhd,blhsd->blhs', queries, keys) * self.scale
+        
+        decay_envelope = torch.exp(-rel_dist / decay.unsqueeze(-1).clamp(min=0.1))
+        
+        attn_logits = attn_logits.masked_fill(~valid_mask, float('-inf'))
+        attn_weights = F.softmax(attn_logits, dim=-1) * decay_envelope * valid_mask.float()
         attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        output = torch.einsum('blhkd,blhk->blhd', values, attn_weights).reshape(B, L, C)
+        output = torch.einsum('blhsd,blhs->blhd', values, attn_weights).reshape(B, L, C)
         
         se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
         output = output * se_weights
@@ -593,7 +553,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -601,6 +561,9 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.channel_dim = embed_dim // num_channels
         self.poolable_dims = poolable_dims if poolable_dims is not None else tuple(range(ndim))
         self.min_size = min_size
+        self.conv_position = conv_position
+        self.attn_residual = attn_residual
+        self.reduce_mode = reduce_mode
         
         if isinstance(window_size, int):
             window_size = (window_size,) * ndim
@@ -608,16 +571,22 @@ class HierarchicalLocalAttentionND(nn.Module):
         
         conv_cls = [nn.Conv1d, nn.Conv2d, nn.Conv3d][ndim - 1]
         
-        self.conv = AdaptiveConvND(embed_dim, ndim=ndim, max_kernel_size=window_size[0], num_channels=num_channels)
+        self.conv = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=window_size[0], num_channels=num_channels)
         self.conv_norm = RMSNorm(embed_dim)
         
         self.reduce_norm = RMSNorm(embed_dim)
-        if len(self.poolable_dims) == ndim:
-            self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, stride=2)
-        else:
-            reduce_stride = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
-            reduce_kernel = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
-            self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=reduce_kernel, stride=reduce_stride)
+        if reduce_mode == 'conv':
+            if len(self.poolable_dims) == ndim:
+                self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=2, stride=2)
+            else:
+                reduce_stride = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
+                reduce_kernel = tuple(2 if d in self.poolable_dims else 1 for d in range(ndim))
+                self.reduce_conv = conv_cls(embed_dim, embed_dim, kernel_size=reduce_kernel, stride=reduce_stride)
+        elif reduce_mode == 'cross_attn':
+            self.reduce_q = nn.Linear(embed_dim, embed_dim, bias=False)
+            self.reduce_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
+            self.reduce_out = nn.Linear(embed_dim, embed_dim, bias=False)
+            self.reduce_scale = embed_dim ** -0.5
         
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
         
@@ -636,8 +605,45 @@ class HierarchicalLocalAttentionND(nn.Module):
         min_poolable = min(spatial_shape[d] for d in self.poolable_dims)
         return max(1, (min_poolable // self.min_size).bit_length())
     
-    def _reduce(self, h: torch.Tensor) -> torch.Tensor:
-        return self.reduce_conv(h)
+    def _reduce(self, h: torch.Tensor, spatial_shape: tuple[int, ...]) -> torch.Tensor:
+        if self.reduce_mode == 'conv':
+            return self.reduce_conv(h)
+        
+        B, C = h.shape[0], h.shape[1]
+        h_flat = h.reshape(B, C, -1).mT
+        
+        reduced_shape = tuple(
+            s // 2 if d in self.poolable_dims else s
+            for d, s in enumerate(spatial_shape)
+        )
+        
+        coords = [torch.arange(s, device=h.device) for s in spatial_shape]
+        mesh = torch.meshgrid(*coords, indexing='ij')
+        all_pos = torch.stack([m.flatten() for m in mesh], dim=-1)
+        
+        reduced_coords = [torch.arange(s, device=h.device) for s in reduced_shape]
+        reduced_mesh = torch.meshgrid(*reduced_coords, indexing='ij')
+        query_pos = torch.stack([m.flatten() for m in reduced_mesh], dim=-1) * 2
+        
+        L_full = all_pos.shape[0]
+        L_reduced = query_pos.shape[0]
+        
+        strides = [1]
+        for d in range(self.ndim - 1, 0, -1):
+            strides.insert(0, strides[0] * spatial_shape[d])
+        query_idx = sum(query_pos[:, d].long().clamp(0, spatial_shape[d] - 1) * strides[d] for d in range(self.ndim))
+        
+        q_input = h_flat[:, query_idx]
+        q = self.reduce_q(q_input)
+        kv = self.reduce_kv(h_flat)
+        k, v = kv.chunk(2, dim=-1)
+        
+        scores = torch.einsum('bqc,bkc->bqk', q, k) * self.reduce_scale
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('bqk,bkc->bqc', attn, v)
+        out = self.reduce_out(out) + q_input
+        
+        return out.mT.reshape(B, C, *reduced_shape)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
@@ -654,17 +660,29 @@ class HierarchicalLocalAttentionND(nn.Module):
         current_shape = list(spatial_shape)
         
         for i in range(n_levels):
-            conv_out, _ = self.conv(h)
-            conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
-            h = h + conv_out
+            h_input = h
+            
+            if self.conv_position == 'pre':
+                conv_out, _ = self.conv(h)
+                conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
+                h = h + conv_out
             
             h = self.attn(h)
+            if self.attn_residual:
+                h = h + h_input
+            
+            if self.conv_position == 'post':
+                conv_out, _ = self.conv(h)
+                conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
+                h = h + conv_out
+            
             levels.append(h)
             
             if i < n_levels - 1:
-                h_normed = self.reduce_norm(h.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
-                h_flat = h_normed.reshape(B, -1, C).mT.reshape(B, C, *h.shape[1:-1])
-                h_reduced = self._reduce(h_flat)
+                h_spatial = h.shape[1:-1]
+                h_normed = self.reduce_norm(h.reshape(B, -1, C)).reshape(B, *h_spatial, C)
+                h_flat = h_normed.reshape(B, -1, C).mT.reshape(B, C, *h_spatial)
+                h_reduced = self._reduce(h_flat, h_spatial)
                 current_shape = list(h_reduced.shape[2:])
                 h = h_reduced.reshape(B, C, -1).mT.reshape(B, *current_shape, C)
         
@@ -691,24 +709,24 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims)
+        self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6):
-        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps)
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+        super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
 LocalKernelAttention = LocalAttention
