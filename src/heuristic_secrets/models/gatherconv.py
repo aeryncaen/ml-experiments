@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from functools import reduce
 from operator import mul
 
@@ -31,8 +32,10 @@ class GatherConvND(nn.Module):
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
         chunk_size: int = 768,
+        checkpoint: bool = True,
     ):
         super().__init__()
+        self.checkpoint = checkpoint
         self.channels = channels
         self.ndim = ndim
         self.max_samples = max_samples
@@ -180,12 +183,24 @@ class GatherConvND(nn.Module):
         x_flat = x.reshape(B, L, C)
         
         if L <= self.chunk_size:
-            output = self._forward_chunk(x_flat, x_flat, 0, L, spatial, L)
+            if self.checkpoint and self.training:
+                output = grad_checkpoint(
+                    self._forward_chunk, x_flat, x_flat, 0, L, spatial, L,
+                    use_reentrant=False,
+                )
+            else:
+                output = self._forward_chunk(x_flat, x_flat, 0, L, spatial, L)
         else:
             outputs = []
             for start in range(0, L, self.chunk_size):
                 end = min(start + self.chunk_size, L)
-                chunk_out = self._forward_chunk(x_flat, x_flat[:, start:end], start, end, spatial, L)
+                if self.checkpoint and self.training:
+                    chunk_out = grad_checkpoint(
+                        self._forward_chunk, x_flat, x_flat[:, start:end], start, end, spatial, L,
+                        use_reentrant=False,
+                    )
+                else:
+                    chunk_out = self._forward_chunk(x_flat, x_flat[:, start:end], start, end, spatial, L)
                 outputs.append(chunk_out)
             output = torch.cat(outputs, dim=1)
         
