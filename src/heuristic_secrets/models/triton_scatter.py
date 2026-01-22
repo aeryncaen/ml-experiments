@@ -767,71 +767,17 @@ class TritonLocalWindowAttn(nn.Module):
         return out
 
 
-class FusedRoPESSMFunc(Function):
-    @staticmethod
-    def _apply_rope(x, theta, layer_idx):
-        theta_k = theta * (layer_idx + 1)
-        theta_k = theta_k.unsqueeze(1)
-        cos = theta_k.cos()
-        sin = theta_k.sin()
-        out = torch.empty_like(x)
-        out[..., ::2] = x[..., ::2] * cos - x[..., 1::2] * sin
-        out[..., 1::2] = x[..., ::2] * sin + x[..., 1::2] * cos
-        return out
-    
-    @staticmethod
-    def _apply_rope_bwd(grad, theta, layer_idx):
-        theta_k = theta * (layer_idx + 1)
-        theta_k = theta_k.unsqueeze(1)
-        cos = theta_k.cos()
-        sin = theta_k.sin()
-        grad_x = torch.empty_like(grad)
-        grad_x[..., ::2] = grad[..., ::2] * cos + grad[..., 1::2] * sin
-        grad_x[..., 1::2] = -grad[..., ::2] * sin + grad[..., 1::2] * cos
-        return grad_x
-    
-    @staticmethod
-    def forward(ctx, B_proj, theta, layer_idx, H, X_r, decay):
-        B, R, L, N = H.shape
-        
-        if HAS_TRITON and B_proj.is_cuda:
-            B_rot = B_proj.clone()
-            BLOCK_N2 = triton.next_power_of_2(N // 2)
-            grid = (B, R, L)
-            _rope_kernel[grid](B_rot, theta, layer_idx, B, R, L, N, BLOCK_N2)
-        else:
-            B_rot = FusedRoPESSMFunc._apply_rope(B_proj, theta, layer_idx)
-        
-        decay_exp = decay.unsqueeze(1)
-        X_r_exp = X_r.unsqueeze(-1)
-        H_new = decay_exp * H + B_rot * X_r_exp
-        out_flat = H_new.permute(0, 2, 1, 3).reshape(B, L, N * R)
-        
-        ctx.save_for_backward(B_proj, theta, H, X_r_exp, decay_exp)
-        ctx.layer_idx = layer_idx
-        ctx.shapes = (B, R, L, N)
-        
-        return H_new, out_flat
-    
-    @staticmethod
-    def backward(ctx, grad_H_new, grad_out_flat):
-        B_proj, theta, H, X_r_exp, decay_exp = ctx.saved_tensors
-        layer_idx = ctx.layer_idx
-        B, R, L, N = ctx.shapes
-        
-        B_rot = FusedRoPESSMFunc._apply_rope(B_proj, theta, layer_idx)
-        
-        grad_from_out = grad_out_flat.reshape(B, L, R, N).permute(0, 2, 1, 3)
-        grad_total = grad_H_new + grad_from_out
-        
-        grad_H = grad_total * decay_exp
-        grad_B_rot = grad_total * X_r_exp
-        grad_X_r = (grad_total * B_rot).sum(dim=-1)
-        grad_decay = (grad_total * H).sum(dim=1)
-        
-        grad_B_proj = FusedRoPESSMFunc._apply_rope_bwd(grad_B_rot, theta, layer_idx)
-        
-        return grad_B_proj, None, None, grad_H, grad_X_r, grad_decay
+def apply_rope(x, theta, layer_idx):
+    """Apply RoPE rotation. Uses Triton kernel on CUDA if available."""
+    B, R, L, N = x.shape
+    theta_k = theta * (layer_idx + 1)
+    theta_k = theta_k.unsqueeze(1)
+    cos = theta_k.cos()
+    sin = theta_k.sin()
+    out = torch.empty_like(x)
+    out[..., ::2] = x[..., ::2] * cos - x[..., 1::2] * sin
+    out[..., 1::2] = x[..., ::2] * sin + x[..., 1::2] * cos
+    return out
 
 
 class TritonSSMStep(nn.Module):
@@ -859,7 +805,10 @@ class TritonSSMStep(nn.Module):
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         
-        H, out_flat = FusedRoPESSMFunc.apply(B_proj, theta, layer_idx, H, X_r, decay)
+        B_rot = apply_rope(B_proj, theta, layer_idx)
+        inject = B_rot * X_r.unsqueeze(-1)
+        H = decay.unsqueeze(1) * H + inject
+        out_flat = H.permute(0, 2, 1, 3).reshape(B, L, self.N * self.R)
         
         out = F.silu(self.out_proj(out_flat))
         return H, out
