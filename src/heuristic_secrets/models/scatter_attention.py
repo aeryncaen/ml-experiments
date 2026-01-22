@@ -129,6 +129,7 @@ class AdaptiveConvND(nn.Module):
         num_channels: int = 1,
         max_freq: float = 16.0,
         min_freq: float = 1.0,
+        chunk_size: int = 2048,
     ):
         super().__init__()
         self.channels = channels
@@ -136,6 +137,7 @@ class AdaptiveConvND(nn.Module):
         self.max_samples = max_samples
         self.num_channels = num_channels
         self.channel_dim = channels // num_channels
+        self.chunk_size = chunk_size
         H = num_channels
         
         self.max_freq = max_freq
@@ -171,38 +173,37 @@ class AdaptiveConvND(nn.Module):
         nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
     
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        B = x.shape[0]
-        spatial = x.shape[1:-1]
-        C = x.shape[-1]
+    def _forward_chunk(self, x_flat: torch.Tensor, chunk_start: int, chunk_end: int, 
+                        wave_params_chunk: torch.Tensor, queries_chunk: torch.Tensor,
+                        spatial: tuple, L: int) -> torch.Tensor:
+        B = x_flat.shape[0]
+        C = x_flat.shape[-1]
         H = self.num_channels
         D = self.channel_dim
-        L = reduce(mul, spatial, 1)
         S = self.num_samples
+        chunk_len = chunk_end - chunk_start
         
-        x_flat = x.reshape(B, L, C)
-        
-        wave_params = F.silu(self.wave_proj(x_flat)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
-        freq = torch.sigmoid(wave_params[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
-        phase = torch.tanh(wave_params[..., 1]) * self.max_freq
-        decay = torch.sigmoid(wave_params[..., 2]) * 9.5 + 0.5
+        freq = torch.sigmoid(wave_params_chunk[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
+        phase = torch.tanh(wave_params_chunk[..., 1]) * self.max_freq
+        decay = torch.sigmoid(wave_params_chunk[..., 2]) * 9.5 + 0.5
         
         freq_avg = freq.mean(dim=2)
         phase_avg = phase.mean(dim=2)
         
         if self.ndim == 1:
-            centers = torch.arange(L, device=x.device, dtype=x.dtype)
-            sample_pos = centers.view(1, L, 1) + self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
+            centers = torch.arange(chunk_start, chunk_end, device=x_flat.device, dtype=x_flat.dtype)
+            sample_pos = centers.view(1, chunk_len, 1) + self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
             sample_idx = sample_pos.long().clamp(0, L - 1)
         else:
-            coords = [torch.arange(s, device=x.device, dtype=x.dtype) for s in spatial]
+            coords = [torch.arange(s, device=x_flat.device, dtype=x_flat.dtype) for s in spatial]
             mesh = torch.meshgrid(*coords, indexing='ij')
-            centers = torch.stack([m.flatten() for m in mesh], dim=-1)
+            centers_all = torch.stack([m.flatten() for m in mesh], dim=-1)
+            centers = centers_all[chunk_start:chunk_end]
             
-            sample_pos = centers.view(1, L, 1, self.ndim) + self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, L, 1, 1) + phase_avg.view(B, L, 1, 1)
+            sample_pos = centers.view(1, chunk_len, 1, self.ndim) + self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, chunk_len, 1, 1) + phase_avg.view(B, chunk_len, 1, 1)
             
-            valid_mask = torch.ones(B, L, S, dtype=torch.bool, device=x.device)
+            valid_mask = torch.ones(B, chunk_len, S, dtype=torch.bool, device=x_flat.device)
             for dim in range(self.ndim):
                 valid_mask = valid_mask & (sample_pos[..., dim] >= 0) & (sample_pos[..., dim] < spatial[dim])
             
@@ -215,17 +216,15 @@ class AdaptiveConvND(nn.Module):
                 strides.insert(0, strides[0] * spatial[dim])
             sample_idx = sum(sample_coords[..., dim] * strides[dim] for dim in range(self.ndim))
         
-        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(B, L, S)
-        values = x_flat[batch_idx, sample_idx].reshape(B, L, S, H, D).permute(0, 1, 3, 2, 4)
+        batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1).expand(B, chunk_len, S)
+        values = x_flat[batch_idx, sample_idx].reshape(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
         
-        valid_mask = valid_mask.unsqueeze(2).expand(B, L, H, S)
-        
-        queries = F.silu(self.query_proj(x_flat)).reshape(B, L, H, self.pos_dim)
+        valid_mask = valid_mask.unsqueeze(2).expand(B, chunk_len, H, S)
         
         rel_dist = (self.stride_grid.norm(dim=-1).view(1, 1, 1, S) * freq.unsqueeze(-1)).abs()
         keys = self.key_proj(rel_dist.unsqueeze(-1))
         
-        attn_logits = torch.einsum('blhd,blhsd->blhs', queries, keys) * self.scale
+        attn_logits = torch.einsum('blhd,blhsd->blhs', queries_chunk, keys) * self.scale
         
         decay_envelope = torch.exp(-rel_dist / decay.unsqueeze(-1).clamp(min=0.1))
         
@@ -233,15 +232,42 @@ class AdaptiveConvND(nn.Module):
         attn_weights = F.softmax(attn_logits, dim=-1) * decay_envelope * valid_mask.float()
         attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        output = torch.einsum('blhsd,blhs->blhd', values, attn_weights).reshape(B, L, C)
+        output = torch.einsum('blhsd,blhs->blhd', values, attn_weights).reshape(B, chunk_len, C)
+        return output
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        B = x.shape[0]
+        spatial = x.shape[1:-1]
+        C = x.shape[-1]
+        H = self.num_channels
+        L = reduce(mul, spatial, 1)
+        
+        x_flat = x.reshape(B, L, C)
+        
+        wave_params = F.silu(self.wave_proj(x_flat)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
+        queries = F.silu(self.query_proj(x_flat)).reshape(B, L, H, self.pos_dim)
+        
+        if L <= self.chunk_size:
+            output = self._forward_chunk(x_flat, 0, L, wave_params, queries, spatial, L)
+        else:
+            outputs = []
+            for start in range(0, L, self.chunk_size):
+                end = min(start + self.chunk_size, L)
+                chunk_out = self._forward_chunk(
+                    x_flat, start, end,
+                    wave_params[:, start:end],
+                    queries[:, start:end],
+                    spatial, L
+                )
+                outputs.append(chunk_out)
+            output = torch.cat(outputs, dim=1)
         
         se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
         output = output * se_weights
         
         output = self.out_proj(output).reshape(B, *spatial, C)
         
-        entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1).mean()
-        return output, {"entropy_reg": -entropy}
+        return output, {}
 
 
 # Backward compatibility alias
