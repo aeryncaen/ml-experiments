@@ -876,23 +876,24 @@ class LocalBlock(nn.Module):
 class SGSBAttentionND(nn.Module):
     """Scatter-Gather-Scatter-Broadcast attention. Full pipeline: adaptive conv → local attn → adaptive conv → low-rank full attn."""
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, chunk_size: int = 2048):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
         self.num_channels = num_channels
+        self.chunk_size = chunk_size
         
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size,) * ndim
         self.kernel_size = kernel_size
         
-        self.scatter_pre = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels)
+        self.scatter_pre = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels, chunk_size=chunk_size)
         self.scatter_pre_norm = RMSNorm(embed_dim)
         
-        self.gather = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.gather = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels, chunk_size=chunk_size)
         self.gather_norm = RMSNorm(embed_dim)
         
-        self.scatter_post = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels)
+        self.scatter_post = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels, chunk_size=chunk_size)
         self.scatter_post_norm = RMSNorm(embed_dim)
         
         self.broadcast = LowRankAttention(embed_dim)
@@ -925,16 +926,16 @@ class SGSBAttentionND(nn.Module):
 
 
 class SGSBAttention(SGSBAttentionND):
-    def __init__(self, embed_dim: int, kernel_size: int = 17, num_channels: int = 1):
-        super().__init__(embed_dim, kernel_size, ndim=1, num_channels=num_channels)
+    def __init__(self, embed_dim: int, kernel_size: int = 17, num_channels: int = 1, chunk_size: int = 2048):
+        super().__init__(embed_dim, kernel_size, ndim=1, num_channels=num_channels, chunk_size=chunk_size)
 
 
 class SGSBBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6, chunk_size: int = 2048):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
-        self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels, chunk_size=chunk_size)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
