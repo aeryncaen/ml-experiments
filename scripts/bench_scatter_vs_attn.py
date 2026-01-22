@@ -1001,6 +1001,28 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     return model.to(device)
 
 
+class PreloadedDataset:
+    def __init__(self, loader, device):
+        print('Preloading dataset to GPU...')
+        all_x, all_y = [], []
+        for x, y in loader:
+            all_x.append(x)
+            all_y.append(y)
+        self.x = torch.cat(all_x, dim=0).to(device)
+        self.y = torch.cat(all_y, dim=0).to(device)
+        self.batch_size = loader.batch_size
+        print(f'  Loaded {len(self.x)} samples ({self.x.element_size() * self.x.numel() / 1e9:.2f} GB)')
+    
+    def __iter__(self):
+        indices = torch.randperm(len(self.x), device=self.x.device)
+        for i in range(0, len(self.x), self.batch_size):
+            idx = indices[i:i+self.batch_size]
+            yield self.x[idx], self.y[idx]
+    
+    def __len__(self):
+        return (len(self.x) + self.batch_size - 1) // self.batch_size
+
+
 def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0):
     task_type = 'classification'
     vocab_size = None
@@ -1146,6 +1168,7 @@ def main():
     parser.add_argument('--amp', action='store_true', help='Enable automatic mixed precision (fp16)')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for kernel fusion')
     parser.add_argument('--profile', action='store_true', help='Profile 1 batch after 10 warmup, then exit')
+    parser.add_argument('--preload', action='store_true', help='Preload entire dataset to GPU memory')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
@@ -1184,6 +1207,10 @@ def main():
     train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
         args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers
     )
+
+    if args.preload:
+        train_loader = PreloadedDataset(train_loader, device)
+        test_loader = PreloadedDataset(test_loader, device)
 
     attn_residual = not args.no_attn_residual
     
