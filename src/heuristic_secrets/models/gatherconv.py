@@ -215,6 +215,26 @@ GatherConv2d = lambda *args, **kwargs: GatherConvND(*args, ndim=2, **kwargs)
 GatherConv3d = lambda *args, **kwargs: GatherConvND(*args, ndim=3, **kwargs)
 
 
+class SDPAttention(nn.Module):
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.qkv = nn.Linear(channels, 3 * channels)
+        self.out = nn.Linear(channels, channels)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, L, C)
+        return self.out(out)
+
+
 if __name__ == "__main__":
     import time
     
@@ -224,91 +244,116 @@ if __name__ == "__main__":
     max_samples = 32
     warmup_iters = 5
     bench_iters = 20
-    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384]
+    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768]
     
     print(f"Device: {device}")
-    print(f"Batch={B}, Channels={C}, Heads={num_heads}, MaxSamples={max_samples}")
-    print("-" * 70)
-    print(f"{'SeqLen':>8} | {'Fwd (ms)':>10} | {'Fwd+Bwd (ms)':>12} | {'Fwd Mem':>10} | {'F+B Mem':>10}")
-    print("-" * 70)
+    print(f"Batch={B}, Channels={C}, Heads={num_heads}")
+    print()
     
-    conv = GatherConvND(
-        channels=C,
-        ndim=1,
-        max_samples=max_samples,
-        num_heads=num_heads,
+    gather_conv = GatherConvND(
+        channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads, checkpoint=True
     ).to(device)
+    gather_conv.train()
+    
+    sdp_attn = SDPAttention(channels=C, num_heads=num_heads).to(device)
+    sdp_attn.train()
+    
+    def bench(model, x, is_gather=False):
+        if device == "cuda":
+            torch.cuda.synchronize()
+        for _ in range(warmup_iters):
+            out = model(x)[0] if is_gather else model(x)
+            if device == "cuda":
+                torch.cuda.synchronize()
+        
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            out = model(x)[0] if is_gather else model(x)
+            if device == "cuda":
+                torch.cuda.synchronize()
+        fwd_time = (time.perf_counter() - start) / bench_iters * 1000
+        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
+        return fwd_time, fwd_mem
+    
+    def bench_bwd(model, x, is_gather=False):
+        if device == "cuda":
+            torch.cuda.synchronize()
+        for _ in range(warmup_iters):
+            out = model(x)[0] if is_gather else model(x)
+            out.sum().backward()
+            model.zero_grad()
+            if device == "cuda":
+                torch.cuda.synchronize()
+        
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            out = model(x)[0] if is_gather else model(x)
+            out.sum().backward()
+            model.zero_grad()
+            if device == "cuda":
+                torch.cuda.synchronize()
+        fwd_bwd_time = (time.perf_counter() - start) / bench_iters * 1000
+        fwd_bwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
+        return fwd_bwd_time, fwd_bwd_mem
+    
+    print("=" * 90)
+    print(f"{'':>8} | {'GatherConv':^38} | {'SDPA Full Attention':^38}")
+    print(f"{'SeqLen':>8} | {'Fwd ms':>8} {'Bwd ms':>8} {'Fwd MB':>9} {'Bwd MB':>9} | {'Fwd ms':>8} {'Bwd ms':>8} {'Fwd MB':>9} {'Bwd MB':>9}")
+    print("=" * 90)
     
     for L in seq_lengths:
+        gc_fwd = gc_bwd = gc_fwd_mem = gc_bwd_mem = "OOM"
+        sdp_fwd = sdp_bwd = sdp_fwd_mem = sdp_bwd_mem = "OOM"
+        
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        
         try:
             x = torch.randn(B, L, C, device=device)
-            
-            if device == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.synchronize()
-            
-            for _ in range(warmup_iters):
-                out, _ = conv(x)
-                if device == "cuda":
-                    torch.cuda.synchronize()
-            
-            if device == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.synchronize()
-            
-            start = time.perf_counter()
-            for _ in range(bench_iters):
-                out, _ = conv(x)
-                if device == "cuda":
-                    torch.cuda.synchronize()
-            fwd_time = (time.perf_counter() - start) / bench_iters * 1000
-            
-            fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
-            
+            gc_fwd, gc_fwd_mem = bench(gather_conv, x, is_gather=True)
             del x
-            if device == "cuda":
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
             
-            x_grad = torch.randn(B, L, C, device=device, requires_grad=True)
-            
-            for _ in range(warmup_iters):
-                out, _ = conv(x_grad)
-                loss = out.sum()
-                loss.backward()
-                conv.zero_grad()
-                if device == "cuda":
-                    torch.cuda.synchronize()
-            
-            if device == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.synchronize()
-            
-            start = time.perf_counter()
-            for _ in range(bench_iters):
-                out, _ = conv(x_grad)
-                loss = out.sum()
-                loss.backward()
-                conv.zero_grad()
-                if device == "cuda":
-                    torch.cuda.synchronize()
-            fwd_bwd_time = (time.perf_counter() - start) / bench_iters * 1000
-            
-            fwd_bwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
-            
-            del x_grad
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            
-            print(f"{L:>8} | {fwd_time:>10.2f} | {fwd_bwd_time:>12.2f} | {fwd_mem:>8.1f} MB | {fwd_bwd_mem:>8.1f} MB")
-            
+            x = torch.randn(B, L, C, device=device, requires_grad=True)
+            gc_bwd, gc_bwd_mem = bench_bwd(gather_conv, x, is_gather=True)
+            del x
         except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"{L:>8} | {'OOM':>10} | {'OOM':>12} | {'OOM':>10} | {'OOM':>10}")
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-            else:
+            if "out of memory" not in str(e).lower():
                 raise
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        
+        try:
+            x = torch.randn(B, L, C, device=device)
+            sdp_fwd, sdp_fwd_mem = bench(sdp_attn, x, is_gather=False)
+            del x
+            
+            x = torch.randn(B, L, C, device=device, requires_grad=True)
+            sdp_bwd, sdp_bwd_mem = bench_bwd(sdp_attn, x, is_gather=False)
+            del x
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        
+        def fmt(v):
+            return f"{v:>8.2f}" if isinstance(v, float) else f"{v:>8}"
+        def fmt_mem(v):
+            return f"{v:>8.1f}" if isinstance(v, float) else f"{v:>8}"
+        
+        print(f"{L:>8} | {fmt(gc_fwd)} {fmt(gc_bwd)} {fmt_mem(gc_fwd_mem)} {fmt_mem(gc_bwd_mem)} | {fmt(sdp_fwd)} {fmt(sdp_bwd)} {fmt_mem(sdp_fwd_mem)} {fmt_mem(sdp_bwd_mem)}")
     
-    print("-" * 70)
-    print(f"Parameters: {sum(p.numel() for p in conv.parameters()):,}")
+    print("=" * 90)
+    print(f"GatherConv params: {sum(p.numel() for p in gather_conv.parameters()):,}")
+    print(f"SDPA params: {sum(p.numel() for p in sdp_attn.parameters()):,}")
