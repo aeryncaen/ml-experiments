@@ -342,9 +342,7 @@ def main():
         check_triton_vs_fallback(device)
     
     if args.benchmark and device == "cuda":
-        benchmark_module(scatter, scatter_shape, device, name="TritonScatterConv")
-        benchmark_module(attn, attn_shape, device, name="TritonLocalWindowAttn")
-        benchmark_module(ssm, ssm_shape, device, name="TritonSSMStep")
+        benchmark_triton_vs_pytorch(args.batch, args.seq, args.dim, device)
     
     print("\n" + "=" * 50)
     print("All tests passed!")
