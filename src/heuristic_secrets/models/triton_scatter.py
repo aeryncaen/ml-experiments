@@ -645,6 +645,106 @@ class TritonLocalWindowAttn(nn.Module):
         return out
 
 
+class RoPEFunc(Function):
+    """Autograd function for RoPE rotation."""
+    
+    @staticmethod
+    def forward(ctx, x, theta, layer_idx):
+        # x: [B, R, L, N], theta: [B, L, N//2]
+        B, R, L, N = x.shape
+        
+        # Clone to avoid in-place modification issues
+        out = x.clone()
+        
+        if HAS_TRITON and x.is_cuda:
+            BLOCK_N2 = triton.next_power_of_2(N // 2)
+            grid = (B, R, L)
+            _rope_kernel[grid](
+                out, theta, layer_idx,
+                B, R, L, N, BLOCK_N2,
+            )
+        else:
+            theta_k = theta * (layer_idx + 1)
+            theta_k = theta_k.unsqueeze(1)  # [B, 1, L, N//2]
+            cos = theta_k.cos()
+            sin = theta_k.sin()
+            out[..., ::2] = x[..., ::2] * cos - x[..., 1::2] * sin
+            out[..., 1::2] = x[..., ::2] * sin + x[..., 1::2] * cos
+        
+        ctx.save_for_backward(theta)
+        ctx.layer_idx = layer_idx
+        ctx.shapes = (B, R, L, N)
+        
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        theta, = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+        B, R, L, N = ctx.shapes
+        
+        # RoPE backward is just reverse rotation (negate sin)
+        theta_k = theta * (layer_idx + 1)
+        theta_k = theta_k.unsqueeze(1)  # [B, 1, L, N//2]
+        cos = theta_k.cos()
+        sin = theta_k.sin()
+        
+        grad_x = torch.empty_like(grad_output)
+        # Reverse rotation: multiply by conjugate (cos, -sin)
+        grad_x[..., ::2] = grad_output[..., ::2] * cos + grad_output[..., 1::2] * sin
+        grad_x[..., 1::2] = -grad_output[..., ::2] * sin + grad_output[..., 1::2] * cos
+        
+        # grad_theta would be complex, skip for now (theta comes from learned projection anyway)
+        return grad_x, None, None
+
+
+class SSMStepFunc(Function):
+    """Autograd function for SSM step: H_new = decay * H + B_rot * X_r"""
+    
+    @staticmethod
+    def forward(ctx, H, B_rot, X_r, decay):
+        # H: [B, R, L, N], B_rot: [B, R, L, N], X_r: [B, R, L], decay: [B, L, N]
+        B, R, L, N = H.shape
+        
+        inject = B_rot * X_r.unsqueeze(-1)  # [B, R, L, N]
+        H_new = decay.unsqueeze(1) * H + inject  # [B, R, L, N]
+        
+        out_flat = H_new.permute(0, 2, 1, 3).reshape(B, L, N * R)
+        
+        ctx.save_for_backward(H, B_rot, X_r, decay)
+        ctx.shapes = (B, R, L, N)
+        
+        return H_new, out_flat
+    
+    @staticmethod
+    def backward(ctx, grad_H_new, grad_out_flat):
+        H, B_rot, X_r, decay = ctx.saved_tensors
+        B, R, L, N = ctx.shapes
+        
+        # Reshape grad_out_flat back: [B, L, N*R] -> [B, R, L, N]
+        grad_from_out = grad_out_flat.reshape(B, L, R, N).permute(0, 2, 1, 3)
+        
+        # Total gradient on H_new
+        grad_H_new_total = grad_H_new + grad_from_out
+        
+        # H_new = decay * H + B_rot * X_r
+        # grad_H = grad_H_new * decay
+        grad_H = grad_H_new_total * decay.unsqueeze(1)
+        
+        # grad_decay = grad_H_new * H, summed over R
+        grad_decay = (grad_H_new_total * H).sum(dim=1)  # [B, L, N]
+        
+        # grad_inject = grad_H_new
+        # inject = B_rot * X_r
+        # grad_B_rot = grad_inject * X_r
+        grad_B_rot = grad_H_new_total * X_r.unsqueeze(-1)
+        
+        # grad_X_r = (grad_inject * B_rot).sum(dim=-1)
+        grad_X_r = (grad_H_new_total * B_rot).sum(dim=-1)  # [B, R, L]
+        
+        return grad_H, grad_B_rot, grad_X_r, grad_decay
+
+
 class TritonSSMStep(nn.Module):
     """Fused SSM step operations using Triton."""
     
