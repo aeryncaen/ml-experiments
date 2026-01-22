@@ -173,8 +173,8 @@ class AdaptiveConvND(nn.Module):
         nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
     
-    def _forward_chunk(self, x_flat: torch.Tensor, chunk_start: int, chunk_end: int, 
-                        wave_params_chunk: torch.Tensor, queries_chunk: torch.Tensor,
+    def _forward_chunk(self, x_flat: torch.Tensor, x_chunk: torch.Tensor, 
+                        chunk_start: int, chunk_end: int,
                         spatial: tuple, L: int) -> torch.Tensor:
         B = x_flat.shape[0]
         C = x_flat.shape[-1]
@@ -183,9 +183,12 @@ class AdaptiveConvND(nn.Module):
         S = self.num_samples
         chunk_len = chunk_end - chunk_start
         
-        freq = torch.sigmoid(wave_params_chunk[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
-        phase = torch.tanh(wave_params_chunk[..., 1]) * self.max_freq
-        decay = torch.sigmoid(wave_params_chunk[..., 2]) * 9.5 + 0.5
+        wave_params = F.silu(self.wave_proj(x_chunk)).reshape(B, chunk_len, 3, H).permute(0, 1, 3, 2)
+        queries = F.silu(self.query_proj(x_chunk)).reshape(B, chunk_len, H, self.pos_dim)
+        
+        freq = torch.sigmoid(wave_params[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
+        phase = torch.tanh(wave_params[..., 1]) * self.max_freq
+        decay = torch.sigmoid(wave_params[..., 2]) * 9.5 + 0.5
         
         freq_avg = freq.mean(dim=2)
         phase_avg = phase.mean(dim=2)
@@ -224,7 +227,7 @@ class AdaptiveConvND(nn.Module):
         rel_dist = (self.stride_grid.norm(dim=-1).view(1, 1, 1, S) * freq.unsqueeze(-1)).abs()
         keys = self.key_proj(rel_dist.unsqueeze(-1))
         
-        attn_logits = torch.einsum('blhd,blhsd->blhs', queries_chunk, keys) * self.scale
+        attn_logits = torch.einsum('blhd,blhsd->blhs', queries, keys) * self.scale
         
         decay_envelope = torch.exp(-rel_dist / decay.unsqueeze(-1).clamp(min=0.1))
         
@@ -233,37 +236,29 @@ class AdaptiveConvND(nn.Module):
         attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
         output = torch.einsum('blhsd,blhs->blhd', values, attn_weights).reshape(B, chunk_len, C)
+        
+        se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
+        output = output * se_weights
+        
         return output
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B = x.shape[0]
         spatial = x.shape[1:-1]
         C = x.shape[-1]
-        H = self.num_channels
         L = reduce(mul, spatial, 1)
         
         x_flat = x.reshape(B, L, C)
         
-        wave_params = F.silu(self.wave_proj(x_flat)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
-        queries = F.silu(self.query_proj(x_flat)).reshape(B, L, H, self.pos_dim)
-        
         if L <= self.chunk_size:
-            output = self._forward_chunk(x_flat, 0, L, wave_params, queries, spatial, L)
+            output = self._forward_chunk(x_flat, x_flat, 0, L, spatial, L)
         else:
             outputs = []
             for start in range(0, L, self.chunk_size):
                 end = min(start + self.chunk_size, L)
-                chunk_out = self._forward_chunk(
-                    x_flat, start, end,
-                    wave_params[:, start:end],
-                    queries[:, start:end],
-                    spatial, L
-                )
+                chunk_out = self._forward_chunk(x_flat, x_flat[:, start:end], start, end, spatial, L)
                 outputs.append(chunk_out)
             output = torch.cat(outputs, dim=1)
-        
-        se_weights = torch.sigmoid(self.se_fc2(F.silu(self.se_fc1(output))))
-        output = output * se_weights
         
         output = self.out_proj(output).reshape(B, *spatial, C)
         
@@ -727,7 +722,8 @@ class LocalAttentionND(nn.Module):
         
         self.scale = self.channel_dim ** -0.5
         
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=False)
         self.q_norm = RMSNorm(self.channel_dim)
         self.k_norm = RMSNorm(self.channel_dim)
         self.window_proj = nn.Linear(embed_dim, 2 * num_channels)
@@ -756,23 +752,32 @@ class LocalAttentionND(nn.Module):
             x = x.unfold(dim + 1, self.kernel_size[dim], 1)
         return x
     
-    def _forward_chunk_1d(self, q_chunk: torch.Tensor, k_padded: torch.Tensor, v_padded: torch.Tensor,
-                          width_chunk: torch.Tensor, sharpness_chunk: torch.Tensor,
-                          chunk_start: int) -> torch.Tensor:
-        B, chunk_len, H, D = q_chunk.shape
-        C = H * D
+    def _forward_chunk_1d(self, x_chunk: torch.Tensor, k_padded: torch.Tensor, v_padded: torch.Tensor,
+                          chunk_start: int, L: int) -> torch.Tensor:
+        B, chunk_len, C = x_chunk.shape
+        H = self.num_channels
+        D = self.channel_dim
         K = self.kernel_size[0]
+        
+        q = F.silu(self.q_proj(x_chunk))
+        q_flat = self.q_norm(q.reshape(B, chunk_len, H, D))
+        q_flat = apply_rope(q_flat)
+        
+        window_params = F.silu(self.window_proj(x_chunk))
+        width_raw, sharpness_raw = window_params.chunk(2, dim=-1)
+        width = width_raw.sigmoid() * self.max_dist + 0.5
+        sharpness = sharpness_raw.sigmoid() * 9.5 + 0.5
         
         k_win = k_padded[:, chunk_start:chunk_start + chunk_len + K - 1].unfold(1, K, 1)
         v_win = v_padded[:, chunk_start:chunk_start + chunk_len + K - 1].unfold(1, K, 1)
         
-        k_win = k_win.reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
-        v_win = v_win.reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
+        k_win = k_win.permute(0, 1, 3, 2).reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
+        v_win = v_win.permute(0, 1, 3, 2).reshape(B, chunk_len, K, H, D).permute(0, 1, 3, 4, 2)
         
-        width_flat = width_chunk.reshape(B, chunk_len, H, 1)
-        sharpness_flat = sharpness_chunk.reshape(B, chunk_len, H, 1)
+        width_flat = width.reshape(B, chunk_len, H, 1)
+        sharpness_flat = sharpness.reshape(B, chunk_len, H, 1)
         
-        scores = torch.einsum('blhd,blhdw->blhw', q_chunk, k_win) * self.scale
+        scores = torch.einsum('blhd,blhdw->blhw', q_flat, k_win) * self.scale
         
         soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
         scores = scores - (1 - soft_mask) * 1e4
@@ -792,45 +797,46 @@ class LocalAttentionND(nn.Module):
         H = self.num_channels
         D = self.channel_dim
         
-        qkv = F.silu(self.qkv(x))
-        q, k, v = qkv.chunk(3, dim=-1)
-        
-        q_flat = self.q_norm(q.reshape(B, L, H, D))
-        k_flat = self.k_norm(k.reshape(B, L, H, D))
-        q_flat = apply_rope(q_flat)
-        k_flat = apply_rope(k_flat)
-        k = k_flat.reshape(*k.shape)
-        
-        window_params = F.silu(self.window_proj(x))
-        width_raw, sharpness_raw = window_params.chunk(2, dim=-1)
-        width = width_raw.sigmoid() * self.max_dist + 0.5
-        sharpness = sharpness_raw.sigmoid() * 9.5 + 0.5
+        x_flat = x.reshape(B, L, C)
         
         if self.ndim == 1 and L > self.chunk_size:
+            kv = F.silu(self.kv_proj(x_flat))
+            k, v = kv.chunk(2, dim=-1)
+            
+            k_flat = self.k_norm(k.reshape(B, L, H, D))
+            k_flat = apply_rope(k_flat)
+            k = k_flat.reshape(B, L, C)
+            
             K = self.kernel_size[0]
             pad_left = (K - 1) // 2
             pad_right = K // 2
-            k_padded = F.pad(k.reshape(B, L, C), (0, 0, pad_left, pad_right))
-            v_padded = F.pad(v.reshape(B, L, C), (0, 0, pad_left, pad_right))
-            
-            width_flat = width.reshape(B, L, H)
-            sharpness_flat = sharpness.reshape(B, L, H)
+            k_padded = F.pad(k, (0, 0, pad_left, pad_right))
+            v_padded = F.pad(v, (0, 0, pad_left, pad_right))
             
             outputs = []
             for start in range(0, L, self.chunk_size):
                 end = min(start + self.chunk_size, L)
-                chunk_out = self._forward_chunk_1d(
-                    q_flat[:, start:end],
-                    k_padded, v_padded,
-                    width_flat[:, start:end],
-                    sharpness_flat[:, start:end],
-                    start
-                )
+                chunk_out = self._forward_chunk_1d(x_flat[:, start:end], k_padded, v_padded, start, L)
                 outputs.append(chunk_out)
             out = torch.cat(outputs, dim=1)
         else:
-            k_win = self._unfold_nd(k)
-            v_win = self._unfold_nd(v)
+            q = F.silu(self.q_proj(x_flat))
+            kv = F.silu(self.kv_proj(x_flat))
+            k, v = kv.chunk(2, dim=-1)
+            
+            q_flat = self.q_norm(q.reshape(B, L, H, D))
+            k_flat = self.k_norm(k.reshape(B, L, H, D))
+            q_flat = apply_rope(q_flat)
+            k_flat = apply_rope(k_flat)
+            k = k_flat.reshape(*k.shape)
+            
+            window_params = F.silu(self.window_proj(x_flat))
+            width_raw, sharpness_raw = window_params.chunk(2, dim=-1)
+            width = width_raw.sigmoid() * self.max_dist + 0.5
+            sharpness = sharpness_raw.sigmoid() * 9.5 + 0.5
+            
+            k_win = self._unfold_nd(k.reshape(B, *spatial_shape, C))
+            v_win = self._unfold_nd(v.reshape(B, *spatial_shape, C))
             
             perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
             k_win = k_win.permute(*perm).reshape(B, L, self.window_size, H, D).permute(0, 1, 3, 4, 2)
