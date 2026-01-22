@@ -719,7 +719,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
     
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     total_steps = epochs * len(train_loader)
