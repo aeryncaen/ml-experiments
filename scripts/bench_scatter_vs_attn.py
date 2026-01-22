@@ -1258,9 +1258,9 @@ def main():
                 model = builder(mt)
                 print(f'\nTraining {mt}...')
             
-        # RippleClassifierND/FlatRippleClassifierND in 2D/3D mode expects spatial input, not flattened
-        # In 1D mode, ripple/flat needs flattened 1D sequence input
-        model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
+            # RippleClassifierND/FlatRippleClassifierND in 2D/3D mode expects spatial input, not flattened
+            # In 1D mode, ripple/flat needs flattened 1D sequence input
+            model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
             
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
