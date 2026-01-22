@@ -395,7 +395,6 @@ class LowRankAttentionMerge(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.gate_proj = nn.Linear(dim, 1)
     
     def forward(self, embed: torch.Tensor, processed: torch.Tensor) -> torch.Tensor:
         B, L, C = embed.shape
@@ -411,10 +410,7 @@ class LowRankAttentionMerge(nn.Module):
         v_down = F.adaptive_avg_pool1d(v.mT, r).mT
         
         out = F.scaled_dot_product_attention(q, k_down, v_down)
-        out = self.out_proj(out)
-        
-        gate = torch.sigmoid(self.gate_proj(embed))
-        return gate * embed + (1 - gate) * out
+        return processed + self.out_proj(out)
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
