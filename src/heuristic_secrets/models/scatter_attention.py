@@ -17,6 +17,19 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .backbone import AdaptiveDeformConv1d
 
+try:
+    from .triton_scatter import (
+        TritonScatterConv,
+        TritonLocalWindowAttn,
+        TritonSSMStep,
+        HAS_TRITON,
+    )
+except ImportError:
+    HAS_TRITON = False
+    TritonScatterConv = None
+    TritonLocalWindowAttn = None
+    TritonSSMStep = None
+
 
 def avg_pool_nd(x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
     """Average pool spatial dimensions to target shape. Input: (B, *spatial, C)."""
@@ -172,6 +185,16 @@ class AdaptiveConvND(nn.Module):
         nn.init.zeros_(self.wave_proj.weight)
         nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
+        
+        self._triton_mod = None
+        if ndim == 1 and HAS_TRITON and TritonScatterConv is not None:
+            self._triton_mod = TritonScatterConv(
+                channels=channels,
+                max_samples=max_samples,
+                num_channels=num_channels,
+                max_freq=max_freq,
+                min_freq=min_freq,
+            )
     
     def _forward_chunk(self, x_flat: torch.Tensor, x_chunk: torch.Tensor,
                         chunk_start: int, chunk_end: int,
@@ -247,6 +270,10 @@ class AdaptiveConvND(nn.Module):
         spatial = x.shape[1:-1]
         C = x.shape[-1]
         L = reduce(mul, spatial, 1)
+        
+        if self._triton_mod is not None and x.is_cuda:
+            out, info = self._triton_mod(x.reshape(B, L, C))
+            return F.silu(self.out_proj(out)).reshape(B, *spatial, C), info
         
         x_flat = x.reshape(B, L, C)
         
@@ -803,6 +830,14 @@ class LocalAttentionND(nn.Module):
         rel_dist = torch.sqrt(torch.stack([g**2 for g in grids]).sum(dim=0))
         self.register_buffer('rel_dist', rel_dist.flatten())
         self.max_dist = rel_dist.max().item()
+        
+        self._triton_mod = None
+        if ndim == 1 and HAS_TRITON and TritonLocalWindowAttn is not None:
+            self._triton_mod = TritonLocalWindowAttn(
+                embed_dim=embed_dim,
+                kernel_size=kernel_size[0],
+                num_channels=num_channels,
+            )
     
     def _unfold_nd(self, x: torch.Tensor) -> torch.Tensor:
         pad_dims = [0, 0]
@@ -857,6 +892,9 @@ class LocalAttentionND(nn.Module):
         L = 1
         for s in spatial_shape:
             L *= s
+        
+        if self._triton_mod is not None and x.is_cuda:
+            return self._triton_mod(x.reshape(B, L, C)).reshape(B, *spatial_shape, C)
         
         H = self.num_channels
         D = self.channel_dim
