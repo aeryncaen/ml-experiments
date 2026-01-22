@@ -515,9 +515,13 @@ class LocalAttentionND(nn.Module):
         self.max_dist = rel_dist.max().item()
     
     def _unfold_nd(self, x: torch.Tensor) -> torch.Tensor:
+        # Asymmetric padding to handle even kernel sizes correctly
+        # Total pad = k-1, so after unfold we get original size back
         pad_dims = [0, 0]
-        for half in reversed(self.half_k):
-            pad_dims.extend([half, half])
+        for k in reversed(self.kernel_size):
+            pad_left = (k - 1) // 2
+            pad_right = k // 2
+            pad_dims.extend([pad_left, pad_right])
         x = F.pad(x, pad_dims)
         
         for dim in range(self.ndim):
