@@ -1445,6 +1445,158 @@ class RippleClassifier(RippleClassifierND):
                          mimo_rank=mimo_rank)
 
 
+class FlatRippleND(nn.Module):
+    
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        iterations: int = 8,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        self.iterations = iterations
+        
+        self.embed = nn.Linear(input_dim, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm_norm = RMSNorm(embed_dim)
+        
+        self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.attn_norm = RMSNorm(embed_dim)
+        
+        self.merge = LowRankAttentionMergeND(embed_dim)
+        
+        self.state_norm = RMSNorm(embed_dim)
+        self.state_gate = nn.Linear(embed_dim, embed_dim)
+        nn.init.zeros_(self.state_gate.weight)
+        nn.init.constant_(self.state_gate.bias, -2.0)
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, output_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        embed = self.embed_norm(F.silu(self.embed(x)))
+        
+        x = embed
+        H = self.ssm.init_state(x)
+        state = torch.zeros_like(x)
+        
+        for i in range(self.iterations):
+            H, ssm_out = self.ssm.step(self.ssm_norm(x), H, i)
+            x = x + self.attn(self.attn_norm(x))
+            x = x + ssm_out
+            x = self.merge(embed, x)
+            
+            gate = torch.sigmoid(self.state_gate(x))
+            state = self.state_norm(state + x)
+            x = gate * state + (1 - gate) * x
+        
+        x = self.out_norm(x)
+        return self.head(x)
+
+
+class FlatRipple(FlatRippleND):
+    
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        iterations: int = 8,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+    ):
+        super().__init__(input_dim, embed_dim, output_dim, iterations, kernel_size,
+                         ndim=1, num_channels=num_channels, state_dim=state_dim,
+                         mimo_rank=mimo_rank)
+
+
+class FlatRippleClassifierND(nn.Module):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        iterations: int = 8,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        self.iterations = iterations
+        
+        self.embed = nn.Linear(1, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm_norm = RMSNorm(embed_dim)
+        
+        self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.attn_norm = RMSNorm(embed_dim)
+        
+        self.merge = LowRankAttentionMergeND(embed_dim)
+        
+        self.state_norm = RMSNorm(embed_dim)
+        self.state_gate = nn.Linear(embed_dim, embed_dim)
+        nn.init.zeros_(self.state_gate.weight)
+        nn.init.constant_(self.state_gate.bias, -2.0)
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, n_classes)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.unsqueeze(-1)
+        embed = self.embed_norm(F.silu(self.embed(x)))
+        
+        x = embed
+        H = self.ssm.init_state(x)
+        state = torch.zeros_like(x)
+        
+        for i in range(self.iterations):
+            H, ssm_out = self.ssm.step(self.ssm_norm(x), H, i)
+            x = x + self.attn(self.attn_norm(x))
+            x = x + ssm_out
+            x = self.merge(embed, x)
+            
+            gate = torch.sigmoid(self.state_gate(x))
+            state = self.state_norm(state + x)
+            x = gate * state + (1 - gate) * x
+        
+        pool_dims = tuple(range(1, self.ndim + 1))
+        x = self.out_norm(x).mean(dim=pool_dims)
+        return self.head(x)
+
+
+class FlatRippleClassifier(FlatRippleClassifierND):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        iterations: int = 8,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+        state_dim: int = 64,
+        mimo_rank: int = 4,
+    ):
+        super().__init__(embed_dim, n_classes, iterations, kernel_size, ndim=1,
+                         num_channels=num_channels, state_dim=state_dim,
+                         mimo_rank=mimo_rank)
+
+
 class HierarchicalLocalAttentionND(nn.Module):
     
     def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'both', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
