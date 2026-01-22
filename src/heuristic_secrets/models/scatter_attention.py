@@ -348,6 +348,19 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
+class GatedMerge(nn.Module):
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 2.0)
+    
+    def forward(self, embed: torch.Tensor, processed: torch.Tensor) -> torch.Tensor:
+        gate = torch.sigmoid(self.gate_proj(embed))
+        return gate * embed + (1 - gate) * processed
+
+
 def apply_rope(x: torch.Tensor, positions: torch.Tensor | None = None, base: float = 10000.0) -> torch.Tensor:
     """Apply rotary position embedding.
     
@@ -459,10 +472,10 @@ class LocalAttentionND(nn.Module):
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.q_norm = RMSNorm(self.channel_dim)
         self.k_norm = RMSNorm(self.channel_dim)
-        # Projects to (width, sharpness) per channel
         self.window_proj = nn.Linear(embed_dim, 2 * num_channels)
         self.out_norm = RMSNorm(embed_dim)
         self.out = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_gate = GatedMerge(embed_dim)
         
         # Init: width→mid, sharpness→5.0
         nn.init.zeros_(self.window_proj.weight)
@@ -532,7 +545,8 @@ class LocalAttentionND(nn.Module):
         out = torch.einsum('blhw,blhdw->blhd', attn, v_win).reshape(B, L, C)
         
         out = self.out_norm(out.reshape(*x.shape[:-1], C))
-        return F.silu(self.out(out + v))
+        merged = self.v_gate(v, out)
+        return F.silu(self.out(merged))
 
 
 class LocalAttention(LocalAttentionND):
@@ -587,8 +601,11 @@ class HierarchicalLocalAttentionND(nn.Module):
             self.reduce_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
             self.reduce_out = nn.Linear(embed_dim, embed_dim, bias=False)
             self.reduce_scale = embed_dim ** -0.5
+            self.reduce_gate = GatedMerge(embed_dim)
         
         self.attn = LocalAttentionND(embed_dim, window_size, ndim, num_channels)
+        
+        self.conv_gate = GatedMerge(embed_dim)
         
         self.level_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         self.level_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
@@ -596,6 +613,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         self.ctx_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.hidden_kv = nn.Linear(embed_dim, embed_dim * 2, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_gate = GatedMerge(embed_dim)
         
         nn.init.zeros_(self.out_proj.weight)
     
@@ -641,7 +659,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         scores = torch.einsum('bqc,bkc->bqk', q, k) * self.reduce_scale
         attn = F.softmax(scores, dim=-1)
         out = torch.einsum('bqk,bkc->bqc', attn, v)
-        out = self.reduce_out(out) + q_input
+        out = self.reduce_gate(q_input, self.reduce_out(out))
         
         return out.mT.reshape(B, C, *reduced_shape)
     
@@ -665,7 +683,7 @@ class HierarchicalLocalAttentionND(nn.Module):
             if self.conv_position == 'pre':
                 conv_out, _ = self.conv(h)
                 conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
-                h = h + conv_out
+                h = self.conv_gate(h.reshape(B, -1, C), conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
             
             h = self.attn(h)
             if self.attn_residual:
@@ -674,7 +692,7 @@ class HierarchicalLocalAttentionND(nn.Module):
             if self.conv_position == 'post':
                 conv_out, _ = self.conv(h)
                 conv_out = self.conv_norm(conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
-                h = h + conv_out
+                h = self.conv_gate(h.reshape(B, -1, C), conv_out.reshape(B, -1, C)).reshape(B, *h.shape[1:-1], C)
             
             levels.append(h)
             
@@ -704,7 +722,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         hidden_weights = F.softmax(hidden_scores, dim=-1)
         update = torch.einsum('bqk,bkc->bqc', hidden_weights, hidden_v)
         
-        out = level0_flat + self.out_proj(update)
+        out = self.out_gate(level0_flat, self.out_proj(update))
         return out.reshape(B, *spatial_shape, C)
 
 
