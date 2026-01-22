@@ -567,7 +567,7 @@ class LocalBlock(nn.Module):
 
 class HierarchicalLocalAttentionND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, min_size: int = 4, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -727,13 +727,13 @@ class HierarchicalLocalAttentionND(nn.Module):
 
 
 class HierarchicalLocalAttention(HierarchicalLocalAttentionND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
         super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
 class HierarchicalLocalBlockND(nn.Module):
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
         super().__init__()
         self.norm = RMSNorm(embed_dim, eps)
         self.attn = HierarchicalLocalAttentionND(embed_dim, window_size, ndim, num_channels, poolable_dims, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
@@ -743,7 +743,7 @@ class HierarchicalLocalBlockND(nn.Module):
 
 
 class HierarchicalLocalBlock(HierarchicalLocalBlockND):
-    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'pre', attn_residual: bool = False, reduce_mode: str = 'conv'):
+    def __init__(self, embed_dim: int, window_size: int = 17, num_channels: int = 1, poolable_dims: tuple[int, ...] | None = None, eps: float = 1e-6, conv_position: str = 'post', attn_residual: bool = True, reduce_mode: str = 'conv'):
         super().__init__(embed_dim, window_size, ndim=1, num_channels=num_channels, poolable_dims=poolable_dims, eps=eps, conv_position=conv_position, attn_residual=attn_residual, reduce_mode=reduce_mode)
 
 
