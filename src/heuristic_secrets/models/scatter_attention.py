@@ -173,32 +173,9 @@ class AdaptiveConvND(nn.Module):
         nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
     
-    def _sample_values_grid(
-        self, x_spatial: torch.Tensor, sample_pos: torch.Tensor, spatial: tuple
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample values using F.grid_sample (2D/3D only). Returns (values, valid_mask)."""
-        B, chunk_len, S, ndim = sample_pos.shape
-        
-        valid_mask = torch.ones(B, chunk_len, S, dtype=torch.bool, device=sample_pos.device)
-        for dim in range(ndim):
-            valid_mask = valid_mask & (sample_pos[..., dim] >= 0) & (sample_pos[..., dim] < spatial[dim])
-        
-        grid = sample_pos.clone()
-        for dim in range(ndim):
-            grid[..., dim] = 2.0 * grid[..., dim] / max(spatial[dim] - 1, 1) - 1.0
-        grid = grid.flip(-1)
-        
-        values = F.grid_sample(
-            x_spatial, grid, mode='bilinear', padding_mode='zeros', align_corners=True
-        )
-        values = values.permute(0, 2, 3, 1)
-        
-        return values, valid_mask
-    
     def _forward_chunk(self, x_flat: torch.Tensor, x_chunk: torch.Tensor,
                         chunk_start: int, chunk_end: int,
-                        spatial: tuple, L: int,
-                        x_spatial: torch.Tensor | None = None) -> torch.Tensor:
+                        spatial: tuple, L: int) -> torch.Tensor:
         B = x_flat.shape[0]
         C = x_flat.shape[-1]
         H = self.num_channels
@@ -220,10 +197,7 @@ class AdaptiveConvND(nn.Module):
             centers = torch.arange(chunk_start, chunk_end, device=x_flat.device, dtype=x_flat.dtype)
             sample_pos = centers.view(1, chunk_len, 1) + self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
-            sample_idx = sample_pos.long().clamp(0, L - 1).expand(B, -1, -1)
-            idx_flat = sample_idx.reshape(B, chunk_len * S).unsqueeze(-1).expand(-1, -1, C)
-            values = torch.gather(x_flat, 1, idx_flat).reshape(B, chunk_len, S, C)
-            values = values.reshape(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
+            sample_idx = sample_pos.long().clamp(0, L - 1)
         else:
             coords = [torch.arange(s, device=x_flat.device, dtype=x_flat.dtype) for s in spatial]
             mesh = torch.meshgrid(*coords, indexing='ij')
@@ -232,9 +206,21 @@ class AdaptiveConvND(nn.Module):
             
             sample_pos = centers.view(1, chunk_len, 1, self.ndim) + self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, chunk_len, 1, 1) + phase_avg.view(B, chunk_len, 1, 1)
             
-            assert x_spatial is not None
-            values, valid_mask = self._sample_values_grid(x_spatial, sample_pos, spatial)
-            values = values.reshape(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
+            valid_mask = torch.ones(B, chunk_len, S, dtype=torch.bool, device=x_flat.device)
+            for dim in range(self.ndim):
+                valid_mask = valid_mask & (sample_pos[..., dim] >= 0) & (sample_pos[..., dim] < spatial[dim])
+            
+            sample_coords = sample_pos.long()
+            for dim in range(self.ndim):
+                sample_coords[..., dim] = sample_coords[..., dim].clamp(0, spatial[dim] - 1)
+            
+            strides = [1]
+            for dim in range(self.ndim - 1, 0, -1):
+                strides.insert(0, strides[0] * spatial[dim])
+            sample_idx = sum(sample_coords[..., dim] * strides[dim] for dim in range(self.ndim))
+        
+        batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1).expand(B, chunk_len, S)
+        values = x_flat[batch_idx, sample_idx].reshape(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
         
         valid_mask = valid_mask.unsqueeze(2).expand(B, chunk_len, H, S)
         
@@ -263,15 +249,14 @@ class AdaptiveConvND(nn.Module):
         L = reduce(mul, spatial, 1)
         
         x_flat = x.reshape(B, L, C)
-        x_spatial = x.movedim(-1, 1) if self.ndim >= 2 else None
         
         if L <= self.chunk_size:
-            output = self._forward_chunk(x_flat, x_flat, 0, L, spatial, L, x_spatial)
+            output = self._forward_chunk(x_flat, x_flat, 0, L, spatial, L)
         else:
             outputs = []
             for start in range(0, L, self.chunk_size):
                 end = min(start + self.chunk_size, L)
-                chunk_out = self._forward_chunk(x_flat, x_flat[:, start:end], start, end, spatial, L, x_spatial)
+                chunk_out = self._forward_chunk(x_flat, x_flat[:, start:end], start, end, spatial, L)
                 outputs.append(chunk_out)
             output = torch.cat(outputs, dim=1)
         
@@ -920,21 +905,40 @@ class LocalAttentionND(nn.Module):
             
             k_spatial = k.reshape(B, *spatial_shape, C)
             v_spatial = v.reshape(B, *spatial_shape, C)
-            k_win = self._unfold_nd(k_spatial)
-            v_win = self._unfold_nd(v_spatial)
             
-            perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
-            k_win = k_win.permute(*perm).reshape(B, *spatial_shape, self.window_size, H, D)
-            v_win = v_win.permute(*perm).reshape(B, *spatial_shape, self.window_size, H, D)
-            
-            scores = torch.einsum('b...hd,b...whd->b...hw', q, k_win) * self.scale
-            
-            soft_mask = torch.sigmoid((width - self.rel_dist) * sharpness)
-            scores = scores - (1 - soft_mask) * 1e4
-            
-            attn = F.softmax(scores, dim=-1)
-            out = torch.einsum('b...hw,b...whd->b...hd', attn, v_win)
-            out = out.reshape(B, *spatial_shape, C)
+            if self.ndim == 2:
+                Hs, Ws = spatial_shape
+                L = Hs * Ws
+                k_cf = k_spatial.permute(0, 3, 1, 2)
+                v_cf = v_spatial.permute(0, 3, 1, 2)
+                k_unfold = F.unfold(k_cf, kernel_size=self.kernel_size, padding=self.half_k, stride=1)
+                v_unfold = F.unfold(v_cf, kernel_size=self.kernel_size, padding=self.half_k, stride=1)
+                k_win = k_unfold.view(B, H, D, self.window_size, L).permute(0, 4, 3, 1, 2)
+                v_win = v_unfold.view(B, H, D, self.window_size, L).permute(0, 4, 3, 1, 2)
+                q_flat = q.reshape(B, L, H, D)
+                width_flat = width.reshape(B, L, H, 1)
+                sharpness_flat = sharpness.reshape(B, L, H, 1)
+                scores = torch.einsum('blhd,blkhd->blhk', q_flat, k_win) * self.scale
+                soft_mask = torch.sigmoid((width_flat - self.rel_dist) * sharpness_flat)
+                scores = scores - (1 - soft_mask) * 1e4
+                attn = F.softmax(scores, dim=-1)
+                out = torch.einsum('blhk,blkhd->blhd', attn, v_win).reshape(B, Hs, Ws, C)
+            else:
+                k_win = self._unfold_nd(k_spatial)
+                v_win = self._unfold_nd(v_spatial)
+                
+                perm = [0] + list(range(1, self.ndim + 1)) + list(range(self.ndim + 2, self.ndim * 2 + 2)) + [self.ndim + 1]
+                k_win = k_win.permute(*perm).reshape(B, *spatial_shape, self.window_size, H, D)
+                v_win = v_win.permute(*perm).reshape(B, *spatial_shape, self.window_size, H, D)
+                
+                scores = torch.einsum('b...hd,b...whd->b...hw', q, k_win) * self.scale
+                
+                soft_mask = torch.sigmoid((width - self.rel_dist) * sharpness)
+                scores = scores - (1 - soft_mask) * 1e4
+                
+                attn = F.softmax(scores, dim=-1)
+                out = torch.einsum('b...hw,b...whd->b...hd', attn, v_win)
+                out = out.reshape(B, *spatial_shape, C)
             
             out = self.out_norm(out)
             merged = self.v_gate(v_spatial, out)
