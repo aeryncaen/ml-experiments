@@ -84,7 +84,6 @@ def test_ssm_step(device, B=32, L=512, C=64):
 
 
 def measure_memory_and_time(fn, n_warmup=5, n_iter=20):
-    """Run fn, measure peak memory and avg time."""
     for _ in range(n_warmup):
         fn()
     
