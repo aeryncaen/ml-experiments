@@ -448,7 +448,6 @@ class LowRankAttentionND(nn.Module):
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
-        
         out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
         
         return out.reshape(B, *spatial_shape, C)
