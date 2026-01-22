@@ -554,7 +554,9 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
 
 def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None):
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
+    total_loss_t = torch.tensor(0.0, device=device)
+    correct_t = torch.tensor(0, device=device)
+    total_t = torch.tensor(0, device=device)
 
     desc = "Train"
     if wtf_mode:
@@ -604,8 +606,8 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                         loss = per_token_loss.mean()
                 mask = labels_flat != -100
                 preds = logits_flat.argmax(dim=-1)
-                correct += (preds[mask] == labels_flat[mask]).sum().item()
-                total += mask.sum().item()
+                correct_t += (preds[mask] == labels_flat[mask]).sum()
+                total_t += mask.sum()
             else:
                 per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
                 if wtf_mode:
@@ -624,8 +626,8 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                         loss = topk_losses.mean()
                     else:
                         loss = per_sample_loss.mean()
-                correct += (logits.argmax(dim=-1) == labels).sum().item()
-                total += labels.size(0)
+                correct_t += (logits.argmax(dim=-1) == labels).sum()
+                total_t += labels.size(0)
 
         if scaler:
             scaler.scale(loss).backward()
@@ -640,10 +642,12 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         if scheduler:
             scheduler.step()
 
-        total_loss += loss.item()
-        pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
+        total_loss_t += loss.detach()
 
-    return total_loss / len(loader), correct / max(total, 1)
+    total_loss = total_loss_t.item()
+    correct = correct_t.item()
+    total = max(total_t.item(), 1)
+    return total_loss / len(loader), correct / total
 
 
 @torch.no_grad()
