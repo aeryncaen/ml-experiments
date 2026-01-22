@@ -17,6 +17,8 @@ from heuristic_secrets.models.triton_scatter import (
     TritonLocalWindowAttn,
     TritonSSMStep,
     HAS_TRITON,
+    set_block_config_override,
+    clear_block_config_override,
 )
 
 
@@ -103,6 +105,46 @@ def measure_memory_and_time(fn, n_warmup=5, n_iter=20):
     avg_time = sum(times) / len(times) * 1000
     
     return avg_time, peak_mem
+
+
+def _run_kernel_sweep(B, L, C, device):
+    print("\n=== Kernel Config Sweep (Scatter + LocalWindow) ===")
+    print(f"B={B}, L={L}, C={C}")
+    print("BLOCK_D  warps  stages | Scatter ms  Mem(MB) | Local ms  Mem(MB)")
+    print("-" * 70)
+
+    scatter = TritonScatterConv(channels=C, max_samples=17, num_channels=4).to(device)
+    attn = TritonLocalWindowAttn(embed_dim=C, kernel_size=17, num_channels=4).to(device)
+
+    def run_scatter():
+        x = torch.randn(B, L, C, device=device, requires_grad=True)
+        out, _ = scatter(x)
+        out.sum().backward()
+
+    def run_attn():
+        x = torch.randn(B, L, C, device=device, requires_grad=True)
+        out = attn(x)
+        out.sum().backward()
+
+    configs = [
+        (32, 2, 2),
+        (32, 4, 2),
+        (64, 2, 2),
+        (64, 4, 2),
+        (64, 4, 3),
+        (128, 4, 2),
+        (128, 4, 3),
+        (128, 8, 3),
+    ]
+
+    for block_d, warps, stages in configs:
+        set_block_config_override(block_d, warps, stages)
+        try:
+            scatter_ms, scatter_mem = measure_memory_and_time(run_scatter)
+            attn_ms, attn_mem = measure_memory_and_time(run_attn)
+            print(f"{block_d:<7} {warps:<5} {stages:<6} | {scatter_ms:<10.3f} {scatter_mem:<7.1f} | {attn_ms:<8.3f} {attn_mem:<7.1f}")
+        finally:
+            clear_block_config_override()
 
 
 def benchmark_triton_vs_pytorch(B, L, C, device):
@@ -324,6 +366,7 @@ def check_triton_vs_fallback(device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true", help="Run benchmarks")
+    parser.add_argument("--sweep", action="store_true", help="Run kernel config sweep")
     parser.add_argument("--batch", type=int, default=32, help="Batch size")
     parser.add_argument("--seq", type=int, default=512, help="Sequence length")
     parser.add_argument("--dim", type=int, default=64, help="Embedding dimension")
@@ -348,6 +391,9 @@ def main():
     
     if args.benchmark and device == "cuda":
         benchmark_triton_vs_pytorch(args.batch, args.seq, args.dim, device)
+
+    if args.sweep and device == "cuda":
+        _run_kernel_sweep(args.batch, args.seq, args.dim, device)
     
     print("\n" + "=" * 50)
     print("All tests passed!")
