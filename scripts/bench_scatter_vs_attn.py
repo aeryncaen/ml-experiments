@@ -1041,7 +1041,7 @@ def main():
     parser.add_argument('--duo-merge', type=str, default='mean', choices=DuoModel.MERGE_STRATEGIES, help='Duo merge strategy (default: mean)')
     parser.add_argument('--conv-position', type=str, default='post', choices=['pre', 'post', 'both'], help='Where to run conv relative to attention (default: post)')
     parser.add_argument('--reduce-mode', type=str, default='cross_attn', choices=['conv', 'cross_attn'], help='Level reduction mode (default: cross_attn)')
-    parser.add_argument('--merge-mode', type=str, default='gate', choices=['gate', 'learned'], help='Merge mode for residuals (default: gate)')
+    parser.add_argument('--merge-mode', type=str, default='gate', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: gate)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     args = parser.parse_args()
 
