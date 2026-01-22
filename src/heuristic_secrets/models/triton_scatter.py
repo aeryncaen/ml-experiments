@@ -270,8 +270,8 @@ if HAS_TRITON:
         k_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
         v_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
         
-        max_score = -float('inf')
-        sum_exp = 0.0
+        max_score = -1e9
+        sum_exp = 1e-8
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
         
         for w in range(K):
@@ -296,7 +296,7 @@ if HAS_TRITON:
             sum_exp = sum_exp * exp_old + exp_new
             max_score = new_max
         
-        out = acc / (sum_exp + 1e-8)
+        out = acc / sum_exp
         
         out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
         tl.store(out_ptr + out_base + d_offsets, out, mask=d_mask)
