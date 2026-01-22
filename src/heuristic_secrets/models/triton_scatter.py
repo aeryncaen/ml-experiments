@@ -100,6 +100,98 @@ if HAS_TRITON:
 
 
     @triton.jit
+    def _scatter_attn_fwd_with_attn_kernel(
+        x_ptr,              # [B, L, C]
+        q_ptr,              # [B, L, H, pos_dim]
+        freq_ptr,           # [B, L, H]
+        phase_ptr,          # [B, L, H]
+        decay_ptr,          # [B, L, H]
+        key_weight_ptr,     # [pos_dim]
+        stride_grid_ptr,    # [S]
+        out_ptr,            # [B, L, H, D]
+        attn_ptr,           # [B, L, H, S] - output attention weights
+        sample_idx_ptr,     # [B, L, H, S] - output sample indices
+        B: tl.constexpr,
+        L: tl.constexpr,
+        C: tl.constexpr,
+        H: tl.constexpr,
+        D: tl.constexpr,
+        S: tl.constexpr,
+        pos_dim: tl.constexpr,
+        scale: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+            return
+        
+        freq_offset = pid_b * L * H + pid_l * H + pid_h
+        freq = tl.load(freq_ptr + freq_offset)
+        phase = tl.load(phase_ptr + freq_offset)
+        decay = tl.load(decay_ptr + freq_offset)
+        
+        q_base = pid_b * L * H * pos_dim + pid_l * H * pos_dim + pid_h * pos_dim
+        q = tl.load(q_ptr + q_base + tl.arange(0, pos_dim))
+        
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < D
+        head_start = pid_h * D
+        
+        attn_base = pid_b * L * H * S + pid_l * H * S + pid_h * S
+        idx_base = pid_b * L * H * S + pid_l * H * S + pid_h * S
+        
+        max_score = -1e9
+        for s in range(S):
+            offset = tl.load(stride_grid_ptr + s)
+            sample_pos = pid_l + offset * freq + phase
+            valid = (sample_pos >= 0) & (sample_pos < L)
+            rel_dist = tl.abs(offset * freq)
+            key = tl.load(key_weight_ptr + tl.arange(0, pos_dim)) * rel_dist
+            score = tl.sum(q * key) * scale
+            score = tl.where(valid, score, -1e9)
+            max_score = tl.maximum(max_score, score)
+        
+        sum_exp = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        
+        for s in range(S):
+            offset = tl.load(stride_grid_ptr + s)
+            sample_pos = pid_l + offset * freq + phase
+            sample_idx = tl.minimum(tl.maximum(sample_pos.to(tl.int32), 0), L - 1)
+            valid = (sample_pos >= 0) & (sample_pos < L)
+            
+            tl.store(sample_idx_ptr + idx_base + s, sample_idx)
+            
+            x_base = pid_b * L * C + sample_idx * C + head_start
+            v = tl.load(x_ptr + x_base + d_offsets, mask=d_mask, other=0.0)
+            
+            rel_dist = tl.abs(offset * freq)
+            key = tl.load(key_weight_ptr + tl.arange(0, pos_dim)) * rel_dist
+            score = tl.sum(q * key) * scale
+            decay_factor = tl.exp(-rel_dist / tl.maximum(decay, 0.1))
+            score = tl.where(valid, score, -1e9)
+            
+            exp_score = tl.exp(score - max_score) * decay_factor * valid.to(tl.float32)
+            sum_exp += exp_score
+            acc += v * exp_score
+            
+            tl.store(attn_ptr + attn_base + s, exp_score)
+        
+        inv_sum = 1.0 / (sum_exp + 1e-8)
+        out = acc * inv_sum
+        
+        for s in range(S):
+            attn_val = tl.load(attn_ptr + attn_base + s)
+            tl.store(attn_ptr + attn_base + s, attn_val * inv_sum)
+        
+        out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        tl.store(out_ptr + out_base + d_offsets, out, mask=d_mask)
+
+
+    @triton.jit
     def _scatter_attn_bwd_kernel(
         grad_out_ptr,       # [B, L, H, D]
         x_ptr,              # [B, L, C]
@@ -169,56 +261,36 @@ class ScatterAttentionFunc(Function):
         D = C // H
         
         out = torch.empty(B, L, H, D, device=x.device, dtype=x.dtype)
+        attn = torch.empty(B, L, H, S, device=x.device, dtype=x.dtype)
+        sample_idx = torch.empty(B, L, H, S, device=x.device, dtype=torch.int32)
         
         BLOCK_D = triton.next_power_of_2(D)
-        
         grid = (B, L, H)
-        _scatter_attn_fwd_kernel[grid](
-            x, q, freq, phase, decay, key_weight, stride_grid, out,
+        _scatter_attn_fwd_with_attn_kernel[grid](
+            x, q, freq, phase, decay, key_weight, stride_grid, out, attn, sample_idx,
             B, L, C, H, D, S, pos_dim, scale,
             BLOCK_D=BLOCK_D,
         )
         
-        ctx.save_for_backward(x, q, freq, phase, decay, key_weight, stride_grid)
-        ctx.scale = scale
-        ctx.shapes = (B, L, C, H, D, S, pos_dim)
+        ctx.save_for_backward(attn, sample_idx)
+        ctx.shapes = (B, L, C, H, D, S)
         
         return out.reshape(B, L, C)
     
     @staticmethod
     def backward(ctx, grad_output):
-        x, q, freq, phase, decay, key_weight, stride_grid = ctx.saved_tensors
-        B, L, C, H, D, S, pos_dim = ctx.shapes
-        scale = ctx.scale
+        attn, sample_idx = ctx.saved_tensors
+        B, L, C, H, D, S = ctx.shapes
         
-        grad_output = grad_output.reshape(B, L, H, D).contiguous()
+        grad_output = grad_output.reshape(B, L, H, D)
+        grad_x = torch.zeros(B, L, C, device=grad_output.device, dtype=grad_output.dtype)
         
-        centers = torch.arange(L, device=x.device, dtype=x.dtype)
-        sample_pos = centers.view(1, L, 1, 1) + stride_grid.view(1, 1, S, 1) * freq.view(B, L, 1, H) + phase.view(B, L, 1, H)
-        sample_pos = sample_pos[..., 0]
-        valid_mask = (sample_pos >= 0) & (sample_pos < L)
-        sample_idx = sample_pos.long().clamp(0, L - 1)
-        
-        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(B, L, S)
-        values = x[batch_idx, sample_idx].reshape(B, L, S, H, D).permute(0, 1, 3, 2, 4)
-        
-        rel_dist = stride_grid.abs().view(1, 1, 1, S) * freq.view(B, L, H, 1)
-        keys = key_weight.view(1, 1, 1, 1, pos_dim) * rel_dist.unsqueeze(-1)
-        scores = torch.einsum('blhd,blhsd->blhs', q, keys) * scale
-        decay_env = torch.exp(-rel_dist / decay.view(B, L, H, 1).clamp(min=0.1))
-        
-        valid_mask_exp = valid_mask.unsqueeze(2).expand(B, L, H, S)
-        scores = scores.masked_fill(~valid_mask_exp, float('-inf'))
-        attn = F.softmax(scores, dim=-1) * decay_env * valid_mask_exp.float()
-        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        grad_values = torch.einsum('blhd,blhs->blhsd', grad_output.reshape(B, L, H, D), attn)
-        grad_values = grad_values.permute(0, 1, 3, 2, 4).reshape(B, L, S, C)
-        
-        grad_x = torch.zeros_like(x)
         for s in range(S):
-            idx = sample_idx[:, :, s]
-            grad_x.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, C), grad_values[:, :, s])
+            idx_s = sample_idx[:, :, :, s].long()
+            attn_s = attn[:, :, :, s:s+1]
+            grad_v_s = (grad_output * attn_s).reshape(B, L, C)
+            idx_expanded = idx_s.unsqueeze(-1).expand(-1, -1, -1, D).reshape(B, L, C)
+            grad_x.scatter_add_(1, idx_expanded, grad_v_s)
         
         return grad_x, None, None, None, None, None, None, None
 
@@ -515,44 +587,31 @@ class LocalWindowAttnFunc(Function):
         
         grad_output = grad_output.contiguous()
         
-        # Unfold k and v to get windows: [B, L, K, C] -> [B, L, K, H, D]
-        # k_padded is [B, L+K-1, C], we need windows of size K for each position
-        k_win = k_padded.unfold(1, K, 1)  # [B, L, C, K]
-        v_win = v_padded.unfold(1, K, 1)  # [B, L, C, K]
-        
-        k_win = k_win.permute(0, 1, 3, 2).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)  # [B, L, H, K, D]
-        v_win = v_win.permute(0, 1, 3, 2).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)  # [B, L, H, K, D]
-        
-        # grad_v: [B, L, H, K, D] = attn[B, L, H, K] * grad_output[B, L, H, D]
-        grad_v_win = torch.einsum('blhk,blhd->blhkd', attn, grad_output)
-        
-        # grad_attn: [B, L, H, K] = grad_output[B, L, H, D] · v_win[B, L, H, K, D]
-        grad_attn = torch.einsum('blhd,blhkd->blhk', grad_output, v_win)
-        
-        # Softmax backward: grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True))
-        grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True))
-        grad_scores = grad_scores * scale
-        
-        # grad_q: [B, L, H, D] = grad_scores[B, L, H, K] · k_win[B, L, H, K, D]
-        grad_q = torch.einsum('blhk,blhkd->blhd', grad_scores, k_win)
-        
-        # grad_k_win: [B, L, H, K, D] = grad_scores[B, L, H, K] * q[B, L, H, D]
-        grad_k_win = torch.einsum('blhk,blhd->blhkd', grad_scores, q)
-        
-        # Fold gradients back to padded tensors
-        # grad_k_win and grad_v_win are [B, L, H, K, D], need to scatter back to [B, L+K-1, C]
-        grad_k_win = grad_k_win.permute(0, 1, 3, 2, 4).reshape(B, L, K, C)  # [B, L, K, C]
-        grad_v_win = grad_v_win.permute(0, 1, 3, 2, 4).reshape(B, L, K, C)  # [B, L, K, C]
-        
+        grad_q = torch.zeros_like(q)
         grad_k_padded = torch.zeros_like(k_padded)
         grad_v_padded = torch.zeros_like(v_padded)
         
-        # Scatter gradients back - each window position w at query position l contributes to position l+w
+        grad_attn = torch.zeros(B, L, H, K, device=q.device, dtype=q.dtype)
         for w in range(K):
-            grad_k_padded[:, w:w+L, :] += grad_k_win[:, :, w, :]
-            grad_v_padded[:, w:w+L, :] += grad_v_win[:, :, w, :]
+            v_w = v_padded[:, w:w+L, :].reshape(B, L, H, D)
+            grad_attn[:, :, :, w] = (grad_output * v_w).sum(dim=-1)
         
-        # We don't backprop through width/sharpness for now (would need soft_mask backward)
+        grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True)) * scale
+        
+        for w in range(K):
+            k_w = k_padded[:, w:w+L, :].reshape(B, L, H, D)
+            v_w = v_padded[:, w:w+L, :].reshape(B, L, H, D)
+            attn_w = attn[:, :, :, w:w+1]
+            grad_scores_w = grad_scores[:, :, :, w:w+1]
+            
+            grad_v_w = (grad_output * attn_w).reshape(B, L, C)
+            grad_v_padded[:, w:w+L, :] += grad_v_w
+            
+            grad_q += (grad_scores_w * k_w)
+            
+            grad_k_w = (grad_scores_w * q).reshape(B, L, C)
+            grad_k_padded[:, w:w+L, :] += grad_k_w
+        
         return grad_q, grad_k_padded, grad_v_padded, None, None, None, None, None
 
 
@@ -699,48 +758,32 @@ class RoPEFunc(Function):
 
 
 class SSMStepFunc(Function):
-    """Autograd function for SSM step: H_new = decay * H + B_rot * X_r"""
-    
     @staticmethod
     def forward(ctx, H, B_rot, X_r, decay):
-        # H: [B, R, L, N], B_rot: [B, R, L, N], X_r: [B, R, L], decay: [B, L, N]
         B, R, L, N = H.shape
+        decay_exp = decay.unsqueeze(1)
+        X_r_exp = X_r.unsqueeze(-1)
         
-        inject = B_rot * X_r.unsqueeze(-1)  # [B, R, L, N]
-        H_new = decay.unsqueeze(1) * H + inject  # [B, R, L, N]
-        
+        H_new = decay_exp * H + B_rot * X_r_exp
         out_flat = H_new.permute(0, 2, 1, 3).reshape(B, L, N * R)
         
-        ctx.save_for_backward(H, B_rot, X_r, decay)
+        ctx.save_for_backward(H, B_rot, X_r_exp, decay_exp)
         ctx.shapes = (B, R, L, N)
         
         return H_new, out_flat
     
     @staticmethod
     def backward(ctx, grad_H_new, grad_out_flat):
-        H, B_rot, X_r, decay = ctx.saved_tensors
+        H, B_rot, X_r_exp, decay_exp = ctx.saved_tensors
         B, R, L, N = ctx.shapes
         
-        # Reshape grad_out_flat back: [B, L, N*R] -> [B, R, L, N]
         grad_from_out = grad_out_flat.reshape(B, L, R, N).permute(0, 2, 1, 3)
+        grad_total = grad_H_new + grad_from_out
         
-        # Total gradient on H_new
-        grad_H_new_total = grad_H_new + grad_from_out
-        
-        # H_new = decay * H + B_rot * X_r
-        # grad_H = grad_H_new * decay
-        grad_H = grad_H_new_total * decay.unsqueeze(1)
-        
-        # grad_decay = grad_H_new * H, summed over R
-        grad_decay = (grad_H_new_total * H).sum(dim=1)  # [B, L, N]
-        
-        # grad_inject = grad_H_new
-        # inject = B_rot * X_r
-        # grad_B_rot = grad_inject * X_r
-        grad_B_rot = grad_H_new_total * X_r.unsqueeze(-1)
-        
-        # grad_X_r = (grad_inject * B_rot).sum(dim=-1)
-        grad_X_r = (grad_H_new_total * B_rot).sum(dim=-1)  # [B, R, L]
+        grad_H = grad_total * decay_exp
+        grad_B_rot = grad_total * X_r_exp
+        grad_X_r = (grad_total * B_rot).sum(dim=-1)
+        grad_decay = (grad_total * H).sum(dim=1)
         
         return grad_H, grad_B_rot, grad_X_r, grad_decay
 
