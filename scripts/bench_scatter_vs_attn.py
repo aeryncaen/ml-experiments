@@ -1002,28 +1002,76 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
 
 
 class PreloadedDataset:
-    def __init__(self, loader, device):
-        print('Preloading dataset to GPU...')
+    def __init__(self, loader, device, augment=None):
+        print('Preloading dataset to CPU...')
         all_x, all_y = [], []
         for x, y in loader:
             all_x.append(x)
             all_y.append(y)
-        self.x = torch.cat(all_x, dim=0).to(device)
-        self.y = torch.cat(all_y, dim=0).to(device)
+        self.x = torch.cat(all_x, dim=0)
+        self.y = torch.cat(all_y, dim=0)
         self.batch_size = loader.batch_size
+        self.device = device
+        self.augment = augment
         print(f'  Loaded {len(self.x)} samples ({self.x.element_size() * self.x.numel() / 1e9:.2f} GB)')
     
     def __iter__(self):
-        indices = torch.randperm(len(self.x), device=self.x.device)
+        indices = torch.randperm(len(self.x))
         for i in range(0, len(self.x), self.batch_size):
             idx = indices[i:i+self.batch_size]
-            yield self.x[idx], self.y[idx]
+            x_batch = self.x[idx]
+            if self.augment:
+                x_batch = self.augment(x_batch)
+            yield x_batch.to(self.device), self.y[idx].to(self.device)
     
     def __len__(self):
         return (len(self.x) + self.batch_size - 1) // self.batch_size
 
 
-def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0):
+def make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)):
+    def augment(x):
+        B = x.shape[0]
+        # x is (B, C, H, W)
+        angle = (torch.rand(B) * 2 - 1) * degrees * (3.14159 / 180)
+        tx = (torch.rand(B) * 2 - 1) * translate[0]
+        ty = (torch.rand(B) * 2 - 1) * translate[1]
+        s = torch.rand(B) * (scale[1] - scale[0]) + scale[0]
+        
+        cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+        # Affine matrix: scale * rotation, then translate
+        theta = torch.zeros(B, 2, 3)
+        theta[:, 0, 0] = s * cos_a
+        theta[:, 0, 1] = -s * sin_a
+        theta[:, 0, 2] = tx
+        theta[:, 1, 0] = s * sin_a
+        theta[:, 1, 1] = s * cos_a
+        theta[:, 1, 2] = ty
+        
+        grid = F.affine_grid(theta, x.shape, align_corners=False)
+        return F.grid_sample(x, grid, align_corners=False, padding_mode='zeros')
+    return augment
+
+
+def make_crop_flip_augment(padding=4):
+    def augment(x):
+        B, C, H, W = x.shape
+        # Pad
+        x = F.pad(x, [padding]*4, mode='reflect')
+        # Random crop
+        top = torch.randint(0, 2*padding + 1, (B,))
+        left = torch.randint(0, 2*padding + 1, (B,))
+        crops = []
+        for i in range(B):
+            crops.append(x[i:i+1, :, top[i]:top[i]+H, left[i]:left[i]+W])
+        x = torch.cat(crops, dim=0)
+        # Random horizontal flip
+        flip_mask = torch.rand(B) > 0.5
+        x[flip_mask] = x[flip_mask].flip(-1)
+        return x
+    return augment
+
+
+def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0, no_augment=False):
     task_type = 'classification'
     vocab_size = None
 
@@ -1046,11 +1094,17 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         return train_loader, test_loader, n_classes, sl, None, 'audio'
 
     if name == 'mnist':
-        train_transform = transforms.Compose([
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
+        if no_augment:
+            train_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,))
+            ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,))
+            ])
         test_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
@@ -1060,11 +1114,17 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         n_classes, seq_len, img_size = 10, 784, (28, 28)
 
     elif name == 'fashion':
-        train_transform = transforms.Compose([
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.2860,), (0.3530,))
-        ])
+        if no_augment:
+            train_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.2860,), (0.3530,))
+            ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.2860,), (0.3530,))
+            ])
         test_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.2860,), (0.3530,))
@@ -1075,24 +1135,37 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
 
     elif name == 'cifar10':
         if mode_3d:
-            train_transform = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-            ])
+            if no_augment:
+                train_transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+                ])
+            else:
+                train_transform = transforms.Compose([
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+                ])
             test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
             ])
             n_classes, seq_len, img_size = 10, 3072, (32, 32, 3)
         else:
-            train_transform = transforms.Compose([
-                transforms.Grayscale(),
-                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4734,), (0.2516,))
-            ])
+            if no_augment:
+                train_transform = transforms.Compose([
+                    transforms.Grayscale(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4734,), (0.2516,))
+                ])
+            else:
+                train_transform = transforms.Compose([
+                    transforms.Grayscale(),
+                    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4734,), (0.2516,))
+                ])
             test_transform = transforms.Compose([
                 transforms.Grayscale(),
                 transforms.ToTensor(),
@@ -1104,24 +1177,37 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
 
     elif name == 'cifar100':
         if mode_3d:
-            train_transform = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-            ])
+            if no_augment:
+                train_transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                ])
+            else:
+                train_transform = transforms.Compose([
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                ])
             test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
             ])
             n_classes, seq_len, img_size = 100, 3072, (32, 32, 3)
         else:
-            train_transform = transforms.Compose([
-                transforms.Grayscale(),
-                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4734,), (0.2516,))
-            ])
+            if no_augment:
+                train_transform = transforms.Compose([
+                    transforms.Grayscale(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4734,), (0.2516,))
+                ])
+            else:
+                train_transform = transforms.Compose([
+                    transforms.Grayscale(),
+                    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4734,), (0.2516,))
+                ])
             test_transform = transforms.Compose([
                 transforms.Grayscale(),
                 transforms.ToTensor(),
@@ -1205,12 +1291,20 @@ def main():
     print(f'Dataset: {args.dataset}')
 
     train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
-        args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers
+        args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers,
+        no_augment=args.preload
     )
 
     if args.preload:
-        train_loader = PreloadedDataset(train_loader, device)
-        test_loader = PreloadedDataset(test_loader, device)
+        # Pick augmentation based on dataset
+        if args.dataset in ('mnist', 'fashion') or (args.dataset in ('cifar10', 'cifar100') and not args.mode_3d):
+            train_aug = make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1))
+        elif args.dataset in ('cifar10', 'cifar100') and args.mode_3d:
+            train_aug = make_crop_flip_augment(padding=4)
+        else:
+            train_aug = None
+        train_loader = PreloadedDataset(train_loader, device, augment=train_aug)
+        test_loader = PreloadedDataset(test_loader, device, augment=None)
 
     attn_residual = not args.no_attn_residual
     

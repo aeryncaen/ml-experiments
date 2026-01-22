@@ -1326,6 +1326,7 @@ class RippleModelND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1333,7 +1334,7 @@ class RippleModelND(nn.Module):
         self.embed = nn.Linear(input_dim, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
-        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim * ssm_scale, mimo_rank * ssm_scale, ndim)
         self.ssm_norm = RMSNorm(embed_dim)
         
         self.layers = nn.ModuleList([
@@ -1373,10 +1374,11 @@ class RippleModel(RippleModelND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__(input_dim, embed_dim, output_dim, n_layers, kernel_size,
                          ndim=1, num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank)
+                         mimo_rank=mimo_rank, ssm_scale=ssm_scale)
 
 
 class RippleClassifierND(nn.Module):
@@ -1391,6 +1393,7 @@ class RippleClassifierND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1398,7 +1401,7 @@ class RippleClassifierND(nn.Module):
         self.embed = nn.Linear(1, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
-        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim * ssm_scale, mimo_rank * ssm_scale, ndim)
         self.ssm_norm = RMSNorm(embed_dim)
         
         self.layers = nn.ModuleList([
@@ -1439,10 +1442,11 @@ class RippleClassifier(RippleClassifierND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__(embed_dim, n_classes, n_layers, kernel_size, ndim=1,
                          num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank)
+                         mimo_rank=mimo_rank, ssm_scale=ssm_scale)
 
 
 class FlatRippleND(nn.Module):
@@ -1458,6 +1462,7 @@ class FlatRippleND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1466,7 +1471,7 @@ class FlatRippleND(nn.Module):
         self.embed = nn.Linear(input_dim, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
-        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim * ssm_scale, mimo_rank * ssm_scale, ndim)
         self.ssm_norm = RMSNorm(embed_dim)
         
         self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
@@ -1515,10 +1520,11 @@ class FlatRipple(FlatRippleND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__(input_dim, embed_dim, output_dim, iterations, kernel_size,
                          ndim=1, num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank)
+                         mimo_rank=mimo_rank, ssm_scale=ssm_scale)
 
 
 class FlatRippleClassifierND(nn.Module):
@@ -1533,6 +1539,7 @@ class FlatRippleClassifierND(nn.Module):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__()
         self.ndim = ndim
@@ -1541,7 +1548,7 @@ class FlatRippleClassifierND(nn.Module):
         self.embed = nn.Linear(1, embed_dim)
         self.embed_norm = RMSNorm(embed_dim)
         
-        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim, mimo_rank, ndim)
+        self.ssm = MIMOJacobiSSM_ND(embed_dim, state_dim * ssm_scale, mimo_rank * ssm_scale, ndim)
         self.ssm_norm = RMSNorm(embed_dim)
         
         self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
@@ -1591,10 +1598,11 @@ class FlatRippleClassifier(FlatRippleClassifierND):
         num_channels: int = 4,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        ssm_scale: int = 2,
     ):
         super().__init__(embed_dim, n_classes, iterations, kernel_size, ndim=1,
                          num_channels=num_channels, state_dim=state_dim,
-                         mimo_rank=mimo_rank)
+                         mimo_rank=mimo_rank, ssm_scale=ssm_scale)
 
 
 class HierarchicalLocalAttentionND(nn.Module):
