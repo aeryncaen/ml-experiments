@@ -318,8 +318,8 @@ if HAS_TRITON:
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         
-    if (pid_b >= B_dim) | (pid_l >= L_dim):
-        return
+        if (pid_b >= B_dim) | (pid_l >= L_dim):
+            return
         
         n_offsets = tl.arange(0, BLOCK_N)
         n_mask = n_offsets < N
