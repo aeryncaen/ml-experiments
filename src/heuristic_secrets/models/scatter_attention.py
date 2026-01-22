@@ -221,7 +221,8 @@ class AdaptiveConvND(nn.Module):
             sample_pos = centers.view(1, chunk_len, 1) + self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
             sample_idx = sample_pos.long().clamp(0, L - 1).expand(B, -1, -1)
-            values = torch.gather(x_flat, 1, sample_idx.unsqueeze(-1).expand(-1, -1, -1, C))
+            idx_flat = sample_idx.reshape(B, chunk_len * S).unsqueeze(-1).expand(-1, -1, C)
+            values = torch.gather(x_flat, 1, idx_flat).reshape(B, chunk_len, S, C)
             values = values.reshape(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
         else:
             coords = [torch.arange(s, device=x_flat.device, dtype=x_flat.dtype) for s in spatial]
