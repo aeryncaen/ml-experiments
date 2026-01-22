@@ -139,7 +139,6 @@ class GatherConvND(nn.Module):
             rel_pos = rel_pos_nd.norm(dim=-1)
         
         batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1).expand(B, chunk_len, S)
-        gathered = x_flat[batch_idx, sample_idx]
         
         kernel_max = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K)
         
@@ -152,17 +151,20 @@ class GatherConvND(nn.Module):
         w_ceil = idx_float - idx_floor.float()
         w_floor = 1.0 - w_ceil
         
+        valid_mask_f = valid_mask.float()
+        
         output = torch.zeros(B, chunk_len, C, device=x_flat.device, dtype=x_flat.dtype)
         
         for h in range(H):
-            values_h = gathered[..., h * D : (h + 1) * D]
+            x_head = x_flat[..., h * D : (h + 1) * D]
+            values_h = x_head[batch_idx, sample_idx]
             
             km_h = kernel_max[:, :, h, :]
             k_floor_h = km_h.gather(-1, idx_floor)
             k_ceil_h = km_h.gather(-1, idx_ceil)
             kernel_h = k_floor_h * w_floor + k_ceil_h * w_ceil
             
-            kernel_h = kernel_h * valid_mask.float()
+            kernel_h = kernel_h * valid_mask_f
             kernel_h = kernel_h / (kernel_h.sum(dim=-1, keepdim=True) + 1e-8)
             
             output[:, :, h * D : (h + 1) * D] = torch.einsum('bls,blsd->bld', kernel_h, values_h)
