@@ -388,9 +388,8 @@ class LearnedMerge(nn.Module):
 
 class LowRankAttentionMerge(nn.Module):
     
-    def __init__(self, dim: int, rank: int = 32):
+    def __init__(self, dim: int):
         super().__init__()
-        self.rank = rank
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -405,7 +404,7 @@ class LowRankAttentionMerge(nn.Module):
         k = self.k_proj(embed)
         v = self.v_proj(embed)
         
-        r = min(self.rank, L)
+        r = max(1, int(L ** 0.5))
         k_down = F.adaptive_avg_pool1d(k.mT, r).mT
         v_down = F.adaptive_avg_pool1d(v.mT, r).mT
         
