@@ -63,8 +63,10 @@ class AdaptiveConvND(nn.Module):
         K = self.kernel_numel
         H = num_channels
         
-        self.adapt_proj = nn.Linear(channels, 2 * H)
-        self.deform_proj = nn.Linear(channels, H * ndim)
+        self.max_freq = 8.0
+        self.min_freq = 0.25
+        
+        self.wave_proj = nn.Linear(channels, 3 * H)  # freq, phase, decay per head
         
         pos_dim = 16
         self.pos_dim = pos_dim
@@ -83,13 +85,11 @@ class AdaptiveConvND(nn.Module):
         self.register_buffer('rel_pos', rel_pos)
         self.register_buffer('rel_dist', rel_pos.norm(dim=-1))
         
-        nn.init.zeros_(self.adapt_proj.weight)
-        nn.init.zeros_(self.adapt_proj.bias)
-        nn.init.zeros_(self.deform_proj.weight)
-        nn.init.zeros_(self.deform_proj.bias)
+        nn.init.zeros_(self.wave_proj.weight)
+        nn.init.zeros_(self.wave_proj.bias)
         nn.init.zeros_(self.out_proj.weight)
     
-    def _gather_window(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    def _gather_window(self, x: torch.Tensor, freq: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         spatial = x.shape[1:-1]
         C = x.shape[-1]
@@ -98,12 +98,14 @@ class AdaptiveConvND(nn.Module):
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
-        offset_avg = offsets.mean(dim=-1) if offsets.dim() > 3 else offsets.mean(dim=2)
+        freq_avg = freq.mean(dim=2)
+        phase_avg = phase.mean(dim=2)
         
         if self.ndim == 1:
             x_t = x.reshape(B, L, C).permute(0, 2, 1)
             centers = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1)
-            sample_pos = centers + self.rel_pos[:, 0].view(1, 1, K) + offset_avg.unsqueeze(-1)
+            scaled_rel = self.rel_pos[:, 0].view(1, 1, K) * freq_avg.unsqueeze(-1)
+            sample_pos = centers + scaled_rel + phase_avg.unsqueeze(-1)
             grid = (sample_pos / max(L - 1, 1)) * 2 - 1
             
             x_4d = x_t.unsqueeze(2)
@@ -114,16 +116,19 @@ class AdaptiveConvND(nn.Module):
             
         elif self.ndim == 2:
             Sh, Sw = spatial
-            x_t = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+            x_t = x.permute(0, 3, 1, 2)
             
             h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
             w_coords = torch.arange(Sw, device=x.device, dtype=x.dtype)
             grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing='ij')
             centers = torch.stack([grid_w, grid_h], dim=-1).view(1, Sh, Sw, 1, 2)
             
-            sample_pos = centers + self.rel_pos.view(1, 1, 1, K, 2).flip(-1)
+            freq_2d = freq_avg.view(B, Sh, Sw, 1, 1)
+            phase_2d = phase_avg.view(B, Sh, Sw, 1, 1)
+            scaled_rel = self.rel_pos.view(1, 1, 1, K, 2).flip(-1) * freq_2d
+            sample_pos = centers + scaled_rel + phase_2d
             
-            grid = torch.zeros_like(sample_pos).expand(B, -1, -1, -1, -1).clone()
+            grid = torch.zeros(B, Sh, Sw, K, 2, device=x.device, dtype=x.dtype)
             grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
             grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
             
@@ -134,7 +139,7 @@ class AdaptiveConvND(nn.Module):
             
         elif self.ndim == 3:
             Sd, Sh, Sw = spatial
-            x_t = x.permute(0, 4, 1, 2, 3)  # (B, C, D, H, W)
+            x_t = x.permute(0, 4, 1, 2, 3)
             
             d_coords = torch.arange(Sd, device=x.device, dtype=x.dtype)
             h_coords = torch.arange(Sh, device=x.device, dtype=x.dtype)
@@ -142,9 +147,12 @@ class AdaptiveConvND(nn.Module):
             grid_d, grid_h, grid_w = torch.meshgrid(d_coords, h_coords, w_coords, indexing='ij')
             centers = torch.stack([grid_w, grid_h, grid_d], dim=-1).view(1, Sd, Sh, Sw, 1, 3)
             
-            sample_pos = centers + self.rel_pos.view(1, 1, 1, 1, K, 3).flip(-1)
+            freq_3d = freq_avg.view(B, Sd, Sh, Sw, 1, 1)
+            phase_3d = phase_avg.view(B, Sd, Sh, Sw, 1, 1)
+            scaled_rel = self.rel_pos.view(1, 1, 1, 1, K, 3).flip(-1) * freq_3d
+            sample_pos = centers + scaled_rel + phase_3d
             
-            grid = torch.zeros_like(sample_pos).expand(B, -1, -1, -1, -1, -1).clone()
+            grid = torch.zeros(B, Sd, Sh, Sw, K, 3, device=x.device, dtype=x.dtype)
             grid[..., 0] = (sample_pos[..., 0] / max(Sw - 1, 1)) * 2 - 1
             grid[..., 1] = (sample_pos[..., 1] / max(Sh - 1, 1)) * 2 - 1
             grid[..., 2] = (sample_pos[..., 2] / max(Sd - 1, 1)) * 2 - 1
@@ -166,23 +174,25 @@ class AdaptiveConvND(nn.Module):
         K = self.kernel_numel
         L = reduce(mul, spatial, 1)
         
-        adapt_params = F.silu(self.adapt_proj(x)).reshape(B, L, 2, H).permute(0, 1, 3, 2)
-        width = torch.sigmoid(adapt_params[..., 0]) * self.half_k + 0.5
-        sharpness = torch.sigmoid(adapt_params[..., 1]) * 9.5 + 0.5
+        wave_params = F.silu(self.wave_proj(x)).reshape(B, L, 3, H).permute(0, 1, 3, 2)
+        freq = torch.sigmoid(wave_params[..., 0]) * (self.max_freq - self.min_freq) + self.min_freq
+        phase = torch.tanh(wave_params[..., 1]) * self.half_k * freq
+        decay = torch.sigmoid(wave_params[..., 2]) * 9.5 + 0.5
         
-        deform = torch.tanh(F.silu(self.deform_proj(x))).reshape(B, L, H, self.ndim) * self.half_k
+        values = self._gather_window(x, freq, phase)
         
-        values = self._gather_window(x, deform[..., 0] if self.ndim == 1 else deform)
-        
-        # Position cross-attention: Q from content, K from scaled positions, V from gathered values
         queries = F.silu(self.query_proj(x)).reshape(B, L, H, self.pos_dim)
         
-        scaled_pos = self.rel_pos.view(1, 1, 1, K, self.ndim) / width.view(B, L, H, 1, 1).clamp(min=0.5)
-        keys = self.key_proj(scaled_pos)
+        scaled_rel = self.rel_pos.view(1, 1, 1, K, self.ndim) * freq.view(B, L, H, 1, 1)
+        keys = self.key_proj(scaled_rel)
         
-        # Cross-attention: Q @ K^T, with sharpness as inverse temperature
-        attn_logits = torch.einsum('blhd,blhkd->blhk', queries, keys) * self.scale * sharpness.unsqueeze(-1)
-        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_logits = torch.einsum('blhd,blhkd->blhk', queries, keys) * self.scale
+        
+        scaled_dist = self.rel_dist.view(1, 1, 1, K) * freq.unsqueeze(-1)
+        decay_envelope = torch.exp(-scaled_dist / decay.unsqueeze(-1).clamp(min=0.1))
+        
+        attn_weights = F.softmax(attn_logits, dim=-1) * decay_envelope
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
         output = torch.einsum('blhkd,blhk->blhd', values, attn_weights).reshape(B, L, C)
         
@@ -192,8 +202,7 @@ class AdaptiveConvND(nn.Module):
         output = self.out_proj(output).reshape(B, *spatial, C)
         
         entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1).mean()
-        deform_reg = (deform ** 2).mean()
-        return output, {"entropy_reg": -entropy, "deform_reg": deform_reg}
+        return output, {"entropy_reg": -entropy}
 
 
 # Backward compatibility alias
