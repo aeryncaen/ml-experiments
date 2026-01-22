@@ -118,7 +118,7 @@ class AttentionBlock(nn.Module):
 
 
 class HierarchicalBlock(nn.Module):
-    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
+    def __init__(self, width: int, window_size: int = 17, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'both', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttention(width, window_size, num_channels, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
@@ -225,7 +225,7 @@ class LocalBlock2D(nn.Module):
 
 
 class HierarchicalBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
+    def __init__(self, width: int, kernel_size: int = 7, num_channels: int = 4, dropout: float = 0.1, use_ssm: bool = False, conv_position: str = 'both', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttentionND(width, kernel_size, ndim=2, num_channels=num_channels, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
@@ -395,7 +395,7 @@ class LocalBlock3D(nn.Module):
 
 
 class HierarchicalBlock3D(nn.Module):
-    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, dropout: float = 0.1, conv_position: str = 'post', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
+    def __init__(self, width: int, window_size: int = 5, num_channels: int = 4, dropout: float = 0.1, conv_position: str = 'both', attn_residual: bool = True, merge_mode: str = 'lowrank', lowrank_hier: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.hier_attn = HierarchicalLocalAttentionND(width, window_size, ndim=3, num_channels=num_channels, poolable_dims=(0, 1), conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
@@ -807,7 +807,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
@@ -829,7 +829,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
@@ -855,7 +855,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     return model.to(device)
 
 
-def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
+def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
     WIDTH_HIER = 48
@@ -881,7 +881,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_CONV = 140
@@ -903,7 +903,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='post', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_CONV = 70
@@ -1039,7 +1039,7 @@ def main():
     parser.add_argument('--wtf-mode', action='store_true', help='WTF mode: gradient ascent on easy samples, descent on hard (per-batch median split)')
     parser.add_argument('--duo', action='store_true', help='Duo mode: train two models with inverse curriculum (uses --hard-start/--hard-end), merge at inference')
     parser.add_argument('--duo-merge', type=str, default='mean', choices=DuoModel.MERGE_STRATEGIES, help='Duo merge strategy (default: mean)')
-    parser.add_argument('--conv-position', type=str, default='post', choices=['pre', 'post', 'both'], help='Where to run conv relative to attention (default: post)')
+    parser.add_argument('--conv-position', type=str, default='both', choices=['pre', 'post', 'both'], help='Where to run conv relative to attention (default: both)')
     parser.add_argument('--merge-mode', type=str, default='lowrank', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: lowrank)')
     parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
