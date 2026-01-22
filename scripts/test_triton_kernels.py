@@ -17,8 +17,10 @@ from heuristic_secrets.models.triton_scatter import (
     TritonLocalWindowAttn,
     TritonSSMStep,
     HAS_TRITON,
-    set_block_config_override,
-    clear_block_config_override,
+    set_scatter_block_config_override,
+    clear_scatter_block_config_override,
+    set_local_block_config_override,
+    clear_local_block_config_override,
 )
 
 
@@ -138,13 +140,15 @@ def _run_kernel_sweep(B, L, C, device):
     ]
 
     for block_d, warps, stages in configs:
-        set_block_config_override(block_d, warps, stages)
+        set_scatter_block_config_override(block_d, warps, stages)
+        set_local_block_config_override(block_d, warps, stages)
         try:
             scatter_ms, scatter_mem = measure_memory_and_time(run_scatter)
             attn_ms, attn_mem = measure_memory_and_time(run_attn)
             print(f"{block_d:<7} {warps:<5} {stages:<6} | {scatter_ms:<10.3f} {scatter_mem:<7.1f} | {attn_ms:<8.3f} {attn_mem:<7.1f}")
         finally:
-            clear_block_config_override()
+            clear_scatter_block_config_override()
+            clear_local_block_config_override()
 
 
 def benchmark_triton_vs_pytorch(B, L, C, device):

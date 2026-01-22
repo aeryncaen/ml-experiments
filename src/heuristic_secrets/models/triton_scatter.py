@@ -250,7 +250,7 @@ class ScatterAttentionFunc(Function):
         attn = torch.empty(B, L, H, S, device=x.device, dtype=x.dtype)
         sample_idx = torch.empty(B, L, H, S, device=x.device, dtype=torch.int32)
         
-        BLOCK_D, num_warps, num_stages = _pick_block_config(D)
+        BLOCK_D, num_warps, num_stages = _pick_scatter_block_config(D)
         grid = (B, L, H)
         _scatter_attn_fwd_with_attn_kernel[grid](
             x, q, freq, phase, decay, key_weight, stride_grid, out, attn, sample_idx,
@@ -273,7 +273,7 @@ class ScatterAttentionFunc(Function):
         grad_output = grad_output.reshape(B, L, H, D).contiguous()
         grad_x = torch.zeros(B, L, C, device=grad_output.device, dtype=grad_output.dtype)
         
-        BLOCK_D, num_warps, num_stages = _pick_block_config(D)
+        BLOCK_D, num_warps, num_stages = _pick_scatter_block_config(D)
         grid = (B, L, H)
         
         _scatter_attn_bwd_kernel[grid](
@@ -287,29 +287,52 @@ class ScatterAttentionFunc(Function):
         return grad_x, None, None, None, None, None, None, None
 
 
-_BLOCK_CONFIG_OVERRIDE: tuple[int, int, int] | None = None
+_SCATTER_BLOCK_CONFIG_OVERRIDE: tuple[int, int, int] | None = None
+_LOCAL_BLOCK_CONFIG_OVERRIDE: tuple[int, int, int] | None = None
 
 
-def set_block_config_override(block_d: int, num_warps: int, num_stages: int) -> None:
-    global _BLOCK_CONFIG_OVERRIDE
-    _BLOCK_CONFIG_OVERRIDE = (block_d, num_warps, num_stages)
+def set_scatter_block_config_override(block_d: int, num_warps: int, num_stages: int) -> None:
+    global _SCATTER_BLOCK_CONFIG_OVERRIDE
+    _SCATTER_BLOCK_CONFIG_OVERRIDE = (block_d, num_warps, num_stages)
 
 
-def clear_block_config_override() -> None:
-    global _BLOCK_CONFIG_OVERRIDE
-    _BLOCK_CONFIG_OVERRIDE = None
+def clear_scatter_block_config_override() -> None:
+    global _SCATTER_BLOCK_CONFIG_OVERRIDE
+    _SCATTER_BLOCK_CONFIG_OVERRIDE = None
 
 
-def _pick_block_config(D: int) -> tuple[int, int, int]:
-    if _BLOCK_CONFIG_OVERRIDE is not None:
-        return _BLOCK_CONFIG_OVERRIDE
+def set_local_block_config_override(block_d: int, num_warps: int, num_stages: int) -> None:
+    global _LOCAL_BLOCK_CONFIG_OVERRIDE
+    _LOCAL_BLOCK_CONFIG_OVERRIDE = (block_d, num_warps, num_stages)
+
+
+def clear_local_block_config_override() -> None:
+    global _LOCAL_BLOCK_CONFIG_OVERRIDE
+    _LOCAL_BLOCK_CONFIG_OVERRIDE = None
+
+
+def _pick_scatter_block_config(D: int) -> tuple[int, int, int]:
+    if _SCATTER_BLOCK_CONFIG_OVERRIDE is not None:
+        return _SCATTER_BLOCK_CONFIG_OVERRIDE
     if D <= 32:
-        return 32, 2, 2
+        return 64, 4, 2
     if D <= 64:
         return 64, 4, 2
     if D <= 128:
         return 128, 4, 3
     return 256, 8, 3
+
+
+def _pick_local_block_config(D: int) -> tuple[int, int, int]:
+    if _LOCAL_BLOCK_CONFIG_OVERRIDE is not None:
+        return _LOCAL_BLOCK_CONFIG_OVERRIDE
+    if D <= 32:
+        return 32, 2, 2
+    if D <= 64:
+        return 64, 2, 2
+    if D <= 128:
+        return 128, 4, 2
+    return 256, 4, 3
 
 
 def triton_scatter_attention(x, q, freq, phase, decay, key_weight, stride_grid, scale):
@@ -655,7 +678,7 @@ class LocalWindowAttnFunc(Function):
         out = torch.empty(B, L, H, D, device=q.device, dtype=q.dtype)
         attn = torch.empty(B, L, H, K, device=q.device, dtype=q.dtype)
         
-        BLOCK_D, num_warps, num_stages = _pick_block_config(D)
+        BLOCK_D, num_warps, num_stages = _pick_local_block_config(D)
         grid = (B, L, H)
         
         _local_window_attn_fwd_kernel_with_attn[grid](
@@ -684,7 +707,7 @@ class LocalWindowAttnFunc(Function):
         grad_k_padded = torch.zeros_like(k_padded)
         grad_v_padded = torch.zeros_like(v_padded)
         
-        BLOCK_D, num_warps, num_stages = _pick_block_config(D)
+        BLOCK_D, num_warps, num_stages = _pick_local_block_config(D)
         grid = (B, L, H)
         
         _local_window_attn_bwd_kernel[grid](
