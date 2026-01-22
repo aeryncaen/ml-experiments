@@ -1240,13 +1240,14 @@ class RippleLayerND(nn.Module):
         mimo_rank: int = 4,
         ssm_iterations: int = 4,
         eps: float = 1e-6,
+        checkpoint_merges: bool = True,
     ):
         super().__init__()
         self.ndim = ndim
+        self.checkpoint_merges = checkpoint_merges
         
         self.norm1 = RMSNorm(dim, eps)
         self.norm2 = RMSNorm(dim, eps)
-        self.norm3 = RMSNorm(dim, eps)
         
         self.attn = SGSBAttentionND(dim, kernel_size, ndim, num_channels)
         self.ssm = MIMOJacobiSSM_ND(dim, state_dim, mimo_rank, ssm_iterations, ndim)
@@ -1256,6 +1257,12 @@ class RippleLayerND(nn.Module):
         self.reduce_norm = RMSNorm(dim, eps)
         self.downsample = SIRENDownsampleND(dim, ndim=ndim)
     
+    def _merge_fn(self, embed: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        return self.merge(embed, x)
+    
+    def _accum_fn(self, x: torch.Tensor, *accumulated: torch.Tensor) -> torch.Tensor:
+        return self.accum_attn.forward_accumulated(x, list(accumulated))
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -1263,12 +1270,18 @@ class RippleLayerND(nn.Module):
         accumulated: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(accumulated) > 1:
-            x = self.accum_attn.forward_accumulated(x, accumulated)
+            if self.checkpoint_merges and self.training:
+                x = grad_checkpoint(self._accum_fn, x, *accumulated, use_reentrant=False)  # type: ignore[assignment]
+            else:
+                x = self.accum_attn.forward_accumulated(x, accumulated)
         
         x = x + self.attn(self.norm1(x))
         x = x + self.ssm(self.norm2(x))
-        x = x + self.attn(self.norm3(x))
-        x = self.merge(embed, x)
+        
+        if self.checkpoint_merges and self.training:
+            x = grad_checkpoint(self._merge_fn, embed, x, use_reentrant=False)  # type: ignore[assignment]
+        else:
+            x = self.merge(embed, x)
         
         spatial_shape = x.shape[1:-1]
         target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)

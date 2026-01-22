@@ -2,6 +2,7 @@
 
 import argparse
 import math
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -550,7 +551,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -571,66 +572,70 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             inputs = inputs.squeeze(1)
 
         optimizer.zero_grad()
-        logits = model(inputs)
+        
+        amp_ctx = torch.autocast(device.type, dtype=torch.float16) if scaler else nullcontext()
+        with amp_ctx:
+            logits = model(inputs)
 
-        if task_type == 'lm':
-            logits_flat = logits.view(-1, logits.size(-1))
-            labels_flat = labels.view(-1)
-            per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
-            if wtf_mode:
+            if task_type == 'lm':
+                logits_flat = logits.view(-1, logits.size(-1))
+                labels_flat = labels.view(-1)
+                per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
+                if wtf_mode:
+                    mask = labels_flat != -100
+                    valid_losses = per_token_loss[mask]
+                    median = valid_losses.median()
+                    min_l, max_l = valid_losses.min(), valid_losses.max()
+                    weights = torch.where(
+                        valid_losses < median,
+                        (valid_losses - median) / (median - min_l + 1e-8),
+                        10 * (valid_losses - median) / (max_l - median + 1e-8)
+                    )
+                    loss = (valid_losses * weights).sum() / mask.sum()
+                else:
+                    if hard_pct is not None:
+                        valid_mask = labels_flat != -100
+                        valid_losses = per_token_loss[valid_mask]
+                        k = max(1, int(hard_pct * valid_losses.size(0)))
+                        topk_losses, _ = valid_losses.topk(k)
+                        loss = topk_losses.mean()
+                    else:
+                        loss = per_token_loss.mean()
                 mask = labels_flat != -100
-                valid_losses = per_token_loss[mask]
-                # Normalize weights to [-1, +10] centered on median
-                # Below median: [min, median] -> [-1, 0] (detrain easy)
-                # Above median: [median, max] -> [0, +10] (push hard)
-                median = valid_losses.median()
-                min_l, max_l = valid_losses.min(), valid_losses.max()
-                weights = torch.where(
-                    valid_losses < median,
-                    (valid_losses - median) / (median - min_l + 1e-8),
-                    10 * (valid_losses - median) / (max_l - median + 1e-8)
-                )
-                loss = (valid_losses * weights).sum() / mask.sum()
+                preds = logits_flat.argmax(dim=-1)
+                correct += (preds[mask] == labels_flat[mask]).sum().item()
+                total += mask.sum().item()
             else:
-                if hard_pct is not None:
-                    valid_mask = labels_flat != -100
-                    valid_losses = per_token_loss[valid_mask]
-                    k = max(1, int(hard_pct * valid_losses.size(0)))
-                    topk_losses, _ = valid_losses.topk(k)
-                    loss = topk_losses.mean()
+                per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
+                if wtf_mode:
+                    median = per_sample_loss.median()
+                    min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
+                    weights = torch.where(
+                        per_sample_loss < median,
+                        (per_sample_loss - median) / (median - min_l + 1e-8),
+                        10 * (per_sample_loss - median) / (max_l - median + 1e-8)
+                    )
+                    loss = (per_sample_loss * weights).mean()
                 else:
-                    loss = per_token_loss.mean()
-            mask = labels_flat != -100
-            preds = logits_flat.argmax(dim=-1)
-            correct += (preds[mask] == labels_flat[mask]).sum().item()
-            total += mask.sum().item()
-        else:
-            per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
-            if wtf_mode:
-                # Normalize weights to [-1, +10] centered on median
-                # Below median: [min, median] -> [-1, 0] (detrain easy)
-                # Above median: [median, max] -> [0, +10] (push hard)
-                median = per_sample_loss.median()
-                min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
-                weights = torch.where(
-                    per_sample_loss < median,
-                    (per_sample_loss - median) / (median - min_l + 1e-8),
-                    10 * (per_sample_loss - median) / (max_l - median + 1e-8)
-                )
-                loss = (per_sample_loss * weights).mean()
-            else:
-                if hard_pct is not None:
-                    k = max(1, int(hard_pct * per_sample_loss.size(0)))
-                    topk_losses, _ = per_sample_loss.topk(k)
-                    loss = topk_losses.mean()
-                else:
-                    loss = per_sample_loss.mean()
-            correct += (logits.argmax(dim=-1) == labels).sum().item()
-            total += labels.size(0)
+                    if hard_pct is not None:
+                        k = max(1, int(hard_pct * per_sample_loss.size(0)))
+                        topk_losses, _ = per_sample_loss.topk(k)
+                        loss = topk_losses.mean()
+                    else:
+                        loss = per_sample_loss.mean()
+                correct += (logits.argmax(dim=-1) == labels).sum().item()
+                total += labels.size(0)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         if scheduler:
             scheduler.step()
 
@@ -702,13 +707,14 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification'):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
     
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     total_steps = epochs * len(train_loader)
@@ -772,11 +778,10 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
                 flatten=flatten, task_type=task_type, hard_pct=hard_pct
             )
         else:
-            # Standard training
             train_loss, train_acc = train_epoch(
                 model, current_loader, optimizer, device, active_scheduler, 
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
-                hard_pct=hard_pct if hard_mining else None
+                hard_pct=hard_pct if hard_mining else None, scaler=scaler
             )
         
         if use_swa_sched:
@@ -1121,6 +1126,7 @@ def main():
     parser.add_argument('--kernel-size', type=int, default=None, help='Kernel/window size for attention (default: 17 for 1D, 7 for 2D, 5 for 3D)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block after attention')
     parser.add_argument('--ssm-iterations', type=int, default=4, help='Number of Jacobi iterations in MIMOJacobiSSM (default: 4)')
+    parser.add_argument('--amp', action='store_true', help='Enable automatic mixed precision (fp16)')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
@@ -1249,7 +1255,7 @@ def main():
                 swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                 hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type
+                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp
             )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
