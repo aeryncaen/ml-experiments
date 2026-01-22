@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from tqdm import tqdm
-from heuristic_secrets.models.scatter_attention import LocalAttention, LocalAttentionND, LowRankAttentionND, RMSNorm
+from heuristic_secrets.models.scatter_attention import LocalAttention, LocalAttentionND, LowRankAttentionND, SGSBAttention, RMSNorm
 
 
 class FullAttention(nn.Module):
@@ -92,19 +92,21 @@ def main():
     
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
-    print('=' * 100)
-    print(f'LOCAL ATTENTION vs LOWRANK vs FULL ATTENTION (checkpoint={args.checkpoint})')
-    print('=' * 100)
+    print('=' * 120)
+    print(f'SGSB vs LOCAL vs LOWRANK vs FULL ATTENTION (checkpoint={args.checkpoint})')
+    print('=' * 120)
 
     B = 2
     C = 64
     K = 17
     H = 4
 
+    sgsb = SGSBAttention(embed_dim=C, kernel_size=K, num_channels=H).to(device)
     local = LocalAttentionND(embed_dim=C, kernel_size=K, ndim=1, num_channels=H, checkpoint=args.checkpoint).to(device)
     lowrank = LowRankAttentionND(embed_dim=C, window_size=K, ndim=1, num_channels=H).to(device)
     full = FullAttention(embed_dim=C, num_heads=H).to(device)
 
+    print(f'SGSB (K={K}):           {count_params(sgsb):>8,} params')
     print(f'Local (K={K}):         {count_params(local):>8,} params')
     print(f'LowRank (sqrt(L)):     {count_params(lowrank):>8,} params')
     print(f'Full (H={H}):           {count_params(full):>8,} params')
@@ -114,15 +116,15 @@ def main():
 
     for mode, backward in [('Forward', False), ('Fwd+Bwd', True)]:
         print(f'\n{mode} pass (time, peak memory):')
-        print('-' * 100)
-        print(f'{"L":>6} | {"Local":>20} | {"LowRank":>20} | {"Full":>20}')
-        print('-' * 100)
+        print('-' * 120)
+        print(f'{"L":>6} | {"SGSB":>20} | {"Local":>20} | {"LowRank":>20} | {"Full":>20}')
+        print('-' * 120)
 
         for L in tqdm(seq_lengths, desc=mode):
             x = torch.randn(B, L, C, device=device)
             results = {}
             
-            for name, model in [('local', local), ('lowrank', lowrank), ('full', full)]:
+            for name, model in [('sgsb', sgsb), ('local', local), ('lowrank', lowrank), ('full', full)]:
                 try:
                     model.train()
                     reset_memory_stats(device)
@@ -132,13 +134,14 @@ def main():
                     results[name] = (float('inf'), float('inf'))
                     tqdm.write(f'{name} failed at L={L}: {e}')
             
+            sgsb_t, sgsb_m = results['sgsb']
             local_t, local_m = results['local']
             lr_t, lr_m = results['lowrank']
             full_t, full_m = results['full']
             
-            tqdm.write(f'{L:>6} | {local_t:>7.2f}ms {local_m:>7.1f}MB | {lr_t:>7.2f}ms {lr_m:>7.1f}MB | {full_t:>7.2f}ms {full_m:>7.1f}MB')
+            tqdm.write(f'{L:>6} | {sgsb_t:>7.2f}ms {sgsb_m:>7.1f}MB | {local_t:>7.2f}ms {local_m:>7.1f}MB | {lr_t:>7.2f}ms {lr_m:>7.1f}MB | {full_t:>7.2f}ms {full_m:>7.1f}MB')
 
-        print('-' * 100)
+        print('-' * 120)
 
 
 if __name__ == '__main__':
