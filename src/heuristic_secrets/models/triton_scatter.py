@@ -47,8 +47,8 @@ if HAS_TRITON:
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-    if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
-        return
+        if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+            return
         
         freq_offset = pid_b * L * H + pid_l * H + pid_h
         freq = tl.load(freq_ptr + freq_offset)
@@ -129,8 +129,8 @@ if HAS_TRITON:
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-    if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
-        return
+        if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+            return
         
         freq_offset = pid_b * L * H + pid_l * H + pid_h
         freq = tl.load(freq_ptr + freq_offset)
