@@ -303,6 +303,97 @@ if HAS_TRITON:
 
 
     @triton.jit
+    def _local_window_attn_fwd_kernel_with_attn(
+        q_ptr,              # [B, L, H, D]
+        k_ptr,              # [B, L + K - 1, C] (padded)
+        v_ptr,              # [B, L + K - 1, C] (padded)
+        width_ptr,          # [B, L, H]
+        sharpness_ptr,      # [B, L, H]
+        rel_dist_ptr,       # [K]
+        out_ptr,            # [B, L, H, D]
+        attn_ptr,           # [B, L, H, K] - save attention weights for backward
+        B: tl.constexpr,
+        L: tl.constexpr,
+        C: tl.constexpr,
+        H: tl.constexpr,
+        D: tl.constexpr,
+        K: tl.constexpr,
+        scale: tl.constexpr,
+        half_k: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Forward kernel that also saves attention weights for backward pass."""
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+            return
+        
+        param_offset = pid_b * L * H + pid_l * H + pid_h
+        width = tl.load(width_ptr + param_offset)
+        sharpness = tl.load(sharpness_ptr + param_offset)
+        
+        q_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < D
+        q = tl.load(q_ptr + q_base + d_offsets, mask=d_mask, other=0.0)
+        
+        head_start = pid_h * D
+        k_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
+        v_row_start = pid_b * (L + K - 1) * C + pid_l * C + head_start
+        
+        # First pass: compute max score for numerical stability
+        max_score = -1e9
+        for w in range(K):
+            rel_d = tl.load(rel_dist_ptr + w)
+            k_offset = k_row_start + w * C
+            k_vec = tl.load(k_ptr + k_offset + d_offsets, mask=d_mask, other=0.0)
+            score = tl.sum(q * k_vec) * scale
+            soft_mask = tl.sigmoid((width - rel_d) * sharpness)
+            score = score - (1.0 - soft_mask) * 1e4
+            max_score = tl.maximum(max_score, score)
+        
+        # Second pass: compute softmax and weighted sum, save attention
+        sum_exp = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        attn_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        
+        for w in range(K):
+            rel_d = tl.load(rel_dist_ptr + w)
+            k_offset = k_row_start + w * C
+            k_vec = tl.load(k_ptr + k_offset + d_offsets, mask=d_mask, other=0.0)
+            score = tl.sum(q * k_vec) * scale
+            soft_mask = tl.sigmoid((width - rel_d) * sharpness)
+            score = score - (1.0 - soft_mask) * 1e4
+            
+            exp_score = tl.exp(score - max_score)
+            sum_exp += exp_score
+            
+            v_offset = v_row_start + w * C
+            v_vec = tl.load(v_ptr + v_offset + d_offsets, mask=d_mask, other=0.0)
+            acc += v_vec * exp_score
+        
+        # Normalize and save
+        attn_norm = 1.0 / (sum_exp + 1e-8)
+        out = acc * attn_norm
+        
+        out_base = pid_b * L * H * D + pid_l * H * D + pid_h * D
+        tl.store(out_ptr + out_base + d_offsets, out, mask=d_mask)
+        
+        # Save normalized attention weights for backward
+        for w in range(K):
+            rel_d = tl.load(rel_dist_ptr + w)
+            k_offset = k_row_start + w * C
+            k_vec = tl.load(k_ptr + k_offset + d_offsets, mask=d_mask, other=0.0)
+            score = tl.sum(q * k_vec) * scale
+            soft_mask = tl.sigmoid((width - rel_d) * sharpness)
+            score = score - (1.0 - soft_mask) * 1e4
+            attn_w = tl.exp(score - max_score) * attn_norm
+            tl.store(attn_ptr + attn_base + w, attn_w)
+
+
+    @triton.jit
     def _ssm_fused_step_kernel(
         H_ptr,              # [B, R, L, N] - state (in/out)
         B_rot_ptr,          # [B, R, L, N] - rotated input projection
@@ -390,6 +481,89 @@ if HAS_TRITON:
         tl.store(x_ptr + x_base + n2_offsets * 2 + 1, out2, mask=n2_mask)
 
 
+class LocalWindowAttnFunc(Function):
+    """Autograd function for local window attention with Triton forward."""
+    
+    @staticmethod
+    def forward(ctx, q, k_padded, v_padded, width, sharpness, rel_dist, scale, K):
+        B, L, H, D = q.shape
+        C = k_padded.shape[-1]
+        
+        out = torch.empty(B, L, H, D, device=q.device, dtype=q.dtype)
+        attn = torch.empty(B, L, H, K, device=q.device, dtype=q.dtype)
+        
+        BLOCK_D = triton.next_power_of_2(D)
+        grid = (B, L, H)
+        
+        _local_window_attn_fwd_kernel_with_attn[grid](
+            q, k_padded, v_padded, width, sharpness, rel_dist, out, attn,
+            B, L, C, H, D, K, scale, K // 2,
+            BLOCK_D=BLOCK_D,
+        )
+        
+        ctx.save_for_backward(q, k_padded, v_padded, attn, rel_dist)
+        ctx.scale = scale
+        ctx.shapes = (B, L, C, H, D, K)
+        
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        q, k_padded, v_padded, attn, rel_dist = ctx.saved_tensors
+        B, L, C, H, D, K = ctx.shapes
+        scale = ctx.scale
+        
+        grad_output = grad_output.contiguous()
+        
+        # Unfold k and v to get windows: [B, L, K, C] -> [B, L, K, H, D]
+        # k_padded is [B, L+K-1, C], we need windows of size K for each position
+        k_win = k_padded.unfold(1, K, 1)  # [B, L, C, K]
+        v_win = v_padded.unfold(1, K, 1)  # [B, L, C, K]
+        
+        k_win = k_win.permute(0, 1, 3, 2).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)  # [B, L, H, K, D]
+        v_win = v_win.permute(0, 1, 3, 2).reshape(B, L, K, H, D).permute(0, 1, 3, 2, 4)  # [B, L, H, K, D]
+        
+        # grad_v: [B, L, H, K, D] = attn[B, L, H, K] * grad_output[B, L, H, D]
+        grad_v_win = torch.einsum('blhk,blhd->blhkd', attn, grad_output)
+        
+        # grad_attn: [B, L, H, K] = grad_output[B, L, H, D] · v_win[B, L, H, K, D]
+        grad_attn = torch.einsum('blhd,blhkd->blhk', grad_output, v_win)
+        
+        # Softmax backward: grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True))
+        grad_scores = attn * (grad_attn - (grad_attn * attn).sum(-1, keepdim=True))
+        grad_scores = grad_scores * scale
+        
+        # grad_q: [B, L, H, D] = grad_scores[B, L, H, K] · k_win[B, L, H, K, D]
+        grad_q = torch.einsum('blhk,blhkd->blhd', grad_scores, k_win)
+        
+        # grad_k_win: [B, L, H, K, D] = grad_scores[B, L, H, K] * q[B, L, H, D]
+        grad_k_win = torch.einsum('blhk,blhd->blhkd', grad_scores, q)
+        
+        # Fold gradients back to padded tensors
+        # grad_k_win and grad_v_win are [B, L, H, K, D], need to scatter back to [B, L+K-1, C]
+        grad_k_win = grad_k_win.permute(0, 1, 3, 2, 4).reshape(B, L, K, C)  # [B, L, K, C]
+        grad_v_win = grad_v_win.permute(0, 1, 3, 2, 4).reshape(B, L, K, C)  # [B, L, K, C]
+        
+        grad_k_padded = torch.zeros_like(k_padded)
+        grad_v_padded = torch.zeros_like(v_padded)
+        
+        # Scatter gradients back - each window position w at query position l contributes to position l+w
+        for w in range(K):
+            grad_k_padded[:, w:w+L, :] += grad_k_win[:, :, w, :]
+            grad_v_padded[:, w:w+L, :] += grad_v_win[:, :, w, :]
+        
+        # We don't backprop through width/sharpness for now (would need soft_mask backward)
+        return grad_q, grad_k_padded, grad_v_padded, None, None, None, None, None
+
+
+def triton_local_window_attn(q, k_padded, v_padded, width, sharpness, rel_dist, scale, K):
+    """Dispatch to Triton or raise error."""
+    if HAS_TRITON and q.is_cuda:
+        return LocalWindowAttnFunc.apply(q, k_padded, v_padded, width, sharpness, rel_dist, scale, K)
+    else:
+        raise RuntimeError("Triton local window attention requires CUDA and triton")
+
+
 class TritonLocalWindowAttn(nn.Module):
     """Fused local window attention using Triton (1D only)."""
     
@@ -442,15 +616,9 @@ class TritonLocalWindowAttn(nn.Module):
         v_padded = F.pad(v, (0, 0, pad_left, pad_right))
         
         if HAS_TRITON and x.is_cuda:
-            out = torch.empty(B, L, H, D, device=x.device, dtype=x.dtype)
-            
-            BLOCK_D = triton.next_power_of_2(D)
-            grid = (B, L, H)
-            
-            _local_window_attn_fwd_kernel[grid](
-                q, k_padded, v_padded, width, sharpness, self.rel_dist, out,
-                B, L, C, H, D, K, self.scale, self.half_k,
-                BLOCK_D=BLOCK_D,
+            # Use autograd-wrapped Triton kernel for training support
+            out = LocalWindowAttnFunc.apply(
+                q, k_padded, v_padded, width, sharpness, self.rel_dist, self.scale, K
             )
             out = out.reshape(B, L, C)
         else:
