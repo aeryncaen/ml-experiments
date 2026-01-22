@@ -30,7 +30,7 @@ class GatherConvND(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
-        chunk_size: int = 2048,
+        chunk_size: int = 768,
     ):
         super().__init__()
         self.channels = channels
@@ -139,7 +139,7 @@ class GatherConvND(nn.Module):
             rel_pos = rel_pos_nd.norm(dim=-1)
         
         batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1).expand(B, chunk_len, S)
-        values = x_flat[batch_idx, sample_idx].view(B, chunk_len, S, H, D).permute(0, 1, 3, 2, 4)
+        gathered = x_flat[batch_idx, sample_idx]
         
         kernel_max = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K)
         
@@ -149,23 +149,23 @@ class GatherConvND(nn.Module):
         idx_float = norm_pos * (K - 1)
         idx_floor = idx_float.long().clamp(0, K - 2)
         idx_ceil = idx_floor + 1
-        w_ceil = (idx_float - idx_floor.float()).unsqueeze(2)
+        w_ceil = idx_float - idx_floor.float()
         w_floor = 1.0 - w_ceil
         
-        idx_floor = idx_floor.unsqueeze(2).expand(B, chunk_len, H, S)
-        idx_ceil = idx_ceil.unsqueeze(2).expand(B, chunk_len, H, S)
+        output = torch.zeros(B, chunk_len, C, device=x_flat.device, dtype=x_flat.dtype)
         
-        k_floor = kernel_max.gather(-1, idx_floor)
-        k_ceil = kernel_max.gather(-1, idx_ceil)
-        
-        kernel = k_floor * w_floor + k_ceil * w_ceil
-        
-        valid_mask = valid_mask.unsqueeze(2).expand(B, chunk_len, H, S)
-        kernel = kernel * valid_mask.float()
-        kernel = kernel / (kernel.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        output = torch.einsum('blhsd,blhs->blhd', values, kernel)
-        output = output.reshape(B, chunk_len, C)
+        for h in range(H):
+            values_h = gathered[..., h * D : (h + 1) * D]
+            
+            km_h = kernel_max[:, :, h, :]
+            k_floor_h = km_h.gather(-1, idx_floor)
+            k_ceil_h = km_h.gather(-1, idx_ceil)
+            kernel_h = k_floor_h * w_floor + k_ceil_h * w_ceil
+            
+            kernel_h = kernel_h * valid_mask.float()
+            kernel_h = kernel_h / (kernel_h.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            output[:, :, h * D : (h + 1) * D] = torch.einsum('bls,blsd->bld', kernel_h, values_h)
         
         return output
     
