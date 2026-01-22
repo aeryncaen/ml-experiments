@@ -1141,42 +1141,61 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
     
     def _apply_rope(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x[..., ::2, :], x[..., 1::2, :]
-        cos = theta.cos().unsqueeze(-1)
-        sin = theta.sin().unsqueeze(-1)
-        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-2)
+        # x: (B, R, *spatial, N)
+        # theta: (B, 1, *spatial, N//2) - broadcasts to R dim
+        # x[..., ::2] gets even N indices (N//2), x[..., 1::2] gets odd (N//2)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        cos = theta.cos()
+        sin = theta.sin()
+        # Interleave back: x1*cos - x2*sin for even, x1*sin + x2*cos for odd
+        out = torch.empty_like(x)
+        out[..., ::2] = x1 * cos - x2 * sin
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out
     
     def init_state(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
-        return torch.zeros(B, *spatial_shape, self.N, self.R, device=x.device, dtype=x.dtype)
+        # H layout: (B, R, *spatial, N) - R second for easy flatten to (B*R, *spatial, N)
+        return torch.zeros(B, self.R, *spatial_shape, self.N, device=x.device, dtype=x.dtype)
     
     def step(self, x: torch.Tensor, H: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         
-        B_base = F.silu(self.to_B(x)).reshape(B, *spatial_shape, self.N, self.R)
-        C_base = F.silu(self.to_C(x)).reshape(B, *spatial_shape, self.N, self.R)
-        X_r = F.silu(self.to_X(x))
-        decay = torch.sigmoid(self.to_decay(x))
-        theta = self.to_theta(x)
+        # Project and reshape to (B, R, *spatial, N)
+        B_proj = F.silu(self.to_B(x)).view(B, *spatial_shape, self.N, self.R)
+        C_proj = F.silu(self.to_C(x)).view(B, *spatial_shape, self.N, self.R)
+        # Move R to position 1: (B, R, *spatial, N)
+        ndim = len(spatial_shape)
+        perm_to_BR = (0, ndim + 2) + tuple(range(1, ndim + 1)) + (ndim + 1,)
+        B_base = B_proj.permute(*perm_to_BR).contiguous()
+        C_base = C_proj.permute(*perm_to_BR).contiguous()
+        
+        X_r = F.silu(self.to_X(x))  # (B, *spatial, R)
+        decay = torch.sigmoid(self.to_decay(x))  # (B, *spatial, N)
+        theta = self.to_theta(x)  # (B, *spatial, N//2)
         
         theta_k = theta * (layer_idx + 1)
-        B_rot = self._apply_rope(B_base, theta_k)
-        inject = B_rot * X_r.unsqueeze(-2)
+        B_rot = self._apply_rope(B_base, theta_k.unsqueeze(1))
+        # X_r is (B, *spatial, R), need (B, R, *spatial, 1) for broadcast
+        perm_Xr = (0, ndim + 1) + tuple(range(1, ndim + 1))
+        X_r_bcast = X_r.permute(*perm_Xr).unsqueeze(-1)
+        inject = B_rot * X_r_bcast
         
-        ndim = len(spatial_shape)
-        batch_perm = (0, ndim + 2) + tuple(range(1, ndim + 2))
-        unbatch_perm = (0,) + tuple(range(2, ndim + 2)) + (ndim + 2, 1)
+        # Diffuse: flatten (B, R) -> (B*R), no permute needed since R is already dim 1
+        H_flat = H.view(B * self.R, *spatial_shape, self.N)
+        H_flat, _ = self.diffuse(H_flat)
+        H = H_flat.view(B, self.R, *spatial_shape, self.N)
         
-        H = H.permute(*batch_perm).reshape(B * self.R, *spatial_shape, self.N)
-        H, _ = self.diffuse(H)
-        H = H.reshape(B, self.R, *spatial_shape, self.N).permute(*unbatch_perm)
-        H = decay.unsqueeze(-1) * H + inject
+        # decay is (B, *spatial, N), need (B, 1, *spatial, N) for broadcast
+        H = decay.unsqueeze(1) * H + inject
         
-        C_rot = self._apply_rope(C_base, theta_k)
-        Y_full = H.reshape(B, *spatial_shape, self.N * self.R)
-        out = F.silu(self.out_proj(Y_full))
+        # Output: flatten to (B, *spatial, N*R)
+        # H is (B, R, *spatial, N), need (B, *spatial, N*R)
+        perm_to_spatial = (0,) + tuple(range(2, ndim + 2)) + (1, ndim + 2)
+        H_out = H.permute(*perm_to_spatial).reshape(B, *spatial_shape, self.N * self.R)
+        out = F.silu(self.out_proj(H_out))
         
         return H, out
     
