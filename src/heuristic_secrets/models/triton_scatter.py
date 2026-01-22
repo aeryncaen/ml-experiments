@@ -47,8 +47,8 @@ if HAS_TRITON:
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        if pid_b >= B or pid_l >= L or pid_h >= H:
-            return
+    if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+        return
         
         freq_offset = pid_b * L * H + pid_l * H + pid_h
         freq = tl.load(freq_ptr + freq_offset)
@@ -129,8 +129,8 @@ if HAS_TRITON:
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        if pid_b >= B or pid_l >= L or pid_h >= H:
-            return
+    if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+        return
         
         freq_offset = pid_b * L * H + pid_l * H + pid_h
         freq = tl.load(freq_ptr + freq_offset)
@@ -254,8 +254,8 @@ if HAS_TRITON:
         pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        if pid_b >= B or pid_l >= L or pid_h >= H:
-            return
+    if (pid_b >= B) | (pid_l >= L) | (pid_h >= H):
+        return
         
         param_offset = pid_b * L * H + pid_l * H + pid_h
         width = tl.load(width_ptr + param_offset)
@@ -318,8 +318,8 @@ if HAS_TRITON:
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         
-        if pid_b >= B_dim or pid_l >= L_dim:
-            return
+    if (pid_b >= B_dim) | (pid_l >= L_dim):
+        return
         
         n_offsets = tl.arange(0, BLOCK_N)
         n_mask = n_offsets < N
@@ -364,8 +364,8 @@ if HAS_TRITON:
         pid_r = tl.program_id(1)
         pid_l = tl.program_id(2)
         
-        if pid_b >= B_dim or pid_r >= R or pid_l >= L_dim:
-            return
+    if (pid_b >= B_dim) | (pid_r >= R) | (pid_l >= L_dim):
+        return
         
         N2 = N // 2
         n2_offsets = tl.arange(0, BLOCK_N2)
