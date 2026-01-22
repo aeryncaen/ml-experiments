@@ -772,27 +772,12 @@ class TritonSSMStep(nn.Module):
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         
-        if HAS_TRITON and x.is_cuda:
-            BLOCK_N2 = triton.next_power_of_2(self.N // 2)
-            grid_rope = (B, self.R, L)
-            _rope_kernel[grid_rope](
-                B_proj, theta, layer_idx,
-                B, self.R, L, self.N, BLOCK_N2,
-            )
-            
-            out_flat = torch.empty(B, L, self.N * self.R, device=x.device, dtype=x.dtype)
-            
-            BLOCK_N = triton.next_power_of_2(self.N)
-            grid_ssm = (B, L)
-            _ssm_fused_step_kernel[grid_ssm](
-                H, B_proj, X_r, decay, out_flat,
-                B, self.R, L, self.N, BLOCK_N,
-            )
-        else:
-            B_rot = self._apply_rope_pytorch(B_proj, theta, layer_idx)
-            inject = B_rot * X_r.unsqueeze(-1)
-            H = decay.unsqueeze(1) * H + inject
-            out_flat = H.permute(0, 2, 1, 3).reshape(B, L, self.N * self.R)
+        # Use autograd-wrapped functions for training support
+        # RoPE rotation (uses Triton kernel internally if available)
+        B_rot = RoPEFunc.apply(B_proj, theta, layer_idx)
+        
+        # SSM step (PyTorch for now - Triton SSM kernel needs work for proper backward)
+        H, out_flat = SSMStepFunc.apply(H, B_rot, X_r, decay)
         
         out = F.silu(self.out_proj(out_flat))
         return H, out
