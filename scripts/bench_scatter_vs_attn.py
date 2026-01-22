@@ -1170,5 +1170,84 @@ def main():
             print(f'{mt:12s}: {mean_acc:.4f}')
 
 
+def benchmark_memory():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--width', type=int, default=64)
+    parser.add_argument('--batch', type=int, default=2)
+    parser.add_argument('--heads', type=int, default=4)
+    args = parser.parse_args()
+    
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        return
+    
+    device = torch.device(args.device)
+    
+    from heuristic_secrets.models.scatter_attention import LocalAttentionND, LowRankAttentionND
+    
+    seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    
+    print(f"\nSequence Length Scaling (forward pass time, peak memory):")
+    print("-" * 80)
+    print(f"{'L':>6} | {'Local (K=17)':>20} | {'LowRank':>20} | {'Full Attn':>20}")
+    print("-" * 80)
+    
+    for L in seq_lens:
+        results = {}
+        
+        for name, model_fn in [
+            ('local', lambda: LocalAttentionND(args.width, kernel_size=17, ndim=1, num_channels=args.heads, checkpoint=False)),
+            ('lowrank', lambda: LowRankAttentionND(args.width, window_size=17, ndim=1, num_channels=args.heads)),
+            ('full', lambda: SDPAttention(args.width, num_heads=args.heads, dropout=0.0)),
+        ]:
+            model = model_fn().to(device)
+            x = torch.randn(args.batch, L, args.width, device=device)
+            
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize()
+            
+            for _ in range(3):
+                if name == 'full':
+                    _ = model(x)
+                else:
+                    _ = model(x)
+            torch.cuda.synchronize()
+            
+            torch.cuda.reset_peak_memory_stats(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            
+            start.record()
+            if name == 'full':
+                out = model(x)
+            else:
+                out = model(x)
+            end.record()
+            torch.cuda.synchronize()
+            
+            time_ms = start.elapsed_time(end)
+            peak_mb = torch.cuda.max_memory_allocated(device) / 1024 / 1024
+            
+            results[name] = (time_ms, peak_mb)
+            
+            del model, x, out
+            torch.cuda.empty_cache()
+        
+        local_t, local_m = results['local']
+        lr_t, lr_m = results['lowrank']
+        full_t, full_m = results['full']
+        
+        print(f"{L:>6} | {local_t:>7.2f}ms {local_m:>7.1f}MB | {lr_t:>7.2f}ms {lr_m:>7.1f}MB | {full_t:>7.2f}ms {full_m:>7.1f}MB")
+    
+    print("-" * 80)
+
+
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'memory':
+        sys.argv.pop(1)
+        benchmark_memory()
+    else:
+        main()
