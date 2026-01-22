@@ -854,12 +854,13 @@ class TritonScatterConv(nn.Module):
         decay_avg = decay.mean(dim=2)
         
         if HAS_TRITON and x.is_cuda:
+            # Must be contiguous - expand() creates views with stride 0
             out = triton_scatter_attention(
-                x, queries,
-                freq_avg.unsqueeze(-1).expand(-1, -1, H),
-                phase_avg.unsqueeze(-1).expand(-1, -1, H),
-                decay_avg.unsqueeze(-1).expand(-1, -1, H),
-                self.key_weight, self.stride_grid, self.scale
+                x, queries.contiguous(),
+                freq_avg.unsqueeze(-1).expand(-1, -1, H).contiguous(),
+                phase_avg.unsqueeze(-1).expand(-1, -1, H).contiguous(),
+                decay_avg.unsqueeze(-1).expand(-1, -1, H).contiguous(),
+                self.key_weight.contiguous(), self.stride_grid.contiguous(), self.scale
             )
         else:
             out = self._pytorch_fallback(x, queries, freq_avg, phase_avg, decay_avg)
