@@ -51,14 +51,59 @@ def interpolate_nd(x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tens
     return x.movedim(1, -1)
 
 
+class Sine(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(x)
+
+
+class SIRENDownsampleND(nn.Module):
+    """Learned depthwise strided conv with SIREN-generated kernel. Kernel size adapts to input."""
+    
+    def __init__(self, channels: int, ndim: int = 1, hidden: int = 32, omega_0: float = 30.0):
+        super().__init__()
+        self.channels = channels
+        self.ndim = ndim
+        self.kernel_net = KernelNetND(ndim, channels, hidden=hidden, omega_0=omega_0)
+    
+    def forward(self, x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+        spatial = x.shape[1:-1]
+        B, C = x.shape[0], x.shape[-1]
+        
+        if spatial == target_shape:
+            return x
+        
+        kernel_size = tuple(max(1, s // t) for s, t in zip(spatial, target_shape))
+        
+        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
+        if self.ndim == 1:
+            positions = grids[0].unsqueeze(-1)
+        else:
+            mesh = torch.meshgrid(*grids, indexing='ij')
+            positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
+        
+        kernel_flat = self.kernel_net(positions)
+        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
+        
+        x = x.movedim(-1, 1)
+        conv_fn = [F.conv1d, F.conv2d, F.conv3d][self.ndim - 1]
+        x = conv_fn(x, kernel, stride=kernel_size, groups=C)
+        
+        current = x.shape[2:]
+        if current != target_shape:
+            mode = ['linear', 'bilinear', 'trilinear'][self.ndim - 1]
+            x = F.interpolate(x, size=target_shape, mode=mode, align_corners=False)
+        
+        return x.movedim(1, -1)
+
+
 class KernelNetND(nn.Module):
     def __init__(self, ndim: int, out_channels: int, hidden: int = 32, layers: int = 3, omega_0: float = 30.0):
         super().__init__()
         self.omega_0 = omega_0
-        net = [nn.Linear(ndim, hidden)]
+        net: list[nn.Module] = [nn.Linear(ndim, hidden)]
         for _ in range(layers - 1):
-            net.extend([nn.SiLU(), nn.Linear(hidden, hidden)])
-        net.extend([nn.SiLU(), nn.Linear(hidden, out_channels)])
+            net.extend([Sine(), nn.Linear(hidden, hidden)])
+        net.extend([Sine(), nn.Linear(hidden, out_channels)])
         self.net = nn.Sequential(*net)
     
     def forward(self, positions: torch.Tensor) -> torch.Tensor:
@@ -455,6 +500,7 @@ class LowRankAttention(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
         self.embed_dim = embed_dim
+        self.downsample = SIRENDownsampleND(embed_dim, ndim=1)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -464,7 +510,7 @@ class LowRankAttention(nn.Module):
         B, L, C = x.shape
         r = max(1, int(L ** 0.5))
         
-        x_down = avg_pool_nd(x, (r,))
+        x_down = self.downsample(x, (r,))
         
         q = self.q_proj(x_down)
         k = self.k_proj(x_down)
@@ -513,6 +559,7 @@ class LowRankAttentionND(nn.Module):
         self.num_channels = num_channels
         self.channel_dim = embed_dim // num_channels
         
+        self.downsample = SIRENDownsampleND(embed_dim, ndim=ndim)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -524,7 +571,7 @@ class LowRankAttentionND(nn.Module):
         
         target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
         
-        x_down = avg_pool_nd(x, target_shape)
+        x_down = self.downsample(x, target_shape)
         
         r = 1
         for t in target_shape:
@@ -749,6 +796,176 @@ class LocalBlock(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
+
+
+class SGSBAttentionND(nn.Module):
+    """Scatter-Gather-Scatter-Broadcast attention. Full pipeline: adaptive conv → local attn → adaptive conv → low-rank full attn."""
+    
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ndim = ndim
+        self.num_channels = num_channels
+        
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,) * ndim
+        self.kernel_size = kernel_size
+        
+        self.scatter_pre = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels)
+        self.scatter_pre_norm = RMSNorm(embed_dim)
+        
+        self.gather = LocalAttentionND(embed_dim, kernel_size, ndim, num_channels)
+        self.gather_norm = RMSNorm(embed_dim)
+        
+        self.scatter_post = AdaptiveConvND(embed_dim, ndim=ndim, max_samples=kernel_size[0], num_channels=num_channels)
+        self.scatter_post_norm = RMSNorm(embed_dim)
+        
+        self.broadcast = LowRankAttention(embed_dim)
+        self.broadcast_norm = RMSNorm(embed_dim)
+        
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = x.shape[1:-1]
+        B, C = x.shape[0], x.shape[-1]
+        L = 1
+        for s in spatial_shape:
+            L *= s
+        
+        h = x
+        
+        conv_out, _ = self.scatter_pre(h)
+        h = h + self.scatter_pre_norm(conv_out)
+        
+        h = h + self.gather_norm(self.gather(h))
+        
+        conv_out, _ = self.scatter_post(h)
+        h = h + self.scatter_post_norm(conv_out)
+        
+        h_flat = h.reshape(B, L, C)
+        broadcast_out, _ = self.broadcast(h_flat)
+        h = h + self.broadcast_norm(broadcast_out).reshape(B, *spatial_shape, C)
+        
+        return self.out_proj(h)
+
+
+class SGSBAttention(SGSBAttentionND):
+    def __init__(self, embed_dim: int, kernel_size: int = 17, num_channels: int = 1):
+        super().__init__(embed_dim, kernel_size, ndim=1, num_channels=num_channels)
+
+
+class SGSBBlockND(nn.Module):
+    
+    def __init__(self, embed_dim: int, kernel_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, eps: float = 1e-6):
+        super().__init__()
+        self.norm = RMSNorm(embed_dim, eps)
+        self.attn = SGSBAttentionND(embed_dim, kernel_size, ndim, num_channels)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.attn(self.norm(x))
+
+
+class SGSBBlock(SGSBBlockND):
+    def __init__(self, embed_dim: int, kernel_size: int = 17, num_channels: int = 1, eps: float = 1e-6):
+        super().__init__(embed_dim, kernel_size, ndim=1, num_channels=num_channels, eps=eps)
+
+
+class SGSBModelND(nn.Module):
+    
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        n_layers: int = 4,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        
+        self.embed = nn.Linear(input_dim, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.layers = nn.ModuleList([
+            SGSBBlockND(embed_dim, kernel_size, ndim, num_channels)
+            for _ in range(n_layers)
+        ])
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, output_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed_norm(F.silu(self.embed(x)))
+        
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.out_norm(x)
+        return self.head(x)
+
+
+class SGSBModel(SGSBModelND):
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        output_dim: int,
+        n_layers: int = 4,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+    ):
+        super().__init__(input_dim, embed_dim, output_dim, n_layers, kernel_size, ndim=1, num_channels=num_channels)
+
+
+class SGSBClassifierND(nn.Module):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        n_layers: int = 4,
+        kernel_size: int | tuple[int, ...] = 17,
+        ndim: int = 1,
+        num_channels: int = 4,
+    ):
+        super().__init__()
+        self.ndim = ndim
+        
+        self.embed = nn.Linear(1, embed_dim)
+        self.embed_norm = RMSNorm(embed_dim)
+        
+        self.layers = nn.ModuleList([
+            SGSBBlockND(embed_dim, kernel_size, ndim, num_channels)
+            for _ in range(n_layers)
+        ])
+        
+        self.out_norm = RMSNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, n_classes)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.unsqueeze(-1)
+        x = self.embed_norm(F.silu(self.embed(x)))
+        
+        for layer in self.layers:
+            x = layer(x)
+        
+        pool_dims = tuple(range(1, self.ndim + 1))
+        x = self.out_norm(x).mean(dim=pool_dims)
+        return self.head(x)
+
+
+class SGSBClassifier(SGSBClassifierND):
+    def __init__(
+        self,
+        embed_dim: int,
+        n_classes: int,
+        n_layers: int = 4,
+        kernel_size: int = 17,
+        num_channels: int = 4,
+    ):
+        super().__init__(embed_dim, n_classes, n_layers, kernel_size, ndim=1, num_channels=num_channels)
 
 
 class HierarchicalLocalAttentionND(nn.Module):
