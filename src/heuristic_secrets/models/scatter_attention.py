@@ -410,7 +410,7 @@ class LowRankAttentionMerge(nn.Module):
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
-        out = F.interpolate(out.mT.unsqueeze(-1), size=(L, 1), mode='bicubic', align_corners=False).squeeze(-1).mT
+        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
         
         return processed + out
 
@@ -448,7 +448,7 @@ class LowRankAttentionND(nn.Module):
         
         out = F.scaled_dot_product_attention(q, k, v)
         out = F.silu(self.out_proj(out))
-        out = F.interpolate(out.mT.unsqueeze(-1), size=(L, 1), mode='bicubic', align_corners=False).squeeze(-1).mT
+        out = F.interpolate(out.mT, size=L, mode='linear', align_corners=False).mT
         
         return out.reshape(B, *spatial_shape, C)
 
@@ -818,7 +818,7 @@ class HierarchicalLocalAttentionND(nn.Module):
         for lvl in levels:
             lvl_flat = lvl.reshape(B, -1, C)
             if lvl_flat.shape[1] < L:
-                lvl_up = F.interpolate(lvl_flat.mT.unsqueeze(-1), size=(L, 1), mode='bicubic', align_corners=False).squeeze(-1).mT
+                lvl_up = F.interpolate(lvl_flat.mT, size=L, mode='linear', align_corners=False).mT
             else:
                 lvl_up = lvl_flat
             upsampled.append(lvl_up)
