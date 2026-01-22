@@ -1138,53 +1138,47 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_decay = nn.Linear(dim, state_dim)
         self.to_theta = nn.Linear(dim, state_dim // 2)
         
-        # Single diffuse module - all R ranks batched together
         self.diffuse = AdaptiveConvND(state_dim, ndim=ndim)
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
-        
-    def _apply_rotation(self, H: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        # H: (B*R, *spatial, N) or (B, *spatial, N, R)
-        # theta: (B, *spatial, N//2)
-        H1, H2 = H[..., ::2, :], H[..., 1::2, :]
+    
+    def _apply_rope(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x[..., ::2, :], x[..., 1::2, :]
         cos = theta.cos().unsqueeze(-1)
         sin = theta.sin().unsqueeze(-1)
-        return torch.cat([H1 * cos - H2 * sin, H1 * sin + H2 * cos], dim=-2)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-2)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
         
-        B_mat = F.silu(self.to_B(x)).reshape(B, *spatial_shape, self.N, self.R)
-        C_mat = F.silu(self.to_C(x)).reshape(B, *spatial_shape, self.N, self.R)
+        B_base = F.silu(self.to_B(x)).reshape(B, *spatial_shape, self.N, self.R)
+        C_base = F.silu(self.to_C(x)).reshape(B, *spatial_shape, self.N, self.R)
         X_r = F.silu(self.to_X(x))
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         
-        inject = B_mat * X_r.unsqueeze(-2)
-        
-        H = inject.clone()
+        H = torch.zeros_like(B_base)
         
         ndim = len(spatial_shape)
-        # Permute indices: (B, *spatial, N, R) -> (B, R, *spatial, N)
         batch_perm = (0, ndim + 2) + tuple(range(1, ndim + 2))
-        # Permute indices: (B, R, *spatial, N) -> (B, *spatial, N, R)
         unbatch_perm = (0,) + tuple(range(2, ndim + 2)) + (ndim + 2, 1)
         
-        for _ in range(self.K):
-            H = self._apply_rotation(H, theta)
+        for k in range(self.K):
+            theta_k = theta * (k + 1)
+            B_rot = self._apply_rope(B_base, theta_k)
+            C_rot = self._apply_rope(C_base, theta_k)
             
-            # (B, *spatial, N, R) -> (B, R, *spatial, N) -> (B*R, *spatial, N)
+            inject = B_rot * X_r.unsqueeze(-2)
+            
             H = H.permute(*batch_perm).reshape(B * self.R, *spatial_shape, self.N)
-            
             H, _ = self.diffuse(H)
-            
-            # (B*R, *spatial, N) -> (B, R, *spatial, N) -> (B, *spatial, N, R)
             H = H.reshape(B, self.R, *spatial_shape, self.N).permute(*unbatch_perm)
             
             H = decay.unsqueeze(-1) * H + inject
         
-        Y = (H * C_mat).sum(dim=-2)
+        C_final = self._apply_rope(C_base, theta * self.K)
+        Y = (H * C_final).sum(dim=-2)
         Y_full = H.reshape(B, *spatial_shape, self.N * self.R)
         
         return F.silu(self.out_proj(Y_full))

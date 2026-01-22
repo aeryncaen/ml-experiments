@@ -818,7 +818,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, ssm_iterations=4):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
@@ -849,7 +849,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return model.to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, ssm_iterations=4):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
@@ -875,6 +875,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         return RippleClassifierND(
             embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
             kernel_size=kernel_size, ndim=2, num_channels=num_channels,
+            ssm_iterations=ssm_iterations,
         ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
@@ -884,7 +885,7 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     return model.to(device)
 
 
-def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=5):
+def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels=4, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=5, ssm_iterations=4):
     WIDTH_ATTN = 48
     WIDTH_LOCAL = 48
     WIDTH_HIER = 48
@@ -910,6 +911,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
         return RippleClassifierND(
             embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
             kernel_size=kernel_size, ndim=3, num_channels=num_channels,
+            ssm_iterations=ssm_iterations,
         ).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
@@ -1118,6 +1120,7 @@ def main():
     parser.add_argument('--channels', type=int, default=4, help='Number of attention channels/heads (default: 4)')
     parser.add_argument('--kernel-size', type=int, default=None, help='Kernel/window size for attention (default: 17 for 1D, 7 for 2D, 5 for 3D)')
     parser.add_argument('--ssm', action='store_true', help='Add SSM block after attention')
+    parser.add_argument('--ssm-iterations', type=int, default=4, help='Number of Jacobi iterations in MIMOJacobiSSM (default: 4)')
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
@@ -1179,7 +1182,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 5
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'conv']
-        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        builder = lambda mt: build_model_3d(mt, args.layers, n_classes, img_size, device, args.channels, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.ssm_iterations)
         shape_str = f'vol_size={img_size}'
         flatten = False
         print(f'Task type: 3D Classification (SSM not supported)')
@@ -1187,7 +1190,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.ssm_iterations)
         shape_str = f'img_size={img_size}'
         flatten = True
         print(f'Task type: 2D Classification')
@@ -1195,7 +1198,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'conv']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.ssm_iterations)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
@@ -1236,8 +1239,9 @@ def main():
                 model = builder(mt)
                 print(f'\nTraining {mt}...')
             
-            # RippleClassifierND expects spatial input (B, H, W), not flattened
-            model_flatten = flatten and mt != 'ripple'
+            # RippleClassifierND in 2D/3D mode expects spatial input, not flattened
+            # In 1D mode, ripple needs flattened 1D sequence input
+            model_flatten = flatten and not (mt == 'ripple' and (args.mode_2d or args.mode_3d))
             
             acc = train_model(
                 model, train_loader, test_loader, device, args.epochs, args.lr,
