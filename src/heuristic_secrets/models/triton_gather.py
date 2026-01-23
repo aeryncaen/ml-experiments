@@ -106,6 +106,41 @@ if HAS_TRITON:
         sig = 1.0 / (1.0 + tl.exp(-x))
         tl.store(out_ptr + offs, x * sig, mask=mask)
 
+    @triton.jit
+    def rmsnorm_silu_fwd_kernel(
+        x_ptr, gamma_ptr, out_ptr,
+        M, N,
+        stride_xm, stride_xn,
+        stride_om, stride_on,
+        eps,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Fused RMSNorm -> SiLU. Each program handles one row."""
+        pid_m = tl.program_id(0)
+        
+        offs_n = tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
+        
+        # Load input row
+        x_ptrs = x_ptr + pid_m * stride_xm + offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=n_mask, other=0.0)
+        
+        # RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma
+        x_sq = x * x
+        mean_sq = tl.sum(x_sq) / N
+        rrms = 1.0 / tl.sqrt(mean_sq + eps)
+        
+        gamma = tl.load(gamma_ptr + offs_n, mask=n_mask, other=1.0)
+        normed = x * rrms * gamma
+        
+        # SiLU: x * sigmoid(x)
+        sigmoid_val = 1.0 / (1.0 + tl.exp(-normed))
+        out = normed * sigmoid_val
+        
+        # Store
+        out_ptrs = out_ptr + pid_m * stride_om + offs_n * stride_on
+        tl.store(out_ptrs, out, mask=n_mask)
+
     # ========== Gather-Conv kernel ==========
     @triton.jit
     def gather_conv_fwd_kernel(
@@ -406,6 +441,31 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def triton_rmsnorm_silu(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """x: (M, N), gamma: (N,) -> (M, N). Fused RMSNorm + SiLU."""
+    M, N = x.shape
+    out = torch.empty_like(x)
+    
+    BLOCK_N = triton.next_power_of_2(N)
+    grid = (M,)
+    
+    rmsnorm_silu_fwd_kernel[grid](
+        x, gamma, out,
+        M, N,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        eps,
+        BLOCK_N,
+    )
+    return out
+
+
+def triton_linear_rmsnorm_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """x: (M, K), w: (N, K), b: (N,), gamma: (N,) -> (M, N). Linear + RMSNorm + SiLU."""
+    linear_out = triton_linear(x, w) + b
+    return triton_rmsnorm_silu(linear_out, gamma, eps)
+
+
 def triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_start=0):
     """freq/phase/kernel are for a chunk starting at chunk_start, output is chunk-sized"""
     B, L, C = x.shape
@@ -455,8 +515,10 @@ class TritonGatherConv(nn.Module):
         
         self.wave_w = nn.Parameter(torch.empty(2 * num_heads, channels))
         self.wave_b = nn.Parameter(torch.zeros(2 * num_heads))
+        self.wave_gamma = nn.Parameter(torch.ones(2 * num_heads))
         self.kernel_w = nn.Parameter(torch.empty(num_heads * max_kernel_size, channels))
         self.kernel_b = nn.Parameter(torch.zeros(num_heads * max_kernel_size))
+        self.kernel_gamma = nn.Parameter(torch.ones(num_heads * max_kernel_size))
         self.out_w = nn.Parameter(torch.empty(channels, channels))
         
         nn.init.zeros_(self.wave_w)
@@ -465,7 +527,8 @@ class TritonGatherConv(nn.Module):
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         return _GatherConvTriton.apply(
-            x, self.wave_w, self.wave_b, self.kernel_w, self.kernel_b, self.out_w,
+            x, self.wave_w, self.wave_b, self.wave_gamma,
+            self.kernel_w, self.kernel_b, self.kernel_gamma, self.out_w,
             self.num_heads, self.half_s, self.max_receptive,
             self.max_freq, self.min_freq, self.max_kernel_size, self.chunk_size,
         ), {}
@@ -473,7 +536,7 @@ class TritonGatherConv(nn.Module):
 
 class _GatherConvTriton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, wave_w, wave_b, kernel_w, kernel_b, out_w,
+    def forward(ctx, x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w,
                 H, half_s, max_receptive, max_freq, min_freq, K, chunk_size):
         B, L, C = x.shape
         D = C // H
@@ -491,18 +554,17 @@ class _GatherConvTriton(torch.autograd.Function):
             
             x_chunk = x[:, start:end, :].reshape(M_chunk, C)
             
-            # wave_proj for chunk
-            wave_out = triton_linear_silu(x_chunk, wave_w, wave_b)  # (M_chunk, 2H)
+            # wave_proj for chunk: linear -> RMSNorm -> SiLU
+            wave_out = triton_linear_rmsnorm_silu(x_chunk, wave_w, wave_b, wave_gamma)  # (M_chunk, 2H)
             wave_out = wave_out.view(B, chunk_len, 2, H)
             
             freq_pre = wave_out[:, :, 0, :]
             phase_pre = wave_out[:, :, 1, :]
             freq_chunk = torch.sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
-            exp2p = torch.exp(2.0 * phase_pre)
-            phase_chunk = ((exp2p - 1.0) / (exp2p + 1.0)) * max_freq
+            phase_chunk = torch.tanh(phase_pre) * max_freq
             
-            # kernel_proj for chunk
-            kernel_out = triton_linear_silu(x_chunk, kernel_w, kernel_b)  # (M_chunk, H*K)
+            # kernel_proj for chunk: linear -> RMSNorm -> SiLU
+            kernel_out = triton_linear_rmsnorm_silu(x_chunk, kernel_w, kernel_b, kernel_gamma)  # (M_chunk, H*K)
             kernel_chunk = kernel_out.view(B, chunk_len, H, K)
             
             # gather-conv for chunk (reads from full x, writes to chunk)
@@ -521,7 +583,7 @@ class _GatherConvTriton(torch.autograd.Function):
             out[:, start:end, :] = triton_silu(out_pre).view(B, chunk_len, C)
         
         # Save x and weights for backward (recompute intermediates)
-        ctx.save_for_backward(x, wave_w, wave_b, kernel_w, kernel_b, out_w)
+        ctx.save_for_backward(x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w)
         ctx.H = H
         ctx.half_s = half_s
         ctx.max_receptive = max_receptive
