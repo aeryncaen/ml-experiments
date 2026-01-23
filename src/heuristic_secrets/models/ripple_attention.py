@@ -422,7 +422,10 @@ class RippleClassifier(nn.Module):
         if self.embed_2d is not None:
             x = self.embed(x)
         elif self.vocab_size is not None:
-            x = self.embed_norm(self.embed(x.long()) + self.pos_embed)
+            x_long = x.long()
+            assert x_long.min() >= 0 and x_long.max() < self.vocab_size, \
+                f"Token indices out of bounds: min={x_long.min().item()}, max={x_long.max().item()}, vocab_size={self.vocab_size}"
+            x = self.embed_norm(self.embed(x_long) + self.pos_embed)
         else:
             x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
         
