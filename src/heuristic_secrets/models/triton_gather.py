@@ -11,7 +11,9 @@ try:
     import triton
     import triton.language as tl
     HAS_TRITON = True
-except ImportError:
+except Exception as e:
+    import sys
+    print(f"triton_gather.py: Triton import failed: {type(e).__name__}: {e}", file=sys.stderr)
     HAS_TRITON = False
 
 
