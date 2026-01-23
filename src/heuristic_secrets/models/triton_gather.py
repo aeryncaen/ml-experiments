@@ -114,13 +114,17 @@ if HAS_TRITON:
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive,
+        chunk_start, chunk_len: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
-        pid_l = tl.program_id(1)
+        pid_l_local = tl.program_id(1)  # Local position within chunk
         pid_h = tl.program_id(2)
         
-        freq_off = pid_b * L * H + pid_l * H + pid_h
+        pid_l = chunk_start + pid_l_local  # Absolute position in sequence
+        
+        # freq/phase/kernel are stored per-chunk, use local index
+        freq_off = pid_b * chunk_len * H + pid_l_local * H + pid_h
         freq_h = tl.load(freq_ptr + freq_off)
         phase_h = tl.load(phase_ptr + freq_off)
         
@@ -128,13 +132,15 @@ if HAS_TRITON:
         d_mask = d_offs < D
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        # kernel stored per-chunk
+        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
         out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
         
         for s_idx in range(S):
             s_off = s_idx - half_s
+            # Use absolute position for sampling
             sample_pos_f = pid_l + s_off * freq_h + phase_h
             
             valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
@@ -156,11 +162,13 @@ if HAS_TRITON:
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
             kernel_w = kernel_w * valid.to(tl.float32)
             
+            # Read from full x using absolute position
             val_base = pid_b * L * C + sample_idx * C + pid_h * D
             vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
             out_h += vals * kernel_w
         
-        out_base = pid_b * L * C + pid_l * C + pid_h * D
+        # Write to chunk output using local position
+        out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
 
     @triton.jit
@@ -171,13 +179,17 @@ if HAS_TRITON:
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive,
+        chunk_start, chunk_len: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
-        pid_l = tl.program_id(1)
+        pid_l_local = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        freq_off = pid_b * L * H + pid_l * H + pid_h
+        pid_l = chunk_start + pid_l_local  # Absolute position
+        
+        # freq/phase/kernel/d_out stored per-chunk
+        freq_off = pid_b * chunk_len * H + pid_l_local * H + pid_h
         freq_h = tl.load(freq_ptr + freq_off)
         phase_h = tl.load(phase_ptr + freq_off)
         
@@ -185,10 +197,10 @@ if HAS_TRITON:
         d_mask = d_offs < D
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
-        d_out_base = pid_b * L * C + pid_l * C + pid_h * D
+        d_out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
         d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
         
         d_freq_acc = 0.0
@@ -196,6 +208,7 @@ if HAS_TRITON:
         
         for s_idx in range(S):
             s_off = s_idx - half_s
+            # Use absolute position for sampling
             sample_pos_f = pid_l + s_off * freq_h + phase_h
             
             valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
@@ -219,10 +232,11 @@ if HAS_TRITON:
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
             kernel_w = kernel_w * valid_f
             
+            # Read from full x using absolute position
             val_base = pid_b * L * C + sample_idx * C + pid_h * D
             vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
             
-            # d_x via atomic add
+            # d_x via atomic add to full d_x
             d_x_contrib = d_out_h * kernel_w
             tl.atomic_add(d_x_ptr + val_base + d_offs, d_x_contrib, mask=d_mask)
             
@@ -238,6 +252,7 @@ if HAS_TRITON:
             s_off_f = s_off * 1.0
             d_freq_acc += d_rel_pos * tl.abs(s_off_f)
         
+        # Store to chunk-sized outputs
         tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
         tl.store(d_freq_ptr + freq_off, d_freq_acc)
 
@@ -371,19 +386,22 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive):
+def triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_start=0):
+    """freq/phase/kernel are for a chunk starting at chunk_start, output is chunk-sized"""
     B, L, C = x.shape
+    chunk_len = freq.shape[1]  # freq is (B, chunk_len, H)
     H = freq.shape[-1]
     K = kernel.shape[-1]
     D = C // H
     S = 2 * half_s + 1
     BLOCK_D = triton.next_power_of_2(D)
     
-    out = torch.empty_like(x)
-    grid = (B, L, H)
+    out = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+    grid = (B, chunk_len, H)
     gather_conv_fwd_kernel[grid](
         x, out, freq, phase, kernel,
-        B, L, C, H, D, S, K, half_s, max_receptive, BLOCK_D,
+        B, L, C, H, D, S, K, half_s, max_receptive,
+        chunk_start, chunk_len, BLOCK_D,
     )
     return out
 
@@ -432,39 +450,55 @@ class TritonGatherConv(nn.Module):
 
 
 class _GatherConvTriton(torch.autograd.Function):
+    CHUNK_SIZE = 1024  # Process this many positions at a time
+    
     @staticmethod
     def forward(ctx, x, wave_w, wave_b, kernel_w, kernel_b, out_w,
                 H, half_s, max_receptive, max_freq, min_freq, K):
         B, L, C = x.shape
-        M = B * L
         D = C // H
         S = 2 * half_s + 1
+        BLOCK_D = triton.next_power_of_2(D)
+        chunk_size = min(_GatherConvTriton.CHUNK_SIZE, L)
         
-        x_flat = x.view(M, C)
+        out = torch.empty_like(x)
         
-        # wave_proj: (M, C) @ (C, 2H) -> (M, 2H), then silu
-        wave_out = triton_linear_silu(x_flat, wave_w, wave_b)  # (M, 2H)
-        wave_out = wave_out.view(B, L, 2, H)
-        
-        # freq/phase extraction (simple ops, keep in torch for now)
-        freq_pre = wave_out[:, :, 0, :]
-        phase_pre = wave_out[:, :, 1, :]
-        freq = torch.sigmoid(freq_pre) * (max_freq - min_freq) + min_freq  # (B, L, H)
-        exp2p = torch.exp(2.0 * phase_pre)
-        phase = ((exp2p - 1.0) / (exp2p + 1.0)) * max_freq  # tanh
-        
-        # kernel_proj: (M, C) @ (C, H*K) -> (M, H*K), then silu
-        kernel_out = triton_linear_silu(x_flat, kernel_w, kernel_b)  # (M, H*K)
-        kernel = kernel_out.view(B, L, H, K)
-        
-        # gather-conv
-        hidden = triton_gather_conv(x, freq.contiguous(), phase.contiguous(), 
-                                    kernel.contiguous(), half_s, max_receptive)
-        
-        # out_proj: (M, C) @ (C, C) -> (M, C), then silu
-        hidden_flat = hidden.view(M, C)
-        out_pre = triton_linear(hidden_flat, out_w)
-        out = triton_silu(out_pre).view(B, L, C)
+        # Process in chunks to minimize intermediate memory
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            chunk_len = end - start
+            M_chunk = B * chunk_len
+            
+            x_chunk = x[:, start:end, :].reshape(M_chunk, C)
+            
+            # wave_proj for chunk
+            wave_out = triton_linear_silu(x_chunk, wave_w, wave_b)  # (M_chunk, 2H)
+            wave_out = wave_out.view(B, chunk_len, 2, H)
+            
+            freq_pre = wave_out[:, :, 0, :]
+            phase_pre = wave_out[:, :, 1, :]
+            freq_chunk = torch.sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
+            exp2p = torch.exp(2.0 * phase_pre)
+            phase_chunk = ((exp2p - 1.0) / (exp2p + 1.0)) * max_freq
+            
+            # kernel_proj for chunk
+            kernel_out = triton_linear_silu(x_chunk, kernel_w, kernel_b)  # (M_chunk, H*K)
+            kernel_chunk = kernel_out.view(B, chunk_len, H, K)
+            
+            # gather-conv for chunk (reads from full x, writes to chunk)
+            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+            grid = (B, chunk_len, H)
+            gather_conv_fwd_kernel[grid](
+                x, hidden_chunk,
+                freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
+                B, L, C, H, D, S, K, half_s, max_receptive,
+                start, chunk_len, BLOCK_D,
+            )
+            
+            # out_proj for chunk
+            hidden_flat = hidden_chunk.view(M_chunk, C)
+            out_pre = triton_linear(hidden_flat, out_w)
+            out[:, start:end, :] = triton_silu(out_pre).view(B, chunk_len, C)
         
         # Save ONLY quantized x and weights for backward
         if HAS_FP8:
@@ -494,10 +528,10 @@ class _GatherConvTriton(torch.autograd.Function):
         min_freq = ctx.min_freq
         K = ctx.K
         B, L, C = ctx.shape
-        M = B * L
         D = C // H
         S = 2 * half_s + 1
         BLOCK_D = triton.next_power_of_2(D)
+        chunk_size = min(_GatherConvTriton.CHUNK_SIZE, L)
         
         if ctx.use_fp8:
             x_q, x_scale, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
@@ -505,140 +539,152 @@ class _GatherConvTriton(torch.autograd.Function):
         else:
             x, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
         
-        x_flat = x.view(M, C)
-        d_out_flat = d_out.view(M, C)
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         
-        # === Recompute forward ===
-        wave_out = triton_linear_silu(x_flat, wave_w, wave_b).view(B, L, 2, H)
-        freq_pre = wave_out[:, :, 0, :]
-        phase_pre = wave_out[:, :, 1, :]
-        sig_freq = torch.sigmoid(freq_pre)
-        freq = sig_freq * (max_freq - min_freq) + min_freq
-        exp2p = torch.exp(2.0 * phase_pre)
-        tanh_phase = (exp2p - 1.0) / (exp2p + 1.0)
-        phase = tanh_phase * max_freq
-        
-        kernel_out = triton_linear_silu(x_flat, kernel_w, kernel_b)
-        kernel = kernel_out.view(B, L, H, K)
-        
-        hidden = triton_gather_conv(x, freq.contiguous(), phase.contiguous(),
-                                    kernel.contiguous(), half_s, max_receptive)
-        hidden_flat = hidden.view(M, C)
-        
-        out_pre = triton_linear(hidden_flat, out_w)
-        
-        # === Backward through out_proj + silu ===
-        sig_out = torch.sigmoid(out_pre)
-        d_out_pre = d_out_flat * sig_out * (1.0 + out_pre * (1.0 - sig_out))
-        
-        # d_out_w = d_out_pre.T @ hidden
-        d_out_w = torch.zeros_like(out_w)
-        BLOCK_N, BLOCK_K, BLOCK_M = 64, 64, 32
-        grid = (triton.cdiv(C, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_out_pre, hidden_flat, d_out_w,
-            M, C, C,
-            d_out_pre.stride(0), d_out_pre.stride(1),
-            hidden_flat.stride(0), hidden_flat.stride(1),
-            d_out_w.stride(0), d_out_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        
-        # d_hidden = d_out_pre @ out_w
-        d_hidden = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        BLOCK_M, BLOCK_K, BLOCK_N = 64, 64, 32
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_out_pre, out_w, d_hidden,
-            M, C, C,
-            d_out_pre.stride(0), d_out_pre.stride(1),
-            out_w.stride(0), out_w.stride(1),
-            d_hidden.stride(0), d_hidden.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        d_hidden = d_hidden.view(B, L, C)
-        
-        # === Backward through gather-conv ===
-        d_x_gather = torch.zeros_like(x)
-        d_freq = torch.zeros_like(freq)
-        d_kernel = torch.zeros(B, L, H, K, device=x.device, dtype=x.dtype)
-        
-        grid = (B, L, H)
-        gather_conv_bwd_kernel[grid](
-            x, d_hidden.contiguous(), d_x_gather,
-            freq.contiguous(), phase.contiguous(), kernel.contiguous(),
-            d_freq, d_kernel,
-            B, L, C, H, D, S, K, half_s, max_receptive, BLOCK_D,
-        )
-        
-        # === Backward through kernel_proj (silu + linear) ===
-        kernel_pre = triton_linear(x_flat, kernel_w)  # recompute pre-activation
-        sig_k = torch.sigmoid(kernel_pre)
-        d_kernel_flat = d_kernel.view(M, H * K)
-        d_kernel_pre = d_kernel_flat * sig_k * (1.0 + kernel_pre * (1.0 - sig_k))
-        
-        d_kernel_w = torch.zeros_like(kernel_w)
-        grid = (triton.cdiv(H * K, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_kernel_pre, x_flat, d_kernel_w,
-            M, H * K, C,
-            d_kernel_pre.stride(0), d_kernel_pre.stride(1),
-            x_flat.stride(0), x_flat.stride(1),
-            d_kernel_w.stride(0), d_kernel_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        d_kernel_b = d_kernel_pre.sum(0)
-        
-        d_x_kernel = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_kernel_pre, kernel_w, d_x_kernel,
-            M, H * K, C,
-            d_kernel_pre.stride(0), d_kernel_pre.stride(1),
-            kernel_w.stride(0), kernel_w.stride(1),
-            d_x_kernel.stride(0), d_x_kernel.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        
-        # === Backward through wave_proj ===
-        # d_freq -> d_freq_pre -> d_wave_out[:,:,0,:] 
-        # freq = sigmoid(freq_pre) * scale + offset
-        d_freq_pre = d_freq * (max_freq - min_freq) * sig_freq * (1.0 - sig_freq)
-        
-        # phase uses tanh, d_phase is 0 from gather_conv_bwd (we don't compute it)
-        d_phase_pre = torch.zeros_like(phase_pre)
-        
-        d_wave_out = torch.stack([d_freq_pre, d_phase_pre], dim=2).view(M, 2 * H)
-        
-        wave_pre = triton_linear(x_flat, wave_w)  # recompute
-        sig_w = torch.sigmoid(wave_pre)
-        d_wave_pre = d_wave_out * sig_w * (1.0 + wave_pre * (1.0 - sig_w))
-        
+        # Initialize gradient accumulators
+        d_x = torch.zeros_like(x)
         d_wave_w = torch.zeros_like(wave_w)
-        grid = (triton.cdiv(2 * H, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_wave_pre, x_flat, d_wave_w,
-            M, 2 * H, C,
-            d_wave_pre.stride(0), d_wave_pre.stride(1),
-            x_flat.stride(0), x_flat.stride(1),
-            d_wave_w.stride(0), d_wave_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        d_wave_b = d_wave_pre.sum(0)
+        d_wave_b = torch.zeros_like(wave_b)
+        d_kernel_w = torch.zeros_like(kernel_w)
+        d_kernel_b = torch.zeros_like(kernel_b)
+        d_out_w = torch.zeros_like(out_w)
         
-        d_x_wave = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_wave_pre, wave_w, d_x_wave,
-            M, 2 * H, C,
-            d_wave_pre.stride(0), d_wave_pre.stride(1),
-            wave_w.stride(0), wave_w.stride(1),
-            d_x_wave.stride(0), d_x_wave.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        
-        # Combine d_x
-        d_x = d_x_gather + d_x_kernel.view(B, L, C) + d_x_wave.view(B, L, C)
+        # Process backward in chunks
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            chunk_len = end - start
+            M_chunk = B * chunk_len
+            
+            x_chunk = x[:, start:end, :].reshape(M_chunk, C)
+            d_out_chunk = d_out[:, start:end, :].reshape(M_chunk, C)
+            
+            # === Recompute forward for this chunk ===
+            wave_out = triton_linear_silu(x_chunk, wave_w, wave_b).view(B, chunk_len, 2, H)
+            freq_pre = wave_out[:, :, 0, :]
+            phase_pre = wave_out[:, :, 1, :]
+            sig_freq = torch.sigmoid(freq_pre)
+            freq_chunk = sig_freq * (max_freq - min_freq) + min_freq
+            exp2p = torch.exp(2.0 * phase_pre)
+            tanh_phase = (exp2p - 1.0) / (exp2p + 1.0)
+            phase_chunk = tanh_phase * max_freq
+            
+            kernel_out = triton_linear_silu(x_chunk, kernel_w, kernel_b)
+            kernel_chunk = kernel_out.view(B, chunk_len, H, K)
+            
+            # Recompute hidden for chunk
+            hidden_chunk = triton_gather_conv(x, freq_chunk.contiguous(), phase_chunk.contiguous(),
+                                              kernel_chunk.contiguous(), half_s, max_receptive, start)
+            hidden_flat = hidden_chunk.view(M_chunk, C)
+            
+            out_pre = triton_linear(hidden_flat, out_w)
+            
+            # === Backward through out_proj + silu ===
+            sig_out = torch.sigmoid(out_pre)
+            d_out_pre = d_out_chunk * sig_out * (1.0 + out_pre * (1.0 - sig_out))
+            
+            # Accumulate d_out_w
+            d_out_w_chunk = torch.zeros_like(out_w)
+            grid = (triton.cdiv(C, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_out_pre, hidden_flat, d_out_w_chunk,
+                M_chunk, C, C,
+                d_out_pre.stride(0), d_out_pre.stride(1),
+                hidden_flat.stride(0), hidden_flat.stride(1),
+                d_out_w_chunk.stride(0), d_out_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_out_w += d_out_w_chunk
+            
+            # d_hidden for chunk
+            d_hidden_flat = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_out_pre, out_w, d_hidden_flat,
+                M_chunk, C, C,
+                d_out_pre.stride(0), d_out_pre.stride(1),
+                out_w.stride(0), out_w.stride(1),
+                d_hidden_flat.stride(0), d_hidden_flat.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            d_hidden_chunk = d_hidden_flat.view(B, chunk_len, C)
+            
+            # === Backward through gather-conv ===
+            d_freq_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
+            d_kernel_chunk = torch.zeros(B, chunk_len, H, K, device=x.device, dtype=x.dtype)
+            
+            grid = (B, chunk_len, H)
+            gather_conv_bwd_kernel[grid](
+                x, d_hidden_chunk.contiguous(), d_x,  # d_x accumulates via atomics
+                freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
+                d_freq_chunk, d_kernel_chunk,
+                B, L, C, H, D, S, K, half_s, max_receptive,
+                start, chunk_len, BLOCK_D,
+            )
+            
+            # === Backward through kernel_proj ===
+            kernel_pre = triton_linear(x_chunk, kernel_w)
+            sig_k = torch.sigmoid(kernel_pre)
+            d_kernel_flat = d_kernel_chunk.view(M_chunk, H * K)
+            d_kernel_pre = d_kernel_flat * sig_k * (1.0 + kernel_pre * (1.0 - sig_k))
+            
+            d_kernel_w_chunk = torch.zeros_like(kernel_w)
+            grid = (triton.cdiv(H * K, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_kernel_pre, x_chunk, d_kernel_w_chunk,
+                M_chunk, H * K, C,
+                d_kernel_pre.stride(0), d_kernel_pre.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_kernel_w_chunk.stride(0), d_kernel_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_kernel_w += d_kernel_w_chunk
+            d_kernel_b += d_kernel_pre.sum(0)
+            
+            d_x_kernel_chunk = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_kernel_pre, kernel_w, d_x_kernel_chunk,
+                M_chunk, H * K, C,
+                d_kernel_pre.stride(0), d_kernel_pre.stride(1),
+                kernel_w.stride(0), kernel_w.stride(1),
+                d_x_kernel_chunk.stride(0), d_x_kernel_chunk.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            d_x[:, start:end, :] += d_x_kernel_chunk.view(B, chunk_len, C)
+            
+            # === Backward through wave_proj ===
+            d_freq_pre = d_freq_chunk * (max_freq - min_freq) * sig_freq * (1.0 - sig_freq)
+            d_phase_pre = torch.zeros_like(phase_pre)
+            d_wave_out = torch.stack([d_freq_pre, d_phase_pre], dim=2).view(M_chunk, 2 * H)
+            
+            wave_pre = triton_linear(x_chunk, wave_w)
+            sig_w = torch.sigmoid(wave_pre)
+            d_wave_pre = d_wave_out * sig_w * (1.0 + wave_pre * (1.0 - sig_w))
+            
+            d_wave_w_chunk = torch.zeros_like(wave_w)
+            grid = (triton.cdiv(2 * H, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_wave_pre, x_chunk, d_wave_w_chunk,
+                M_chunk, 2 * H, C,
+                d_wave_pre.stride(0), d_wave_pre.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_wave_w_chunk.stride(0), d_wave_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_wave_w += d_wave_w_chunk
+            d_wave_b += d_wave_pre.sum(0)
+            
+            d_x_wave_chunk = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_wave_pre, wave_w, d_x_wave_chunk,
+                M_chunk, 2 * H, C,
+                d_wave_pre.stride(0), d_wave_pre.stride(1),
+                wave_w.stride(0), wave_w.stride(1),
+                d_x_wave_chunk.stride(0), d_x_wave_chunk.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            d_x[:, start:end, :] += d_x_wave_chunk.view(B, chunk_len, C)
         
         return d_x, d_wave_w, d_wave_b, d_kernel_w, d_kernel_b, d_out_w, \
                None, None, None, None, None, None
@@ -648,7 +694,9 @@ class _GatherConvTriton(torch.autograd.Function):
 class GatherConvOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, freq, phase, kernel, half_s, max_receptive, quantize_bwd):
-        out = triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive)
+        # freq/phase/kernel are for full L here (not chunked)
+        chunk_len = freq.shape[1]
+        out = triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_start=0)
         
         if quantize_bwd and HAS_FP8:
             x_q, x_scale = quantize_fp8(x)
@@ -675,6 +723,7 @@ class GatherConvOp(torch.autograd.Function):
             x, freq, phase, kernel = ctx.saved_tensors
         
         B, L, C = x.shape
+        chunk_len = freq.shape[1]
         H = freq.shape[-1]
         K = kernel.shape[-1]
         D = C // H
@@ -685,12 +734,13 @@ class GatherConvOp(torch.autograd.Function):
         d_freq = torch.zeros_like(freq)
         d_kernel = torch.zeros_like(kernel)
         
-        grid = (B, L, H)
+        grid = (B, chunk_len, H)
         gather_conv_bwd_kernel[grid](
             x, d_out.contiguous(), d_x,
             freq, phase, kernel,
             d_freq, d_kernel,
-            B, L, C, H, D, S, K, half_s, max_receptive, BLOCK_D,
+            B, L, C, H, D, S, K, half_s, max_receptive,
+            0, chunk_len, BLOCK_D,  # chunk_start=0 for full sequence
         )
         
         return d_x, d_freq, None, d_kernel, None, None, None
