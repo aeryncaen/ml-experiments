@@ -870,7 +870,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def find_width_for_params(block_factory, target_params, min_w=16, max_w=512):
+def find_width_for_params(model_factory, target_params, min_w=16, max_w=512):
     lo, hi = min_w, max_w
     best_w, best_diff = lo, float('inf')
     
@@ -878,8 +878,8 @@ def find_width_for_params(block_factory, target_params, min_w=16, max_w=512):
         mid = (lo + hi) // 2
         mid = max(mid // 2 * 2, 2)
         try:
-            block = block_factory(mid)
-            params = sum(p.numel() for p in block.parameters())
+            model = model_factory(mid)
+            params = sum(p.numel() for p in model.parameters())
         except:
             hi = mid - 2
             continue
@@ -899,7 +899,7 @@ def find_width_for_params(block_factory, target_params, min_w=16, max_w=512):
     return best_w
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', params_per_layer=100_000):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000):
     
     if model_type == 'attention':
         block_factory = lambda w: AttentionBlock(w, num_heads=num_channels, use_ssm=use_ssm)
@@ -914,23 +914,21 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     elif model_type == 'ripple':
         block_factory = lambda w: RippleAttentionBlock(w, num_heads=num_channels, order=attn_order)
     elif model_type == 'flat':
-        width = find_width_for_params(
-            lambda w: FlatRippleClassifierND(embed_dim=w, n_classes=n_classes, iterations=1, kernel_size=kernel_size, ndim=1, num_channels=num_channels),
-            params_per_layer
-        )
-        return FlatRippleClassifierND(
-            embed_dim=width, n_classes=n_classes, iterations=layers,
-            kernel_size=kernel_size, ndim=1, num_channels=num_channels,
-        ).to(device)
+        def model_factory(w):
+            return FlatRippleClassifierND(embed_dim=w, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
+        width = find_width_for_params(model_factory, target_params)
+        return model_factory(width).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
     
-    width = find_width_for_params(block_factory, params_per_layer)
-    block_fn = lambda: block_factory(width)
+    def model_factory(w):
+        block_fn = lambda: block_factory(w)
+        model = SequenceClassifier(block_fn(), w, layers, n_classes, seq_len)
+        model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+        return model
     
-    model = SequenceClassifier(block_fn(), width, layers, n_classes, seq_len)
-    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
-    return model.to(device)
+    width = find_width_for_params(model_factory, target_params)
+    return model_factory(width).to(device)
 
 
 def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7):
@@ -1043,7 +1041,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', params_per_layer=100_000):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000):
     
     if model_type == 'attention':
         block_factory = lambda w: AttentionBlock(w, num_heads=num_channels, use_ssm=use_ssm)
@@ -1060,12 +1058,14 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
-    width = find_width_for_params(block_factory, params_per_layer)
-    block_fn = lambda: block_factory(width)
+    def model_factory(w):
+        block_fn = lambda: block_factory(w)
+        model = AudioClassifier(block_fn(), w, layers, n_classes, seq_len)
+        model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+        return model
     
-    model = AudioClassifier(block_fn(), width, layers, n_classes, seq_len)
-    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
-    return model.to(device)
+    width = find_width_for_params(model_factory, target_params)
+    return model_factory(width).to(device)
 
 
 class PreloadedDataset:
@@ -1298,7 +1298,7 @@ def main():
     parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     parser.add_argument('--attn-order', type=str, default='tele,conv,lowrank', help='Order of attention layers for ripple model (default: tele,conv,lowrank)')
-    parser.add_argument('--params-per-layer', type=int, default=100_000, help='Target params per layer for width search (default: 100000)')
+    parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
     args = parser.parse_args()
 
     def seed_everything(seed):
