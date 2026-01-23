@@ -13,7 +13,9 @@ from operator import mul
 
 try:
     from .triton_gather import TritonGatherConv, HAS_TRITON
-except ImportError:
+except Exception as e:
+    import sys
+    print(f"Triton import failed: {type(e).__name__}: {e}", file=sys.stderr)
     HAS_TRITON = False
     TritonGatherConv = None
 
