@@ -876,12 +876,12 @@ def find_width_for_params(block_factory, target_params, min_w=16, max_w=512):
     
     while lo <= hi:
         mid = (lo + hi) // 2
-        mid = max(mid // 8 * 8, 8)
+        mid = max(mid // 2 * 2, 2)
         try:
             block = block_factory(mid)
             params = sum(p.numel() for p in block.parameters())
         except:
-            hi = mid - 8
+            hi = mid - 2
             continue
         
         diff = abs(params - target_params)
@@ -890,9 +890,9 @@ def find_width_for_params(block_factory, target_params, min_w=16, max_w=512):
             best_w = mid
         
         if params < target_params:
-            lo = mid + 8
+            lo = mid + 2
         elif params > target_params:
-            hi = mid - 8
+            hi = mid - 2
         else:
             break
     
