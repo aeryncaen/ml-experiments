@@ -1067,17 +1067,16 @@ class PreloadedDataset:
         return (len(self.x) + self.batch_size - 1) // self.batch_size
 
 
-def make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)):
+def make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1), pack_rgb=False):
+    pack = PackRGB() if pack_rgb else None
     def augment(x):
         B = x.shape[0]
-        # x is (B, C, H, W)
         angle = (torch.rand(B) * 2 - 1) * degrees * (3.14159 / 180)
         tx = (torch.rand(B) * 2 - 1) * translate[0]
         ty = (torch.rand(B) * 2 - 1) * translate[1]
         s = torch.rand(B) * (scale[1] - scale[0]) + scale[0]
         
         cos_a, sin_a = torch.cos(angle), torch.sin(angle)
-        # Affine matrix: scale * rotation, then translate
         theta = torch.zeros(B, 2, 3)
         theta[:, 0, 0] = s * cos_a
         theta[:, 0, 1] = -s * sin_a
@@ -1087,25 +1086,28 @@ def make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)):
         theta[:, 1, 2] = ty
         
         grid = F.affine_grid(theta, x.shape, align_corners=False)
-        return F.grid_sample(x, grid, align_corners=False, padding_mode='zeros')
+        x = F.grid_sample(x, grid, align_corners=False, padding_mode='zeros')
+        if pack:
+            x = torch.stack([pack(xi) for xi in x])
+        return x
     return augment
 
 
-def make_crop_flip_augment(padding=4):
+def make_crop_flip_augment(padding=4, pack_rgb=False):
+    pack = PackRGB() if pack_rgb else None
     def augment(x):
         B, C, H, W = x.shape
-        # Pad
         x = F.pad(x, [padding]*4, mode='reflect')
-        # Random crop
         top = torch.randint(0, 2*padding + 1, (B,))
         left = torch.randint(0, 2*padding + 1, (B,))
         crops = []
         for i in range(B):
             crops.append(x[i:i+1, :, top[i]:top[i]+H, left[i]:left[i]+W])
         x = torch.cat(crops, dim=0)
-        # Random horizontal flip
         flip_mask = torch.rand(B) > 0.5
         x[flip_mask] = x[flip_mask].flip(-1)
+        if pack:
+            x = torch.stack([pack(xi) for xi in x])
         return x
     return augment
 
@@ -1176,7 +1178,6 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         if no_augment:
             train_transform = transforms.Compose([
                 transforms.ToTensor(),
-                PackRGB(),
             ])
         else:
             train_transform = transforms.Compose([
@@ -1200,7 +1201,6 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         if no_augment:
             train_transform = transforms.Compose([
                 transforms.ToTensor(),
-                PackRGB(),
             ])
         else:
             train_transform = transforms.Compose([
@@ -1299,9 +1299,10 @@ def main():
     )
 
     if args.preload:
-        # Pick augmentation based on dataset
-        if args.dataset in ('mnist', 'fashion') or (args.dataset in ('cifar10', 'cifar100') and not args.mode_3d):
+        if args.dataset in ('mnist', 'fashion'):
             train_aug = make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1))
+        elif args.dataset in ('cifar10', 'cifar100') and not args.mode_3d:
+            train_aug = make_affine_augment(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1), pack_rgb=True)
         elif args.dataset in ('cifar10', 'cifar100') and args.mode_3d:
             train_aug = make_crop_flip_augment(padding=4)
         else:
