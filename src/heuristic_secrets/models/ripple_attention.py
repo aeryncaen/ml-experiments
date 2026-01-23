@@ -8,13 +8,127 @@ import torch.nn.functional as F
 
 from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
-from .scatter_attention import LowRankAttention, RMSNorm
+from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, interpolate_nd, apply_rope
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
 except ImportError:
     HAS_TRITON = False
     TritonAdaptiveLocalConv = None
+
+
+class LayerHistoryAccumulator(nn.Module):
+    """Downsamples layer output to L^reduction_power for cross-layer history accumulation.
+    
+    Placed at the END of each layer (after normalization). Produces a low-rank
+    representation that gets appended to the cross-layer history stack.
+    """
+    
+    def __init__(
+        self,
+        channels: int,
+        reduction_power: float = 0.75,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.reduction_power = reduction_power
+        self.downsample = SIRENDownsampleND(channels, ndim=1)
+        self.norm = RMSNorm(channels, eps)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Downsample and normalize layer output for history accumulation.
+        
+        Args:
+            x: (B, L, C) layer output after normalization
+            
+        Returns:
+            (B, L^reduction_power, C) low-rank representation
+        """
+        B, L, C = x.shape
+        target_len = max(1, int(L ** self.reduction_power))
+        x_down = self.downsample(x, (target_len,))
+        return self.norm(x_down)
+
+
+class CrossLayerAttention(nn.Module):
+    """Attends across accumulated layer history at the START of each layer.
+    
+    If history has 2+ entries:
+    - Q = most recent entry (top of stack)
+    - K/V = all prior entries
+    - Full attention with RoPE encoding layer depth
+    - Interpolate result back to full sequence length
+    - Add as residual to layer input
+    """
+    
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, eps)
+        self.k_norm = RMSNorm(self.head_dim, eps)
+        self.out_proj = nn.Linear(channels, channels, bias=False)
+        self.out_norm = RMSNorm(channels, eps)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        history: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply cross-layer attention if history has 2+ entries."""
+        if len(history) < 2:
+            return x
+        
+        B, L, C = x.shape
+        H = self.num_heads
+        D = self.head_dim
+        
+        q_src = history[-1]
+        L_q = q_src.shape[1]
+        kv_list = history[:-1]
+        
+        q_depth = torch.full((B, L_q), len(history) - 1, device=x.device, dtype=x.dtype)
+        
+        kv_depths = []
+        kv_tensors = []
+        for depth_idx, kv in enumerate(kv_list):
+            kv_tensors.append(kv)
+            kv_depths.append(torch.full((B, kv.shape[1]), depth_idx, device=x.device, dtype=x.dtype))
+        
+        kv_cat = torch.cat(kv_tensors, dim=1)
+        kv_depth_cat = torch.cat(kv_depths, dim=1)
+        L_kv = kv_cat.shape[1]
+        
+        q = self.q_proj(q_src).reshape(B, L_q, H, D)
+        k = self.k_proj(kv_cat).reshape(B, L_kv, H, D)
+        v = self.v_proj(kv_cat).reshape(B, L_kv, H, D)
+        
+        q = apply_rope(self.q_norm(q), q_depth)
+        k = apply_rope(self.k_norm(k), kv_depth_cat)
+        
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, L_q, C)
+        out = self.out_proj(out)
+        
+        out = interpolate_nd(out, (L,))
+        
+        return x + self.out_norm(out)
 
 
 class RippleAttention(nn.Module):
@@ -114,8 +228,10 @@ class RippleBlock(nn.Module):
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
+        cross_layer: bool = False,
     ):
         super().__init__()
+        self.cross_layer = cross_layer
         self.attn = RippleAttention(
             channels=channels,
             num_heads=num_heads,
@@ -135,12 +251,102 @@ class RippleBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, channels),
         )
+        
+        if cross_layer:
+            self.cross_layer_attn = CrossLayerAttention(channels, num_heads, eps)
+            self.history_accum = LayerHistoryAccumulator(channels, lowrank_power, eps)
     
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        history: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict] | tuple[torch.Tensor, dict, torch.Tensor]:
+        if self.cross_layer and history is not None:
+            x = self.cross_layer_attn(x, history)
+        
         attn_out, info = self.attn(x)
         x = x + attn_out
         x = x + self.mlp(x)
+        
+        if self.cross_layer:
+            x_lowrank = self.history_accum(x)
+            return x, info, x_lowrank
+        
         return x, info
+
+
+class RippleClassifier(nn.Module):
+    """Sequence classifier with RippleBlocks and optional cross-layer attention."""
+    
+    def __init__(
+        self,
+        width: int,
+        n_layers: int,
+        n_classes: int,
+        seq_len: int,
+        num_heads: int = 8,
+        max_kernel_size: int = 64,
+        mlp_ratio: float = 4.0,
+        use_triton: bool = True,
+        eps: float = 1e-6,
+        order: str = "tele,conv,lowrank",
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
+        cross_layer: bool = False,
+    ):
+        super().__init__()
+        self.cross_layer = cross_layer
+        self.lowrank_power = lowrank_power
+        
+        self.embed = nn.Linear(1, width)
+        self.embed_norm = RMSNorm(width, eps)
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+        self.pos_norm = RMSNorm(width, eps)
+        
+        self.layers = nn.ModuleList([
+            RippleBlock(
+                channels=width,
+                num_heads=num_heads,
+                max_kernel_size=max_kernel_size,
+                mlp_ratio=mlp_ratio,
+                use_triton=use_triton,
+                eps=eps,
+                order=order,
+                lowrank_power=lowrank_power,
+                telephone_power=telephone_power,
+                conv_power=conv_power,
+                max_seq_len=max_seq_len,
+                cross_layer=cross_layer,
+            )
+            for _ in range(n_layers)
+        ])
+        
+        self.norm = RMSNorm(width, eps)
+        self.head = nn.Linear(width, n_classes)
+        
+        if cross_layer:
+            self.embed_accum = LayerHistoryAccumulator(width, lowrank_power, eps)
+            self.head_cross_attn = CrossLayerAttention(width, num_heads, eps)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
+        
+        if self.cross_layer:
+            history: list[torch.Tensor] = [self.embed_accum(x)]
+            
+            for layer in self.layers:
+                x, _, x_lowrank = layer(x, history)
+                history.append(x_lowrank)
+            
+            x = self.head_cross_attn(x, history)
+        else:
+            for layer in self.layers:
+                x, _ = layer(x)
+        
+        x = self.norm(x)
+        return self.head(x.mean(dim=1))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
-from heuristic_secrets.models.ripple_attention import RippleAttention
+from heuristic_secrets.models.ripple_attention import RippleAttention, RippleClassifier
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.models.telephone_attention import TelephoneAttentionND
@@ -1085,7 +1085,21 @@ def find_config_for_params(
     return best_config
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False):
+    
+    if model_type == 'ripple' and cross_layer:
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
+            return RippleClassifier(
+                width=w, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+                num_heads=num_channels, order=attn_order, cross_layer=True
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return RippleClassifier(
+            width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+            num_heads=num_channels, order=attn_order, cross_layer=True
+        ).to(device)
     
     if model_type == 'attention':
         def block_factory_fn(h):
@@ -1503,6 +1517,7 @@ def main():
     parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
+    parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1582,7 +1597,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
