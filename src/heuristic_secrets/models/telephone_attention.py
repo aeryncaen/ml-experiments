@@ -51,7 +51,7 @@ class TelephoneAttentionND(nn.Module):
         chunk_size: int = 1024,
         checkpoint: bool = True,
         use_triton: bool = True,
-        scale_power: float = 0.5625,
+        scale_power: float = 0.4489,
         max_seq_len: int = 8192,
     ):
         super().__init__()

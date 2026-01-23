@@ -45,7 +45,7 @@ class AdaptiveLocalConv(nn.Module):
         num_heads: int = 8,
         max_kernel_size: int = 64,
         min_window: float = 1.0,
-        scale_power: float = 0.421875,
+        scale_power: float = 0.30,
     ):
         super().__init__()
         self.channels = channels

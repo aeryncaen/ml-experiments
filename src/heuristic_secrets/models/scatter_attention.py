@@ -631,7 +631,7 @@ class LowRankAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int = 8,
-        reduction_power: float = 0.75,
+        reduction_power: float = 0.67,
         lambda_init: float = 0.8,
     ):
         super().__init__()
