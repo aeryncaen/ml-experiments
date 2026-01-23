@@ -269,12 +269,17 @@ class RippleBlock(nn.Module):
         if cross_layer:
             self.cross_layer_attn = CrossLayerAttention(channels, num_heads, eps)
             self.history_accum = LayerHistoryAccumulator(channels, lowrank_power, eps)
+            self.decay_head = nn.Sequential(
+                nn.Linear(channels, channels // 4),
+                nn.SiLU(),
+                nn.Linear(channels // 4, 1),
+            )
     
     def forward(
         self,
         x: torch.Tensor,
         history: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, dict] | tuple[torch.Tensor, dict, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict] | tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor]:
         if self.cross_layer and history is not None:
             x = self.cross_layer_attn(x, history)
         
@@ -284,7 +289,8 @@ class RippleBlock(nn.Module):
         
         if self.cross_layer:
             x_lowrank = self.history_accum(x)
-            return x, info, x_lowrank
+            decay = 0.5 + 0.5 * torch.sigmoid(self.decay_head(x.mean(dim=1))).unsqueeze(-1)
+            return x, info, x_lowrank, decay
         
         return x, info
 
@@ -343,7 +349,6 @@ class RippleClassifier(nn.Module):
         if cross_layer:
             self.embed_accum = LayerHistoryAccumulator(width, lowrank_power, eps)
             self.head_cross_attn = CrossLayerAttention(width, num_heads, eps)
-            self.history_decay = nn.Parameter(torch.full((n_layers,), 2.0))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
@@ -351,9 +356,8 @@ class RippleClassifier(nn.Module):
         if self.cross_layer:
             history: list[torch.Tensor] = [self.embed_accum(x)]
             
-            for i, layer in enumerate(self.layers):
-                x, _, x_lowrank = layer(x, history)
-                decay = 0.5 + 0.5 * torch.sigmoid(self.history_decay[i])
+            for layer in self.layers:
+                x, _, x_lowrank, decay = layer(x, history)
                 history = [h * decay for h in history]
                 history.append(x_lowrank)
             
