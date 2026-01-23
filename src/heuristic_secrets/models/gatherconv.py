@@ -11,6 +11,12 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from functools import reduce
 from operator import mul
 
+try:
+    from .triton_gather import TritonGatherConv, HAS_TRITON
+except ImportError:
+    HAS_TRITON = False
+    TritonGatherConv = None
+
 
 class GatherConvND(nn.Module):
     """
@@ -33,9 +39,11 @@ class GatherConvND(nn.Module):
         max_kernel_size: int = 64,
         chunk_size: int = 768,
         checkpoint: bool = True,
+        use_triton: bool = True,
     ):
         super().__init__()
         self.checkpoint = checkpoint
+        self.use_triton = use_triton and HAS_TRITON and ndim == 1
         self.channels = channels
         self.ndim = ndim
         self.max_samples = max_samples
