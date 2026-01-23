@@ -680,45 +680,73 @@ if __name__ == "__main__":
     device = "cuda"
     B, L, C = 4, 8192, 256
     H = 8
+    warmup_iters = 3
+    bench_iters = 10
     
     print(f"Config: B={B}, L={L}, C={C}, H={H}")
-    print(f"FP8 available: {HAS_FP8}")
     print()
     
+    def bench_model(model, x):
+        # Warmup
+        for _ in range(warmup_iters):
+            out, _ = model(x)
+            out.sum().backward()
+            model.zero_grad()
+            x.grad.zero_()
+        
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Forward
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            with torch.no_grad():
+                out, _ = model(x)
+        torch.cuda.synchronize()
+        fwd_time = (time.perf_counter() - start) / bench_iters * 1000
+        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2
+        
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Forward + backward
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            out, _ = model(x)
+            out.sum().backward()
+            model.zero_grad()
+            x.grad.zero_()
+        torch.cuda.synchronize()
+        total_time = (time.perf_counter() - start) / bench_iters * 1000
+        bwd_time = total_time - fwd_time
+        bwd_mem = torch.cuda.max_memory_allocated() / 1024**2
+        
+        return fwd_time, bwd_time, fwd_mem, bwd_mem
+    
+    # Default benchmark
     model = TritonGatherConv(channels=C, num_heads=H).to(device)
     x = torch.randn(B, L, C, device=device, requires_grad=True)
+    fwd_time, bwd_time, fwd_mem, bwd_mem = bench_model(model, x)
+    print(f"Default (chunk=1024): Fwd: {fwd_time:5.1f}ms ({fwd_mem:5.0f}MB)  Bwd: {bwd_time:5.1f}ms ({bwd_mem:5.0f}MB)")
     
-    # Warmup
-    for _ in range(3):
-        out, _ = model(x)
-        out.sum().backward()
-        model.zero_grad()
-        x.grad.zero_()
+    # Chunk size sweep
+    print()
+    print("=" * 70)
+    print("CHUNK SIZE SWEEP")
+    print("=" * 70)
+    print(f"{'ChunkSize':>10} | {'Fwd(ms)':>8} {'Bwd(ms)':>8} {'FwdMem':>8} {'BwdMem':>8}")
+    print("-" * 70)
     
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
+    chunk_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
     
-    # Forward
-    start = time.perf_counter()
-    for _ in range(10):
-        with torch.no_grad():
-            out, _ = model(x)
-    torch.cuda.synchronize()
-    fwd_time = (time.perf_counter() - start) / 10 * 1000
-    fwd_mem = torch.cuda.max_memory_allocated() / 1024**2
+    for cs in chunk_sizes:
+        model_cs = TritonGatherConv(channels=C, num_heads=H, chunk_size=cs).to(device)
+        model_cs.load_state_dict(model.state_dict())
+        x = torch.randn(B, L, C, device=device, requires_grad=True)
+        
+        fwd, bwd, fwd_m, bwd_m = bench_model(model_cs, x)
+        print(f"{cs:>10} | {fwd:>8.1f} {bwd:>8.1f} {fwd_m:>8.0f} {bwd_m:>8.0f}")
+        
+        del model_cs, x
+        torch.cuda.empty_cache()
     
-    torch.cuda.reset_peak_memory_stats()
-    
-    # Forward + backward
-    start = time.perf_counter()
-    for _ in range(10):
-        out, _ = model(x)
-        out.sum().backward()
-        model.zero_grad()
-        x.grad.zero_()
-    torch.cuda.synchronize()
-    total_time = (time.perf_counter() - start) / 10 * 1000
-    bwd_time = total_time - fwd_time
-    bwd_mem = torch.cuda.max_memory_allocated() / 1024**2
-    
-    print(f"Fwd: {fwd_time:5.1f}ms ({fwd_mem:5.0f}MB)  Bwd: {bwd_time:5.1f}ms ({bwd_mem:5.0f}MB)")
+    print("=" * 70)
