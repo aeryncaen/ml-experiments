@@ -659,6 +659,11 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             scheduler.step()
 
         total_loss_t += loss.detach()
+        
+        pbar.set_postfix(
+            loss=f"{total_loss_t.item()/(pbar.n+1):.4f}",
+            acc=f"{correct_t.item()/max(total_t.item(),1):.4f}"
+        )
 
     total_loss = total_loss_t.item()
     correct = correct_t.item()
