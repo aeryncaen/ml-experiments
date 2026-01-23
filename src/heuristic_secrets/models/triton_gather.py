@@ -149,7 +149,7 @@ if HAS_TRITON:
     @triton.jit
     def gather_conv_fwd_kernel(
         x_ptr, out_ptr,
-        freq_ptr, phase_ptr, kernel_ptr,
+        freq_ptr, phase_ptr, kernel_ptr, exponent_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive,
@@ -166,6 +166,10 @@ if HAS_TRITON:
         freq_off = pid_b * chunk_len * H + pid_l_local * H + pid_h
         freq_h = tl.load(freq_ptr + freq_off)
         phase_h = tl.load(phase_ptr + freq_off)
+        
+        # exponent is per-position (B, chunk_len, 1), shared across heads
+        exponent_off = pid_b * chunk_len + pid_l_local
+        exponent = tl.load(exponent_ptr + exponent_off)
         
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
@@ -204,7 +208,12 @@ if HAS_TRITON:
             k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
             k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
-            kernel_w = kernel_w * valid_f
+            
+            # Power-law decay: 1 / (1 + norm_dist)^exponent
+            # norm_dist = rel_pos / L (normalized by sequence length)
+            norm_dist = rel_pos / L
+            power_weight = 1.0 / tl.math.pow(1.0 + norm_dist, exponent)
+            kernel_w = kernel_w * power_weight * valid_f
             
             # Soft gather: interpolate between floor and ceil values
             val_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
@@ -221,8 +230,8 @@ if HAS_TRITON:
     @triton.jit
     def gather_conv_bwd_kernel(
         x_ptr, d_out_ptr, d_x_ptr,
-        freq_ptr, phase_ptr, kernel_ptr,
-        d_freq_ptr, d_phase_ptr, d_kernel_ptr,
+        freq_ptr, phase_ptr, kernel_ptr, exponent_ptr,
+        d_freq_ptr, d_phase_ptr, d_kernel_ptr, d_exponent_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive,
@@ -239,6 +248,10 @@ if HAS_TRITON:
         freq_h = tl.load(freq_ptr + freq_off)
         phase_h = tl.load(phase_ptr + freq_off)
         
+        # exponent is per-position (B, chunk_len, 1), shared across heads
+        exponent_off = pid_b * chunk_len + pid_l_local
+        exponent = tl.load(exponent_ptr + exponent_off)
+        
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         
@@ -252,6 +265,7 @@ if HAS_TRITON:
         d_freq_acc = 0.0
         d_phase_acc = 0.0
         d_kernel_acc = tl.zeros((K,), dtype=tl.float32)
+        d_exponent_acc = 0.0
         
         for s_idx in range(S):
             s_off = s_idx - half_s
@@ -280,8 +294,13 @@ if HAS_TRITON:
             
             k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
             k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
-            kernel_w = k_floor * w_floor + k_ceil * w_ceil
-            kernel_w = kernel_w * valid_f
+            kernel_interp = k_floor * w_floor + k_ceil * w_ceil
+            
+            # Power-law decay: 1 / (1 + norm_dist)^exponent
+            norm_dist = rel_pos / L
+            one_plus_dist = 1.0 + norm_dist
+            power_weight = 1.0 / tl.math.pow(one_plus_dist, exponent)
+            kernel_w = kernel_interp * power_weight * valid_f
             
             # Load values from floor and ceil positions
             val_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
@@ -300,10 +319,16 @@ if HAS_TRITON:
             # d_pos_frac from soft interpolation: d_frac = d_out * kernel_w * (vals_ceil - vals_floor)
             d_pos_frac = tl.sum(d_out_h * kernel_w * (vals_ceil - vals_floor))
             
-            # d_kernel
-            d_kernel_w = tl.sum(d_out_h * vals) * valid_f
+            # d_kernel (through power_weight and valid_f)
+            d_kernel_w = tl.sum(d_out_h * vals) * power_weight * valid_f
             d_kernel_acc += tl.where(k_offs == idx_floor, d_kernel_w * w_floor, 0.0)
             d_kernel_acc += tl.where(k_offs == idx_ceil, d_kernel_w * w_ceil, 0.0)
+            
+            # d_exponent: d_power_weight/d_exponent = -power_weight * log(1 + norm_dist)
+            # d_exponent = d_kernel_w_total * d_power_weight/d_exponent * kernel_interp * valid_f
+            d_total_w = tl.sum(d_out_h * vals) * valid_f
+            log_term = tl.log(one_plus_dist + 1e-6)  # eps for stability when dist ≈ 0
+            d_exponent_acc += d_total_w * kernel_interp * (-power_weight * log_term)
             
             # d_freq from kernel interpolation
             d_w_ceil = d_kernel_w * (k_ceil - k_floor)
@@ -324,6 +349,8 @@ if HAS_TRITON:
         tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
         tl.store(d_freq_ptr + freq_off, d_freq_acc)
         tl.store(d_phase_ptr + freq_off, d_phase_acc)
+        # exponent is shared across heads, so atomic_add
+        tl.atomic_add(d_exponent_ptr + exponent_off, d_exponent_acc)
 
     # ========== Backward kernels for linear layers ==========
     @triton.jit
@@ -470,9 +497,13 @@ def triton_linear_rmsnorm_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
     return triton_rmsnorm_silu(linear_out, gamma, eps)
 
 
-def triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_start=0):
-    """freq/phase/kernel are for a chunk starting at chunk_start, output is chunk-sized"""
+def triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
+    """freq/phase/kernel are for a chunk starting at chunk_start, output is chunk-sized
+    exponent is (B, chunk_len, 1) - per-position decay exponent
+    """
     B, L, C = x.shape
+    if seq_len is None:
+        seq_len = L
     chunk_len = freq.shape[1]  # freq is (B, chunk_len, H)
     H = freq.shape[-1]
     K = kernel.shape[-1]
@@ -483,11 +514,16 @@ def triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_star
     out = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
     grid = (B, chunk_len, H)
     gather_conv_fwd_kernel[grid](
-        x, out, freq, phase, kernel,
-        B, L, C, H, D, S, K, half_s, max_receptive,
+        x, out, freq, phase, kernel, exponent,
+        B, seq_len, C, H, D, S, K, half_s, max_receptive,
         chunk_start, chunk_len, BLOCK_D,
     )
     return out
+
+
+def triton_gather_conv_with_exponent(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
+    """Alias for triton_gather_conv with exponent support"""
+    return triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start, seq_len)
 
 
 # ========== Main module ==========
@@ -523,25 +559,34 @@ class TritonGatherConv(nn.Module):
         self.kernel_w = nn.Parameter(torch.empty(num_heads * max_kernel_size, channels))
         self.kernel_b = nn.Parameter(torch.zeros(num_heads * max_kernel_size))
         self.kernel_gamma = nn.Parameter(torch.ones(num_heads * max_kernel_size))
+        self.exponent_w = nn.Parameter(torch.empty(1, channels))
+        self.exponent_b = nn.Parameter(torch.zeros(1))
+        self.exponent_gamma = nn.Parameter(torch.ones(1))
         self.out_w = nn.Parameter(torch.empty(channels, channels))
         
         nn.init.zeros_(self.wave_w)
         nn.init.xavier_uniform_(self.kernel_w, gain=0.1)
+        nn.init.zeros_(self.exponent_w)
+        nn.init.zeros_(self.exponent_b)  # sigmoid(0)*3.5+0.5 = 2.25
         nn.init.xavier_uniform_(self.out_w, gain=0.1)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        B, L, C = x.shape
         return _GatherConvTriton.apply(
             x, self.wave_w, self.wave_b, self.wave_gamma,
-            self.kernel_w, self.kernel_b, self.kernel_gamma, self.out_w,
+            self.kernel_w, self.kernel_b, self.kernel_gamma,
+            self.exponent_w, self.exponent_b, self.exponent_gamma,
+            self.out_w,
             self.num_heads, self.half_s, self.max_receptive,
-            self.max_freq, self.min_freq, self.max_kernel_size, self.chunk_size,
+            self.max_freq, self.min_freq, self.max_kernel_size, self.chunk_size, L,
         ), {}
 
 
 class _GatherConvTriton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w,
-                H, half_s, max_receptive, max_freq, min_freq, K, chunk_size):
+    def forward(ctx, x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma,
+                exponent_w, exponent_b, exponent_gamma, out_w,
+                H, half_s, max_receptive, max_freq, min_freq, K, chunk_size, seq_len):
         B, L, C = x.shape
         D = C // H
         S = 2 * half_s + 1
@@ -571,12 +616,25 @@ class _GatherConvTriton(torch.autograd.Function):
             kernel_out = triton_linear_rmsnorm_silu(x_chunk, kernel_w, kernel_b, kernel_gamma)  # (M_chunk, H*K)
             kernel_chunk = kernel_out.view(B, chunk_len, H, K)
             
+            # exponent_proj for chunk: linear -> RMSNorm -> sigmoid -> [0.5, 4.0]
+            exponent_out = triton_linear_rmsnorm_silu(x_chunk, exponent_w, exponent_b, exponent_gamma)  # (M_chunk, 1)
+            # Undo SiLU to get normed value, then apply sigmoid
+            # Actually, let's compute it properly: linear -> rmsnorm -> sigmoid
+            exponent_linear = triton_linear(x_chunk, exponent_w) + exponent_b  # (M_chunk, 1)
+            exponent_linear_f32 = exponent_linear.float()
+            exponent_variance = exponent_linear_f32.pow(2).mean(dim=-1, keepdim=True)
+            exponent_rrms = torch.rsqrt(exponent_variance + 1e-6)
+            exponent_normed = (exponent_gamma * exponent_linear_f32 * exponent_rrms).to(exponent_linear.dtype)
+            exponent_chunk = torch.sigmoid(exponent_normed) * 3.5 + 0.5  # (M_chunk, 1) -> (B, chunk_len, 1)
+            exponent_chunk = exponent_chunk.view(B, chunk_len, 1)
+            
             # gather-conv for chunk (reads from full x, writes to chunk)
             hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
             grid = (B, chunk_len, H)
             gather_conv_fwd_kernel[grid](
                 x, hidden_chunk,
                 freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
+                exponent_chunk.contiguous(),
                 B, L, C, H, D, S, K, half_s, max_receptive,
                 start, chunk_len, BLOCK_D,
             )
@@ -587,7 +645,8 @@ class _GatherConvTriton(torch.autograd.Function):
             out[:, start:end, :] = triton_silu(out_pre).view(B, chunk_len, C)
         
         # Save x and weights for backward (recompute intermediates)
-        ctx.save_for_backward(x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w)
+        ctx.save_for_backward(x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma,
+                              exponent_w, exponent_b, exponent_gamma, out_w)
         ctx.H = H
         ctx.half_s = half_s
         ctx.max_receptive = max_receptive
@@ -595,6 +654,7 @@ class _GatherConvTriton(torch.autograd.Function):
         ctx.min_freq = min_freq
         ctx.K = K
         ctx.chunk_size = chunk_size
+        ctx.seq_len = seq_len
         ctx.shape = (B, L, C)
         
         return out
@@ -613,7 +673,9 @@ class _GatherConvTriton(torch.autograd.Function):
         BLOCK_D = triton.next_power_of_2(D)
         chunk_size = min(ctx.chunk_size, L)
         
-        x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w = ctx.saved_tensors
+        x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, \
+            exponent_w, exponent_b, exponent_gamma, out_w = ctx.saved_tensors
+        seq_len = ctx.seq_len
         
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         eps = 1e-6  # LlamaRMSNorm epsilon
@@ -626,6 +688,9 @@ class _GatherConvTriton(torch.autograd.Function):
         d_kernel_w = torch.zeros_like(kernel_w)
         d_kernel_b = torch.zeros_like(kernel_b)
         d_kernel_gamma = torch.zeros_like(kernel_gamma)
+        d_exponent_w = torch.zeros_like(exponent_w)
+        d_exponent_b = torch.zeros_like(exponent_b)
+        d_exponent_gamma = torch.zeros_like(exponent_gamma)
         d_out_w = torch.zeros_like(out_w)
         
         # Process backward in chunks
@@ -664,9 +729,22 @@ class _GatherConvTriton(torch.autograd.Function):
             kernel_out = kernel_normed * torch.sigmoid(kernel_normed)
             kernel_chunk = kernel_out.view(B, chunk_len, H, K)
             
-            # Recompute hidden for chunk
-            hidden_chunk = triton_gather_conv(x, freq_chunk.contiguous(), phase_chunk.contiguous(),
-                                              kernel_chunk.contiguous(), half_s, max_receptive, start)
+            # exponent_proj: linear -> LlamaRMSNorm -> sigmoid -> [0.5, 4.0]
+            exponent_linear = triton_linear(x_chunk, exponent_w) + exponent_b  # (M_chunk, 1)
+            exponent_linear_f32 = exponent_linear.float()
+            exponent_variance = exponent_linear_f32.pow(2).mean(dim=-1, keepdim=True)
+            exponent_rrms = torch.rsqrt(exponent_variance + eps)
+            exponent_x_normed = exponent_linear_f32 * exponent_rrms
+            exponent_normed = (exponent_gamma * exponent_x_normed).to(exponent_linear.dtype)
+            sig_exponent = torch.sigmoid(exponent_normed)
+            exponent_chunk = (sig_exponent * 3.5 + 0.5).view(B, chunk_len, 1)
+            
+            # Recompute hidden for chunk (need to update triton_gather_conv to accept exponent)
+            # For now, compute in PyTorch style for backward compatibility
+            hidden_chunk = triton_gather_conv_with_exponent(
+                x, freq_chunk.contiguous(), phase_chunk.contiguous(),
+                kernel_chunk.contiguous(), exponent_chunk.contiguous(),
+                half_s, max_receptive, start, seq_len)
             hidden_flat = hidden_chunk.view(M_chunk, C)
             
             out_pre = triton_linear(hidden_flat, out_w)
@@ -705,13 +783,15 @@ class _GatherConvTriton(torch.autograd.Function):
             d_freq_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
             d_phase_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
             d_kernel_chunk = torch.zeros(B, chunk_len, H, K, device=x.device, dtype=x.dtype)
+            d_exponent_chunk = torch.zeros(B, chunk_len, 1, device=x.device, dtype=x.dtype)
             
             grid = (B, chunk_len, H)
             gather_conv_bwd_kernel[grid](
                 x, d_hidden_chunk.contiguous(), d_x,
                 freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
-                d_freq_chunk, d_phase_chunk, d_kernel_chunk,
-                B, L, C, H, D, S, K, half_s, max_receptive,
+                exponent_chunk.contiguous(),
+                d_freq_chunk, d_phase_chunk, d_kernel_chunk, d_exponent_chunk,
+                B, seq_len, C, H, D, S, K, half_s, max_receptive,
                 start, chunk_len, BLOCK_D,
             )
             
@@ -756,6 +836,47 @@ class _GatherConvTriton(torch.autograd.Function):
                 BLOCK_M, BLOCK_K, BLOCK_N,
             )
             d_x[:, start:end, :] += d_x_kernel_chunk.view(B, chunk_len, C)
+            
+            # === Backward through exponent_proj (sigmoid -> LlamaRMSNorm -> Linear) ===
+            # Forward: exponent = sigmoid(normed) * 3.5 + 0.5
+            # d_normed = d_exponent * 3.5 * sigmoid'(normed) = d_exponent * 3.5 * sig * (1 - sig)
+            d_exponent_flat = d_exponent_chunk.view(M_chunk, 1)
+            d_exponent_normed = d_exponent_flat * 3.5 * sig_exponent * (1.0 - sig_exponent)
+            
+            # Backward through LlamaRMSNorm (in float32)
+            d_exponent_normed_f32 = d_exponent_normed.float()
+            d_exponent_gamma += (d_exponent_normed_f32 * exponent_x_normed).sum(dim=0)
+            d_exponent_x_normed = d_exponent_normed_f32 * exponent_gamma
+            inner_e = (exponent_x_normed * d_exponent_x_normed).mean(dim=-1, keepdim=True)
+            d_exponent_linear_f32 = exponent_rrms * (d_exponent_x_normed - exponent_x_normed * inner_e)
+            d_exponent_linear = d_exponent_linear_f32.to(exponent_linear.dtype)
+            
+            d_exponent_pre = d_exponent_linear
+            
+            d_exponent_w_chunk = torch.zeros_like(exponent_w)
+            grid = (triton.cdiv(1, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_exponent_pre, x_chunk, d_exponent_w_chunk,
+                M_chunk, 1, C,
+                d_exponent_pre.stride(0), d_exponent_pre.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_exponent_w_chunk.stride(0), d_exponent_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_exponent_w += d_exponent_w_chunk
+            d_exponent_b += d_exponent_pre.sum(0)
+            
+            d_x_exponent_chunk = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_exponent_pre, exponent_w, d_x_exponent_chunk,
+                M_chunk, 1, C,
+                d_exponent_pre.stride(0), d_exponent_pre.stride(1),
+                exponent_w.stride(0), exponent_w.stride(1),
+                d_x_exponent_chunk.stride(0), d_x_exponent_chunk.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            d_x[:, start:end, :] += d_x_exponent_chunk.view(B, chunk_len, C)
             
             # === Backward through wave_proj (sigmoid/tanh -> SiLU -> LlamaRMSNorm -> Linear) ===
             # freq = sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
@@ -808,8 +929,9 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             d_x[:, start:end, :] += d_x_wave_chunk.view(B, chunk_len, C)
         
-        return d_x, d_wave_w, d_wave_b, d_wave_gamma, d_kernel_w, d_kernel_b, d_kernel_gamma, d_out_w, \
-               None, None, None, None, None, None, None  # 7 Nones for H, half_s, max_receptive, max_freq, min_freq, K, chunk_size
+        return d_x, d_wave_w, d_wave_b, d_wave_gamma, d_kernel_w, d_kernel_b, d_kernel_gamma, \
+               d_exponent_w, d_exponent_b, d_exponent_gamma, d_out_w, \
+               None, None, None, None, None, None, None, None  # 8 Nones for H, half_s, max_receptive, max_freq, min_freq, K, chunk_size, seq_len
 
 
 if __name__ == "__main__":
