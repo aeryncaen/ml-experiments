@@ -468,15 +468,11 @@ def run_profile(
     print("=" * 100)
     print()
     
-    # Group by component and show sub-operations
     for component in ["Telephone", "AdaptiveConv", "TritonConv", "LowRank", "Ripple"]:
         ops = []
         for event in prof.key_averages():
             if event.key.startswith(f"{component}::"):
-                if device == "cuda":
-                    time_us = event.cuda_time_total
-                else:
-                    time_us = event.cpu_time_total
+                time_us = get_time(event, use_cuda)
                 ops.append((event.key, time_us))
         
         if ops:
