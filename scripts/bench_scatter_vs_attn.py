@@ -1338,7 +1338,7 @@ def main():
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'conv']
+        all_model_types = ['attention', 'sgsb', 'conv', 'gather']
         builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
@@ -1346,7 +1346,7 @@ def main():
     elif task_type == 'audio':
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv']
+        all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
         builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
@@ -1370,7 +1370,7 @@ def main():
     else:
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv']
+        all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
         builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
         shape_str = f'seq_len={seq_len}'
         flatten = True
