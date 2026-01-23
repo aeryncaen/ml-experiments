@@ -96,11 +96,8 @@ class AdaptiveLocalConv(nn.Module):
         # Project values: (B, L, C) -> index as (B, L, H, D)
         v = self.v_proj(x)
         
-        # Positions for indexing
         positions = torch.arange(L, device=x.device, dtype=x.dtype)
-        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(B, L, 1)
-        
-        # Local offsets: -half_window_max to +half_window_max
+        batch_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, L)
         local_offsets = torch.arange(-half_window_max, half_window_max + 1, device=x.device, dtype=x.dtype)
         
         output = torch.zeros(B, L, C, device=x.device, dtype=x.dtype)
@@ -116,46 +113,39 @@ class AdaptiveLocalConv(nn.Module):
             
             weight_sum = torch.zeros(B, L, 1, device=x.device, dtype=x.dtype)
             
-            for s_idx, s_off in enumerate(local_offsets.tolist()):
-                # Neighbor position = self + center_offset + local_offset
+            for s_off in local_offsets.tolist():
                 neighbor_pos = positions.view(1, L) + center_off_h + s_off
                 
-                # Valid mask
                 valid = (neighbor_pos >= 0) & (neighbor_pos < L)
-                valid_f = valid.float().unsqueeze(-1)
+                valid_f = valid.float()
                 
-                # Soft window mask based on distance from window center
                 rel_dist = abs(s_off) / (half_win_h + 1e-6)
-                window_mask = torch.sigmoid(sharpness * (1.0 - rel_dist)).unsqueeze(-1)
+                window_mask = torch.sigmoid(sharpness * (1.0 - rel_dist))
                 
-                # Kernel interpolation based on relative distance
-                norm_pos = (rel_dist.clamp(0, 1) * (K - 1)).unsqueeze(-1)
+                norm_pos = rel_dist.clamp(0, 1) * (K - 1)
                 idx_floor = norm_pos.long().clamp(0, K - 2)
                 idx_ceil = idx_floor + 1
                 w_ceil = norm_pos - idx_floor.float()
                 w_floor = 1.0 - w_ceil
                 
-                k_floor = kernel_h.gather(-1, idx_floor)
-                k_ceil = kernel_h.gather(-1, idx_ceil)
-                kernel_w = (k_floor * w_floor + k_ceil * w_ceil).squeeze(-1)
+                k_floor = kernel_h.gather(-1, idx_floor.unsqueeze(-1)).squeeze(-1)
+                k_ceil = kernel_h.gather(-1, idx_ceil.unsqueeze(-1)).squeeze(-1)
+                kernel_w = k_floor * w_floor + k_ceil * w_ceil
                 
-                # Combined weight
-                weight = kernel_w * window_mask.squeeze(-1) * valid_f.squeeze(-1)
+                weight = kernel_w * window_mask * valid_f
                 weight_sum += weight.unsqueeze(-1)
                 
-                # Bilinear gather
                 pos_clamped = neighbor_pos.clamp(0, L - 1.001)
                 pos_floor = pos_clamped.floor().long().clamp(0, L - 1)
                 pos_ceil = (pos_floor + 1).clamp(0, L - 1)
-                pos_frac = (pos_clamped - pos_floor.float()).unsqueeze(-1)
+                pos_frac = pos_clamped - pos_floor.float()
                 
-                val_floor = v_head[batch_idx.expand(B, L, D), pos_floor.unsqueeze(-1).expand(B, L, D)]
-                val_ceil = v_head[batch_idx.expand(B, L, D), pos_ceil.unsqueeze(-1).expand(B, L, D)]
-                val = val_floor * (1.0 - pos_frac) + val_ceil * pos_frac
+                val_floor = v_head[batch_idx, pos_floor]
+                val_ceil = v_head[batch_idx, pos_ceil]
+                val = val_floor * (1.0 - pos_frac.unsqueeze(-1)) + val_ceil * pos_frac.unsqueeze(-1)
                 
                 out_head.addcmul_(weight.unsqueeze(-1), val)
             
-            # Normalize
             out_head.div_(weight_sum + 1e-6)
         
         output = F.silu(self.out_proj(output))
