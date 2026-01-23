@@ -67,26 +67,29 @@ class SpeechCommandsDataset(Dataset):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, width: int, mult: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, mult: int = 4):
         super().__init__()
-        hidden = width * mult
+        hidden = int(width * mult * 2 / 3)
+        hidden = ((hidden + 7) // 8) * 8
         self.gate = nn.Linear(width, hidden, bias=False)
         self.up = nn.Linear(width, hidden, bias=False)
         self.down = nn.Linear(hidden, width, bias=False)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class SDPAttention(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = width // num_heads
-        self.dropout = dropout
+        self.kv_dim = self.head_dim * self.num_kv_heads
         
-        self.qkv = nn.Linear(width, 3 * width, bias=False)
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, self.kv_dim, bias=False)
+        self.v_proj = nn.Linear(width, self.kv_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.out = nn.Linear(width, width, bias=False)
@@ -94,39 +97,47 @@ class SDPAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
         
-        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim)
         
-        q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
-        k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
-        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
-        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = apply_rope(q)
+        k = apply_rope(k)
         
-        dropout_p = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L, C)
         return self.out(out)
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1, use_ssm: bool = False):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.attn = SDPAttention(width, num_heads, dropout)
-        self.attn_norm = RMSNorm(width)
+        self.attn = SDPAttention(width, num_heads, num_kv_heads)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width)
         self.use_ssm = use_ssm
         if use_ssm:
-            self.ssm_norm = RMSNorm(width)
-            self.ssm = SSMMixer3(width, n_heads=num_heads, use_conv=False, dropout=dropout)
-            self.ssm_out_norm = RMSNorm(width)
+            self.norm_ssm = RMSNorm(width)
+            self.ssm = SSMMixer3(width, n_heads=num_heads, use_conv=False, dropout=0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn_norm(self.attn(self.norm1(x)))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         if self.use_ssm:
-            ssm_out, _ = self.ssm(self.ssm_norm(x))
-            x = x + self.ssm_out_norm(ssm_out)
+            ssm_out, _ = self.ssm(self.norm_ssm(x))
+            x = x + ssm_out
         return x
 
 
@@ -194,13 +205,16 @@ class RippleAttentionBlock(nn.Module):
 
 
 class SDPAttention2D(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = width // num_heads
-        self.dropout = dropout
+        self.kv_dim = self.head_dim * self.num_kv_heads
         
-        self.qkv = nn.Linear(width, 3 * width, bias=False)
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, self.kv_dim, bias=False)
+        self.v_proj = nn.Linear(width, self.kv_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.out = nn.Linear(width, width, bias=False)
@@ -210,39 +224,47 @@ class SDPAttention2D(nn.Module):
         L = H * W
         
         x_flat = x.reshape(B, L, C)
-        qkv = self.qkv(x_flat).reshape(B, L, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = self.q_proj(x_flat).reshape(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x_flat).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x_flat).reshape(B, L, self.num_kv_heads, self.head_dim)
         
-        q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
-        k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
-        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
-        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = apply_rope(q)
+        k = apply_rope(k)
         
-        dropout_p = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, H, W, C)
         return self.out(out)
 
 
 class AttentionBlock2D(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1, use_ssm: bool = False):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None, use_ssm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(width)
-        self.attn = SDPAttention2D(width, num_heads, dropout)
-        self.attn_norm = RMSNorm(width)
+        self.attn = SDPAttention2D(width, num_heads, num_kv_heads)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width)
         self.use_ssm = use_ssm
         if use_ssm:
-            self.ssm_norm = RMSNorm(width)
-            self.ssm = SSMBlock3_2d(width, n_heads=num_heads, use_conv=False, dropout=dropout)
-            self.ssm_out_norm = RMSNorm(width)
+            self.norm_ssm = RMSNorm(width)
+            self.ssm = SSMBlock3_2d(width, n_heads=num_heads, use_conv=False, dropout=0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn_norm(self.attn(self.norm1(x)))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         if self.use_ssm:
-            ssm_out, _ = self.ssm(self.ssm_norm(x))
-            x = x + self.ssm_out_norm(ssm_out)
+            ssm_out, _ = self.ssm(self.norm_ssm(x))
+            x = x + ssm_out
         return x
 
 
@@ -401,26 +423,60 @@ class AudioClassifier(nn.Module):
         return self.head(x)
 
 
-class AttentionBlock3D(nn.Module):
-    def __init__(self, width: int, num_heads: int = 4, dropout: float = 0.1):
+class SDPAttention3D(nn.Module):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None):
         super().__init__()
-        self.norm1 = RMSNorm(width)
-        self.attn = SDPAttention2D(width, num_heads, dropout)
-        self.attn_norm = RMSNorm(width)
-
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads or num_heads
+        self.head_dim = width // num_heads
+        self.kv_dim = self.head_dim * self.num_kv_heads
+        
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, self.kv_dim, bias=False)
+        self.v_proj = nn.Linear(width, self.kv_dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.out = nn.Linear(width, width, bias=False)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, D, C = x.shape
-        x_flat = x.reshape(B, H * W * D, C)
-        attn_out = self.attn.qkv(self.norm1(x_flat).reshape(B, H*W*D, C))
-        qkv = attn_out.reshape(B, H*W*D, 3, self.attn.num_heads, self.attn.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = self.attn.q_norm(q.transpose(1, 2)).transpose(1, 2)
-        k = self.attn.k_norm(k.transpose(1, 2)).transpose(1, 2)
-        q = apply_rope(q.transpose(1, 2)).transpose(1, 2)
-        k = apply_rope(k.transpose(1, 2)).transpose(1, 2)
+        L = H * W * D
+        
+        x_flat = x.reshape(B, L, C)
+        q = self.q_proj(x_flat).reshape(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x_flat).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x_flat).reshape(B, L, self.num_kv_heads, self.head_dim)
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = apply_rope(q)
+        k = apply_rope(k)
+        
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        
         out = F.scaled_dot_product_attention(q, k, v)
-        out = self.attn.out(out.transpose(1, 2).reshape(B, H, W, D, C))
-        x = x + self.attn_norm(out)
+        out = out.transpose(1, 2).reshape(B, H, W, D, C)
+        return self.out(out)
+
+
+class AttentionBlock3D(nn.Module):
+    def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.attn = SDPAttention3D(width, num_heads, num_kv_heads)
+        self.norm2 = RMSNorm(width)
+        self.mlp = SwiGLU(width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
