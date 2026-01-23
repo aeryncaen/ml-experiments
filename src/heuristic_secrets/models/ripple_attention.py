@@ -82,6 +82,22 @@ class CrossLayerAttention(nn.Module):
         self.out_proj = nn.Linear(channels, channels, bias=False)
         self.out_norm = RMSNorm(channels, eps)
     
+    def _apply_depth_rope(self, x: torch.Tensor, depth: int, base: float = 10000.0) -> torch.Tensor:
+        """Apply same rotation to all positions based on a scalar depth."""
+        D = x.shape[-1]
+        half_d = D // 2
+        device = x.device
+        dtype = x.dtype
+        
+        dim_idx = torch.arange(half_d, device=device, dtype=dtype)
+        freqs = 1.0 / (base ** (dim_idx / half_d))
+        angles = depth * freqs
+        cos = angles.cos()
+        sin = angles.sin()
+        
+        x1, x2 = x[..., :half_d], x[..., half_d:half_d * 2]
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -97,26 +113,24 @@ class CrossLayerAttention(nn.Module):
         
         q_src = history[-1]
         L_q = q_src.shape[1]
+        q_depth = len(history) - 1
+        
         kv_list = history[:-1]
         
-        q_depth = torch.full((B, L_q), len(history) - 1, device=x.device, dtype=x.dtype)
-        
-        kv_depths = []
-        kv_tensors = []
-        for depth_idx, kv in enumerate(kv_list):
-            kv_tensors.append(kv)
-            kv_depths.append(torch.full((B, kv.shape[1]), depth_idx, device=x.device, dtype=x.dtype))
-        
-        kv_cat = torch.cat(kv_tensors, dim=1)
-        kv_depth_cat = torch.cat(kv_depths, dim=1)
-        L_kv = kv_cat.shape[1]
-        
         q = self.q_proj(q_src).reshape(B, L_q, H, D)
-        k = self.k_proj(kv_cat).reshape(B, L_kv, H, D)
-        v = self.v_proj(kv_cat).reshape(B, L_kv, H, D)
+        q = self._apply_depth_rope(self.q_norm(q), q_depth)
         
-        q = apply_rope(self.q_norm(q), q_depth)
-        k = apply_rope(self.k_norm(k), kv_depth_cat)
+        k_parts = []
+        v_parts = []
+        for depth_idx, kv in enumerate(kv_list):
+            L_kv = kv.shape[1]
+            k_i = self.k_proj(kv).reshape(B, L_kv, H, D)
+            v_i = self.v_proj(kv).reshape(B, L_kv, H, D)
+            k_parts.append(self._apply_depth_rope(self.k_norm(k_i), depth_idx))
+            v_parts.append(v_i)
+        
+        k = torch.cat(k_parts, dim=1)
+        v = torch.cat(v_parts, dim=1)
         
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
