@@ -127,7 +127,9 @@ class TelephoneAttentionND(nn.Module):
             stride_grid = self.stride_grid[center - half : center + half + 1]
             S = stride_grid.shape[0]
         else:
+            half = self.max_samples // 2
             stride_grid = self.stride_grid
+        max_receptive = half * self.max_freq
         
         # wave_proj: linear -> RMSNorm -> SiLU
         wave_pre = self.wave_proj(x_chunk)
@@ -200,7 +202,7 @@ class TelephoneAttentionND(nn.Module):
         # exponent is (B, chunk_len, 1), expand to (B, chunk_len, 1, 1) for broadcast
         power_weight = 1.0 / (1.0 + norm_dist).pow(exponent.unsqueeze(-1))  # (B, chunk_len, H, S)
         
-        norm_pos = rel_pos.abs() / self.max_receptive
+        norm_pos = rel_pos.abs() / max_receptive
         norm_pos = norm_pos.clamp(0, 1)
         
         idx_float = norm_pos * (K - 1)
