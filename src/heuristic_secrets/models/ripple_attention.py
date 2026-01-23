@@ -440,6 +440,8 @@ class RippleClassifier(nn.Module):
                 x, _ = layer(x)
         
         x = self.norm(x)
+        if self.vocab_size is not None:
+            return self.head(x)
         return self.head(x.mean(dim=1))
 
 

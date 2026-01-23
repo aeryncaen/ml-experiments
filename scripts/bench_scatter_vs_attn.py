@@ -1620,7 +1620,7 @@ def main():
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params)
         shape_str = f'img_size={img_size}'
-        flatten = not (args.cross_layer and args.model == 'ripple')
+        flatten = args.model != 'ripple'
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
