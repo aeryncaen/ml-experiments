@@ -625,28 +625,87 @@ class LowRankAttentionMergeND(nn.Module):
 
 
 class LowRankAttention(nn.Module):
+    """Differential Attention (Ye et al. 2025): DiffAttn = (softmax(Q1K1^T) - λ·softmax(Q2K2^T))V"""
     
-    def __init__(self, embed_dim: int, reduction_power: float = 0.75):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int = 8,
+        reduction_power: float = 0.75,
+        lambda_init: float = 0.8,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
         self.reduction_power = reduction_power
+        self.lambda_init = lambda_init
+        
+        assert embed_dim % (2 * num_heads) == 0, \
+            f"embed_dim ({embed_dim}) must be divisible by 2*num_heads ({2*num_heads})"
+        self.head_dim = embed_dim // (2 * num_heads)
+        self.v_head_dim = 2 * self.head_dim
+        self.scale = self.head_dim ** -0.5
+        
         self.downsample = SIRENDownsampleND(embed_dim, ndim=1)
+        
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        
+        # λ = exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim))
+        
+        self.head_norm = RMSNorm(self.v_head_dim)
+        
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, L, C = x.shape
+        H = self.num_heads
+        d = self.head_dim
         r = max(1, int(L ** self.reduction_power))
         
         x_down = self.downsample(x, (r,))
+        seq_len = x_down.shape[1]
         
-        q = apply_rope(F.silu(self.q_proj(x_down)))
-        k = apply_rope(F.silu(self.k_proj(x_down)))
-        v = F.silu(self.v_proj(x_down))
+        q = self.q_proj(x_down).reshape(B, seq_len, H, 2, d)
+        k = self.k_proj(x_down).reshape(B, seq_len, H, 2, d)
+        v = self.v_proj(x_down).reshape(B, seq_len, H, 2 * d)
         
-        lowrank_out = F.scaled_dot_product_attention(q, k, v)
+        q1, q2 = q[..., 0, :], q[..., 1, :]
+        k1, k2 = k[..., 0, :], k[..., 1, :]
+        
+        q1 = apply_rope(self.q_norm(q1))
+        q2 = apply_rope(self.q_norm(q2))
+        k1 = apply_rope(self.k_norm(k1))
+        k2 = apply_rope(self.k_norm(k2))
+        
+        q1 = q1.transpose(1, 2)
+        q2 = q2.transpose(1, 2)
+        k1 = k1.transpose(1, 2)
+        k2 = k2.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        lambda_val = (
+            torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1))
+            - torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2))
+            + self.lambda_init
+        )
+        
+        attn1 = F.softmax(q1 @ k1.transpose(-2, -1) * self.scale, dim=-1)
+        attn2 = F.softmax(q2 @ k2.transpose(-2, -1) * self.scale, dim=-1)
+        diff_attn = (attn1 - lambda_val * attn2) @ v
+        
+        diff_attn = diff_attn.transpose(1, 2)
+        diff_attn = self.head_norm(diff_attn) * (1 - self.lambda_init)
+        
+        lowrank_out = diff_attn.reshape(B, seq_len, C)
         lowrank_out = F.silu(self.out_proj(lowrank_out))
         
         full_out = interpolate_nd(lowrank_out, (L,))

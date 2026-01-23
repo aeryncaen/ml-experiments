@@ -69,7 +69,11 @@ class RippleAttention(nn.Module):
                 scale_power=conv_power,
             )
         
-        self.lowrank = LowRankAttention(channels, reduction_power=lowrank_power)
+        self.lowrank = LowRankAttention(
+            channels,
+            num_heads=num_heads,
+            reduction_power=lowrank_power,
+        )
         
         self.norms = nn.ModuleDict({
             'tele': RMSNorm(channels, eps),

@@ -79,6 +79,55 @@ class SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+class MLDecoderHead(nn.Module):
+    def __init__(self, width: int, n_classes: int, num_groups: int | None = None, num_heads: int = 8):
+        super().__init__()
+        self.width = width
+        self.n_classes = n_classes
+        
+        for h in [num_heads, 4, 2, 1]:
+            if width % h == 0:
+                num_heads = h
+                break
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        if num_groups is None:
+            num_groups = min(n_classes, 100)
+        self.num_groups = num_groups
+        self.group_size = (n_classes + num_groups - 1) // num_groups
+        
+        self.queries = nn.Parameter(torch.randn(num_groups, width) * 0.02)
+        
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, width, bias=False)
+        self.v_proj = nn.Linear(width, width, bias=False)
+        
+        self.group_fc = nn.Parameter(torch.randn(num_groups, width, self.group_size) * 0.02)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, C = x.shape
+        H = self.num_heads
+        D = self.head_dim
+        
+        q = self.q_proj(self.queries).view(1, self.num_groups, H, D).expand(B, -1, -1, -1)
+        k = self.k_proj(x).view(B, L, H, D)
+        v = self.v_proj(x).view(B, L, H, D)
+        
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).reshape(B, self.num_groups, C)
+        
+        logits = torch.einsum('bgc,gco->bgo', attn, self.group_fc)
+        logits = logits.reshape(B, -1)[:, :self.n_classes]
+        
+        return logits
+
+
 class SDPAttention(nn.Module):
     def __init__(self, width: int, num_heads: int = 4, num_kv_heads: int | None = None):
         super().__init__()
@@ -365,7 +414,7 @@ class ConvBlock2D(nn.Module):
 
 
 class SequenceClassifier(nn.Module):
-    def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, seq_len: int):
+    def __init__(self, block: nn.Module, width: int, n_layers: int, n_classes: int, seq_len: int, ml_decoder: bool = False):
         super().__init__()
         self.embed = nn.Linear(1, width)
         self.embed_norm = RMSNorm(width)
@@ -373,14 +422,21 @@ class SequenceClassifier(nn.Module):
         self.pos_norm = RMSNorm(width)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
-        self.head = nn.Linear(width, n_classes)
+        self.ml_decoder = ml_decoder
+        if ml_decoder:
+            self.head = MLDecoderHead(width, n_classes)
+        else:
+            self.head = nn.Linear(width, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
         for layer in self.layers:
             x = layer(x)
-        x = self.norm(x).mean(dim=1)
-        return self.head(x)
+        x = self.norm(x)
+        if self.ml_decoder:
+            return self.head(x)
+        else:
+            return self.head(x.mean(dim=1))
 
 
 class ImageClassifier(nn.Module):
@@ -987,65 +1043,87 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def find_width_for_params(model_factory, target_params, min_w=16, max_w=512):
-    lo, hi = min_w, max_w
-    best_w, best_diff = lo, float('inf')
+def find_config_for_params(
+    block_factory_fn,
+    classifier_factory_fn, 
+    target_params: int,
+    head_options: list[int] = [2, 4, 8],
+    min_w: int = 16,
+    max_w: int = 512,
+) -> tuple[int, int]:
+    best_config = (min_w, head_options[0])
+    best_diff = float('inf')
     
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        mid = max(mid // 2 * 2, 2)
-        try:
-            model = model_factory(mid)
-            params = sum(p.numel() for p in model.parameters())
-        except:
-            hi = mid - 2
-            continue
+    for num_heads in head_options:
+        align = 2 * num_heads
+        lo, hi = max(min_w, align), max_w
         
-        diff = abs(params - target_params)
-        if diff < best_diff:
-            best_diff = diff
-            best_w = mid
-        
-        if params < target_params:
-            lo = mid + 2
-        elif params > target_params:
-            hi = mid - 2
-        else:
-            break
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            mid = max(mid // align * align, align)
+            
+            try:
+                block_factory = block_factory_fn(num_heads)
+                model = classifier_factory_fn(block_factory, mid)
+                params = sum(p.numel() for p in model.parameters())
+            except:
+                hi = mid - align
+                continue
+            
+            diff = abs(params - target_params)
+            if diff < best_diff:
+                best_diff = diff
+                best_config = (mid, num_heads)
+            
+            if params < target_params:
+                lo = mid + align
+            elif params > target_params:
+                hi = mid - align
+            else:
+                return best_config
     
-    return best_w
+    return best_config
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False):
     
     if model_type == 'attention':
-        block_factory = lambda w: AttentionBlock(w, num_heads=num_channels, use_ssm=use_ssm)
+        def block_factory_fn(h):
+            return lambda w: AttentionBlock(w, num_heads=h, use_ssm=use_ssm)
     elif model_type == 'hier':
-        block_factory = lambda w: HierarchicalBlock(w, window_size=kernel_size, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
+        def block_factory_fn(h):
+            return lambda w: HierarchicalBlock(w, window_size=kernel_size, num_channels=h, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
     elif model_type == 'sgsb':
-        block_factory = lambda w: SGSBBlockND(w, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
+        def block_factory_fn(h):
+            return lambda w: SGSBBlockND(w, kernel_size=kernel_size, ndim=1, num_channels=h)
     elif model_type == 'conv':
-        block_factory = lambda w: ConvBlock(w, kernel_size=kernel_size)
+        def block_factory_fn(h):
+            return lambda w: ConvBlock(w, kernel_size=kernel_size)
     elif model_type == 'gather':
-        block_factory = lambda w: TelephoneAttentionBlock(w, num_heads=num_channels)
+        def block_factory_fn(h):
+            return lambda w: TelephoneAttentionBlock(w, num_heads=h)
     elif model_type == 'ripple':
-        block_factory = lambda w: RippleAttentionBlock(w, num_heads=num_channels, order=attn_order)
+        def block_factory_fn(h):
+            return lambda w: RippleAttentionBlock(w, num_heads=h, order=attn_order)
     elif model_type == 'flat':
-        def model_factory(w):
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
             return FlatRippleClassifierND(embed_dim=w, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
-        width = find_width_for_params(model_factory, target_params)
-        return model_factory(width).to(device)
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return FlatRippleClassifierND(embed_dim=width, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
     
-    def model_factory(w):
+    def classifier_factory_fn(block_factory, w):
         block_fn = lambda: block_factory(w)
-        model = SequenceClassifier(block_fn(), w, layers, n_classes, seq_len)
+        model = SequenceClassifier(block_fn(), w, layers, n_classes, seq_len, ml_decoder=ml_decoder)
         model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
         return model
     
-    width = find_width_for_params(model_factory, target_params)
-    return model_factory(width).to(device)
+    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    block_factory = block_factory_fn(num_heads)
+    return classifier_factory_fn(block_factory, width).to(device)
 
 
 def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7):
@@ -1161,28 +1239,35 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
 def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000):
     
     if model_type == 'attention':
-        block_factory = lambda w: AttentionBlock(w, num_heads=num_channels, use_ssm=use_ssm)
+        def block_factory_fn(h):
+            return lambda w: AttentionBlock(w, num_heads=h, use_ssm=use_ssm)
     elif model_type == 'hier':
-        block_factory = lambda w: HierarchicalBlock(w, window_size=kernel_size, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
+        def block_factory_fn(h):
+            return lambda w: HierarchicalBlock(w, window_size=kernel_size, num_channels=h, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
     elif model_type == 'sgsb':
-        block_factory = lambda w: SGSBBlockND(w, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
+        def block_factory_fn(h):
+            return lambda w: SGSBBlockND(w, kernel_size=kernel_size, ndim=1, num_channels=h)
     elif model_type == 'conv':
-        block_factory = lambda w: ConvBlock(w, kernel_size=kernel_size)
+        def block_factory_fn(h):
+            return lambda w: ConvBlock(w, kernel_size=kernel_size)
     elif model_type == 'gather':
-        block_factory = lambda w: TelephoneAttentionBlock(w, num_heads=num_channels)
+        def block_factory_fn(h):
+            return lambda w: TelephoneAttentionBlock(w, num_heads=h)
     elif model_type == 'ripple':
-        block_factory = lambda w: RippleAttentionBlock(w, num_heads=num_channels, order=attn_order)
+        def block_factory_fn(h):
+            return lambda w: RippleAttentionBlock(w, num_heads=h, order=attn_order)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
-    def model_factory(w):
+    def classifier_factory_fn(block_factory, w):
         block_fn = lambda: block_factory(w)
         model = AudioClassifier(block_fn(), w, layers, n_classes, seq_len)
         model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
         return model
     
-    width = find_width_for_params(model_factory, target_params)
-    return model_factory(width).to(device)
+    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    block_factory = block_factory_fn(num_heads)
+    return classifier_factory_fn(block_factory, width).to(device)
 
 
 class PreloadedDataset:
@@ -1416,6 +1501,7 @@ def main():
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     parser.add_argument('--attn-order', type=str, default='tele,conv,lowrank', help='Order of attention layers for ripple model (default: tele,conv,lowrank)')
     parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
+    parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1495,7 +1581,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
