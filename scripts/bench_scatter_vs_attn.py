@@ -23,6 +23,7 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
+from heuristic_secrets.models.ripple_attention import RippleAttention
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.models.telephone_attention import TelephoneAttentionND
@@ -174,6 +175,20 @@ class TelephoneAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h, _ = self.telephone_attn(self.norm1(x))
+        x = x + h
+        return x
+
+
+class RippleAttentionBlock(nn.Module):
+    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1):
+        super().__init__()
+        self.ripple_attn = RippleAttention(
+            channels=width, num_heads=num_heads, max_samples=max_samples,
+            use_triton=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, _ = self.ripple_attn(x)
         x = x + h
         return x
 
@@ -878,10 +893,9 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         block_fn = lambda: TelephoneAttentionBlock(WIDTH_GATHER, num_heads=num_channels)
         width = WIDTH_GATHER
     elif model_type == 'ripple':
-        return RippleClassifierND(
-            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
-            kernel_size=kernel_size, ndim=1, num_channels=num_channels,
-        ).to(device)
+        WIDTH_RIPPLE = 64
+        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels)
+        width = WIDTH_RIPPLE
     elif model_type == 'flat':
         return FlatRippleClassifierND(
             embed_dim=WIDTH_SGSB, n_classes=n_classes, iterations=layers,
