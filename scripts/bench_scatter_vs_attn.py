@@ -1140,12 +1140,28 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return classifier_factory_fn(block_factory, width).to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
     WIDTH_CONV = 70
+    
+    if model_type == 'ripple' and cross_layer:
+        h, w = img_size
+        seq_len = h * w
+        def block_factory_fn(heads):
+            return lambda width: None
+        def classifier_factory_fn(block_factory, width):
+            return RippleClassifier(
+                width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+                num_heads=num_channels, order=attn_order, cross_layer=True, embed_2d=(h, w)
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return RippleClassifier(
+            width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+            num_heads=num_channels, order=attn_order, cross_layer=True, embed_2d=(h, w)
+        ).to(device)
     
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -1589,9 +1605,9 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params)
         shape_str = f'img_size={img_size}'
-        flatten = True
+        flatten = not (args.cross_layer and args.model == 'ripple')
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab

@@ -17,6 +17,61 @@ except ImportError:
     TritonAdaptiveLocalConv = None
 
 
+class LearnedSinusoidal2DEmbed(nn.Module):
+    
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        embed_dim: int,
+        n_freq: int = 32,
+    ):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.embed_dim = embed_dim
+        self.n_freq = n_freq
+        
+        self.pixel_embed = nn.Linear(1, embed_dim)
+        
+        self.freq_h = nn.Parameter(torch.randn(n_freq) * 0.1)
+        self.freq_w = nn.Parameter(torch.randn(n_freq) * 0.1)
+        self.phase_h = nn.Parameter(torch.zeros(n_freq))
+        self.phase_w = nn.Parameter(torch.zeros(n_freq))
+        
+        self.pos_proj = nn.Linear(n_freq * 4, embed_dim)
+        self.norm = RMSNorm(embed_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W = x.shape
+        
+        h_pos = torch.arange(H, device=x.device, dtype=x.dtype) / H
+        w_pos = torch.arange(W, device=x.device, dtype=x.dtype) / W
+        
+        freq_h = F.softplus(self.freq_h) * 10
+        freq_w = F.softplus(self.freq_w) * 10
+        
+        h_angles = h_pos.unsqueeze(-1) * freq_h + self.phase_h
+        w_angles = w_pos.unsqueeze(-1) * freq_w + self.phase_w
+        
+        h_enc = torch.cat([h_angles.sin(), h_angles.cos()], dim=-1)
+        w_enc = torch.cat([w_angles.sin(), w_angles.cos()], dim=-1)
+        
+        pos_enc = torch.cat([
+            h_enc.unsqueeze(1).expand(H, W, -1),
+            w_enc.unsqueeze(0).expand(H, W, -1),
+        ], dim=-1)
+        
+        pos_embed = self.pos_proj(pos_enc)
+        
+        x_flat = x.reshape(B, H * W, 1)
+        x_embed = self.pixel_embed(x_flat)
+        
+        x_embed = x_embed + pos_embed.reshape(1, H * W, self.embed_dim)
+        
+        return self.norm(F.silu(x_embed))
+
+
 class LayerHistoryAccumulator(nn.Module):
     """Downsamples layer output to L^reduction_power for cross-layer history accumulation.
     
@@ -315,15 +370,21 @@ class RippleClassifier(nn.Module):
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         cross_layer: bool = False,
+        embed_2d: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.cross_layer = cross_layer
         self.lowrank_power = lowrank_power
+        self.embed_2d = embed_2d
         
-        self.embed = nn.Linear(1, width)
-        self.embed_norm = RMSNorm(width, eps)
-        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
-        self.pos_norm = RMSNorm(width, eps)
+        if embed_2d is not None:
+            height, width_2d = embed_2d
+            self.embed = LearnedSinusoidal2DEmbed(height, width_2d, width)
+        else:
+            self.embed = nn.Linear(1, width)
+            self.embed_norm = RMSNorm(width, eps)
+            self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+            self.pos_norm = RMSNorm(width, eps)
         
         self.layers = nn.ModuleList([
             RippleBlock(
@@ -351,7 +412,10 @@ class RippleClassifier(nn.Module):
             self.head_cross_attn = CrossLayerAttention(width, num_heads, eps)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
+        if self.embed_2d is not None:
+            x = self.embed(x)
+        else:
+            x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
         
         if self.cross_layer:
             history: list[torch.Tensor] = [self.embed_accum(x)]
