@@ -13,11 +13,12 @@ from operator import mul
 
 try:
     from .triton_gather import TritonGatherConv, HAS_TRITON
-except Exception as e:
-    import sys
-    print(f"Triton import failed: {type(e).__name__}: {e}", file=sys.stderr)
-    HAS_TRITON = False
-    TritonGatherConv = None
+except ImportError:
+    try:
+        from triton_gather import TritonGatherConv, HAS_TRITON
+    except ImportError:
+        HAS_TRITON = False
+        TritonGatherConv = None
 
 
 class GatherConvND(nn.Module):
@@ -200,7 +201,10 @@ class GatherConvND(nn.Module):
         while BLOCK_D < D:
             BLOCK_D *= 2
         
-        from .triton_gather import gather_conv_fwd_kernel_chunked
+        try:
+            from .triton_gather import gather_conv_fwd_kernel_chunked
+        except ImportError:
+            from triton_gather import gather_conv_fwd_kernel_chunked
         
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
