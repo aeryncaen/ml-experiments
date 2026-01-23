@@ -1,5 +1,5 @@
 """
-GatherConv: Learned position sampling with interpolated kernel convolution.
+TelephoneAttention: Learned position sampling with power-law decay.
 """
 
 from __future__ import annotations
@@ -12,13 +12,13 @@ from functools import reduce
 from operator import mul
 
 try:
-    from .triton_gather import _GatherConvTriton, HAS_TRITON
+    from .triton_telephone import _TelephoneAttentionTriton, HAS_TRITON
 except ImportError:
     try:
-        from triton_gather import _GatherConvTriton, HAS_TRITON
+        from triton_telephone import _TelephoneAttentionTriton, HAS_TRITON
     except ImportError:
         HAS_TRITON = False
-        _GatherConvTriton = None
+        _TelephoneAttentionTriton = None
 
 
 def llama_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -30,7 +30,7 @@ def llama_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> t
     return (weight * x).to(input_dtype)
 
 
-class GatherConvND(nn.Module):
+class TelephoneAttentionND(nn.Module):
     """
     Gather samples at learned positions, convolve with interpolated kernel.
     
@@ -230,9 +230,9 @@ class GatherConvND(nn.Module):
         return output
     
     def _forward_triton(self, x: torch.Tensor, L: int) -> torch.Tensor:
-        # Use _GatherConvTriton directly with our nn.Linear weights
+        # Use _TelephoneAttentionTriton directly with our nn.Linear weights
         # This gets full chunked memory benefits
-        return _GatherConvTriton.apply(
+        return _TelephoneAttentionTriton.apply(
             x,
             self.wave_proj.weight,    # (2*H, C)
             self.wave_proj.bias,      # (2*H,)
@@ -292,9 +292,9 @@ class GatherConvND(nn.Module):
         return output.reshape(B, *spatial, C), {}
 
 
-GatherConv1d = GatherConvND
-GatherConv2d = lambda *args, **kwargs: GatherConvND(*args, ndim=2, **kwargs)
-GatherConv3d = lambda *args, **kwargs: GatherConvND(*args, ndim=3, **kwargs)
+TelephoneAttention1d = TelephoneAttentionND
+TelephoneAttention2d = lambda *args, **kwargs: TelephoneAttentionND(*args, ndim=2, **kwargs)
+TelephoneAttention3d = lambda *args, **kwargs: TelephoneAttentionND(*args, ndim=3, **kwargs)
 
 
 class SDPAttention(nn.Module):
@@ -333,17 +333,17 @@ if __name__ == "__main__":
     print(f"Batch={B}, Channels={C}, Heads={num_heads}")
     print()
     
-    gather_triton = GatherConvND(
+    tel_triton = TelephoneAttentionND(
         channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads, 
         checkpoint=True, use_triton=True
     ).to(device)
-    gather_triton.train()
+    tel_triton.train()
     
-    gather_pytorch = GatherConvND(
+    tel_pytorch = TelephoneAttentionND(
         channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads,
         checkpoint=True, use_triton=False
     ).to(device)
-    gather_pytorch.train()
+    tel_pytorch.train()
     
     sdp_attn = SDPAttention(channels=C, num_heads=num_heads).to(device)
     sdp_attn.train()
@@ -353,13 +353,13 @@ if __name__ == "__main__":
     print("=" * 60)
     
     if HAS_TRITON:
-        gather_pytorch.load_state_dict(gather_triton.state_dict())
+        tel_pytorch.load_state_dict(tel_triton.state_dict())
         
         torch.manual_seed(42)
         x_test = torch.randn(2, 512, C, device=device)
         
-        out_triton, _ = gather_triton(x_test)
-        out_pytorch, _ = gather_pytorch(x_test)
+        out_triton, _ = tel_triton(x_test)
+        out_pytorch, _ = tel_pytorch(x_test)
         
         fwd_diff = (out_triton - out_pytorch).abs().max().item()
         fwd_match = fwd_diff < 1e-3
@@ -368,10 +368,10 @@ if __name__ == "__main__":
         x_test_tr = x_test.clone().requires_grad_(True)
         x_test_pt = x_test.clone().requires_grad_(True)
         
-        out_tr, _ = gather_triton(x_test_tr)
+        out_tr, _ = tel_triton(x_test_tr)
         out_tr.sum().backward()
         
-        out_pt, _ = gather_pytorch(x_test_pt)
+        out_pt, _ = tel_pytorch(x_test_pt)
         out_pt.sum().backward()
         
         dx_diff = (x_test_tr.grad - x_test_pt.grad).abs().max().item()
@@ -380,14 +380,14 @@ if __name__ == "__main__":
         
         H = num_heads
         # wave_proj outputs [freq_pre, phase_pre] so first H rows are freq, last H are phase
-        freq_grad_tr = gather_triton.wave_proj.weight.grad[:H].abs().sum().item()
-        freq_grad_pt = gather_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
-        phase_grad_tr = gather_triton.wave_proj.weight.grad[H:].abs().sum().item()
-        phase_grad_pt = gather_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
-        kernel_grad_tr = gather_triton.kernel_proj.weight.grad.abs().sum().item()
-        kernel_grad_pt = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
-        exponent_grad_tr = gather_triton.exponent_proj.weight.grad.abs().sum().item()
-        exponent_grad_pt = gather_pytorch.exponent_proj.weight.grad.abs().sum().item()
+        freq_grad_tr = tel_triton.wave_proj.weight.grad[:H].abs().sum().item()
+        freq_grad_pt = tel_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
+        phase_grad_tr = tel_triton.wave_proj.weight.grad[H:].abs().sum().item()
+        phase_grad_pt = tel_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
+        kernel_grad_tr = tel_triton.kernel_proj.weight.grad.abs().sum().item()
+        kernel_grad_pt = tel_pytorch.kernel_proj.weight.grad.abs().sum().item()
+        exponent_grad_tr = tel_triton.exponent_proj.weight.grad.abs().sum().item()
+        exponent_grad_pt = tel_pytorch.exponent_proj.weight.grad.abs().sum().item()
         
         freq_grad_match = abs(freq_grad_tr - freq_grad_pt) / (freq_grad_pt + 1e-8) < 0.2
         phase_grad_match = abs(phase_grad_tr - phase_grad_pt) / (phase_grad_pt + 1e-8) < 0.2
@@ -403,28 +403,28 @@ if __name__ == "__main__":
         print(f"kernel_proj grad match: {'PASS' if kernel_grad_match else 'FAIL'}")
         print(f"exponent_proj grad match: {'PASS' if exponent_grad_match else 'FAIL'}")
         
-        gather_triton.zero_grad()
-        gather_pytorch.zero_grad()
+        tel_triton.zero_grad()
+        tel_pytorch.zero_grad()
         del x_test, x_test_tr, x_test_pt, out_triton, out_pytorch, out_tr, out_pt
         if device == "cuda":
             torch.cuda.empty_cache()
     else:
         torch.manual_seed(42)
         x_test = torch.randn(2, 512, C, device=device, requires_grad=True)
-        out, _ = gather_pytorch(x_test)
+        out, _ = tel_pytorch(x_test)
         out.sum().backward()
         
         H = num_heads
-        freq_grad = gather_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
-        phase_grad = gather_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
-        kernel_grad = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
+        freq_grad = tel_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
+        phase_grad = tel_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
+        kernel_grad = tel_pytorch.kernel_proj.weight.grad.abs().sum().item()
         
         print(f"freq grad non-zero: {'PASS' if freq_grad > 0 else 'FAIL'} ({freq_grad:.2e})")
         print(f"phase grad non-zero: {'PASS' if phase_grad > 0 else 'FAIL'} ({phase_grad:.2e})")
         print(f"kernel_proj grad non-zero: {'PASS' if kernel_grad > 0 else 'FAIL'} ({kernel_grad:.2e})")
         print("(Triton not available, skipping Triton vs PyTorch comparison)")
         
-        gather_pytorch.zero_grad()
+        tel_pytorch.zero_grad()
         del x_test, out
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -432,12 +432,12 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
     
-    def bench(model, x, is_gather=False):
+    def bench(model, x, is_telephone=False):
         if device == "cuda":
             torch.cuda.synchronize()
         with torch.no_grad():
             for _ in range(warmup_iters):
-                out = model(x)[0] if is_gather else model(x)
+                out = model(x)[0] if is_telephone else model(x)
                 if device == "cuda":
                     torch.cuda.synchronize()
             
@@ -447,18 +447,18 @@ if __name__ == "__main__":
             
             start = time.perf_counter()
             for _ in range(bench_iters):
-                out = model(x)[0] if is_gather else model(x)
+                out = model(x)[0] if is_telephone else model(x)
                 if device == "cuda":
                     torch.cuda.synchronize()
             fwd_time = (time.perf_counter() - start) / bench_iters * 1000
             fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
         return fwd_time, fwd_mem
     
-    def bench_bwd(model, x, is_gather=False):
+    def bench_bwd(model, x, is_telephone=False):
         if device == "cuda":
             torch.cuda.synchronize()
         for _ in range(warmup_iters):
-            out = model(x)[0] if is_gather else model(x)
+            out = model(x)[0] if is_telephone else model(x)
             out.sum().backward()
             model.zero_grad()
             if device == "cuda":
@@ -470,7 +470,7 @@ if __name__ == "__main__":
         
         start = time.perf_counter()
         for _ in range(bench_iters):
-            out = model(x)[0] if is_gather else model(x)
+            out = model(x)[0] if is_telephone else model(x)
             out.sum().backward()
             model.zero_grad()
             if device == "cuda":
@@ -479,17 +479,17 @@ if __name__ == "__main__":
         fwd_bwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
         return fwd_bwd_time, fwd_bwd_mem
     
-    def run_bench(model, name, L, is_gather=False):
+    def run_bench(model, name, L, is_telephone=False):
         fwd = bwd = fwd_mem = bwd_mem = "OOM"
         if device == "cuda":
             torch.cuda.empty_cache()
         try:
             x = torch.randn(B, L, C, device=device)
-            fwd, fwd_mem = bench(model, x, is_gather=is_gather)
+            fwd, fwd_mem = bench(model, x, is_telephone=is_telephone)
             del x
             
             x = torch.randn(B, L, C, device=device, requires_grad=True)
-            bwd, bwd_mem = bench_bwd(model, x, is_gather=is_gather)
+            bwd, bwd_mem = bench_bwd(model, x, is_telephone=is_telephone)
             del x
         except RuntimeError as e:
             if "out of memory" not in str(e).lower():
@@ -498,7 +498,7 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
         return fwd, bwd, fwd_mem, bwd_mem
     
-    triton_label = "Triton" if gather_triton.use_triton else "PyTorch*"
+    triton_label = "Triton" if tel_triton.use_triton else "PyTorch*"
     
     print("=" * 120)
     print(f"{'':>8} | {triton_label:^20} | {'PyTorch':^20} | {'SDPA':^20}")
@@ -506,9 +506,9 @@ if __name__ == "__main__":
     print("=" * 120)
     
     for L in seq_lengths:
-        tr_fwd, tr_bwd, tr_fwd_mem, tr_bwd_mem = run_bench(gather_triton, "triton", L, is_gather=True)
-        pt_fwd, pt_bwd, pt_fwd_mem, pt_bwd_mem = run_bench(gather_pytorch, "pytorch", L, is_gather=True)
-        sd_fwd, sd_bwd, sd_fwd_mem, sd_bwd_mem = run_bench(sdp_attn, "sdpa", L, is_gather=False)
+        tr_fwd, tr_bwd, tr_fwd_mem, tr_bwd_mem = run_bench(tel_triton, "triton", L, is_telephone=True)
+        pt_fwd, pt_bwd, pt_fwd_mem, pt_bwd_mem = run_bench(tel_pytorch, "pytorch", L, is_telephone=True)
+        sd_fwd, sd_bwd, sd_fwd_mem, sd_bwd_mem = run_bench(sdp_attn, "sdpa", L, is_telephone=False)
         
         def fmt(v):
             return f"{v:>4.0f}" if isinstance(v, float) else f"{v:>4}"
@@ -518,9 +518,9 @@ if __name__ == "__main__":
         print(f"{L:>8} | {fmt(tr_fwd)} {fmt(tr_bwd)} {fmt_mem(tr_fwd_mem)} {fmt_mem(tr_bwd_mem):>5} | {fmt(pt_fwd)} {fmt(pt_bwd)} {fmt_mem(pt_fwd_mem)} {fmt_mem(pt_bwd_mem):>5} | {fmt(sd_fwd)} {fmt(sd_bwd)} {fmt_mem(sd_fwd_mem)} {fmt_mem(sd_bwd_mem):>5}")
     
     print("=" * 120)
-    print(f"GatherConv params: {sum(p.numel() for p in gather_triton.parameters()):,}")
+    print(f"TelephoneAttention params: {sum(p.numel() for p in tel_triton.parameters()):,}")
     print(f"SDPA params: {sum(p.numel() for p in sdp_attn.parameters()):,}")
-    if not gather_triton.use_triton:
+    if not tel_triton.use_triton:
         print("* Triton not available, using PyTorch implementation")
     
     # Chunk size sweep at L=8192
@@ -536,14 +536,14 @@ if __name__ == "__main__":
         L_sweep = 8192
         
         for cs in chunk_sizes:
-            model_cs = GatherConvND(
+            model_cs = TelephoneAttentionND(
                 channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads,
                 chunk_size=cs, use_triton=True
             ).to(device)
-            model_cs.load_state_dict(gather_triton.state_dict())
+            model_cs.load_state_dict(tel_triton.state_dict())
             model_cs.train()
             
-            fwd, bwd, fwd_mem, bwd_mem = run_bench(model_cs, f"cs{cs}", L_sweep, is_gather=True)
+            fwd, bwd, fwd_mem, bwd_mem = run_bench(model_cs, f"cs{cs}", L_sweep, is_telephone=True)
             
             def fmt_f(v):
                 return f"{v:>8.1f}" if isinstance(v, float) else f"{v:>8}"

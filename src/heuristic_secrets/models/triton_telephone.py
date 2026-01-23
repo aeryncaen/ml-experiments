@@ -1,4 +1,4 @@
-"""Triton kernels for GatherConv - minimal memory, proper tiling."""
+"""Triton kernels for TelephoneAttention - minimal memory, proper tiling."""
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ if HAS_TRITON:
 
     # ========== Gather-Conv kernel ==========
     @triton.jit
-    def gather_conv_fwd_kernel(
+    def telephone_attn_fwd_kernel(
         x_ptr, out_ptr,
         freq_ptr, phase_ptr, kernel_ptr, exponent_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
@@ -217,7 +217,7 @@ if HAS_TRITON:
             power_weight = tl.exp(-exponent * tl.log(one_plus_dist + 1e-6))
             kernel_w = kernel_w * power_weight * valid_f
             
-            # Soft gather: interpolate between floor and ceil values
+            # Soft sampling: interpolate between floor and ceil values
             val_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
             val_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
             vals_floor = tl.load(x_ptr + val_base_floor + d_offs, mask=d_mask, other=0.0)
@@ -230,7 +230,7 @@ if HAS_TRITON:
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
 
     @triton.jit
-    def gather_conv_bwd_kernel(
+    def telephone_attn_bwd_kernel(
         x_ptr, d_out_ptr, d_x_ptr,
         freq_ptr, phase_ptr, kernel_ptr, exponent_ptr,
         d_freq_ptr, d_phase_ptr, d_kernel_ptr, d_exponent_ptr,
@@ -501,7 +501,7 @@ def triton_linear_rmsnorm_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
     return triton_rmsnorm_silu(linear_out, gamma, eps)
 
 
-def triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
+def triton_telephone_attn(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
     """freq/phase/kernel are for a chunk starting at chunk_start, output is chunk-sized
     exponent is (B, chunk_len, 1) - per-position decay exponent
     """
@@ -517,7 +517,7 @@ def triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, 
     
     out = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
     grid = (B, chunk_len, H)
-    gather_conv_fwd_kernel[grid](
+    telephone_attn_fwd_kernel[grid](
         x, out, freq, phase, kernel, exponent,
         B, seq_len, C, H, D, S, K, half_s, max_receptive,
         chunk_start, chunk_len, BLOCK_D,
@@ -525,13 +525,18 @@ def triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, 
     return out
 
 
-def triton_gather_conv_with_exponent(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
-    """Alias for triton_gather_conv with exponent support"""
-    return triton_gather_conv(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start, seq_len)
+def triton_telephone_attn_with_decay(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start=0, seq_len=None):
+    """Alias for triton_telephone_attn with exponent support"""
+    return triton_telephone_attn(x, freq, phase, kernel, exponent, half_s, max_receptive, chunk_start, seq_len)
 
 
-# ========== Main module ==========
-class TritonGatherConv(nn.Module):
+class TritonTelephoneAttention(nn.Module):
+    """
+    Standalone Triton-only TelephoneAttention module.
+    
+    Uses nn.Linear modules for state_dict compatibility with TelephoneAttentionND.
+    Only works on CUDA with Triton. For CPU fallback, use TelephoneAttentionND.
+    """
     def __init__(
         self,
         channels: int,
@@ -553,40 +558,45 @@ class TritonGatherConv(nn.Module):
         self.min_freq = min_freq
         self.max_kernel_size = max_kernel_size
         self.chunk_size = chunk_size
+        self.max_samples = max_samples
         
-        self.half_s = max_samples // 2
-        self.max_receptive = self.half_s * max_freq
+        half_s = max_samples // 2
+        self.half_s = half_s
+        self.max_receptive = half_s * max_freq
         
-        self.wave_w = nn.Parameter(torch.empty(2 * num_heads, channels))
-        self.wave_b = nn.Parameter(torch.zeros(2 * num_heads))
-        self.wave_gamma = nn.Parameter(torch.ones(2 * num_heads))
-        self.kernel_w = nn.Parameter(torch.empty(num_heads * max_kernel_size, channels))
-        self.kernel_b = nn.Parameter(torch.zeros(num_heads * max_kernel_size))
-        self.kernel_gamma = nn.Parameter(torch.ones(num_heads * max_kernel_size))
-        self.exponent_w = nn.Parameter(torch.empty(1, channels))
-        self.exponent_b = nn.Parameter(torch.zeros(1))
+        H = num_heads
+        K = max_kernel_size
+        
+        self.wave_proj = nn.Linear(channels, 2 * H)
+        self.wave_gamma = nn.Parameter(torch.ones(2 * H))
+        self.kernel_proj = nn.Linear(channels, H * K)
+        self.kernel_gamma = nn.Parameter(torch.ones(H * K))
+        self.exponent_proj = nn.Linear(channels, 1)
         self.exponent_gamma = nn.Parameter(torch.ones(1))
-        self.out_w = nn.Parameter(torch.empty(channels, channels))
+        self.out_proj = nn.Linear(channels, channels, bias=False)
         
-        nn.init.zeros_(self.wave_w)
-        nn.init.xavier_uniform_(self.kernel_w, gain=0.1)
-        nn.init.zeros_(self.exponent_w)
-        nn.init.zeros_(self.exponent_b)  # sigmoid(0)*3.5+0.5 = 2.25
-        nn.init.xavier_uniform_(self.out_w, gain=0.1)
+        nn.init.zeros_(self.wave_proj.weight)
+        nn.init.zeros_(self.wave_proj.bias)
+        nn.init.xavier_uniform_(self.kernel_proj.weight, gain=0.1)
+        nn.init.zeros_(self.kernel_proj.bias)
+        nn.init.zeros_(self.exponent_proj.weight)
+        nn.init.constant_(self.exponent_proj.bias, 0.0)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
-        return _GatherConvTriton.apply(
-            x, self.wave_w, self.wave_b, self.wave_gamma,
-            self.kernel_w, self.kernel_b, self.kernel_gamma,
-            self.exponent_w, self.exponent_b, self.exponent_gamma,
-            self.out_w,
+        return _TelephoneAttentionTriton.apply(
+            x,
+            self.wave_proj.weight, self.wave_proj.bias, self.wave_gamma,
+            self.kernel_proj.weight, self.kernel_proj.bias, self.kernel_gamma,
+            self.exponent_proj.weight, self.exponent_proj.bias, self.exponent_gamma,
+            self.out_proj.weight,
             self.num_heads, self.half_s, self.max_receptive,
             self.max_freq, self.min_freq, self.max_kernel_size, self.chunk_size, L,
         ), {}
 
 
-class _GatherConvTriton(torch.autograd.Function):
+class _TelephoneAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma,
                 exponent_w, exponent_b, exponent_gamma, out_w,
@@ -632,10 +642,10 @@ class _GatherConvTriton(torch.autograd.Function):
             exponent_chunk = torch.sigmoid(exponent_normed) * 3.5 + 0.5  # (M_chunk, 1) -> (B, chunk_len, 1)
             exponent_chunk = exponent_chunk.view(B, chunk_len, 1)
             
-            # gather-conv for chunk (reads from full x, writes to chunk)
+            # telephone-attn for chunk (reads from full x, writes to chunk)
             hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
             grid = (B, chunk_len, H)
-            gather_conv_fwd_kernel[grid](
+            telephone_attn_fwd_kernel[grid](
                 x, hidden_chunk,
                 freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
                 exponent_chunk.contiguous(),
@@ -743,9 +753,9 @@ class _GatherConvTriton(torch.autograd.Function):
             sig_exponent = torch.sigmoid(exponent_normed)
             exponent_chunk = (sig_exponent * 3.5 + 0.5).view(B, chunk_len, 1)
             
-            # Recompute hidden for chunk (need to update triton_gather_conv to accept exponent)
+            # Recompute hidden for chunk (need to update triton_telephone_attn to accept exponent)
             # For now, compute in PyTorch style for backward compatibility
-            hidden_chunk = triton_gather_conv_with_exponent(
+            hidden_chunk = triton_telephone_attn_with_decay(
                 x, freq_chunk.contiguous(), phase_chunk.contiguous(),
                 kernel_chunk.contiguous(), exponent_chunk.contiguous(),
                 half_s, max_receptive, start, seq_len)
@@ -783,14 +793,14 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             d_hidden_chunk = d_hidden_flat.view(B, chunk_len, C)
             
-            # === Backward through gather-conv ===
+            # === Backward through telephone-attn ===
             d_freq_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
             d_phase_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
             d_kernel_chunk = torch.zeros(B, chunk_len, H, K, device=x.device, dtype=x.dtype)
             d_exponent_chunk = torch.zeros(B, chunk_len, 1, device=x.device, dtype=x.dtype)
             
             grid = (B, chunk_len, H)
-            gather_conv_bwd_kernel[grid](
+            telephone_attn_bwd_kernel[grid](
                 x, d_hidden_chunk.contiguous(), d_x,
                 freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
                 exponent_chunk.contiguous(),
@@ -991,7 +1001,7 @@ if __name__ == "__main__":
         return fwd_time, bwd_time, fwd_mem, bwd_mem
     
     # Default benchmark
-    model = TritonGatherConv(channels=C, num_heads=H).to(device)
+    model = TritonTelephoneAttention(channels=C, num_heads=H).to(device)
     x = torch.randn(B, L, C, device=device, requires_grad=True)
     fwd_time, bwd_time, fwd_mem, bwd_mem = bench_model(model, x)
     print(f"Default (chunk=1024): Fwd: {fwd_time:5.1f}ms ({fwd_mem:5.0f}MB)  Bwd: {bwd_time:5.1f}ms ({bwd_mem:5.0f}MB)")
@@ -1007,7 +1017,7 @@ if __name__ == "__main__":
     chunk_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
     
     for cs in chunk_sizes:
-        model_cs = TritonGatherConv(channels=C, num_heads=H, chunk_size=cs).to(device)
+        model_cs = TritonTelephoneAttention(channels=C, num_heads=H, chunk_size=cs).to(device)
         model_cs.load_state_dict(model.state_dict())
         x = torch.randn(B, L, C, device=device, requires_grad=True)
         

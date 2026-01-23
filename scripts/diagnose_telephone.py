@@ -3,7 +3,7 @@ import torch
 import sys
 sys.path.insert(0, '.')
 
-from src.heuristic_secrets.models.gatherconv import GatherConvND
+from src.heuristic_secrets.models.telephone_attention import TelephoneAttentionND
 
 device = 'cuda'
 B, L, C = 4, 8192, 256
@@ -20,7 +20,7 @@ for ckpt in [False, True]:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
-    conv = GatherConvND(channels=C, ndim=1, max_samples=32, num_heads=H, checkpoint=ckpt).to(device)
+    conv = TelephoneAttentionND(channels=C, ndim=1, max_samples=32, num_heads=H, checkpoint=ckpt).to(device)
     conv.train()
     
     x = torch.randn(B, L, C, device=device, requires_grad=True)
