@@ -1,4 +1,4 @@
-"""RippleAttention: lowrank -> telephone -> conv -> telephone -> lowrank (sandwich, weight reuse)."""
+"""RippleAttention: configurable order of telephone, conv, lowrank with norm+residual."""
 
 from __future__ import annotations
 
@@ -17,20 +17,6 @@ except ImportError:
     TritonAdaptiveLocalConv = None
 
 
-class LowRankResidual(nn.Module):
-    
-    def __init__(self, dim: int, rank: int = 16):
-        super().__init__()
-        self.A = nn.Linear(dim, rank, bias=False)
-        self.B = nn.Linear(rank, dim, bias=False)
-        self.D = nn.Parameter(torch.zeros(dim))
-        nn.init.zeros_(self.A.weight)
-        nn.init.zeros_(self.B.weight)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.B(self.A(x)) + x * self.D
-
-
 class RippleAttention(nn.Module):
     
     def __init__(
@@ -44,17 +30,12 @@ class RippleAttention(nn.Module):
         chunk_size: int = 1024,
         use_triton: bool = True,
         eps: float = 1e-6,
-        residual_rank: int = 16,
+        order: str = "tele,conv,lowrank",
     ):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
-        
-        self.lowrank = LowRankAttention(channels)
-        self.lowrank_res1 = LowRankResidual(channels, residual_rank)
-        self.lowrank_res2 = LowRankResidual(channels, residual_rank)
-        self.norm1 = RMSNorm(channels, eps)
-        self.norm5 = RMSNorm(channels, eps)
+        self.order = [s.strip() for s in order.split(",")]
         
         self.telephone = TelephoneAttentionND(
             channels=channels,
@@ -67,63 +48,45 @@ class RippleAttention(nn.Module):
             chunk_size=chunk_size,
             use_triton=use_triton,
         )
-        self.telephone_res1 = LowRankResidual(channels, residual_rank)
-        self.telephone_res2 = LowRankResidual(channels, residual_rank)
-        self.norm2 = RMSNorm(channels, eps)
-        self.norm4 = RMSNorm(channels, eps)
         
         if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
-            self.adaptive_conv = TritonAdaptiveLocalConv(
+            self.conv = TritonAdaptiveLocalConv(
                 channels=channels,
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
                 chunk_size=chunk_size,
             )
         else:
-            self.adaptive_conv = AdaptiveLocalConv(
+            self.conv = AdaptiveLocalConv(
                 channels=channels,
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
             )
-        self.norm3 = RMSNorm(channels, eps)
+        
+        self.lowrank = LowRankAttention(channels)
+        
+        self.norms = nn.ModuleDict({
+            'tele': RMSNorm(channels, eps),
+            'conv': RMSNorm(channels, eps),
+            'lowrank': RMSNorm(channels, eps),
+        })
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        B, L, C = x.shape
+        h = x
+        info = {}
         
-        lowrank_out, _ = self.lowrank(x)
-        h = x + self.norm1(lowrank_out + self.lowrank_res1(lowrank_out))
+        for name in self.order:
+            if name == 'tele':
+                out, _ = self.telephone(h)
+            elif name == 'conv':
+                out, info = self.conv(h)
+            elif name == 'lowrank':
+                out, _ = self.lowrank(h)
+            else:
+                raise ValueError(f"Unknown layer: {name}")
+            h = h + self.norms[name](out)
         
-        tel_out, _ = self.telephone(h)
-        h = h + self.norm2(tel_out + self.telephone_res1(tel_out))
-        
-        conv_out, conv_info = self.adaptive_conv(h)
-        h = h + self.norm3(conv_out)
-        
-        tel_out, _ = self.telephone(h)
-        h = h + self.norm4(tel_out + self.telephone_res2(tel_out))
-        
-        lowrank_out, _ = self.lowrank(h)
-        h = h + self.norm5(lowrank_out + self.lowrank_res2(lowrank_out))
-        
-        return h, conv_info
-    
-    def base_parameters(self):
-        for name, module in self.named_modules():
-            if 'res' not in name and module is not self:
-                for param in module.parameters(recurse=False):
-                    yield param
-    
-    def residual_parameters(self):
-        for name, module in self.named_modules():
-            if 'res' in name:
-                for param in module.parameters(recurse=False):
-                    yield param
-    
-    def param_groups(self, lr: float, base_lr_mult: float = 0.5):
-        return [
-            {'params': list(self.base_parameters()), 'lr': lr * base_lr_mult},
-            {'params': list(self.residual_parameters()), 'lr': lr},
-        ]
+        return h, info
 
 
 class RippleBlock(nn.Module):
@@ -137,6 +100,7 @@ class RippleBlock(nn.Module):
         mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
+        order: str = "tele,conv,lowrank",
     ):
         super().__init__()
         self.attn = RippleAttention(
@@ -146,6 +110,7 @@ class RippleBlock(nn.Module):
             max_kernel_size=max_kernel_size,
             use_triton=use_triton,
             eps=eps,
+            order=order,
         )
         
         hidden = int(channels * mlp_ratio)

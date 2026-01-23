@@ -180,11 +180,11 @@ class TelephoneAttentionBlock(nn.Module):
 
 
 class RippleAttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1, order: str = "tele,conv,lowrank"):
         super().__init__()
         self.ripple_attn = RippleAttention(
             channels=width, num_heads=num_heads, max_samples=max_samples,
-            use_triton=True
+            use_triton=True, order=order
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -763,22 +763,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         os.makedirs(checkpoint_dir, exist_ok=True)
     
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    
-    base_params, residual_params = [], []
-    for m in model.modules():
-        if hasattr(m, 'base_parameters') and hasattr(m, 'residual_parameters'):
-            base_params.extend(m.base_parameters())
-            residual_params.extend(m.residual_parameters())
-    
-    if residual_params:
-        other_params = [p for p in model.parameters() if not any(p is bp for bp in base_params) and not any(p is rp for rp in residual_params)]
-        optimizer = torch.optim.AdamW([
-            {'params': base_params, 'lr': lr * 0.5},
-            {'params': residual_params, 'lr': lr},
-            {'params': other_params, 'lr': lr},
-        ], weight_decay=0.01)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
@@ -885,7 +870,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     return final_acc
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank'):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
@@ -909,7 +894,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         width = WIDTH_GATHER
     elif model_type == 'ripple':
         WIDTH_RIPPLE = 64
-        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels)
+        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels, order=attn_order)
         width = WIDTH_RIPPLE
     elif model_type == 'flat':
         return FlatRippleClassifierND(
@@ -1034,7 +1019,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     return model.to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank'):
     WIDTH_ATTN = 64
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
@@ -1058,7 +1043,7 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
         width = WIDTH_GATHER
     elif model_type == 'ripple':
         WIDTH_RIPPLE = 64
-        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels)
+        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels, order=attn_order)
         width = WIDTH_RIPPLE
     else:
         raise ValueError(f'Unknown model type: {model_type}')
@@ -1297,6 +1282,7 @@ def main():
     parser.add_argument('--merge-mode', type=str, default='lowrank', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: lowrank)')
     parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
+    parser.add_argument('--attn-order', type=str, default='tele,conv,lowrank', help='Order of attention layers for ripple model (default: tele,conv,lowrank)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1376,7 +1362,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
@@ -1427,22 +1413,7 @@ def main():
             if args.profile:
                 print(f'\nProfiling {mt}...')
                 model.train()
-                
-                base_params, residual_params = [], []
-                for m in model.modules():
-                    if hasattr(m, 'base_parameters') and hasattr(m, 'residual_parameters'):
-                        base_params.extend(m.base_parameters())
-                        residual_params.extend(m.residual_parameters())
-                
-                if residual_params:
-                    other_params = [p for p in model.parameters() if not any(p is bp for bp in base_params) and not any(p is rp for rp in residual_params)]
-                    optimizer = torch.optim.AdamW([
-                        {'params': base_params, 'lr': args.lr * 0.5},
-                        {'params': residual_params, 'lr': args.lr},
-                        {'params': other_params, 'lr': args.lr},
-                    ])
-                else:
-                    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
                 
                 # Get a batch
                 inputs, labels = next(iter(train_loader))
