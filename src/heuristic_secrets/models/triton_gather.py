@@ -17,6 +17,14 @@ except ImportError:
 
 if HAS_TRITON:
     @triton.jit
+    def triton_tanh(x):
+        return 2.0 * tl.sigmoid(2.0 * x) - 1.0
+    
+    @triton.jit
+    def triton_silu(x):
+        return x * tl.sigmoid(x)
+    
+    @triton.jit
     def gather_conv_fwd_kernel(
         x_ptr, out_ptr,
         wave_w_ptr, wave_b_ptr,
@@ -52,11 +60,11 @@ if HAS_TRITON:
             dot_freq += tl.load(wave_b_ptr + wave_b_off)
             dot_phase += tl.load(wave_b_ptr + H + wave_b_off)
             
-            dot_freq = dot_freq * tl.sigmoid(dot_freq)
-            dot_phase = dot_phase * tl.sigmoid(dot_phase)
+            dot_freq = triton_silu(dot_freq)
+            dot_phase = triton_silu(dot_phase)
             
             freq_acc += tl.sigmoid(dot_freq) * (max_freq - min_freq) + min_freq
-            phase_acc += tl.tanh(dot_phase) * max_freq
+            phase_acc += triton_tanh(dot_phase) * max_freq
         
         freq_avg = freq_acc / H
         phase_avg = phase_acc / H
@@ -70,7 +78,7 @@ if HAS_TRITON:
                 x_val = tl.load(x_ptr + x_base + c)
                 dot += x_val * tl.load(kernel_w_ptr + kernel_w_base + k * C + c)
             dot += tl.load(kernel_b_ptr + kernel_b_base + k)
-            kernel_out = tl.where(tl.arange(0, K) == k, dot * tl.sigmoid(dot), kernel_out)
+            kernel_out = tl.where(tl.arange(0, K) == k, triton_silu(dot), kernel_out)
         
         out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
         kernel_sum = 0.0
