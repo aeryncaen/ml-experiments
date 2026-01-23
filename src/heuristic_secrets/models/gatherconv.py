@@ -153,7 +153,7 @@ class GatherConvND(nn.Module):
         
         kernel_max = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K)
         
-        norm_pos = (rel_pos.abs() + self.max_receptive) / (2 * self.max_receptive)
+        norm_pos = rel_pos.abs() / self.max_receptive
         norm_pos = norm_pos.clamp(0, 1)
         
         idx_float = norm_pos * (K - 1)
