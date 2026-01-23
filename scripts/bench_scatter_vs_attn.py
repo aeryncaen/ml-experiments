@@ -1179,13 +1179,29 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         block_fn = lambda: ConvBlock2D(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
     elif model_type == 'ripple':
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
+            return RippleClassifierND(
+                embed_dim=w, n_classes=n_classes, n_layers=layers,
+                kernel_size=kernel_size, ndim=2, num_channels=num_channels,
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifierND(
-            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
+            embed_dim=width, n_classes=n_classes, n_layers=layers,
             kernel_size=kernel_size, ndim=2, num_channels=num_channels,
         ).to(device)
     elif model_type == 'flat':
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
+            return FlatRippleClassifierND(
+                embed_dim=w, n_classes=n_classes, iterations=layers,
+                kernel_size=kernel_size, ndim=2, num_channels=num_channels,
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return FlatRippleClassifierND(
-            embed_dim=WIDTH_SGSB, n_classes=n_classes, iterations=layers,
+            embed_dim=width, n_classes=n_classes, iterations=layers,
             kernel_size=kernel_size, ndim=2, num_channels=num_channels,
         ).to(device)
     else:
