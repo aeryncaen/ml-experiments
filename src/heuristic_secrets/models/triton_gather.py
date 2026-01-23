@@ -91,7 +91,7 @@ class TritonGatherConv(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
-        chunk_size: int = 256,
+        chunk_size: int = 1024,
     ):
         super().__init__()
         if not HAS_TRITON:
@@ -166,25 +166,64 @@ if __name__ == "__main__":
         exit()
     
     import time
+    import sys
     
     device = "cuda"
     B, L, C = 4, 8192, 256
     H = 8
     
-    model = TritonGatherConv(channels=C, num_heads=H).to(device)
-    x = torch.randn(B, L, C, device=device)
-    
-    for _ in range(10):
+    if "--trace" in sys.argv:
+        torch.cuda.reset_peak_memory_stats()
+        
+        def mem():
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated() / 1024**2
+        
+        model = TritonGatherConv(channels=C, num_heads=H).to(device)
+        print(f"After model init: {mem():.1f} MB")
+        
+        x = torch.randn(B, L, C, device=device)
+        print(f"After x alloc: {mem():.1f} MB")
+        
+        torch.cuda.reset_peak_memory_stats()
+        out = torch.empty_like(x)
+        print(f"After out alloc: {mem():.1f} MB")
+        
+        torch.cuda.reset_peak_memory_stats()
+        chunk_size = 1024
+        x_chunk = x[:, :chunk_size, :]
+        wave_out = F.silu(model.wave_proj(x_chunk))
+        print(f"After wave_proj: {mem():.1f} MB")
+        
+        torch.cuda.reset_peak_memory_stats()
+        kernel = F.silu(model.kernel_proj(x_chunk))
+        print(f"After kernel_proj: {mem():.1f} MB")
+        
+        torch.cuda.reset_peak_memory_stats()
+        out_final = F.silu(model.out_proj(x))
+        print(f"After out_proj (full L): {mem():.1f} MB")
+        
+        del wave_out, kernel, out_final, out, x_chunk
+        torch.cuda.empty_cache()
+        
+        torch.cuda.reset_peak_memory_stats()
         out, _ = model(x)
-        torch.cuda.synchronize()
-    
-    torch.cuda.reset_peak_memory_stats()
-    start = time.perf_counter()
-    for _ in range(20):
-        out, _ = model(x)
-        torch.cuda.synchronize()
-    elapsed = (time.perf_counter() - start) / 20 * 1000
-    mem = torch.cuda.max_memory_allocated() / 1024**2
-    
-    print(f"Triton GatherConv: {elapsed:.2f} ms, {mem:.1f} MB")
-    print(f"Output shape: {out.shape}")
+        print(f"Full forward: {mem():.1f} MB")
+    else:
+        model = TritonGatherConv(channels=C, num_heads=H).to(device)
+        x = torch.randn(B, L, C, device=device)
+        
+        for _ in range(10):
+            out, _ = model(x)
+            torch.cuda.synchronize()
+        
+        torch.cuda.reset_peak_memory_stats()
+        start = time.perf_counter()
+        for _ in range(20):
+            out, _ = model(x)
+            torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / 20 * 1000
+        mem = torch.cuda.max_memory_allocated() / 1024**2
+        
+        print(f"Triton GatherConv: {elapsed:.2f} ms, {mem:.1f} MB")
+        print(f"Output shape: {out.shape}")
