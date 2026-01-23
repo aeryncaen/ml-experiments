@@ -1238,12 +1238,26 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_SGSB = 128
     WIDTH_CONV = 140
     WIDTH_GATHER = 128
+
+    if model_type == 'ripple':
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
+            return RippleClassifier(
+                width=w, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
+                num_heads=num_channels, order=attn_order, cross_layer=cross_layer
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return RippleClassifier(
+            width=width, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
+            num_heads=num_channels, order=attn_order, cross_layer=cross_layer
+        ).to(device)
 
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -1582,8 +1596,8 @@ def main():
     if task_type == 'lm':
         vocab_size = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'conv', 'gather']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size)
+        all_model_types = ['attention', 'sgsb', 'conv', 'gather', 'ripple']
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
