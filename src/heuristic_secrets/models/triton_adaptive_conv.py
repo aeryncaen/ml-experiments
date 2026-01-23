@@ -114,7 +114,8 @@ if HAS_TRITON:
         
         for s_idx in range(2 * half_window_max + 1):
             s_off = s_idx - half_window_max
-            neighbor_pos_f = pid_l + center_off + s_off
+            # Use absolute position for neighbor lookup in v_full
+            neighbor_pos_f = abs_l + center_off + s_off
             
             valid = (neighbor_pos_f >= 0.0) & (neighbor_pos_f < L)
             valid_f = valid.to(tl.float32)
@@ -143,6 +144,7 @@ if HAS_TRITON:
             pos_ceil = tl.minimum(pos_floor + 1, L - 1)
             pos_frac = pos_clamped - pos_floor.to(tl.float32)
             
+            # v_ptr is the full v_full tensor, use absolute positions
             v_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
             v_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
             
@@ -155,7 +157,8 @@ if HAS_TRITON:
         weight_sum = tl.maximum(weight_sum, 1.0)
         out_acc = out_acc / weight_sum
         
-        out_base = pid_b * L * C + pid_l * C + pid_h * D
+        # Output is chunk-sized, use local position
+        out_base = pid_b * chunk_len * C + pid_l * C + pid_h * D
         tl.store(out_ptr + out_base + d_offs, out_acc, mask=d_mask)
 
     @triton.jit
@@ -167,32 +170,41 @@ if HAS_TRITON:
         H: tl.constexpr, D: tl.constexpr, K: tl.constexpr,
         half_window_max: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        chunk_start,  # offset for chunked processing
+        chunk_len,    # length of current chunk
     ):
         pid_b = tl.program_id(0)
-        pid_l = tl.program_id(1)
+        pid_l = tl.program_id(1)  # local position within chunk [0, chunk_len)
         pid_h = tl.program_id(2)
         
-        hw_off = pid_b * L * H + pid_l * H + pid_h
+        # Absolute position in full sequence
+        abs_l = chunk_start + pid_l
+        
+        # Load from chunk-local tensors (half_win, center_off, kernel are chunk-sized)
+        hw_off = pid_b * chunk_len * H + pid_l * H + pid_h
         half_win = tl.load(half_win_ptr + hw_off)
         half_win = tl.maximum(half_win, 0.5)
         center_off = tl.load(center_off_ptr + hw_off)
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        kernel_base = pid_b * chunk_len * H * K + pid_l * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         
-        d_out_base = pid_b * L * C + pid_l * C + pid_h * D
+        # d_out is chunk-sized, use local position
+        d_out_base = pid_b * chunk_len * C + pid_l * C + pid_h * D
         d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
         
         weight_sum = 0.0
         out_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
         
+        # First pass: compute weight_sum and out_acc for normalization
         for s_idx in range(2 * half_window_max + 1):
             s_off = s_idx - half_window_max
-            neighbor_pos_f = pid_l + center_off + s_off
+            # Use absolute position for neighbor lookup in v_full
+            neighbor_pos_f = abs_l + center_off + s_off
             
             valid = (neighbor_pos_f >= 0.0) & (neighbor_pos_f < L)
             valid_f = valid.to(tl.float32)
@@ -221,6 +233,7 @@ if HAS_TRITON:
             pos_ceil = tl.minimum(pos_floor + 1, L - 1)
             pos_frac = pos_clamped - pos_floor.to(tl.float32)
             
+            # v_ptr is full v_full tensor, use absolute positions
             v_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
             v_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
             
@@ -236,9 +249,11 @@ if HAS_TRITON:
         d_half_win_acc = 0.0
         d_center_off_acc = 0.0
         
+        # Second pass: compute gradients
         for s_idx in range(2 * half_window_max + 1):
             s_off = s_idx - half_window_max
-            neighbor_pos_f = pid_l + center_off + s_off
+            # Use absolute position for neighbor lookup in v_full
+            neighbor_pos_f = abs_l + center_off + s_off
             
             valid = (neighbor_pos_f >= 0.0) & (neighbor_pos_f < L)
             valid_f = valid.to(tl.float32)
@@ -266,6 +281,7 @@ if HAS_TRITON:
             pos_ceil = tl.minimum(pos_floor + 1, L - 1)
             pos_frac = pos_clamped - pos_floor.to(tl.float32)
             
+            # v_ptr and d_v_ptr are full tensors, use absolute positions
             v_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
             v_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
             
@@ -296,6 +312,7 @@ if HAS_TRITON:
             d_pos_frac = tl.sum(d_val * (val_ceil - val_floor))
             d_center_off_acc += d_pos_frac * valid_f
         
+        # d_kernel, d_half_win, d_center_off are chunk-sized outputs
         tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
         tl.atomic_add(d_half_win_ptr + hw_off, d_half_win_acc)
         tl.atomic_add(d_center_off_ptr + hw_off, d_center_off_acc)
@@ -415,6 +432,7 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
 
 
 def triton_adaptive_conv(v, half_win, center_off, kernel, half_window_max):
+    """Standalone helper for full-sequence (non-chunked) forward pass."""
     B, L, C = v.shape
     H = half_win.shape[-1]
     K = kernel.shape[-1]
@@ -426,6 +444,7 @@ def triton_adaptive_conv(v, half_win, center_off, kernel, half_window_max):
     adaptive_conv_fwd_kernel[grid](
         v, out, half_win, center_off, kernel,
         B, L, C, H, D, K, half_window_max, BLOCK_D,
+        0, L,  # chunk_start=0, chunk_len=L (full sequence)
     )
     return out
 
@@ -500,7 +519,7 @@ class _TritonAdaptiveConv(torch.autograd.Function):
                 v_full, hidden_chunk,
                 half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
                 B, L, C, H, D, K, half_window_max, BLOCK_D,
-                chunk_start=start,
+                start, chunk_len,  # chunk_start, chunk_len
             )
             
             out_chunk = triton_linear(hidden_chunk.view(M_chunk, C), out_w)
@@ -580,7 +599,7 @@ class _TritonAdaptiveConv(torch.autograd.Function):
                 v_full, hidden_chunk,
                 half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
                 B, L, C, H, D, K, half_window_max, BLOCK_D,
-                chunk_start=start,
+                start, chunk_len,  # chunk_start, chunk_len
             )
             
             out_pre = triton_linear(hidden_chunk.view(M_chunk, C), out_w)
@@ -622,7 +641,7 @@ class _TritonAdaptiveConv(torch.autograd.Function):
                 half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
                 d_half_windows, d_center_offsets, d_kernel_weights,
                 B, L, C, H, D, K, half_window_max, BLOCK_D,
-                chunk_start=start,
+                start, chunk_len,  # chunk_start, chunk_len
             )
             
             d_kernel_flat = d_kernel_weights.view(M_chunk, H * K)
