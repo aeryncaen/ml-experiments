@@ -21,6 +21,15 @@ except ImportError:
         _GatherConvTriton = None
 
 
+def llama_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """LlamaRMSNorm as a function - equivalent to T5LayerNorm."""
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    return (weight * x).to(input_dtype)
+
+
 class GatherConvND(nn.Module):
     """
     Gather samples at learned positions, convolve with interpolated kernel.
@@ -106,7 +115,7 @@ class GatherConvND(nn.Module):
         
         # wave_proj: linear -> RMSNorm -> SiLU
         wave_pre = self.wave_proj(x_chunk)
-        wave_normed = F.rms_norm(wave_pre, (wave_pre.shape[-1],), self.wave_gamma)
+        wave_normed = llama_rmsnorm(wave_pre, self.wave_gamma)
         wave_params = F.silu(wave_normed).view(B, chunk_len, 2, H)
         
         freq_raw = wave_params[:, :, 0, :]
@@ -162,7 +171,7 @@ class GatherConvND(nn.Module):
         
         # kernel_proj: linear -> RMSNorm -> SiLU
         kernel_pre = self.kernel_proj(x_chunk)
-        kernel_normed = F.rms_norm(kernel_pre, (kernel_pre.shape[-1],), self.kernel_gamma)
+        kernel_normed = llama_rmsnorm(kernel_pre, self.kernel_gamma)
         kernel_max = F.silu(kernel_normed).view(B, chunk_len, H, K)
         
         norm_pos = rel_pos.abs() / self.max_receptive

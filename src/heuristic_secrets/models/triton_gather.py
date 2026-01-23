@@ -115,23 +115,27 @@ if HAS_TRITON:
         eps,
         BLOCK_N: tl.constexpr,
     ):
-        """Fused RMSNorm -> SiLU. Each program handles one row."""
+        """Fused LlamaRMSNorm -> SiLU. Each program handles one row.
+        
+        LlamaRMSNorm math (in float32):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * rsqrt(variance + eps)
+            return weight * x
+        """
         pid_m = tl.program_id(0)
         
         offs_n = tl.arange(0, BLOCK_N)
         n_mask = offs_n < N
         
-        # Load input row
+        # Load input row (already in float32 in Triton)
         x_ptrs = x_ptr + pid_m * stride_xm + offs_n * stride_xn
         x = tl.load(x_ptrs, mask=n_mask, other=0.0)
         
-        # RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma
-        x_sq = x * x
-        mean_sq = tl.sum(x_sq) / N
-        rrms = 1.0 / tl.sqrt(mean_sq + eps)
-        
+        # LlamaRMSNorm: variance = x.pow(2).mean(), x = x * rsqrt(variance + eps), out = weight * x
+        variance = tl.sum(x * x) / N
+        x_normed = x * tl.rsqrt(variance + eps)
         gamma = tl.load(gamma_ptr + offs_n, mask=n_mask, other=1.0)
-        normed = x * rrms * gamma
+        normed = gamma * x_normed  # weight * x (weight applied after)
         
         # SiLU: x * sigmoid(x)
         sigmoid_val = 1.0 / (1.0 + tl.exp(-normed))
@@ -441,8 +445,8 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def triton_rmsnorm_silu(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """x: (M, N), gamma: (N,) -> (M, N). Fused RMSNorm + SiLU."""
+def triton_rmsnorm_silu(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """x: (M, N), gamma: (N,) -> (M, N). Fused LlamaRMSNorm + SiLU."""
     M, N = x.shape
     out = torch.empty_like(x)
     
@@ -460,8 +464,8 @@ def triton_rmsnorm_silu(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-5)
     return out
 
 
-def triton_linear_rmsnorm_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """x: (M, K), w: (N, K), b: (N,), gamma: (N,) -> (M, N). Linear + RMSNorm + SiLU."""
+def triton_linear_rmsnorm_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """x: (M, K), w: (N, K), b: (N,), gamma: (N,) -> (M, N). Linear + LlamaRMSNorm + SiLU."""
     linear_out = triton_linear(x, w) + b
     return triton_rmsnorm_silu(linear_out, gamma, eps)
 
@@ -612,7 +616,7 @@ class _GatherConvTriton(torch.autograd.Function):
         x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w = ctx.saved_tensors
         
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
-        eps = 1e-5  # RMSNorm epsilon
+        eps = 1e-6  # LlamaRMSNorm epsilon
         
         # Initialize gradient accumulators
         d_x = torch.zeros_like(x)
@@ -634,10 +638,13 @@ class _GatherConvTriton(torch.autograd.Function):
             d_out_chunk = d_out[:, start:end, :].reshape(M_chunk, C)
             
             # === Recompute forward for this chunk ===
-            # wave_proj: linear -> RMSNorm -> SiLU
+            # wave_proj: linear -> LlamaRMSNorm -> SiLU (using float32 for RMSNorm)
             wave_linear = triton_linear(x_chunk, wave_w) + wave_b
-            wave_rrms = 1.0 / torch.sqrt((wave_linear ** 2).mean(dim=-1, keepdim=True) + eps)
-            wave_normed = wave_linear * wave_rrms * wave_gamma
+            wave_linear_f32 = wave_linear.float()
+            wave_variance = wave_linear_f32.pow(2).mean(dim=-1, keepdim=True)
+            wave_rrms = torch.rsqrt(wave_variance + eps)
+            wave_x_normed = wave_linear_f32 * wave_rrms
+            wave_normed = (wave_gamma * wave_x_normed).to(wave_linear.dtype)
             wave_out = (wave_normed * torch.sigmoid(wave_normed)).view(B, chunk_len, 2, H)
             
             freq_pre = wave_out[:, :, 0, :]
@@ -647,10 +654,13 @@ class _GatherConvTriton(torch.autograd.Function):
             tanh_phase = torch.tanh(phase_pre)
             phase_chunk = tanh_phase * max_freq
             
-            # kernel_proj: linear -> RMSNorm -> SiLU
+            # kernel_proj: linear -> LlamaRMSNorm -> SiLU (using float32 for RMSNorm)
             kernel_linear = triton_linear(x_chunk, kernel_w) + kernel_b
-            kernel_rrms = 1.0 / torch.sqrt((kernel_linear ** 2).mean(dim=-1, keepdim=True) + eps)
-            kernel_normed = kernel_linear * kernel_rrms * kernel_gamma
+            kernel_linear_f32 = kernel_linear.float()
+            kernel_variance = kernel_linear_f32.pow(2).mean(dim=-1, keepdim=True)
+            kernel_rrms = torch.rsqrt(kernel_variance + eps)
+            kernel_x_normed = kernel_linear_f32 * kernel_rrms
+            kernel_normed = (kernel_gamma * kernel_x_normed).to(kernel_linear.dtype)
             kernel_out = kernel_normed * torch.sigmoid(kernel_normed)
             kernel_chunk = kernel_out.view(B, chunk_len, H, K)
             
@@ -705,19 +715,20 @@ class _GatherConvTriton(torch.autograd.Function):
                 start, chunk_len, BLOCK_D,
             )
             
-            # === Backward through kernel_proj (SiLU -> RMSNorm -> Linear) ===
+            # === Backward through kernel_proj (SiLU -> LlamaRMSNorm -> Linear) ===
             d_kernel_flat = d_kernel_chunk.view(M_chunk, H * K)
             
             # Backward through SiLU: d_normed = d_out * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
             sig_kernel = torch.sigmoid(kernel_normed)
             d_kernel_normed = d_kernel_flat * sig_kernel * (1.0 + kernel_normed * (1.0 - sig_kernel))
             
-            # Backward through RMSNorm
-            # y = x * rrms * gamma  =>  d_gamma = sum(dy * x * rrms), d_x = rrms * (dy * gamma - y_norm * mean(dy * gamma * y_norm))
-            kernel_y_norm = kernel_linear * kernel_rrms
-            d_kernel_gamma += (d_kernel_normed * kernel_y_norm).sum(dim=0)
-            inner_k = (d_kernel_normed * kernel_gamma * kernel_y_norm).mean(dim=-1, keepdim=True)
-            d_kernel_linear = kernel_rrms * (d_kernel_normed * kernel_gamma - kernel_y_norm * inner_k)
+            # Backward through LlamaRMSNorm (in float32)
+            d_kernel_normed_f32 = d_kernel_normed.float()
+            d_kernel_gamma += (d_kernel_normed_f32 * kernel_x_normed).sum(dim=0)
+            d_kernel_x_normed = d_kernel_normed_f32 * kernel_gamma
+            inner_k = (kernel_x_normed * d_kernel_x_normed).mean(dim=-1, keepdim=True)
+            d_kernel_linear_f32 = kernel_rrms * (d_kernel_x_normed - kernel_x_normed * inner_k)
+            d_kernel_linear = d_kernel_linear_f32.to(kernel_linear.dtype)
             
             d_kernel_pre = d_kernel_linear  # For compatibility with existing code below
             
@@ -746,7 +757,7 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             d_x[:, start:end, :] += d_x_kernel_chunk.view(B, chunk_len, C)
             
-            # === Backward through wave_proj (sigmoid/tanh -> SiLU -> RMSNorm -> Linear) ===
+            # === Backward through wave_proj (sigmoid/tanh -> SiLU -> LlamaRMSNorm -> Linear) ===
             # freq = sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
             # d_freq_pre = d_freq * (max_freq - min_freq) * sigmoid'(freq_pre)
             d_freq_pre = d_freq_chunk * (max_freq - min_freq) * sig_freq * (1.0 - sig_freq)
@@ -759,11 +770,16 @@ class _GatherConvTriton(torch.autograd.Function):
             sig_wave = torch.sigmoid(wave_normed)
             d_wave_normed = d_wave_out * sig_wave * (1.0 + wave_normed * (1.0 - sig_wave))
             
-            # Backward through RMSNorm
-            wave_y_norm = wave_linear * wave_rrms
-            d_wave_gamma += (d_wave_normed * wave_y_norm).sum(dim=0)
-            inner_w = (d_wave_normed * wave_gamma * wave_y_norm).mean(dim=-1, keepdim=True)
-            d_wave_linear = wave_rrms * (d_wave_normed * wave_gamma - wave_y_norm * inner_w)
+            # Backward through LlamaRMSNorm (in float32)
+            # Forward was: x_normed = x * rrms, out = gamma * x_normed
+            # d_gamma = sum(d_out * x_normed), d_x_normed = d_out * gamma
+            # d_x = rrms * (d_x_normed - x_normed * mean(x_normed * d_x_normed))
+            d_wave_normed_f32 = d_wave_normed.float()
+            d_wave_gamma += (d_wave_normed_f32 * wave_x_normed).sum(dim=0)
+            d_wave_x_normed = d_wave_normed_f32 * wave_gamma
+            inner_w = (wave_x_normed * d_wave_x_normed).mean(dim=-1, keepdim=True)
+            d_wave_linear_f32 = wave_rrms * (d_wave_x_normed - wave_x_normed * inner_w)
+            d_wave_linear = d_wave_linear_f32.to(wave_linear.dtype)
             
             d_wave_pre = d_wave_linear  # For compatibility with existing code below
             
