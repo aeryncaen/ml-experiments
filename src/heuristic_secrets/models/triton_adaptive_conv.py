@@ -793,7 +793,7 @@ class TritonAdaptiveLocalConv(nn.Module):
         max_kernel_size: int = 64,
         min_window: float = 1.0,
         chunk_size: int = 1024,
-        scale_power: float = 0.30,
+        scale_power: float = 0.421875,
     ):
         super().__init__()
         if not HAS_TRITON:
