@@ -424,6 +424,34 @@ def triton_adaptive_conv(v, half_win, center_off, kernel, half_window_max):
     return out
 
 
+def _compute_chunk_forward(x_chunk, window_w, window_b, window_gamma, offset_w, offset_b, offset_gamma,
+                           kernel_w, kernel_b, kernel_gamma, v_w, v_b,
+                           H, K, min_window, max_window, max_offset):
+    """Compute forward for a chunk, returning intermediates needed for backward."""
+    M_chunk, C = x_chunk.shape
+    
+    window_linear = triton_linear(x_chunk, window_w, window_b)
+    window_normed = triton_rmsnorm(window_linear, window_gamma)
+    window_raw = torch.sigmoid(window_normed)
+    window_sizes = min_window + window_raw * (max_window - min_window)
+    half_windows = window_sizes / 2
+    
+    offset_linear = triton_linear(x_chunk, offset_w, offset_b)
+    offset_normed = triton_rmsnorm(offset_linear, offset_gamma)
+    center_offsets = torch.tanh(offset_normed) * max_offset
+    
+    kernel_linear = triton_linear(x_chunk, kernel_w, kernel_b)
+    kernel_normed = triton_rmsnorm(kernel_linear, kernel_gamma)
+    kernel_weights = triton_silu(kernel_normed)
+    
+    v_chunk = triton_linear(x_chunk, v_w, v_b)
+    
+    return (half_windows, center_offsets, kernel_weights, v_chunk,
+            window_linear, window_normed, window_raw,
+            offset_linear, offset_normed,
+            kernel_linear, kernel_normed)
+
+
 class _TritonAdaptiveConv(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, window_w, window_b, window_gamma, offset_w, offset_b, offset_gamma,
@@ -435,52 +463,64 @@ class _TritonAdaptiveConv(torch.autograd.Function):
         max_window = min(int(math.sqrt(L)), K)
         half_window_max = max_window // 2
         max_offset = int(math.sqrt(L))
+        chunk_size = min(chunk_size, L)
         
-        M = B * L
-        x_flat = x.reshape(M, C)
+        v_full = triton_linear(x.view(B * L, C), v_w, v_b).view(B, L, C)
         
-        window_linear = triton_linear(x_flat, window_w, window_b)
-        window_normed = triton_rmsnorm(window_linear, window_gamma)
-        window_raw = torch.sigmoid(window_normed)
-        window_sizes = min_window + window_raw * (max_window - min_window)
-        half_windows = (window_sizes / 2).view(B, L, H)
+        out = torch.empty(B, L, C, device=x.device, dtype=x.dtype)
         
-        offset_linear = triton_linear(x_flat, offset_w, offset_b)
-        offset_normed = triton_rmsnorm(offset_linear, offset_gamma)
-        center_offsets = (torch.tanh(offset_normed) * max_offset).view(B, L, H)
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            chunk_len = end - start
+            M_chunk = B * chunk_len
+            
+            x_chunk = x[:, start:end, :].reshape(M_chunk, C)
+            
+            (half_windows, center_offsets, kernel_weights, _,
+             _, _, _, _, _, _, _) = _compute_chunk_forward(
+                x_chunk, window_w, window_b, window_gamma, offset_w, offset_b, offset_gamma,
+                kernel_w, kernel_b, kernel_gamma, v_w, v_b,
+                H, K, min_window, max_window, max_offset)
+            
+            half_windows_3d = half_windows.view(B, chunk_len, H)
+            center_offsets_3d = center_offsets.view(B, chunk_len, H)
+            kernel_weights_4d = kernel_weights.view(B, chunk_len, H, K)
+            
+            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+            grid = (B, chunk_len, H)
+            BLOCK_D = triton.next_power_of_2(D)
+            
+            adaptive_conv_fwd_kernel[grid](
+                v_full, hidden_chunk,
+                half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
+                B, L, C, H, D, K, half_window_max, BLOCK_D,
+                chunk_start=start,
+            )
+            
+            out_chunk = triton_linear(hidden_chunk.view(M_chunk, C), out_w)
+            out[:, start:end, :] = triton_silu(out_chunk).view(B, chunk_len, C)
         
-        kernel_linear = triton_linear(x_flat, kernel_w, kernel_b)
-        kernel_normed = triton_rmsnorm(kernel_linear, kernel_gamma)
-        kernel_weights = triton_silu(kernel_normed).view(B, L, H, K)
-        
-        v = triton_linear(x_flat, v_w, v_b).view(B, L, C)
-        
-        hidden = triton_adaptive_conv(v, half_windows, center_offsets, kernel_weights, half_window_max)
-        
-        out_flat = triton_linear(hidden.view(M, C), out_w)
-        out = triton_silu(out_flat).view(B, L, C)
-        
-        ctx.save_for_backward(x, v, half_windows, center_offsets, kernel_weights, hidden,
-                              window_w, window_b, window_gamma, window_linear, window_normed, window_raw,
-                              offset_w, offset_b, offset_gamma, offset_linear, offset_normed,
-                              kernel_w, kernel_b, kernel_gamma, kernel_linear, kernel_normed,
-                              v_w, v_b, out_w, out_flat)
+        ctx.save_for_backward(x, v_full, window_w, window_b, window_gamma,
+                              offset_w, offset_b, offset_gamma,
+                              kernel_w, kernel_b, kernel_gamma,
+                              v_w, v_b, out_w)
         ctx.H = H
         ctx.K = K
         ctx.half_window_max = half_window_max
         ctx.max_window = max_window
         ctx.max_offset = max_offset
         ctx.min_window = min_window
+        ctx.chunk_size = chunk_size
+        ctx.shape = (B, L, C)
         
         return out
     
     @staticmethod
     def backward(ctx, d_out):
-        (x, v, half_windows, center_offsets, kernel_weights, hidden,
-         window_w, window_b, window_gamma, window_linear, window_normed, window_raw,
-         offset_w, offset_b, offset_gamma, offset_linear, offset_normed,
-         kernel_w, kernel_b, kernel_gamma, kernel_linear, kernel_normed,
-         v_w, v_b, out_w, out_flat) = ctx.saved_tensors
+        (x, v_full, window_w, window_b, window_gamma,
+         offset_w, offset_b, offset_gamma,
+         kernel_w, kernel_b, kernel_gamma,
+         v_w, v_b, out_w) = ctx.saved_tensors
         
         H = ctx.H
         K = ctx.K
@@ -488,56 +528,195 @@ class _TritonAdaptiveConv(torch.autograd.Function):
         max_window = ctx.max_window
         max_offset = ctx.max_offset
         min_window = ctx.min_window
-        
-        B, L, C = x.shape
+        chunk_size = ctx.chunk_size
+        B, L, C = ctx.shape
         D = C // H
         M = B * L
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         
-        d_out_flat = d_out.view(M, C)
-        
-        sig_out = torch.sigmoid(out_flat)
-        d_out_pre = d_out_flat * sig_out * (1.0 + out_flat * (1.0 - sig_out))
-        
+        d_x = torch.zeros_like(x)
+        d_v_full = torch.zeros_like(v_full)
+        d_window_w = torch.zeros_like(window_w)
+        d_window_b = torch.zeros_like(window_b)
+        d_window_gamma = torch.zeros_like(window_gamma)
+        d_offset_w = torch.zeros_like(offset_w)
+        d_offset_b = torch.zeros_like(offset_b)
+        d_offset_gamma = torch.zeros_like(offset_gamma)
+        d_kernel_w = torch.zeros_like(kernel_w)
+        d_kernel_b = torch.zeros_like(kernel_b)
+        d_kernel_gamma = torch.zeros_like(kernel_gamma)
         d_out_w = torch.zeros_like(out_w)
-        grid = (triton.cdiv(C, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_out_pre, hidden.view(M, C), d_out_w,
-            M, C, C,
-            d_out_pre.stride(0), d_out_pre.stride(1),
-            hidden.view(M, C).stride(0), hidden.view(M, C).stride(1),
-            d_out_w.stride(0), d_out_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
         
-        d_hidden = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_out_pre, out_w, d_hidden,
-            M, C, C,
-            d_out_pre.stride(0), d_out_pre.stride(1),
-            out_w.stride(0), out_w.stride(1),
-            d_hidden.stride(0), d_hidden.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        d_hidden = d_hidden.view(B, L, C)
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            chunk_len = end - start
+            M_chunk = B * chunk_len
+            
+            x_chunk = x[:, start:end, :].reshape(M_chunk, C)
+            d_out_chunk = d_out[:, start:end, :].reshape(M_chunk, C)
+            
+            (half_windows, center_offsets, kernel_weights, v_chunk,
+             window_linear, window_normed, window_raw,
+             offset_linear, offset_normed,
+             kernel_linear, kernel_normed) = _compute_chunk_forward(
+                x_chunk, window_w, window_b, window_gamma, offset_w, offset_b, offset_gamma,
+                kernel_w, kernel_b, kernel_gamma, v_w, v_b,
+                H, K, min_window, max_window, max_offset)
+            
+            half_windows_3d = half_windows.view(B, chunk_len, H)
+            center_offsets_3d = center_offsets.view(B, chunk_len, H)
+            kernel_weights_4d = kernel_weights.view(B, chunk_len, H, K)
+            
+            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+            grid = (B, chunk_len, H)
+            adaptive_conv_fwd_kernel[grid](
+                v_full, hidden_chunk,
+                half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
+                B, L, C, H, D, K, half_window_max, BLOCK_D,
+                chunk_start=start,
+            )
+            
+            out_pre = triton_linear(hidden_chunk.view(M_chunk, C), out_w)
+            
+            sig_out = torch.sigmoid(out_pre)
+            d_out_pre = d_out_chunk * sig_out * (1.0 + out_pre * (1.0 - sig_out))
+            
+            d_out_w_chunk = torch.zeros_like(out_w)
+            grid = (triton.cdiv(C, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_out_pre, hidden_chunk.view(M_chunk, C), d_out_w_chunk,
+                M_chunk, C, C,
+                d_out_pre.stride(0), d_out_pre.stride(1),
+                hidden_chunk.view(M_chunk, C).stride(0), hidden_chunk.view(M_chunk, C).stride(1),
+                d_out_w_chunk.stride(0), d_out_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_out_w += d_out_w_chunk
+            
+            d_hidden = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_out_pre, out_w, d_hidden,
+                M_chunk, C, C,
+                d_out_pre.stride(0), d_out_pre.stride(1),
+                out_w.stride(0), out_w.stride(1),
+                d_hidden.stride(0), d_hidden.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            d_hidden = d_hidden.view(B, chunk_len, C)
+            
+            d_half_windows = torch.zeros_like(half_windows_3d)
+            d_center_offsets = torch.zeros_like(center_offsets_3d)
+            d_kernel_weights = torch.zeros_like(kernel_weights_4d)
+            
+            grid = (B, chunk_len, H)
+            adaptive_conv_bwd_kernel[grid](
+                v_full, d_hidden, d_v_full,
+                half_windows_3d.contiguous(), center_offsets_3d.contiguous(), kernel_weights_4d.contiguous(),
+                d_half_windows, d_center_offsets, d_kernel_weights,
+                B, L, C, H, D, K, half_window_max, BLOCK_D,
+                chunk_start=start,
+            )
+            
+            d_kernel_flat = d_kernel_weights.view(M_chunk, H * K)
+            sig_kernel = torch.sigmoid(kernel_normed)
+            d_kernel_normed = d_kernel_flat * sig_kernel * (1.0 + kernel_normed * (1.0 - sig_kernel))
+            
+            rrms_k = torch.rsqrt(kernel_linear.pow(2).mean(-1, keepdim=True) + 1e-6)
+            d_kernel_gamma += (d_kernel_normed * kernel_linear * rrms_k).sum(0)
+            d_kernel_linear = d_kernel_normed * kernel_gamma * rrms_k
+            
+            d_kernel_w_chunk = torch.zeros_like(kernel_w)
+            grid = (triton.cdiv(H * K, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_kernel_linear, x_chunk, d_kernel_w_chunk,
+                M_chunk, H * K, C,
+                d_kernel_linear.stride(0), d_kernel_linear.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_kernel_w_chunk.stride(0), d_kernel_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_kernel_w += d_kernel_w_chunk
+            d_kernel_b += d_kernel_linear.sum(0)
+            
+            d_x_kernel = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_kernel_linear, kernel_w, d_x_kernel,
+                M_chunk, H * K, C,
+                d_kernel_linear.stride(0), d_kernel_linear.stride(1),
+                kernel_w.stride(0), kernel_w.stride(1),
+                d_x_kernel.stride(0), d_x_kernel.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            
+            d_window_sizes = d_half_windows / 2
+            d_window_raw = d_window_sizes.view(M_chunk, H) * (max_window - min_window)
+            d_window_normed = d_window_raw * window_raw * (1.0 - window_raw)
+            
+            rrms_w = torch.rsqrt(window_linear.pow(2).mean(-1, keepdim=True) + 1e-6)
+            d_window_gamma += (d_window_normed * window_linear * rrms_w).sum(0)
+            d_window_linear = d_window_normed * window_gamma * rrms_w
+            
+            d_window_w_chunk = torch.zeros_like(window_w)
+            grid = (triton.cdiv(H, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_window_linear, x_chunk, d_window_w_chunk,
+                M_chunk, H, C,
+                d_window_linear.stride(0), d_window_linear.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_window_w_chunk.stride(0), d_window_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_window_w += d_window_w_chunk
+            d_window_b += d_window_linear.sum(0)
+            
+            d_x_window = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_window_linear, window_w, d_x_window,
+                M_chunk, H, C,
+                d_window_linear.stride(0), d_window_linear.stride(1),
+                window_w.stride(0), window_w.stride(1),
+                d_x_window.stride(0), d_x_window.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            
+            tanh_off = torch.tanh(offset_normed)
+            d_offset_normed = d_center_offsets.view(M_chunk, H) * max_offset * (1.0 - tanh_off * tanh_off)
+            
+            rrms_o = torch.rsqrt(offset_linear.pow(2).mean(-1, keepdim=True) + 1e-6)
+            d_offset_gamma += (d_offset_normed * offset_linear * rrms_o).sum(0)
+            d_offset_linear = d_offset_normed * offset_gamma * rrms_o
+            
+            d_offset_w_chunk = torch.zeros_like(offset_w)
+            grid = (triton.cdiv(H, BLOCK_N), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dw_kernel[grid](
+                d_offset_linear, x_chunk, d_offset_w_chunk,
+                M_chunk, H, C,
+                d_offset_linear.stride(0), d_offset_linear.stride(1),
+                x_chunk.stride(0), x_chunk.stride(1),
+                d_offset_w_chunk.stride(0), d_offset_w_chunk.stride(1),
+                BLOCK_N, BLOCK_K, BLOCK_M,
+            )
+            d_offset_w += d_offset_w_chunk
+            d_offset_b += d_offset_linear.sum(0)
+            
+            d_x_offset = torch.zeros(M_chunk, C, device=x.device, dtype=x.dtype)
+            grid = (triton.cdiv(M_chunk, BLOCK_M), triton.cdiv(C, BLOCK_K))
+            linear_bwd_dx_kernel[grid](
+                d_offset_linear, offset_w, d_x_offset,
+                M_chunk, H, C,
+                d_offset_linear.stride(0), d_offset_linear.stride(1),
+                offset_w.stride(0), offset_w.stride(1),
+                d_x_offset.stride(0), d_x_offset.stride(1),
+                BLOCK_M, BLOCK_K, BLOCK_N,
+            )
+            
+            d_x[:, start:end, :] += (d_x_kernel + d_x_window + d_x_offset).view(B, chunk_len, C)
         
-        d_v = torch.zeros_like(v)
-        d_half_windows = torch.zeros_like(half_windows)
-        d_center_offsets = torch.zeros_like(center_offsets)
-        d_kernel_weights = torch.zeros_like(kernel_weights)
-        
-        grid = (B, L, H)
-        adaptive_conv_bwd_kernel[grid](
-            v, d_hidden, d_v,
-            half_windows, center_offsets, kernel_weights,
-            d_half_windows, d_center_offsets, d_kernel_weights,
-            B, L, C, H, D, K, half_window_max, BLOCK_D,
-        )
-        
-        d_v_flat = d_v.view(M, C)
-        
+        d_v_flat = d_v_full.view(M, C)
         d_v_w = torch.zeros_like(v_w)
         grid = (triton.cdiv(C, BLOCK_N), triton.cdiv(C, BLOCK_K))
         linear_bwd_dw_kernel[grid](
@@ -550,108 +729,17 @@ class _TritonAdaptiveConv(torch.autograd.Function):
         )
         d_v_b = d_v_flat.sum(0)
         
-        d_x_from_v = torch.zeros(M, C, device=x.device, dtype=x.dtype)
+        d_x_v = torch.zeros(M, C, device=x.device, dtype=x.dtype)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
         linear_bwd_dx_kernel[grid](
-            d_v_flat, v_w, d_x_from_v,
+            d_v_flat, v_w, d_x_v,
             M, C, C,
             d_v_flat.stride(0), d_v_flat.stride(1),
             v_w.stride(0), v_w.stride(1),
-            d_x_from_v.stride(0), d_x_from_v.stride(1),
+            d_x_v.stride(0), d_x_v.stride(1),
             BLOCK_M, BLOCK_K, BLOCK_N,
         )
-        
-        d_kernel_flat = d_kernel_weights.view(M, H * K)
-        sig_kernel = torch.sigmoid(kernel_normed)
-        d_kernel_normed = d_kernel_flat * sig_kernel * (1.0 + kernel_normed * (1.0 - sig_kernel))
-        
-        d_kernel_gamma = (d_kernel_normed * kernel_linear / (kernel_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)).sum(0)
-        d_kernel_linear = d_kernel_normed * kernel_gamma / (kernel_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
-        
-        d_kernel_w = torch.zeros_like(kernel_w)
-        grid = (triton.cdiv(H * K, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_kernel_linear, x.view(M, C), d_kernel_w,
-            M, H * K, C,
-            d_kernel_linear.stride(0), d_kernel_linear.stride(1),
-            x.view(M, C).stride(0), x.view(M, C).stride(1),
-            d_kernel_w.stride(0), d_kernel_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        d_kernel_b = d_kernel_linear.sum(0)
-        
-        d_x_from_kernel = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_kernel_linear, kernel_w, d_x_from_kernel,
-            M, H * K, C,
-            d_kernel_linear.stride(0), d_kernel_linear.stride(1),
-            kernel_w.stride(0), kernel_w.stride(1),
-            d_x_from_kernel.stride(0), d_x_from_kernel.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        
-        d_window_sizes = d_half_windows / 2
-        d_window_raw = d_window_sizes.view(M, H) * (max_window - min_window)
-        d_window_normed = d_window_raw * window_raw * (1.0 - window_raw)
-        
-        d_window_gamma = (d_window_normed * window_linear / (window_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)).sum(0)
-        d_window_linear = d_window_normed * window_gamma / (window_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
-        
-        d_window_w = torch.zeros_like(window_w)
-        grid = (triton.cdiv(H, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_window_linear, x.view(M, C), d_window_w,
-            M, H, C,
-            d_window_linear.stride(0), d_window_linear.stride(1),
-            x.view(M, C).stride(0), x.view(M, C).stride(1),
-            d_window_w.stride(0), d_window_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        d_window_b = d_window_linear.sum(0)
-        
-        d_x_from_window = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_window_linear, window_w, d_x_from_window,
-            M, H, C,
-            d_window_linear.stride(0), d_window_linear.stride(1),
-            window_w.stride(0), window_w.stride(1),
-            d_x_from_window.stride(0), d_x_from_window.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        
-        d_center_off_flat = d_center_offsets.view(M, H)
-        tanh_off = torch.tanh(offset_normed)
-        d_offset_normed = d_center_off_flat * max_offset * (1.0 - tanh_off * tanh_off)
-        
-        d_offset_gamma = (d_offset_normed * offset_linear / (offset_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)).sum(0)
-        d_offset_linear = d_offset_normed * offset_gamma / (offset_linear.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
-        
-        d_offset_w = torch.zeros_like(offset_w)
-        grid = (triton.cdiv(H, BLOCK_N), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_offset_linear, x.view(M, C), d_offset_w,
-            M, H, C,
-            d_offset_linear.stride(0), d_offset_linear.stride(1),
-            x.view(M, C).stride(0), x.view(M, C).stride(1),
-            d_offset_w.stride(0), d_offset_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M,
-        )
-        d_offset_b = d_offset_linear.sum(0)
-        
-        d_x_from_offset = torch.zeros(M, C, device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_offset_linear, offset_w, d_x_from_offset,
-            M, H, C,
-            d_offset_linear.stride(0), d_offset_linear.stride(1),
-            offset_w.stride(0), offset_w.stride(1),
-            d_x_from_offset.stride(0), d_x_from_offset.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N,
-        )
-        
-        d_x = (d_x_from_v + d_x_from_kernel + d_x_from_window + d_x_from_offset).view(B, L, C)
+        d_x += d_x_v.view(B, L, C)
         
         return (d_x, d_window_w, d_window_b, d_window_gamma, d_offset_w, d_offset_b, d_offset_gamma,
                 d_kernel_w, d_kernel_b, d_kernel_gamma, d_v_w, d_v_b, d_out_w,
