@@ -75,7 +75,7 @@ if HAS_TRITON:
             
             # phase = tanh(wave_out[H + h]) * max_freq
             wave_h2 = tl.sum(tl.where(tl.arange(0, 2 * H) == (H + h), wave_out, 0.0))
-            phase_h = tl.tanh(wave_h2) * max_freq
+            phase_h = ((tl.exp(2.0 * wave_h2) - 1.0) / (tl.exp(2.0 * wave_h2) + 1.0)) * max_freq
             
             # Gather kernel weights for this head
             k_range = tl.arange(0, K)
@@ -198,7 +198,7 @@ if HAS_TRITON:
             freq_h = sig_f * (max_freq - min_freq) + min_freq
             
             wave_h2 = tl.sum(tl.where(h2_range == (H + h), wave_out, 0.0))
-            phase_h = tl.tanh(wave_h2) * max_freq
+            phase_h = ((tl.exp(2.0 * wave_h2) - 1.0) / (tl.exp(2.0 * wave_h2) + 1.0)) * max_freq
             
             kernel_h = tl.zeros((K,), dtype=tl.float32)
             for k in range(K):
@@ -271,7 +271,7 @@ if HAS_TRITON:
             freq_h = sig_f * (max_freq - min_freq) + min_freq
             
             wave_h2 = tl.sum(tl.where(h2_range == (H + h), wave_out, 0.0))
-            tanh_p = tl.tanh(wave_h2)
+            tanh_p = ((tl.exp(2.0 * wave_h2) - 1.0) / (tl.exp(2.0 * wave_h2) + 1.0))
             phase_h = tanh_p * max_freq
             
             kernel_h = tl.zeros((K,), dtype=tl.float32)
