@@ -78,7 +78,7 @@ if HAS_TRITON:
         kernel_sum = tl.maximum(kernel_sum, 1e-8)
         out_h = out_h / kernel_sum
         
-        out_base = pid_b * L * C + pid_l * C + pid_h * D
+        out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
     
 
@@ -129,7 +129,7 @@ class TritonGatherConv(nn.Module):
         K = self.max_kernel_size
         chunk_size = min(self.chunk_size, L)
         
-        hidden = torch.empty_like(x)
+        out = torch.empty_like(x)
         BLOCK_D = triton.next_power_of_2(D)
         
         for start in range(0, L, chunk_size):
@@ -146,9 +146,11 @@ class TritonGatherConv(nn.Module):
             
             kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
             
+            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+            
             grid = (B, chunk_len, H)
             gather_conv_fwd_kernel_chunked[grid](
-                x, hidden,
+                x, hidden_chunk,
                 freq_avg, phase_avg,
                 kernel,
                 B, L, C, H, D, S, K,
@@ -157,11 +159,8 @@ class TritonGatherConv(nn.Module):
                 chunk_len,
                 BLOCK_D,
             )
-        
-        out = torch.empty_like(x)
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            out[:, start:end, :] = F.silu(F.linear(hidden[:, start:end, :], self.out_proj.weight))
+            
+            out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
         
         return out, {}
 
