@@ -168,30 +168,29 @@ if HAS_TRITON:
         BLOCK_C: tl.constexpr,
     ):
         """
-        Backward for kernel: d_kernel[c, k] = sum over b,l of d_out[b,c,l] * x[b,c,in_start+k]
+        Backward for kernel - parallelized over (b, l, c_block), atomic_add to d_kernel
         """
-        pid_k = tl.program_id(0)
-        pid_c_block = tl.program_id(1)
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_c_block = tl.program_id(2)
         
         c_idx = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
         c_mask = c_idx < C
         
-        acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        d_out_offs = pid_b * C * L_out + c_idx * L_out + pid_l
+        d_out_vals = tl.load(d_out_ptr + d_out_offs, mask=c_mask, other=0.0)
         
-        for b in range(B):
-            for l in range(L_out):
-                in_pos = l * stride + pid_k
-                if in_pos < L_in:
-                    d_out_offs = b * C * L_out + c_idx * L_out + l
-                    d_out_vals = tl.load(d_out_ptr + d_out_offs, mask=c_mask, other=0.0)
-                    
-                    x_offs = b * C * L_in + c_idx * L_in + in_pos
-                    x_vals = tl.load(x_ptr + x_offs, mask=c_mask, other=0.0)
-                    
-                    acc += d_out_vals * x_vals
+        in_start = pid_l * stride
         
-        d_k_offs = c_idx * K + pid_k
-        tl.store(d_kernel_ptr + d_k_offs, acc, mask=c_mask)
+        for k in range(K):
+            in_pos = in_start + k
+            if in_pos < L_in:
+                x_offs = pid_b * C * L_in + c_idx * L_in + in_pos
+                x_vals = tl.load(x_ptr + x_offs, mask=c_mask, other=0.0)
+                
+                d_k_vals = d_out_vals * x_vals
+                d_k_offs = c_idx * K + k
+                tl.atomic_add(d_kernel_ptr + d_k_offs, d_k_vals, mask=c_mask)
 
     @triton.jit
     def siren_kernel_gen_bwd(
@@ -393,7 +392,7 @@ def triton_depthwise_conv1d_bwd(
         BLOCK_C,
     )
     
-    grid_k = (K, triton.cdiv(C, BLOCK_C))
+    grid_k = (B, L_out, triton.cdiv(C, BLOCK_C))
     depthwise_conv1d_bwd_kernel[grid_k](
         x, d_out, d_kernel,
         B, L_in, C, L_out, K, stride,
