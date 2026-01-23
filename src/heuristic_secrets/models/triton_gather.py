@@ -622,7 +622,7 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             
             # === Backward through kernel_proj ===
-            kernel_pre = triton_linear(x_chunk, kernel_w)
+            kernel_pre = triton_linear(x_chunk, kernel_w) + kernel_b  # Must include bias!
             sig_k = torch.sigmoid(kernel_pre)
             d_kernel_flat = d_kernel_chunk.view(M_chunk, H * K)
             d_kernel_pre = d_kernel_flat * sig_k * (1.0 + kernel_pre * (1.0 - sig_k))
@@ -657,7 +657,7 @@ class _GatherConvTriton(torch.autograd.Function):
             d_phase_pre = torch.zeros_like(phase_pre)
             d_wave_out = torch.stack([d_freq_pre, d_phase_pre], dim=2).view(M_chunk, 2 * H)
             
-            wave_pre = triton_linear(x_chunk, wave_w)
+            wave_pre = triton_linear(x_chunk, wave_w) + wave_b  # Must include bias!
             sig_w = torch.sigmoid(wave_pre)
             d_wave_pre = d_wave_out * sig_w * (1.0 + wave_pre * (1.0 - sig_w))
             
