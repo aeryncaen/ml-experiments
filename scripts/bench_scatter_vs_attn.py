@@ -1042,10 +1042,9 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
         block_fn = lambda: TelephoneAttentionBlock(WIDTH_GATHER, num_heads=num_channels)
         width = WIDTH_GATHER
     elif model_type == 'ripple':
-        return RippleClassifierND(
-            embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
-            kernel_size=kernel_size, ndim=1, num_channels=num_channels,
-        ).to(device)
+        WIDTH_RIPPLE = 64
+        block_fn = lambda: RippleAttentionBlock(WIDTH_RIPPLE, num_heads=num_channels)
+        width = WIDTH_RIPPLE
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
