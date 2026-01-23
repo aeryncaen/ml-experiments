@@ -12,13 +12,13 @@ from functools import reduce
 from operator import mul
 
 try:
-    from .triton_gather import TritonGatherConv, HAS_TRITON
+    from .triton_gather import _GatherConvTriton, HAS_TRITON
 except ImportError:
     try:
-        from triton_gather import TritonGatherConv, HAS_TRITON
+        from triton_gather import _GatherConvTriton, HAS_TRITON
     except ImportError:
         HAS_TRITON = False
-        TritonGatherConv = None
+        _GatherConvTriton = None
 
 
 class GatherConvND(nn.Module):
@@ -191,29 +191,22 @@ class GatherConvND(nn.Module):
         return output
     
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, C = x.shape
-        H = self.num_heads
-        K = self.max_kernel_size
-        
-        try:
-            from .triton_gather import GatherConvOp
-        except ImportError:
-            from triton_gather import GatherConvOp
-        
-        # Compute freq/phase/kernel for ALL positions (autograd handles these)
-        wave_out = F.silu(self.wave_proj(x))  # (B, L, 2*H)
-        wave_out = wave_out.view(B, L, 2, H)
-        freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
-        phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-        kernel = F.silu(self.kernel_proj(x)).view(B, L, H, K)
-        
-        # Single autograd boundary for gather-conv
-        hidden = GatherConvOp.apply(
-            x, freq.contiguous(), phase.contiguous(), kernel.contiguous(),
-            self.max_offset, self.max_receptive, self.quantize_bwd and self.training,
+        # Use _GatherConvTriton directly with our nn.Linear weights
+        # This gets full chunked memory benefits
+        return _GatherConvTriton.apply(
+            x,
+            self.wave_proj.weight,    # (2*H, C)
+            self.wave_proj.bias,      # (2*H,)
+            self.kernel_proj.weight,  # (H*K, C)
+            self.kernel_proj.bias,    # (H*K,)
+            self.out_proj.weight,     # (C, C)
+            self.num_heads,
+            self.max_offset,
+            self.max_receptive,
+            self.max_freq,
+            self.min_freq,
+            self.max_kernel_size,
         )
-        
-        return F.silu(F.linear(hidden, self.out_proj.weight))
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B = x.shape[0]
@@ -370,10 +363,10 @@ if __name__ == "__main__":
         q_kernel_ok = abs(kernel_grad_q - kernel_grad_tr) / (kernel_grad_tr + 1e-8) < 0.5
         
         try:
-            from .triton_gather import HAS_FP8
+            from .triton_gather import HAS_FP8 as _HAS_FP8
         except ImportError:
-            from triton_gather import HAS_FP8
-        q_type = "FP8" if HAS_FP8 else "INT4"
+            from triton_gather import HAS_FP8 as _HAS_FP8
+        q_type = "FP8" if _HAS_FP8 else "INT4"
         print(f"Quantized ({q_type}) wave_proj grad: {'PASS' if q_wave_ok else 'FAIL'} ({wave_grad_q:.2e} vs {wave_grad_tr:.2e})")
         print(f"Quantized ({q_type}) kernel_proj grad: {'PASS' if q_kernel_ok else 'FAIL'} ({kernel_grad_q:.2e} vs {kernel_grad_tr:.2e})")
         
@@ -497,7 +490,7 @@ if __name__ == "__main__":
     if not gather_triton.use_triton:
         print("* Triton not available, using PyTorch implementation")
     try:
-        from .triton_gather import HAS_FP8
+        from .triton_gather import HAS_FP8 as _HAS_FP8_END
     except ImportError:
-        from triton_gather import HAS_FP8
-    print(f"Quantized backward: {'FP8' if HAS_FP8 else 'INT4'}")
+        from triton_gather import HAS_FP8 as _HAS_FP8_END
+    print(f"Quantized backward: {'FP8' if _HAS_FP8_END else 'INT4'}")
