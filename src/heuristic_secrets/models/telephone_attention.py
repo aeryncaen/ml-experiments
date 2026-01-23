@@ -241,23 +241,26 @@ class TelephoneAttentionND(nn.Module):
         return output
     
     def _forward_triton(self, x: torch.Tensor, L: int) -> torch.Tensor:
-        # Use _TelephoneAttentionTriton directly with our nn.Linear weights
-        # This gets full chunked memory benefits
+        S_for_L = max(3, int(L ** self.scale_power))
+        S = min(self.max_samples, S_for_L)
+        half_s = S // 2
+        max_receptive = half_s * self.max_freq
+        
         return _TelephoneAttentionTriton.apply(
             x,
-            self.wave_proj.weight,    # (2*H, C)
-            self.wave_proj.bias,      # (2*H,)
-            self.wave_gamma,          # (2*H,)
-            self.kernel_proj.weight,  # (H*K, C)
-            self.kernel_proj.bias,    # (H*K,)
-            self.kernel_gamma,        # (H*K,)
-            self.exponent_proj.weight,  # (1, C)
-            self.exponent_proj.bias,    # (1,)
-            self.exponent_gamma,        # (1,)
-            self.out_proj.weight,     # (C, C)
+            self.wave_proj.weight,
+            self.wave_proj.bias,
+            self.wave_gamma,
+            self.kernel_proj.weight,
+            self.kernel_proj.bias,
+            self.kernel_gamma,
+            self.exponent_proj.weight,
+            self.exponent_proj.bias,
+            self.exponent_gamma,
+            self.out_proj.weight,
             self.num_heads,
-            self.max_offset,
-            self.max_receptive,
+            half_s,
+            max_receptive,
             self.max_freq,
             self.min_freq,
             self.max_kernel_size,
