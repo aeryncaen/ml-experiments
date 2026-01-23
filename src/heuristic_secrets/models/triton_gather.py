@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-HAS_FP8 = hasattr(torch, 'float8_e4m3fn')
+
 
 
 if HAS_TRITON:
@@ -327,16 +327,6 @@ if HAS_TRITON:
 
 
 # ========== Helper functions ==========
-def quantize_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = t.abs().max() / 448.0
-    scale = torch.clamp(scale, min=1e-12)
-    return (t / scale).to(torch.float8_e4m3fn), scale
-
-
-def dequantize_fp8(t_q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    return t_q.to(dtype) * scale
-
-
 def triton_linear_silu(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """x: (M, K), w: (N, K), b: (N,) -> (M, N)"""
     M, K = x.shape
@@ -416,6 +406,7 @@ class TritonGatherConv(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
+        chunk_size: int = 1024,
     ):
         super().__init__()
         if not HAS_TRITON:
@@ -427,6 +418,7 @@ class TritonGatherConv(nn.Module):
         self.max_freq = max_freq
         self.min_freq = min_freq
         self.max_kernel_size = max_kernel_size
+        self.chunk_size = chunk_size
         
         self.half_s = max_samples // 2
         self.max_receptive = self.half_s * max_freq
@@ -445,21 +437,19 @@ class TritonGatherConv(nn.Module):
         return _GatherConvTriton.apply(
             x, self.wave_w, self.wave_b, self.kernel_w, self.kernel_b, self.out_w,
             self.num_heads, self.half_s, self.max_receptive,
-            self.max_freq, self.min_freq, self.max_kernel_size,
+            self.max_freq, self.min_freq, self.max_kernel_size, self.chunk_size,
         ), {}
 
 
 class _GatherConvTriton(torch.autograd.Function):
-    CHUNK_SIZE = 1024  # Process this many positions at a time
-    
     @staticmethod
     def forward(ctx, x, wave_w, wave_b, kernel_w, kernel_b, out_w,
-                H, half_s, max_receptive, max_freq, min_freq, K):
+                H, half_s, max_receptive, max_freq, min_freq, K, chunk_size):
         B, L, C = x.shape
         D = C // H
         S = 2 * half_s + 1
         BLOCK_D = triton.next_power_of_2(D)
-        chunk_size = min(_GatherConvTriton.CHUNK_SIZE, L)
+        chunk_size = min(chunk_size, L)
         
         out = torch.empty_like(x)
         
@@ -500,21 +490,15 @@ class _GatherConvTriton(torch.autograd.Function):
             out_pre = triton_linear(hidden_flat, out_w)
             out[:, start:end, :] = triton_silu(out_pre).view(B, chunk_len, C)
         
-        # Save ONLY quantized x and weights for backward
-        if HAS_FP8:
-            x_q, x_scale = quantize_fp8(x)
-            ctx.save_for_backward(x_q, x_scale, wave_w, wave_b, kernel_w, kernel_b, out_w)
-            ctx.use_fp8 = True
-        else:
-            ctx.save_for_backward(x, wave_w, wave_b, kernel_w, kernel_b, out_w)
-            ctx.use_fp8 = False
-        
+        # Save x and weights for backward (recompute intermediates)
+        ctx.save_for_backward(x, wave_w, wave_b, kernel_w, kernel_b, out_w)
         ctx.H = H
         ctx.half_s = half_s
         ctx.max_receptive = max_receptive
         ctx.max_freq = max_freq
         ctx.min_freq = min_freq
         ctx.K = K
+        ctx.chunk_size = chunk_size
         ctx.shape = (B, L, C)
         
         return out
@@ -531,13 +515,9 @@ class _GatherConvTriton(torch.autograd.Function):
         D = C // H
         S = 2 * half_s + 1
         BLOCK_D = triton.next_power_of_2(D)
-        chunk_size = min(_GatherConvTriton.CHUNK_SIZE, L)
+        chunk_size = min(ctx.chunk_size, L)
         
-        if ctx.use_fp8:
-            x_q, x_scale, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
-            x = dequantize_fp8(x_q, x_scale, d_out.dtype)
-        else:
-            x, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
+        x, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
         
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         
@@ -687,63 +667,7 @@ class _GatherConvTriton(torch.autograd.Function):
             d_x[:, start:end, :] += d_x_wave_chunk.view(B, chunk_len, C)
         
         return d_x, d_wave_w, d_wave_b, d_kernel_w, d_kernel_b, d_out_w, \
-               None, None, None, None, None, None
-
-
-# For backward compat with gatherconv.py
-class GatherConvOp(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, freq, phase, kernel, half_s, max_receptive, quantize_bwd):
-        # freq/phase/kernel are for full L here (not chunked)
-        chunk_len = freq.shape[1]
-        out = triton_gather_conv(x, freq, phase, kernel, half_s, max_receptive, chunk_start=0)
-        
-        if quantize_bwd and HAS_FP8:
-            x_q, x_scale = quantize_fp8(x)
-            k_q, k_scale = quantize_fp8(kernel)
-            ctx.save_for_backward(x_q, x_scale, freq, phase, k_q, k_scale)
-            ctx.use_fp8 = True
-        else:
-            ctx.save_for_backward(x, freq, phase, kernel)
-            ctx.use_fp8 = False
-        ctx.half_s = half_s
-        ctx.max_receptive = max_receptive
-        return out
-    
-    @staticmethod
-    def backward(ctx, d_out):
-        half_s = ctx.half_s
-        max_receptive = ctx.max_receptive
-        
-        if ctx.use_fp8:
-            x_q, x_scale, freq, phase, k_q, k_scale = ctx.saved_tensors
-            x = dequantize_fp8(x_q, x_scale, d_out.dtype)
-            kernel = dequantize_fp8(k_q, k_scale, d_out.dtype)
-        else:
-            x, freq, phase, kernel = ctx.saved_tensors
-        
-        B, L, C = x.shape
-        chunk_len = freq.shape[1]
-        H = freq.shape[-1]
-        K = kernel.shape[-1]
-        D = C // H
-        S = 2 * half_s + 1
-        BLOCK_D = triton.next_power_of_2(D)
-        
-        d_x = torch.zeros_like(x)
-        d_freq = torch.zeros_like(freq)
-        d_kernel = torch.zeros_like(kernel)
-        
-        grid = (B, chunk_len, H)
-        gather_conv_bwd_kernel[grid](
-            x, d_out.contiguous(), d_x,
-            freq, phase, kernel,
-            d_freq, d_kernel,
-            B, L, C, H, D, S, K, half_s, max_receptive,
-            0, chunk_len, BLOCK_D,  # chunk_start=0 for full sequence
-        )
-        
-        return d_x, d_freq, None, d_kernel, None, None, None
+               None, None, None, None, None, None, None  # 7 Nones for H, half_s, max_receptive, max_freq, min_freq, K, chunk_size
 
 
 if __name__ == "__main__":

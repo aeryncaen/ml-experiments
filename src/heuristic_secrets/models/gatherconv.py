@@ -206,6 +206,7 @@ class GatherConvND(nn.Module):
             self.max_freq,
             self.min_freq,
             self.max_kernel_size,
+            self.chunk_size,
         )
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
