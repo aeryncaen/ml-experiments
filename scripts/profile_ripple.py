@@ -415,13 +415,23 @@ def run_profile(
     print("=" * 100)
     print()
     
+    def get_time(event, use_cuda: bool) -> float:
+        """Get time from event, handling CUDA/CPU differences."""
+        if use_cuda:
+            # Try cuda_time_total first, fall back to self_cuda_time_total
+            if hasattr(event, 'cuda_time_total'):
+                return event.cuda_time_total
+            elif hasattr(event, 'self_cuda_time_total'):
+                return event.self_cuda_time_total
+            else:
+                return event.cpu_time_total
+        return event.cpu_time_total
+    
+    use_cuda = device == "cuda"
     component_times: dict[str, float] = {}
     for event in prof.key_averages():
         name = event.key
-        if device == "cuda":
-            time_us = event.cuda_time_total
-        else:
-            time_us = event.cpu_time_total
+        time_us = get_time(event, use_cuda)
         
         # Group by component prefix
         if "::" in name:
@@ -434,10 +444,7 @@ def run_profile(
     for event in prof.key_averages():
         name = event.key
         if name in ("forward", "backward"):
-            if device == "cuda":
-                time_us = event.cuda_time_total
-            else:
-                time_us = event.cpu_time_total
+            time_us = get_time(event, use_cuda)
             component_times[name] = time_us
     
     # Sort by time
