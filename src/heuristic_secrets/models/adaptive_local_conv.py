@@ -32,7 +32,6 @@ class AdaptiveLocalConv(nn.Module):
         num_heads: int = 8,
         max_kernel_size: int = 64,
         min_window: float = 1.0,
-        chunk_size: int = 256,
     ):
         super().__init__()
         self.channels = channels
@@ -40,7 +39,6 @@ class AdaptiveLocalConv(nn.Module):
         self.head_dim = channels // num_heads
         self.max_kernel_size = max_kernel_size
         self.min_window = min_window
-        self.chunk_size = chunk_size
         
         H = num_heads
         K = max_kernel_size
@@ -67,95 +65,21 @@ class AdaptiveLocalConv(nn.Module):
         nn.init.zeros_(self.v_proj.bias)
         nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
     
-    def _forward_chunk(
-        self,
-        v: torch.Tensor,
-        window_sizes: torch.Tensor,
-        center_offsets: torch.Tensor,
-        kernel_weights: torch.Tensor,
-        chunk_start: int,
-        chunk_end: int,
-        L: int,
-    ) -> torch.Tensor:
-        B = v.shape[0]
-        H = self.num_heads
-        D = self.head_dim
-        K = self.max_kernel_size
-        chunk_len = chunk_end - chunk_start
-        
-        max_window = min(int(math.sqrt(L)), K)
-        half_window_max = max_window // 2
-        
-        positions = torch.arange(chunk_start, chunk_end, device=v.device, dtype=v.dtype)
-        batch_idx = torch.arange(B, device=v.device).view(B, 1).expand(B, chunk_len)
-        local_offsets = torch.arange(-half_window_max, half_window_max + 1, device=v.device, dtype=v.dtype)
-        num_offsets = local_offsets.shape[0]
-        
-        half_windows = window_sizes[:, chunk_start:chunk_end, :] / 2
-        center_off = center_offsets[:, chunk_start:chunk_end, :]
-        kernel_chunk = kernel_weights[:, chunk_start:chunk_end, :, :]
-        
-        output = torch.zeros(B, chunk_len, self.channels, device=v.device, dtype=v.dtype)
-        sharpness = 5.0
-        
-        for h in range(H):
-            v_head = v[..., h * D : (h + 1) * D]
-            out_head = output[..., h * D : (h + 1) * D]
-            
-            center_off_h = center_off[:, :, h]
-            half_win_h = half_windows[:, :, h]
-            kernel_h = kernel_chunk[:, :, h, :]
-            
-            logits = torch.full((B, chunk_len, num_offsets), -1e9, device=v.device, dtype=v.dtype)
-            vals = torch.zeros(B, chunk_len, num_offsets, D, device=v.device, dtype=v.dtype)
-            
-            for s_idx, s_off in enumerate(local_offsets.tolist()):
-                neighbor_pos = positions.view(1, chunk_len) + center_off_h + s_off
-                
-                valid = (neighbor_pos >= 0) & (neighbor_pos < L)
-                
-                rel_dist = abs(s_off) / (half_win_h.clamp(min=0.5) + 1e-6)
-                window_logit = sharpness * (1.0 - rel_dist)
-                
-                norm_pos = rel_dist.clamp(0, 1) * (K - 1)
-                idx_floor = norm_pos.long().clamp(0, K - 2)
-                idx_ceil = idx_floor + 1
-                w_ceil = norm_pos - idx_floor.float()
-                w_floor = 1.0 - w_ceil
-                
-                k_floor = kernel_h.gather(-1, idx_floor.unsqueeze(-1)).squeeze(-1)
-                k_ceil = kernel_h.gather(-1, idx_ceil.unsqueeze(-1)).squeeze(-1)
-                kernel_logit = k_floor * w_floor + k_ceil * w_ceil
-                
-                logit = window_logit + kernel_logit
-                logits[:, :, s_idx] = torch.where(valid, logit, torch.full_like(logit, -1e9))
-                
-                pos_clamped = neighbor_pos.clamp(0, L - 1.001)
-                pos_floor = pos_clamped.floor().long().clamp(0, L - 1)
-                pos_ceil = (pos_floor + 1).clamp(0, L - 1)
-                pos_frac = pos_clamped - pos_floor.float()
-                
-                val_floor = v_head[batch_idx, pos_floor]
-                val_ceil = v_head[batch_idx, pos_ceil]
-                vals[:, :, s_idx, :] = val_floor * (1.0 - pos_frac.unsqueeze(-1)) + val_ceil * pos_frac.unsqueeze(-1)
-            
-            weights = F.softmax(logits, dim=-1)
-            out_head.copy_((weights.unsqueeze(-1) * vals).sum(dim=2))
-        
-        return output
-    
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B, L, C = x.shape
         H = self.num_heads
+        D = self.head_dim
         K = self.max_kernel_size
         
         max_window = min(int(math.sqrt(L)), K)
+        half_window_max = max_window // 2
         max_offset = int(math.sqrt(L))
         
         window_pre = self.window_proj(x)
         window_normed = llama_rmsnorm(window_pre, self.window_gamma)
         window_raw = torch.sigmoid(window_normed)
         window_sizes = self.min_window + window_raw * (max_window - self.min_window)
+        half_windows = window_sizes / 2
         
         offset_pre = self.offset_proj(x)
         offset_normed = llama_rmsnorm(offset_pre, self.offset_gamma)
@@ -167,14 +91,56 @@ class AdaptiveLocalConv(nn.Module):
         
         v = self.v_proj(x)
         
-        output = torch.empty_like(x)
-        chunk_size = min(self.chunk_size, L)
+        positions = torch.arange(L, device=x.device, dtype=x.dtype)
+        batch_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, L)
+        local_offsets = torch.arange(-half_window_max, half_window_max + 1, device=x.device, dtype=x.dtype)
         
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            output[:, start:end, :] = self._forward_chunk(
-                v, window_sizes, center_offsets, kernel_weights, start, end, L
-            )
+        output = torch.zeros(B, L, C, device=x.device, dtype=x.dtype)
+        
+        for h in range(H):
+            v_head = v[..., h * D : (h + 1) * D]
+            out_head = output[..., h * D : (h + 1) * D]
+            
+            center_off_h = center_offsets[:, :, h]
+            half_win_h = half_windows[:, :, h].clamp(min=0.5)
+            kernel_h = kernel_weights[:, :, h, :]
+            
+            weight_sum = torch.zeros(B, L, device=x.device, dtype=x.dtype)
+            
+            for s_off in local_offsets.tolist():
+                neighbor_pos = positions.view(1, L) + center_off_h + s_off
+                
+                valid = (neighbor_pos >= 0) & (neighbor_pos < L)
+                valid_f = valid.float()
+                
+                rel_dist = abs(s_off) / half_win_h
+                window_w = torch.exp(-rel_dist * rel_dist)
+                
+                norm_pos = rel_dist.clamp(0, 1) * (K - 1)
+                idx_floor = norm_pos.long().clamp(0, K - 2)
+                idx_ceil = idx_floor + 1
+                w_ceil = norm_pos - idx_floor.float()
+                w_floor = 1.0 - w_ceil
+                
+                k_floor = kernel_h.gather(-1, idx_floor.unsqueeze(-1)).squeeze(-1)
+                k_ceil = kernel_h.gather(-1, idx_ceil.unsqueeze(-1)).squeeze(-1)
+                kernel_w = (k_floor * w_floor + k_ceil * w_ceil).clamp(min=0)
+                
+                weight = (kernel_w + 1.0) * window_w * valid_f
+                weight_sum += weight
+                
+                pos_clamped = neighbor_pos.clamp(0, L - 1.001)
+                pos_floor = pos_clamped.floor().long().clamp(0, L - 1)
+                pos_ceil = (pos_floor + 1).clamp(0, L - 1)
+                pos_frac = pos_clamped - pos_floor.float()
+                
+                val_floor = v_head[batch_idx, pos_floor]
+                val_ceil = v_head[batch_idx, pos_ceil]
+                val = val_floor * (1.0 - pos_frac.unsqueeze(-1)) + val_ceil * pos_frac.unsqueeze(-1)
+                
+                out_head.addcmul_(weight.unsqueeze(-1), val)
+            
+            out_head.div_(weight_sum.unsqueeze(-1).clamp(min=1.0))
         
         output = F.silu(self.out_proj(output))
         
@@ -305,34 +271,6 @@ if __name__ == "__main__":
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"{L:>8} {int(math.sqrt(L)):>8} | OOM")
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-            else:
-                raise
-    
-    print()
-    print("=" * 60)
-    print("CHUNK SIZE SWEEP (L=4096)")
-    print("=" * 60)
-    print(f"{'ChunkSize':>10} | {'Fwd+Bwd':>10} {'Mem(MB)':>10}")
-    print("-" * 40)
-    
-    chunk_sizes = [64, 128, 256, 512, 1024, 2048, 4096]
-    L_sweep = 4096
-    
-    for cs in chunk_sizes:
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        
-        try:
-            model_cs = AdaptiveLocalConv(channels=C, num_heads=H, max_kernel_size=K, chunk_size=cs).to(device)
-            x = torch.randn(B, L_sweep, C, device=device)
-            total_ms, mem = bench(model_cs, x)
-            print(f"{cs:>10} | {total_ms:>10.2f} {mem:>10.0f}")
-            del model_cs
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"{cs:>10} | OOM")
                 if device == "cuda":
                     torch.cuda.empty_cache()
             else:
