@@ -118,7 +118,11 @@ class GatherConvND(nn.Module):
                 phase.unsqueeze(-1)
             )
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
-            sample_idx = sample_pos.long().clamp(0, L - 1)
+            # Soft indexing: floor, ceil, and fractional weight
+            pos_clamped = sample_pos.clamp(0, L - 1.001)
+            sample_floor = pos_clamped.floor().long().clamp(0, L - 1)
+            sample_ceil = (sample_floor + 1).clamp(0, L - 1)
+            sample_frac = pos_clamped - sample_floor.float()
             
             rel_pos = self.stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1)
         else:
@@ -180,10 +184,15 @@ class GatherConvND(nn.Module):
             
             x_head = x_flat[..., h * D : (h + 1) * D]
             out_h = output[:, :, h * D : (h + 1) * D]
-            sample_idx_h = sample_idx[:, :, h, :]
+            sample_floor_h = sample_floor[:, :, h, :]
+            sample_ceil_h = sample_ceil[:, :, h, :]
+            sample_frac_h = sample_frac[:, :, h, :]
             
             for s in range(S):
-                val_s = x_head[batch_idx[:, :, h, s], sample_idx_h[:, :, s]]
+                val_floor = x_head[batch_idx[:, :, h, s], sample_floor_h[:, :, s]]
+                val_ceil = x_head[batch_idx[:, :, h, s], sample_ceil_h[:, :, s]]
+                frac = sample_frac_h[:, :, s : s + 1]
+                val_s = val_floor * (1.0 - frac) + val_ceil * frac
                 out_h.addcmul_(kernel_h[:, :, s : s + 1], val_s)
         
         return output

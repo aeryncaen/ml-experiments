@@ -140,11 +140,16 @@ if HAS_TRITON:
         
         for s_idx in range(S):
             s_off = s_idx - half_s
-            # Use absolute position for sampling
             sample_pos_f = pid_l + s_off * freq_h + phase_h
             
+            # Soft indexing: interpolate between floor and ceil positions
+            pos_clamped = tl.maximum(tl.minimum(sample_pos_f, L - 1.001), 0.0)
+            pos_floor = tl.floor(pos_clamped).to(tl.int32)
+            pos_ceil = tl.minimum(pos_floor + 1, L - 1)
+            pos_frac = pos_clamped - pos_floor.to(tl.float32)
+            
             valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
-            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
+            valid_f = valid.to(tl.float32)
             
             rel_pos = tl.abs(s_off * freq_h)
             norm_pos = rel_pos / max_receptive
@@ -160,11 +165,14 @@ if HAS_TRITON:
             k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
             k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
-            kernel_w = kernel_w * valid.to(tl.float32)
+            kernel_w = kernel_w * valid_f
             
-            # Read from full x using absolute position
-            val_base = pid_b * L * C + sample_idx * C + pid_h * D
-            vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
+            # Soft gather: interpolate between floor and ceil values
+            val_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
+            val_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
+            vals_floor = tl.load(x_ptr + val_base_floor + d_offs, mask=d_mask, other=0.0)
+            vals_ceil = tl.load(x_ptr + val_base_ceil + d_offs, mask=d_mask, other=0.0)
+            vals = vals_floor * (1.0 - pos_frac) + vals_ceil * pos_frac
             out_h += vals * kernel_w
         
         # Write to chunk output using local position
@@ -175,7 +183,7 @@ if HAS_TRITON:
     def gather_conv_bwd_kernel(
         x_ptr, d_out_ptr, d_x_ptr,
         freq_ptr, phase_ptr, kernel_ptr,
-        d_freq_ptr, d_kernel_ptr,
+        d_freq_ptr, d_phase_ptr, d_kernel_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive,
@@ -186,9 +194,8 @@ if HAS_TRITON:
         pid_l_local = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        pid_l = chunk_start + pid_l_local  # Absolute position
+        pid_l = chunk_start + pid_l_local
         
-        # freq/phase/kernel/d_out stored per-chunk
         freq_off = pid_b * chunk_len * H + pid_l_local * H + pid_h
         freq_h = tl.load(freq_ptr + freq_off)
         phase_h = tl.load(phase_ptr + freq_off)
@@ -204,16 +211,21 @@ if HAS_TRITON:
         d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
         
         d_freq_acc = 0.0
+        d_phase_acc = 0.0
         d_kernel_acc = tl.zeros((K,), dtype=tl.float32)
         
         for s_idx in range(S):
             s_off = s_idx - half_s
-            # Use absolute position for sampling
             sample_pos_f = pid_l + s_off * freq_h + phase_h
+            
+            # Soft indexing with floor/ceil interpolation
+            pos_clamped = tl.maximum(tl.minimum(sample_pos_f, L - 1.001), 0.0)
+            pos_floor = tl.floor(pos_clamped).to(tl.int32)
+            pos_ceil = tl.minimum(pos_floor + 1, L - 1)
+            pos_frac = pos_clamped - pos_floor.to(tl.float32)
             
             valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
             valid_f = valid.to(tl.float32)
-            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
             
             rel_pos = tl.abs(s_off * freq_h)
             norm_pos = rel_pos / max_receptive
@@ -232,29 +244,47 @@ if HAS_TRITON:
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
             kernel_w = kernel_w * valid_f
             
-            # Read from full x using absolute position
-            val_base = pid_b * L * C + sample_idx * C + pid_h * D
-            vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
+            # Load values from floor and ceil positions
+            val_base_floor = pid_b * L * C + pos_floor * C + pid_h * D
+            val_base_ceil = pid_b * L * C + pos_ceil * C + pid_h * D
+            vals_floor = tl.load(x_ptr + val_base_floor + d_offs, mask=d_mask, other=0.0)
+            vals_ceil = tl.load(x_ptr + val_base_ceil + d_offs, mask=d_mask, other=0.0)
+            vals = vals_floor * (1.0 - pos_frac) + vals_ceil * pos_frac
             
-            # d_x via atomic add to full d_x
-            d_x_contrib = d_out_h * kernel_w
-            tl.atomic_add(d_x_ptr + val_base + d_offs, d_x_contrib, mask=d_mask)
+            # d_x: distribute to both floor and ceil positions
+            d_vals = d_out_h * kernel_w
+            d_vals_floor = d_vals * (1.0 - pos_frac)
+            d_vals_ceil = d_vals * pos_frac
+            tl.atomic_add(d_x_ptr + val_base_floor + d_offs, d_vals_floor, mask=d_mask)
+            tl.atomic_add(d_x_ptr + val_base_ceil + d_offs, d_vals_ceil, mask=d_mask)
+            
+            # d_pos_frac from soft interpolation: d_frac = d_out * kernel_w * (vals_ceil - vals_floor)
+            d_pos_frac = tl.sum(d_out_h * kernel_w * (vals_ceil - vals_floor))
             
             # d_kernel
             d_kernel_w = tl.sum(d_out_h * vals) * valid_f
             d_kernel_acc += tl.where(k_offs == idx_floor, d_kernel_w * w_floor, 0.0)
             d_kernel_acc += tl.where(k_offs == idx_ceil, d_kernel_w * w_ceil, 0.0)
             
-            # d_freq
+            # d_freq from kernel interpolation
             d_w_ceil = d_kernel_w * (k_ceil - k_floor)
             d_norm_pos = d_w_ceil * (K - 1)
             d_rel_pos = d_norm_pos / max_receptive * not_clamped
             s_off_f = s_off * 1.0
-            d_freq_acc += d_rel_pos * tl.abs(s_off_f)
+            d_freq_kernel = d_rel_pos * tl.abs(s_off_f)
+            
+            # d_freq and d_phase from position interpolation
+            # sample_pos = center + s_off * freq + phase
+            # d_freq += d_pos_frac * s_off, d_phase += d_pos_frac
+            d_freq_pos = d_pos_frac * s_off_f * valid_f
+            d_phase_pos = d_pos_frac * valid_f
+            
+            d_freq_acc += d_freq_kernel + d_freq_pos
+            d_phase_acc += d_phase_pos
         
-        # Store to chunk-sized outputs
         tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
         tl.store(d_freq_ptr + freq_off, d_freq_acc)
+        tl.store(d_phase_ptr + freq_off, d_phase_acc)
 
     # ========== Backward kernels for linear layers ==========
     @triton.jit
@@ -590,13 +620,14 @@ class _GatherConvTriton(torch.autograd.Function):
             
             # === Backward through gather-conv ===
             d_freq_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
+            d_phase_chunk = torch.zeros(B, chunk_len, H, device=x.device, dtype=x.dtype)
             d_kernel_chunk = torch.zeros(B, chunk_len, H, K, device=x.device, dtype=x.dtype)
             
             grid = (B, chunk_len, H)
             gather_conv_bwd_kernel[grid](
-                x, d_hidden_chunk.contiguous(), d_x,  # d_x accumulates via atomics
+                x, d_hidden_chunk.contiguous(), d_x,
                 freq_chunk.contiguous(), phase_chunk.contiguous(), kernel_chunk.contiguous(),
-                d_freq_chunk, d_kernel_chunk,
+                d_freq_chunk, d_phase_chunk, d_kernel_chunk,
                 B, L, C, H, D, S, K, half_s, max_receptive,
                 start, chunk_len, BLOCK_D,
             )
@@ -633,8 +664,12 @@ class _GatherConvTriton(torch.autograd.Function):
             d_x[:, start:end, :] += d_x_kernel_chunk.view(B, chunk_len, C)
             
             # === Backward through wave_proj ===
+            # freq = sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
+            # d_freq_pre = d_freq * (max_freq - min_freq) * sigmoid'(freq_pre)
             d_freq_pre = d_freq_chunk * (max_freq - min_freq) * sig_freq * (1.0 - sig_freq)
-            d_phase_pre = torch.zeros_like(phase_pre)
+            # phase = tanh(phase_pre) * max_freq
+            # d_phase_pre = d_phase * max_freq * tanh'(phase_pre) = d_phase * max_freq * (1 - tanh^2)
+            d_phase_pre = d_phase_chunk * max_freq * (1.0 - tanh_phase * tanh_phase)
             d_wave_out = torch.stack([d_freq_pre, d_phase_pre], dim=2).view(M_chunk, 2 * H)
             
             wave_pre = triton_linear(x_chunk, wave_w) + wave_b  # Must include bias!

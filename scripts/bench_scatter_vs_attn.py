@@ -25,6 +25,7 @@ from heuristic_secrets.models.scatter_attention import (
 )
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
+from heuristic_secrets.models.gatherconv import GatherConvND
 from heuristic_secrets.data.synthetic import load_task, TASKS
 
 
@@ -151,6 +152,21 @@ class ConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm1(x).transpose(1, 2)
         h = self.pointwise(self.depthwise(h)).transpose(1, 2)
+        x = x + h
+        return x
+
+
+class GatherConvBlock(nn.Module):
+    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = RMSNorm(width)
+        self.gather_conv = GatherConvND(
+            channels=width, ndim=1, max_samples=max_samples,
+            num_heads=num_heads, use_triton=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, _ = self.gather_conv(self.norm1(x))
         x = x + h
         return x
 
@@ -832,6 +848,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
     WIDTH_CONV = 70
+    WIDTH_GATHER = 64
     
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -845,6 +862,9 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'gather':
+        block_fn = lambda: GatherConvBlock(WIDTH_GATHER, num_heads=num_channels)
+        width = WIDTH_GATHER
     elif model_type == 'ripple':
         return RippleClassifierND(
             embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
@@ -948,6 +968,7 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     WIDTH_HIER = 128
     WIDTH_SGSB = 128
     WIDTH_CONV = 140
+    WIDTH_GATHER = 128
 
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -961,6 +982,9 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'gather':
+        block_fn = lambda: GatherConvBlock(WIDTH_GATHER, num_heads=num_channels)
+        width = WIDTH_GATHER
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
@@ -974,6 +998,7 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     WIDTH_HIER = 64
     WIDTH_SGSB = 64
     WIDTH_CONV = 70
+    WIDTH_GATHER = 64
 
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -987,6 +1012,9 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
     elif model_type == 'conv':
         block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
         width = WIDTH_CONV
+    elif model_type == 'gather':
+        block_fn = lambda: GatherConvBlock(WIDTH_GATHER, num_heads=num_channels)
+        width = WIDTH_GATHER
     elif model_type == 'ripple':
         return RippleClassifierND(
             embed_dim=WIDTH_SGSB, n_classes=n_classes, n_layers=layers,
