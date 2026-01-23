@@ -60,7 +60,9 @@ class GatherConvND(nn.Module):
         H = num_heads
         
         self.wave_proj = nn.Linear(channels, 2 * H)
+        self.wave_gamma = nn.Parameter(torch.ones(2 * H))
         self.kernel_proj = nn.Linear(channels, H * max_kernel_size)
+        self.kernel_gamma = nn.Parameter(torch.ones(H * max_kernel_size))
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
         samples_per_dim = max(3, int(max_samples ** (1.0 / ndim)))

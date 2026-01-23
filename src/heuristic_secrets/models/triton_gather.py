@@ -609,16 +609,19 @@ class _GatherConvTriton(torch.autograd.Function):
         BLOCK_D = triton.next_power_of_2(D)
         chunk_size = min(ctx.chunk_size, L)
         
-        x, wave_w, wave_b, kernel_w, kernel_b, out_w = ctx.saved_tensors
+        x, wave_w, wave_b, wave_gamma, kernel_w, kernel_b, kernel_gamma, out_w = ctx.saved_tensors
         
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        eps = 1e-5  # RMSNorm epsilon
         
         # Initialize gradient accumulators
         d_x = torch.zeros_like(x)
         d_wave_w = torch.zeros_like(wave_w)
         d_wave_b = torch.zeros_like(wave_b)
+        d_wave_gamma = torch.zeros_like(wave_gamma)
         d_kernel_w = torch.zeros_like(kernel_w)
         d_kernel_b = torch.zeros_like(kernel_b)
+        d_kernel_gamma = torch.zeros_like(kernel_gamma)
         d_out_w = torch.zeros_like(out_w)
         
         # Process backward in chunks
@@ -631,16 +634,24 @@ class _GatherConvTriton(torch.autograd.Function):
             d_out_chunk = d_out[:, start:end, :].reshape(M_chunk, C)
             
             # === Recompute forward for this chunk ===
-            wave_out = triton_linear_silu(x_chunk, wave_w, wave_b).view(B, chunk_len, 2, H)
+            # wave_proj: linear -> RMSNorm -> SiLU
+            wave_linear = triton_linear(x_chunk, wave_w) + wave_b
+            wave_rrms = 1.0 / torch.sqrt((wave_linear ** 2).mean(dim=-1, keepdim=True) + eps)
+            wave_normed = wave_linear * wave_rrms * wave_gamma
+            wave_out = (wave_normed * torch.sigmoid(wave_normed)).view(B, chunk_len, 2, H)
+            
             freq_pre = wave_out[:, :, 0, :]
             phase_pre = wave_out[:, :, 1, :]
             sig_freq = torch.sigmoid(freq_pre)
             freq_chunk = sig_freq * (max_freq - min_freq) + min_freq
-            exp2p = torch.exp(2.0 * phase_pre)
-            tanh_phase = (exp2p - 1.0) / (exp2p + 1.0)
+            tanh_phase = torch.tanh(phase_pre)
             phase_chunk = tanh_phase * max_freq
             
-            kernel_out = triton_linear_silu(x_chunk, kernel_w, kernel_b)
+            # kernel_proj: linear -> RMSNorm -> SiLU
+            kernel_linear = triton_linear(x_chunk, kernel_w) + kernel_b
+            kernel_rrms = 1.0 / torch.sqrt((kernel_linear ** 2).mean(dim=-1, keepdim=True) + eps)
+            kernel_normed = kernel_linear * kernel_rrms * kernel_gamma
+            kernel_out = kernel_normed * torch.sigmoid(kernel_normed)
             kernel_chunk = kernel_out.view(B, chunk_len, H, K)
             
             # Recompute hidden for chunk
@@ -694,11 +705,21 @@ class _GatherConvTriton(torch.autograd.Function):
                 start, chunk_len, BLOCK_D,
             )
             
-            # === Backward through kernel_proj ===
-            kernel_pre = triton_linear(x_chunk, kernel_w) + kernel_b  # Must include bias!
-            sig_k = torch.sigmoid(kernel_pre)
+            # === Backward through kernel_proj (SiLU -> RMSNorm -> Linear) ===
             d_kernel_flat = d_kernel_chunk.view(M_chunk, H * K)
-            d_kernel_pre = d_kernel_flat * sig_k * (1.0 + kernel_pre * (1.0 - sig_k))
+            
+            # Backward through SiLU: d_normed = d_out * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+            sig_kernel = torch.sigmoid(kernel_normed)
+            d_kernel_normed = d_kernel_flat * sig_kernel * (1.0 + kernel_normed * (1.0 - sig_kernel))
+            
+            # Backward through RMSNorm
+            # y = x * rrms * gamma  =>  d_gamma = sum(dy * x * rrms), d_x = rrms * (dy * gamma - y_norm * mean(dy * gamma * y_norm))
+            kernel_y_norm = kernel_linear * kernel_rrms
+            d_kernel_gamma += (d_kernel_normed * kernel_y_norm).sum(dim=0)
+            inner_k = (d_kernel_normed * kernel_gamma * kernel_y_norm).mean(dim=-1, keepdim=True)
+            d_kernel_linear = kernel_rrms * (d_kernel_normed * kernel_gamma - kernel_y_norm * inner_k)
+            
+            d_kernel_pre = d_kernel_linear  # For compatibility with existing code below
             
             d_kernel_w_chunk = torch.zeros_like(kernel_w)
             grid = (triton.cdiv(H * K, BLOCK_N), triton.cdiv(C, BLOCK_K))
@@ -725,7 +746,7 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             d_x[:, start:end, :] += d_x_kernel_chunk.view(B, chunk_len, C)
             
-            # === Backward through wave_proj ===
+            # === Backward through wave_proj (sigmoid/tanh -> SiLU -> RMSNorm -> Linear) ===
             # freq = sigmoid(freq_pre) * (max_freq - min_freq) + min_freq
             # d_freq_pre = d_freq * (max_freq - min_freq) * sigmoid'(freq_pre)
             d_freq_pre = d_freq_chunk * (max_freq - min_freq) * sig_freq * (1.0 - sig_freq)
@@ -734,9 +755,17 @@ class _GatherConvTriton(torch.autograd.Function):
             d_phase_pre = d_phase_chunk * max_freq * (1.0 - tanh_phase * tanh_phase)
             d_wave_out = torch.stack([d_freq_pre, d_phase_pre], dim=2).view(M_chunk, 2 * H)
             
-            wave_pre = triton_linear(x_chunk, wave_w) + wave_b  # Must include bias!
-            sig_w = torch.sigmoid(wave_pre)
-            d_wave_pre = d_wave_out * sig_w * (1.0 + wave_pre * (1.0 - sig_w))
+            # Backward through SiLU
+            sig_wave = torch.sigmoid(wave_normed)
+            d_wave_normed = d_wave_out * sig_wave * (1.0 + wave_normed * (1.0 - sig_wave))
+            
+            # Backward through RMSNorm
+            wave_y_norm = wave_linear * wave_rrms
+            d_wave_gamma += (d_wave_normed * wave_y_norm).sum(dim=0)
+            inner_w = (d_wave_normed * wave_gamma * wave_y_norm).mean(dim=-1, keepdim=True)
+            d_wave_linear = wave_rrms * (d_wave_normed * wave_gamma - wave_y_norm * inner_w)
+            
+            d_wave_pre = d_wave_linear  # For compatibility with existing code below
             
             d_wave_w_chunk = torch.zeros_like(wave_w)
             grid = (triton.cdiv(2 * H, BLOCK_N), triton.cdiv(C, BLOCK_K))
@@ -763,7 +792,7 @@ class _GatherConvTriton(torch.autograd.Function):
             )
             d_x[:, start:end, :] += d_x_wave_chunk.view(B, chunk_len, C)
         
-        return d_x, d_wave_w, d_wave_b, d_kernel_w, d_kernel_b, d_out_w, \
+        return d_x, d_wave_w, d_wave_b, d_wave_gamma, d_kernel_w, d_kernel_b, d_kernel_gamma, d_out_w, \
                None, None, None, None, None, None, None  # 7 Nones for H, half_s, max_receptive, max_freq, min_freq, K, chunk_size
 
 
