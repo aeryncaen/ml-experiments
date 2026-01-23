@@ -1167,12 +1167,12 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         def classifier_factory_fn(block_factory, width):
             return RippleClassifier(
                 width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
+                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w)
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
+            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w)
         ).to(device)
     elif model_type == 'flat':
         def block_factory_fn(h):
