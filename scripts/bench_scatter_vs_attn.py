@@ -1608,10 +1608,12 @@ def main():
     for mt in model_types:
         model = builder(mt)
         params = count_params(model)
+        class_name = type(model).__name__
+        cross_layer_str = ' [cross-layer]' if (mt == 'ripple' and args.cross_layer) else ''
         if args.duo:
-            print(f'  {mt:12s}: {params:,} params x2 (duo) = {params*2:,} total')
+            print(f'  {mt:12s}: {params:,} params x2 (duo) = {params*2:,} total ({class_name}){cross_layer_str}')
         else:
-            print(f'  {mt:12s}: {params:,} params')
+            print(f'  {mt:12s}: {params:,} params ({class_name}){cross_layer_str}')
 
     results = {mt: [] for mt in model_types}
 

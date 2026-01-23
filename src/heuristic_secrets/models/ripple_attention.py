@@ -343,6 +343,7 @@ class RippleClassifier(nn.Module):
         if cross_layer:
             self.embed_accum = LayerHistoryAccumulator(width, lowrank_power, eps)
             self.head_cross_attn = CrossLayerAttention(width, num_heads, eps)
+            self.history_decay = nn.Parameter(torch.full((n_layers,), 2.0))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
@@ -350,8 +351,10 @@ class RippleClassifier(nn.Module):
         if self.cross_layer:
             history: list[torch.Tensor] = [self.embed_accum(x)]
             
-            for layer in self.layers:
+            for i, layer in enumerate(self.layers):
                 x, _, x_lowrank = layer(x, history)
+                decay = 0.5 + 0.5 * torch.sigmoid(self.history_decay[i])
+                history = [h * decay for h in history]
                 history.append(x_lowrank)
             
             x = self.head_cross_attn(x, history)
