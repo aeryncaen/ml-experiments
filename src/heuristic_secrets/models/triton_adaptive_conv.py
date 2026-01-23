@@ -86,18 +86,24 @@ if HAS_TRITON:
         H: tl.constexpr, D: tl.constexpr, K: tl.constexpr,
         half_window_max: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        chunk_start,  # offset for chunked processing
+        chunk_len,    # length of current chunk
     ):
         pid_b = tl.program_id(0)
-        pid_l = tl.program_id(1)
+        pid_l = tl.program_id(1)  # local position within chunk [0, chunk_len)
         pid_h = tl.program_id(2)
         
-        hw_off = pid_b * L * H + pid_l * H + pid_h
+        # Absolute position in full sequence
+        abs_l = chunk_start + pid_l
+        
+        # Load from chunk-local tensors (half_win, center_off, kernel are chunk-sized)
+        hw_off = pid_b * chunk_len * H + pid_l * H + pid_h
         half_win = tl.load(half_win_ptr + hw_off)
         half_win = tl.maximum(half_win, 0.5)
         center_off = tl.load(center_off_ptr + hw_off)
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        kernel_base = pid_b * chunk_len * H * K + pid_l * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
         d_offs = tl.arange(0, BLOCK_D)
