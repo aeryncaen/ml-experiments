@@ -196,11 +196,20 @@ class GatherConvND(nn.Module):
         chunk_size = min(self.chunk_size, L)
         
         try:
-            from .triton_gather import gather_conv_fn
+            from .triton_gather import gather_conv_fn, quantize_fp8, quantize_int4, HAS_FP8
         except ImportError:
-            from triton_gather import gather_conv_fn
+            from triton_gather import gather_conv_fn, quantize_fp8, quantize_int4, HAS_FP8
         
         out = torch.empty_like(x)
+        
+        x_q_data = None
+        if self.quantize_bwd and self.training:
+            if HAS_FP8:
+                x_q, x_scale = quantize_fp8(x)
+                x_q_data = (x_q, x_scale, None, True)
+            else:
+                x_q, x_scale, x_min = quantize_int4(x)
+                x_q_data = (x_q, x_scale, x_min, False)
         
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
@@ -216,7 +225,7 @@ class GatherConvND(nn.Module):
             
             hidden_chunk = gather_conv_fn(
                 x, freq.contiguous(), phase.contiguous(), kernel,
-                start, self.max_offset, self.max_receptive, self.quantize_bwd,
+                start, self.max_offset, self.max_receptive, self.quantize_bwd, x_q_data,
             )
             
             out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))

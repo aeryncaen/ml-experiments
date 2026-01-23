@@ -206,7 +206,7 @@ def dequantize_int4(packed: torch.Tensor, scale: torch.Tensor, t_min: torch.Tens
 
 class GatherConvFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive, quantize_bwd):
+    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive, quantize_bwd, x_q_data):
         B, L, C = x.shape
         _, chunk_len, H = freq.shape
         K = kernel.shape[-1]
@@ -230,17 +230,15 @@ class GatherConvFunction(torch.autograd.Function):
         ctx.kernel_shape = kernel.shape
         ctx.orig_dtype = x.dtype
         
-        if quantize_bwd:
-            if HAS_FP8:
-                x_q, x_scale = quantize_fp8(x)
+        if quantize_bwd and x_q_data is not None:
+            x_q, x_scale, x_min, is_fp8 = x_q_data
+            ctx.use_fp8 = is_fp8
+            if is_fp8:
                 kernel_q, kernel_scale = quantize_fp8(kernel)
                 ctx.save_for_backward(x_q, x_scale, freq, phase, kernel_q, kernel_scale)
-                ctx.use_fp8 = True
             else:
-                x_q, x_scale, x_min = quantize_int4(x)
                 kernel_q, kernel_scale, kernel_min = quantize_int4(kernel)
                 ctx.save_for_backward(x_q, x_scale, x_min, freq, phase, kernel_q, kernel_scale, kernel_min)
-                ctx.use_fp8 = False
         else:
             ctx.save_for_backward(x, freq, phase, kernel)
         
@@ -293,7 +291,7 @@ class GatherConvFunction(torch.autograd.Function):
             chunk_start, chunk_len, BLOCK_D,
         )
         
-        return d_x, d_freq, None, d_kernel, None, None, None, None
+        return d_x, d_freq, None, d_kernel, None, None, None, None, None
 
 
 gather_conv_fn = GatherConvFunction.apply
@@ -358,7 +356,7 @@ class TritonGatherConv(nn.Module):
             
             hidden_chunk = gather_conv_fn(
                 x, freq.contiguous(), phase.contiguous(), kernel,
-                start, self.half_s, self.max_receptive,
+                start, self.half_s, self.max_receptive, False, None,
             )
             
             out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
