@@ -37,6 +37,13 @@ SPEECHCOMMANDS_LABELS = [
 ]
 
 
+class PackRGB:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        r, g, b = (x * 255).to(torch.int32).unbind(0)
+        packed = (r << 16) | (g << 8) | b
+        return (packed.float() / 16777215.0) * 2 - 1
+
+
 class SpeechCommandsDataset(Dataset):
     def __init__(self, root: str, subset: str, seq_len: int = 16000):
         self.dataset = torchaudio.datasets.SPEECHCOMMANDS(root, download=True, subset=subset)
@@ -1166,85 +1173,49 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         n_classes, seq_len, img_size = 10, 784, (28, 28)
 
     elif name == 'cifar10':
-        if mode_3d:
-            if no_augment:
-                train_transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-                ])
-            else:
-                train_transform = transforms.Compose([
-                    transforms.RandomCrop(32, padding=4),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-                ])
-            test_transform = transforms.Compose([
+        if no_augment:
+            train_transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+                PackRGB(),
             ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                PackRGB(),
+            ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            PackRGB(),
+        ])
+        if mode_3d:
             n_classes, seq_len, img_size = 10, 3072, (32, 32, 3)
         else:
-            if no_augment:
-                train_transform = transforms.Compose([
-                    transforms.Grayscale(),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4734,), (0.2516,))
-                ])
-            else:
-                train_transform = transforms.Compose([
-                    transforms.Grayscale(),
-                    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4734,), (0.2516,))
-                ])
-            test_transform = transforms.Compose([
-                transforms.Grayscale(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4734,), (0.2516,))
-            ])
             n_classes, seq_len, img_size = 10, 1024, (32, 32)
         train_data = datasets.CIFAR10('data', train=True, download=True, transform=train_transform)
         test_data = datasets.CIFAR10('data', train=False, download=True, transform=test_transform)
 
     elif name == 'cifar100':
-        if mode_3d:
-            if no_augment:
-                train_transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-                ])
-            else:
-                train_transform = transforms.Compose([
-                    transforms.RandomCrop(32, padding=4),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-                ])
-            test_transform = transforms.Compose([
+        if no_augment:
+            train_transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                PackRGB(),
             ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                PackRGB(),
+            ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            PackRGB(),
+        ])
+        if mode_3d:
             n_classes, seq_len, img_size = 100, 3072, (32, 32, 3)
         else:
-            if no_augment:
-                train_transform = transforms.Compose([
-                    transforms.Grayscale(),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4734,), (0.2516,))
-                ])
-            else:
-                train_transform = transforms.Compose([
-                    transforms.Grayscale(),
-                    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.4734,), (0.2516,))
-                ])
-            test_transform = transforms.Compose([
-                transforms.Grayscale(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4734,), (0.2516,))
-            ])
             n_classes, seq_len, img_size = 100, 1024, (32, 32)
         train_data = datasets.CIFAR100('data', train=True, download=True, transform=train_transform)
         test_data = datasets.CIFAR100('data', train=False, download=True, transform=test_transform)

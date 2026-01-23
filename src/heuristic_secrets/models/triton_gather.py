@@ -331,8 +331,8 @@ if HAS_TRITON:
             # d_exponent: d_power_weight/d_exponent = -power_weight * log(1 + norm_dist)
             # d_exponent = d_kernel_w_total * d_power_weight/d_exponent * kernel_interp * valid_f
             d_total_w = tl.sum(d_out_h * vals) * valid_f
-            log_term = tl.log(one_plus_dist + 1e-6)  # eps for stability when dist ≈ 0
-            d_exponent_acc += d_total_w * kernel_interp * (-power_weight * log_term)
+            # log_one_plus_dist already computed above
+            d_exponent_acc += d_total_w * kernel_interp * (-power_weight * log_one_plus_dist)
             
             # d_freq from kernel interpolation
             d_w_ceil = d_kernel_w * (k_ceil - k_floor)
