@@ -1,6 +1,5 @@
 """
 AdaptiveLocalConv: Per-position learned window size, offset, and kernel weights.
-Each position learns: receptive field width, center offset, and kernel weights.
 """
 
 from __future__ import annotations
@@ -75,12 +74,14 @@ class AdaptiveLocalConv(nn.Module):
         max_window = min(int(math.sqrt(L)), K)
         half_window_max = max_window // 2
         max_offset = int(math.sqrt(L))
+        num_offsets = 2 * half_window_max + 1
         
         # Predict window sizes: (B, L, H) in [min_window, max_window]
         window_pre = self.window_proj(x)
         window_normed = llama_rmsnorm(window_pre, self.window_gamma)
         window_raw = torch.sigmoid(window_normed)
         window_sizes = self.min_window + window_raw * (max_window - self.min_window)
+        half_windows = window_sizes / 2
         
         # Predict center offsets: (B, L, H) in [-max_offset, +max_offset]
         offset_pre = self.offset_proj(x)
@@ -92,73 +93,71 @@ class AdaptiveLocalConv(nn.Module):
         kernel_normed = llama_rmsnorm(kernel_pre, self.kernel_gamma)
         kernel_weights = F.silu(kernel_normed).view(B, L, H, K)
         
-        # Project values: (B, L, H, D)
-        v = self.v_proj(x).view(B, L, H, D)
+        # Project values: (B, L, C) -> index as (B, L, H, D)
+        v = self.v_proj(x)
         
-        # Build neighbor offsets (relative to window center)
+        # Positions for indexing
+        positions = torch.arange(L, device=x.device, dtype=x.dtype)
+        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(B, L, 1)
+        
+        # Local offsets: -half_window_max to +half_window_max
         local_offsets = torch.arange(-half_window_max, half_window_max + 1, device=x.device, dtype=x.dtype)
-        num_offsets = local_offsets.shape[0]
         
-        # Neighbor positions = position + center_offset + local_offset
-        # positions: (L,), center_offsets: (B, L, H), local_offsets: (num_offsets,)
-        positions = torch.arange(L, device=x.device, dtype=x.dtype).view(1, L, 1, 1)
-        center_offsets_expanded = center_offsets.unsqueeze(-1)  # (B, L, H, 1)
-        local_offsets_expanded = local_offsets.view(1, 1, 1, num_offsets)
-        
-        neighbor_positions = positions + center_offsets_expanded + local_offsets_expanded  # (B, L, H, num_offsets)
-        
-        # Valid mask and clamped positions for gathering
-        valid_mask = (neighbor_positions >= 0) & (neighbor_positions < L)
-        neighbor_positions_clamped = neighbor_positions.clamp(0, L - 1)
-        
-        # Soft window mask based on distance from window center (not from self)
-        # rel_dist: 0 at window center, 1 at window edge
-        abs_local_offsets = local_offsets.abs().view(1, 1, 1, num_offsets)
-        half_windows = (window_sizes / 2).unsqueeze(-1)
-        rel_dist = abs_local_offsets / (half_windows + 1e-6)
-        
+        output = torch.zeros(B, L, C, device=x.device, dtype=x.dtype)
         sharpness = 5.0
-        window_mask = torch.sigmoid(sharpness * (1.0 - rel_dist)) * valid_mask.float()
         
-        # Interpolate kernel weights by relative position in window
-        kernel_idx_float = rel_dist.clamp(0, 1) * (K - 1)
-        idx_floor = kernel_idx_float.long().clamp(0, K - 2)
-        idx_ceil = idx_floor + 1
-        w_ceil = kernel_idx_float - idx_floor.float()
-        w_floor = 1.0 - w_ceil
+        for h in range(H):
+            v_head = v[..., h * D : (h + 1) * D]
+            out_head = output[..., h * D : (h + 1) * D]
+            
+            center_off_h = center_offsets[:, :, h]
+            half_win_h = half_windows[:, :, h]
+            kernel_h = kernel_weights[:, :, h, :]
+            
+            weight_sum = torch.zeros(B, L, 1, device=x.device, dtype=x.dtype)
+            
+            for s_idx, s_off in enumerate(local_offsets.tolist()):
+                # Neighbor position = self + center_offset + local_offset
+                neighbor_pos = positions.view(1, L) + center_off_h + s_off
+                
+                # Valid mask
+                valid = (neighbor_pos >= 0) & (neighbor_pos < L)
+                valid_f = valid.float().unsqueeze(-1)
+                
+                # Soft window mask based on distance from window center
+                rel_dist = abs(s_off) / (half_win_h + 1e-6)
+                window_mask = torch.sigmoid(sharpness * (1.0 - rel_dist)).unsqueeze(-1)
+                
+                # Kernel interpolation based on relative distance
+                norm_pos = (rel_dist.clamp(0, 1) * (K - 1)).unsqueeze(-1)
+                idx_floor = norm_pos.long().clamp(0, K - 2)
+                idx_ceil = idx_floor + 1
+                w_ceil = norm_pos - idx_floor.float()
+                w_floor = 1.0 - w_ceil
+                
+                k_floor = kernel_h.gather(-1, idx_floor)
+                k_ceil = kernel_h.gather(-1, idx_ceil)
+                kernel_w = (k_floor * w_floor + k_ceil * w_ceil).squeeze(-1)
+                
+                # Combined weight
+                weight = kernel_w * window_mask.squeeze(-1) * valid_f.squeeze(-1)
+                weight_sum += weight.unsqueeze(-1)
+                
+                # Bilinear gather
+                pos_clamped = neighbor_pos.clamp(0, L - 1.001)
+                pos_floor = pos_clamped.floor().long().clamp(0, L - 1)
+                pos_ceil = (pos_floor + 1).clamp(0, L - 1)
+                pos_frac = (pos_clamped - pos_floor.float()).unsqueeze(-1)
+                
+                val_floor = v_head[batch_idx.expand(B, L, D), pos_floor.unsqueeze(-1).expand(B, L, D)]
+                val_ceil = v_head[batch_idx.expand(B, L, D), pos_ceil.unsqueeze(-1).expand(B, L, D)]
+                val = val_floor * (1.0 - pos_frac) + val_ceil * pos_frac
+                
+                out_head.addcmul_(weight.unsqueeze(-1), val)
+            
+            # Normalize
+            out_head.div_(weight_sum + 1e-6)
         
-        k_floor = kernel_weights.gather(-1, idx_floor)
-        k_ceil = kernel_weights.gather(-1, idx_ceil)
-        kernel_interp = k_floor * w_floor + k_ceil * w_ceil
-        
-        # Final attention: kernel * window_mask, normalized
-        attn_weights = kernel_interp * window_mask
-        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        
-        # Bilinear interpolation for gathering (since positions are continuous)
-        pos_floor = neighbor_positions_clamped.floor().long().clamp(0, L - 1)
-        pos_ceil = (pos_floor + 1).clamp(0, L - 1)
-        pos_frac = neighbor_positions_clamped - pos_floor.float()
-        
-        # Gather values at floor and ceil positions
-        v_flat = v.transpose(1, 2).reshape(B * H, L, D)
-        
-        floor_idx = pos_floor.permute(0, 2, 1, 3).reshape(B * H, L * num_offsets)
-        ceil_idx = pos_ceil.permute(0, 2, 1, 3).reshape(B * H, L * num_offsets)
-        
-        v_floor = v_flat.gather(1, floor_idx.unsqueeze(-1).expand(-1, -1, D))
-        v_ceil = v_flat.gather(1, ceil_idx.unsqueeze(-1).expand(-1, -1, D))
-        
-        v_floor = v_floor.view(B * H, L, num_offsets, D)
-        v_ceil = v_ceil.view(B * H, L, num_offsets, D)
-        
-        pos_frac_flat = pos_frac.permute(0, 2, 1, 3).reshape(B * H, L, num_offsets, 1)
-        v_neighbors = v_floor * (1 - pos_frac_flat) + v_ceil * pos_frac_flat
-        v_neighbors = v_neighbors.view(B, H, L, num_offsets, D).permute(0, 2, 1, 3, 4)
-        
-        # Apply attention: (B, L, H, D)
-        output = (attn_weights.unsqueeze(-1) * v_neighbors).sum(dim=3)
-        output = output.reshape(B, L, C)
         output = F.silu(self.out_proj(output))
         
         return output, {
