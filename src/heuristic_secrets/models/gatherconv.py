@@ -104,7 +104,10 @@ class GatherConvND(nn.Module):
         K = self.max_kernel_size
         chunk_len = chunk_end - chunk_start
         
-        wave_params = F.silu(self.wave_proj(x_chunk)).view(B, chunk_len, 2, H)
+        # wave_proj: linear -> RMSNorm -> SiLU
+        wave_pre = self.wave_proj(x_chunk)
+        wave_normed = F.rms_norm(wave_pre, (wave_pre.shape[-1],), self.wave_gamma)
+        wave_params = F.silu(wave_normed).view(B, chunk_len, 2, H)
         
         freq_raw = wave_params[:, :, 0, :]
         phase_raw = wave_params[:, :, 1, :]
@@ -157,7 +160,10 @@ class GatherConvND(nn.Module):
         
         batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1, 1).expand(B, chunk_len, H, S)
         
-        kernel_max = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K)
+        # kernel_proj: linear -> RMSNorm -> SiLU
+        kernel_pre = self.kernel_proj(x_chunk)
+        kernel_normed = F.rms_norm(kernel_pre, (kernel_pre.shape[-1],), self.kernel_gamma)
+        kernel_max = F.silu(kernel_normed).view(B, chunk_len, H, K)
         
         norm_pos = rel_pos.abs() / self.max_receptive
         norm_pos = norm_pos.clamp(0, 1)
@@ -206,8 +212,10 @@ class GatherConvND(nn.Module):
             x,
             self.wave_proj.weight,    # (2*H, C)
             self.wave_proj.bias,      # (2*H,)
+            self.wave_gamma,          # (2*H,)
             self.kernel_proj.weight,  # (H*K, C)
             self.kernel_proj.bias,    # (H*K,)
+            self.kernel_gamma,        # (H*K,)
             self.out_proj.weight,     # (C, C)
             self.num_heads,
             self.max_offset,
