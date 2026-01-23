@@ -43,10 +43,12 @@ class GatherConvND(nn.Module):
         chunk_size: int = 768,
         checkpoint: bool = True,
         use_triton: bool = True,
+        quantize_bwd: bool = False,
     ):
         super().__init__()
         self.checkpoint = checkpoint
         self.use_triton = use_triton and HAS_TRITON and ndim == 1
+        self.quantize_bwd = quantize_bwd
         self.channels = channels
         self.ndim = ndim
         self.max_samples = max_samples
@@ -214,7 +216,7 @@ class GatherConvND(nn.Module):
             
             hidden_chunk = gather_conv_fn(
                 x, freq.contiguous(), phase.contiguous(), kernel,
-                start, self.max_offset, self.max_receptive,
+                start, self.max_offset, self.max_receptive, self.quantize_bwd,
             )
             
             out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
@@ -302,9 +304,15 @@ if __name__ == "__main__":
     
     gather_triton = GatherConvND(
         channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads, 
-        checkpoint=True, use_triton=True
+        checkpoint=True, use_triton=True, quantize_bwd=False
     ).to(device)
     gather_triton.train()
+    
+    gather_triton_q = GatherConvND(
+        channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads, 
+        checkpoint=True, use_triton=True, quantize_bwd=True
+    ).to(device)
+    gather_triton_q.train()
     
     gather_pytorch = GatherConvND(
         channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads,
@@ -358,9 +366,29 @@ if __name__ == "__main__":
         print(f"wave_proj grad match: {'PASS' if wave_grad_match else 'FAIL'}")
         print(f"kernel_proj grad match: {'PASS' if kernel_grad_match else 'FAIL'}")
         
+        gather_triton_q.load_state_dict(gather_triton.state_dict())
+        x_test_q = x_test.clone().requires_grad_(True)
+        gather_triton_q.zero_grad()
+        out_q, _ = gather_triton_q(x_test_q)
+        out_q.sum().backward()
+        
+        wave_grad_q = gather_triton_q.wave_proj.weight.grad.abs().sum().item()
+        kernel_grad_q = gather_triton_q.kernel_proj.weight.grad.abs().sum().item()
+        q_wave_ok = abs(wave_grad_q - wave_grad_tr) / (wave_grad_tr + 1e-8) < 0.5
+        q_kernel_ok = abs(kernel_grad_q - kernel_grad_tr) / (kernel_grad_tr + 1e-8) < 0.5
+        
+        try:
+            from .triton_gather import HAS_FP8
+        except ImportError:
+            from triton_gather import HAS_FP8
+        q_type = "FP8" if HAS_FP8 else "INT4"
+        print(f"Quantized ({q_type}) wave_proj grad: {'PASS' if q_wave_ok else 'FAIL'} ({wave_grad_q:.2e} vs {wave_grad_tr:.2e})")
+        print(f"Quantized ({q_type}) kernel_proj grad: {'PASS' if q_kernel_ok else 'FAIL'} ({kernel_grad_q:.2e} vs {kernel_grad_tr:.2e})")
+        
         gather_triton.zero_grad()
+        gather_triton_q.zero_grad()
         gather_pytorch.zero_grad()
-        del x_test, x_test_tr, x_test_pt, out_triton, out_pytorch, out_tr, out_pt
+        del x_test, x_test_tr, x_test_pt, x_test_q, out_triton, out_pytorch, out_tr, out_pt, out_q
         if device == "cuda":
             torch.cuda.empty_cache()
     else:
@@ -450,27 +478,34 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
         return fwd, bwd, fwd_mem, bwd_mem
     
-    triton_label = "GatherConv (Triton)" if gather_triton.use_triton else "GatherConv (PyTorch*)"
+    triton_label = "Triton" if gather_triton.use_triton else "PyTorch*"
+    triton_q_label = "Triton+Q" if gather_triton_q.use_triton else "PyTorch*"
     
-    print("=" * 130)
-    print(f"{'':>8} | {triton_label:^28} | {'GatherConv (PyTorch)':^28} | {'SDPA Full Attention':^28}")
-    print(f"{'SeqLen':>8} | {'Fwd':>6} {'Bwd':>6} {'FMB':>6} {'BMB':>6} | {'Fwd':>6} {'Bwd':>6} {'FMB':>6} {'BMB':>6} | {'Fwd':>6} {'Bwd':>6} {'FMB':>6} {'BMB':>6}")
-    print("=" * 130)
+    print("=" * 166)
+    print(f"{'':>8} | {triton_label:^20} | {triton_q_label:^20} | {'PyTorch':^20} | {'SDPA':^20}")
+    print(f"{'SeqLen':>8} | {'Fwd':>4} {'Bwd':>4} {'FM':>4} {'BM':>5} | {'Fwd':>4} {'Bwd':>4} {'FM':>4} {'BM':>5} | {'Fwd':>4} {'Bwd':>4} {'FM':>4} {'BM':>5} | {'Fwd':>4} {'Bwd':>4} {'FM':>4} {'BM':>5}")
+    print("=" * 166)
     
     for L in seq_lengths:
         tr_fwd, tr_bwd, tr_fwd_mem, tr_bwd_mem = run_bench(gather_triton, "triton", L, is_gather=True)
+        tq_fwd, tq_bwd, tq_fwd_mem, tq_bwd_mem = run_bench(gather_triton_q, "triton_q", L, is_gather=True)
         pt_fwd, pt_bwd, pt_fwd_mem, pt_bwd_mem = run_bench(gather_pytorch, "pytorch", L, is_gather=True)
         sd_fwd, sd_bwd, sd_fwd_mem, sd_bwd_mem = run_bench(sdp_attn, "sdpa", L, is_gather=False)
         
         def fmt(v):
-            return f"{v:>6.1f}" if isinstance(v, float) else f"{v:>6}"
+            return f"{v:>4.0f}" if isinstance(v, float) else f"{v:>4}"
         def fmt_mem(v):
-            return f"{v:>6.0f}" if isinstance(v, float) else f"{v:>6}"
+            return f"{v:>4.0f}" if isinstance(v, float) else f"{v:>4}"
         
-        print(f"{L:>8} | {fmt(tr_fwd)} {fmt(tr_bwd)} {fmt_mem(tr_fwd_mem)} {fmt_mem(tr_bwd_mem)} | {fmt(pt_fwd)} {fmt(pt_bwd)} {fmt_mem(pt_fwd_mem)} {fmt_mem(pt_bwd_mem)} | {fmt(sd_fwd)} {fmt(sd_bwd)} {fmt_mem(sd_fwd_mem)} {fmt_mem(sd_bwd_mem)}")
+        print(f"{L:>8} | {fmt(tr_fwd)} {fmt(tr_bwd)} {fmt_mem(tr_fwd_mem)} {fmt_mem(tr_bwd_mem):>5} | {fmt(tq_fwd)} {fmt(tq_bwd)} {fmt_mem(tq_fwd_mem)} {fmt_mem(tq_bwd_mem):>5} | {fmt(pt_fwd)} {fmt(pt_bwd)} {fmt_mem(pt_fwd_mem)} {fmt_mem(pt_bwd_mem):>5} | {fmt(sd_fwd)} {fmt(sd_bwd)} {fmt_mem(sd_fwd_mem)} {fmt_mem(sd_bwd_mem):>5}")
     
-    print("=" * 130)
+    print("=" * 166)
     print(f"GatherConv params: {sum(p.numel() for p in gather_triton.parameters()):,}")
     print(f"SDPA params: {sum(p.numel() for p in sdp_attn.parameters()):,}")
     if not gather_triton.use_triton:
-        print("* Triton not available, both columns use PyTorch implementation")
+        print("* Triton not available, using PyTorch implementation")
+    try:
+        from .triton_gather import HAS_FP8
+    except ImportError:
+        from triton_gather import HAS_FP8
+    print(f"Quantized backward: {'FP8' if HAS_FP8 else 'INT4'}")

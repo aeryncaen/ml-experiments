@@ -160,9 +160,53 @@ if HAS_TRITON:
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
 
 
+HAS_FP8 = hasattr(torch, 'float8_e4m3fn')
+
+
+def quantize_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = t.abs().max() / 448.0  # E4M3 max is ~448
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    t_scaled = t / scale
+    t_fp8 = t_scaled.to(torch.float8_e4m3fn)
+    return t_fp8, scale
+
+
+def dequantize_fp8(t_fp8: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return t_fp8.to(dtype) * scale
+
+
+def quantize_int4(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    t_min = t.min()
+    t_max = t.max()
+    scale = (t_max - t_min) / 15.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    
+    t_norm = ((t - t_min) / scale).round().clamp(0, 15).to(torch.uint8)
+    
+    t_flat_q = t_norm.flatten()
+    if t_flat_q.numel() % 2 == 1:
+        t_flat_q = F.pad(t_flat_q, (0, 1))
+    packed = (t_flat_q[0::2] << 4) | t_flat_q[1::2]
+    
+    return packed, scale, t_min
+
+
+def dequantize_int4(packed: torch.Tensor, scale: torch.Tensor, t_min: torch.Tensor, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    hi = (packed >> 4).to(dtype)
+    lo = (packed & 0x0F).to(dtype)
+    t_flat = torch.stack([hi, lo], dim=-1).flatten()
+    
+    numel = 1
+    for s in shape:
+        numel *= s
+    t_flat = t_flat[:numel]
+    
+    return (t_flat * scale + t_min).view(shape)
+
+
 class GatherConvFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive):
+    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive, quantize_bwd):
         B, L, C = x.shape
         _, chunk_len, H = freq.shape
         K = kernel.shape[-1]
@@ -181,7 +225,25 @@ class GatherConvFunction(torch.autograd.Function):
             chunk_start, chunk_len, BLOCK_D,
         )
         
-        ctx.save_for_backward(x, freq, phase, kernel)
+        ctx.quantize_bwd = quantize_bwd
+        ctx.x_shape = x.shape
+        ctx.kernel_shape = kernel.shape
+        ctx.orig_dtype = x.dtype
+        
+        if quantize_bwd:
+            if HAS_FP8:
+                x_q, x_scale = quantize_fp8(x)
+                kernel_q, kernel_scale = quantize_fp8(kernel)
+                ctx.save_for_backward(x_q, x_scale, freq, phase, kernel_q, kernel_scale)
+                ctx.use_fp8 = True
+            else:
+                x_q, x_scale, x_min = quantize_int4(x)
+                kernel_q, kernel_scale, kernel_min = quantize_int4(kernel)
+                ctx.save_for_backward(x_q, x_scale, x_min, freq, phase, kernel_q, kernel_scale, kernel_min)
+                ctx.use_fp8 = False
+        else:
+            ctx.save_for_backward(x, freq, phase, kernel)
+        
         ctx.chunk_start = chunk_start
         ctx.half_s = half_s
         ctx.max_receptive = max_receptive
@@ -190,10 +252,22 @@ class GatherConvFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, d_out):
-        x, freq, phase, kernel = ctx.saved_tensors
         chunk_start = ctx.chunk_start
         half_s = ctx.half_s
         max_receptive = ctx.max_receptive
+        dtype = ctx.orig_dtype
+        
+        if ctx.quantize_bwd:
+            if ctx.use_fp8:
+                x_q, x_scale, freq, phase, kernel_q, kernel_scale = ctx.saved_tensors
+                x = dequantize_fp8(x_q, x_scale, dtype)
+                kernel = dequantize_fp8(kernel_q, kernel_scale, dtype)
+            else:
+                x_q, x_scale, x_min, freq, phase, kernel_q, kernel_scale, kernel_min = ctx.saved_tensors
+                x = dequantize_int4(x_q, x_scale, x_min, ctx.x_shape, dtype)
+                kernel = dequantize_int4(kernel_q, kernel_scale, kernel_min, ctx.kernel_shape, dtype)
+        else:
+            x, freq, phase, kernel = ctx.saved_tensors
         
         B, L, C = x.shape
         _, chunk_len, H = freq.shape
@@ -219,7 +293,7 @@ class GatherConvFunction(torch.autograd.Function):
             chunk_start, chunk_len, BLOCK_D,
         )
         
-        return d_x, d_freq, None, d_kernel, None, None, None
+        return d_x, d_freq, None, d_kernel, None, None, None, None
 
 
 gather_conv_fn = GatherConvFunction.apply
