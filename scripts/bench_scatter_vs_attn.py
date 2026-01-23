@@ -681,7 +681,7 @@ class DuoModel(nn.Module):
             raise ValueError(f"Unknown merge strategy: {self.merge}")
 
 
-def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', hard_pct=0.5):
+def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', hard_pct=0.5, label_smoothing=0.1):
     """Train duo model with inverse curriculum: hard model on top hard_pct%, easy model on bottom (1-hard_pct)%."""
     duo_model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -712,7 +712,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             labels_flat = labels.view(-1)
             
             # Compute per-token loss from merged output for difficulty ranking
-            per_token_loss = F.cross_entropy(merged_flat, labels_flat, ignore_index=-100, reduction='none')
+            per_token_loss = F.cross_entropy(merged_flat, labels_flat, ignore_index=-100, reduction='none', label_smoothing=label_smoothing)
             valid_mask = labels_flat != -100
             valid_losses = per_token_loss[valid_mask]
             valid_indices = torch.where(valid_mask)[0]
@@ -724,8 +724,8 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             easy_token_idx = valid_indices[sorted_idx[k_hard:]]
             
             # Compute losses for each model on their respective tokens
-            loss_hard = F.cross_entropy(hard_flat[hard_token_idx], labels_flat[hard_token_idx]) if len(hard_token_idx) > 0 else merged.new_zeros(())
-            loss_easy = F.cross_entropy(easy_flat[easy_token_idx], labels_flat[easy_token_idx]) if len(easy_token_idx) > 0 else merged.new_zeros(())
+            loss_hard = F.cross_entropy(hard_flat[hard_token_idx], labels_flat[hard_token_idx], label_smoothing=label_smoothing) if len(hard_token_idx) > 0 else merged.new_zeros(())
+            loss_easy = F.cross_entropy(easy_flat[easy_token_idx], labels_flat[easy_token_idx], label_smoothing=label_smoothing) if len(easy_token_idx) > 0 else merged.new_zeros(())
             loss = loss_hard + loss_easy
             
             # Accuracy on merged output
@@ -734,7 +734,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             total += valid_mask.sum().item()
         else:
             # Classification: per-sample losses
-            per_sample_loss = F.cross_entropy(merged, labels, reduction='none')
+            per_sample_loss = F.cross_entropy(merged, labels, reduction='none', label_smoothing=label_smoothing)
             
             # Sort by difficulty (descending = hardest first)
             k_hard = max(1, int(hard_pct * per_sample_loss.size(0)))
@@ -743,8 +743,8 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             easy_idx = sorted_idx[k_hard:]
             
             # Compute losses for each model on their respective samples
-            loss_hard = F.cross_entropy(logits_hard[hard_idx], labels[hard_idx]) if len(hard_idx) > 0 else merged.new_zeros(())
-            loss_easy = F.cross_entropy(logits_easy[easy_idx], labels[easy_idx]) if len(easy_idx) > 0 else merged.new_zeros(())
+            loss_hard = F.cross_entropy(logits_hard[hard_idx], labels[hard_idx], label_smoothing=label_smoothing) if len(hard_idx) > 0 else merged.new_zeros(())
+            loss_easy = F.cross_entropy(logits_easy[easy_idx], labels[easy_idx], label_smoothing=label_smoothing) if len(easy_idx) > 0 else merged.new_zeros(())
             loss = loss_hard + loss_easy
             
             # Accuracy on merged output
@@ -763,7 +763,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1):
     model.train()
     total_loss_t = torch.tensor(0.0, device=device)
     correct_t = torch.tensor(0, device=device)
@@ -794,7 +794,7 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             if task_type == 'lm':
                 logits_flat = logits.view(-1, logits.size(-1))
                 labels_flat = labels.view(-1)
-                per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none')
+                per_token_loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100, reduction='none', label_smoothing=label_smoothing)
                 if wtf_mode:
                     mask = labels_flat != -100
                     valid_losses = per_token_loss[mask]
@@ -820,7 +820,7 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 correct_t += (preds[mask] == labels_flat[mask]).sum()
                 total_t += mask.sum()
             else:
-                per_sample_loss = F.cross_entropy(logits, labels, reduction='none')
+                per_sample_loss = F.cross_entropy(logits, labels, reduction='none', label_smoothing=label_smoothing)
                 if wtf_mode:
                     median = per_sample_loss.median()
                     min_l, max_l = per_sample_loss.min(), per_sample_loss.max()
@@ -928,7 +928,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -995,13 +995,13 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             # Duo mode: hard model gets top hard_pct%, easy model gets bottom (1-hard_pct)%
             train_loss, train_acc = train_epoch_duo(
                 model, current_loader, optimizer, device, active_scheduler,
-                flatten=flatten, task_type=task_type, hard_pct=hard_pct
+                flatten=flatten, task_type=task_type, hard_pct=hard_pct, label_smoothing=label_smoothing
             )
         else:
             train_loss, train_acc = train_epoch(
                 model, current_loader, optimizer, device, active_scheduler, 
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
-                hard_pct=hard_pct if hard_mining else None, scaler=scaler
+                hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing
             )
         
         if use_swa_sched:
@@ -1502,6 +1502,7 @@ def main():
     parser.add_argument('--attn-order', type=str, default='tele,conv,lowrank', help='Order of attention layers for ripple model (default: tele,conv,lowrank)')
     parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
+    parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1691,7 +1692,8 @@ def main():
                 swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                 hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                 wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp
+                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp,
+                label_smoothing=args.label_smoothing
             )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
