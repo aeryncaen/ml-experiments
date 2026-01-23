@@ -197,11 +197,11 @@ class ConvBlock(nn.Module):
 
 
 class TelephoneAttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1):
+    def __init__(self, width: int, num_heads: int = 8):
         super().__init__()
         self.norm1 = RMSNorm(width)
         self.telephone_attn = TelephoneAttentionND(
-            channels=width, ndim=1, max_samples=max_samples,
+            channels=width, ndim=1,
             num_heads=num_heads, use_triton=True
         )
 
@@ -212,10 +212,10 @@ class TelephoneAttentionBlock(nn.Module):
 
 
 class RippleAttentionBlock(nn.Module):
-    def __init__(self, width: int, num_heads: int = 8, max_samples: int = 32, dropout: float = 0.1, order: str = "tele,conv,lowrank"):
+    def __init__(self, width: int, num_heads: int = 8, order: str = "tele,conv,lowrank"):
         super().__init__()
         self.ripple_attn = RippleAttention(
-            channels=width, num_heads=num_heads, max_samples=max_samples,
+            channels=width, num_heads=num_heads,
             use_triton=True, order=order
         )
 

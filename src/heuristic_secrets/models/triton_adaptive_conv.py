@@ -481,13 +481,13 @@ class _TritonAdaptiveConv(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, window_w, window_b, window_gamma, offset_w, offset_b, offset_gamma,
                 kernel_w, kernel_b, kernel_gamma, v_w, v_b, out_w,
-                H, K, min_window, chunk_size):
+                H, K, min_window, chunk_size, scale_power):
         B, L, C = x.shape
         D = C // H
         
-        max_window = min(int(math.sqrt(L)), K)
+        max_window = min(int(L ** scale_power), K)
         half_window_max = max_window // 2
-        max_offset = int(math.sqrt(L))
+        max_offset = int(L ** scale_power)
         chunk_size = min(chunk_size, L)
         
         v_full = triton_linear(x.view(B * L, C), v_w, v_b).view(B, L, C)
@@ -536,6 +536,7 @@ class _TritonAdaptiveConv(torch.autograd.Function):
         ctx.max_offset = max_offset
         ctx.min_window = min_window
         ctx.chunk_size = chunk_size
+        ctx.scale_power = scale_power
         ctx.shape = (B, L, C)
         
         return out
@@ -768,7 +769,20 @@ class _TritonAdaptiveConv(torch.autograd.Function):
         
         return (d_x, d_window_w, d_window_b, d_window_gamma, d_offset_w, d_offset_b, d_offset_gamma,
                 d_kernel_w, d_kernel_b, d_kernel_gamma, d_v_w, d_v_b, d_out_w,
-                None, None, None, None)
+                None, None, None, None, None)
+
+
+class SqueezeExcite1D(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.fc1 = nn.Linear(channels, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, channels, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = x.mean(dim=1)
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        return x * scale.unsqueeze(1)
 
 
 class TritonAdaptiveLocalConv(nn.Module):
@@ -779,6 +793,7 @@ class TritonAdaptiveLocalConv(nn.Module):
         max_kernel_size: int = 64,
         min_window: float = 1.0,
         chunk_size: int = 1024,
+        scale_power: float = 0.421875,
     ):
         super().__init__()
         if not HAS_TRITON:
@@ -790,6 +805,7 @@ class TritonAdaptiveLocalConv(nn.Module):
         self.max_kernel_size = max_kernel_size
         self.min_window = min_window
         self.chunk_size = chunk_size
+        self.scale_power = scale_power
         
         H = num_heads
         K = max_kernel_size
@@ -801,6 +817,7 @@ class TritonAdaptiveLocalConv(nn.Module):
         self.kernel_proj = nn.Linear(channels, H * K)
         self.kernel_gamma = nn.Parameter(torch.ones(H * K))
         self.v_proj = nn.Linear(channels, channels)
+        self.se = SqueezeExcite1D(channels)
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
         self._init_weights()
@@ -823,9 +840,9 @@ class TritonAdaptiveLocalConv(nn.Module):
             self.offset_proj.weight, self.offset_proj.bias, self.offset_gamma,
             self.kernel_proj.weight, self.kernel_proj.bias, self.kernel_gamma,
             self.v_proj.weight, self.v_proj.bias, self.out_proj.weight,
-            self.num_heads, self.max_kernel_size, self.min_window, self.chunk_size,
+            self.num_heads, self.max_kernel_size, self.min_window, self.chunk_size, self.scale_power,
         )
-        return out, {}
+        return self.se(out), {}
 
 
 if __name__ == "__main__":
@@ -859,6 +876,8 @@ if __name__ == "__main__":
         triton_model.kernel_gamma.copy_(pytorch_model.kernel_gamma)
         triton_model.v_proj.weight.copy_(pytorch_model.v_proj.weight)
         triton_model.v_proj.bias.copy_(pytorch_model.v_proj.bias)
+        triton_model.se.fc1.weight.copy_(pytorch_model.se.fc1.weight)
+        triton_model.se.fc2.weight.copy_(pytorch_model.se.fc2.weight)
         triton_model.out_proj.weight.copy_(pytorch_model.out_proj.weight)
     
     print("=" * 60)

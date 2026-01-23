@@ -93,11 +93,6 @@ class SIRENDownsampleND(nn.Module):
         self.ndim = ndim
         self.kernel_net = KernelNetND(ndim, channels, hidden=hidden, omega_0=omega_0)
         self.se = SqueezeExciteND(channels)
-        
-        mlp_hidden = int(channels * 8 / 3)
-        mlp_hidden = ((mlp_hidden + 7) // 8) * 8
-        self.mlp_up = nn.Linear(channels, mlp_hidden, bias=False)
-        self.mlp_down = nn.Linear(mlp_hidden, channels, bias=False)
     
     def forward(self, x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
         spatial = x.shape[1:-1]
@@ -129,10 +124,7 @@ class SIRENDownsampleND(nn.Module):
         
         x = x.movedim(1, -1)
         
-        x = self.se(x)
-        x = x + self.mlp_down(F.silu(self.mlp_up(x)))
-        
-        return x
+        return self.se(x)
 
 
 class KernelNetND(nn.Module):
@@ -634,9 +626,10 @@ class LowRankAttentionMergeND(nn.Module):
 
 class LowRankAttention(nn.Module):
     
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int, reduction_power: float = 0.75):
         super().__init__()
         self.embed_dim = embed_dim
+        self.reduction_power = reduction_power
         self.downsample = SIRENDownsampleND(embed_dim, ndim=1)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -645,7 +638,7 @@ class LowRankAttention(nn.Module):
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, L, C = x.shape
-        r = max(1, int(L ** 0.5))
+        r = max(1, int(L ** self.reduction_power))
         
         x_down = self.downsample(x, (r,))
         
@@ -687,14 +680,14 @@ class LowRankCollapseMerge(nn.Module):
 
 
 class LowRankAttentionND(nn.Module):
-    """Full attention with sqrt per-dim reduction. Drop-in replacement for LocalAttentionND."""
     
-    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1):
+    def __init__(self, embed_dim: int, window_size: int | tuple[int, ...] = 17, ndim: int = 1, num_channels: int = 1, reduction_power: float = 0.75):
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
         self.num_channels = num_channels
         self.channel_dim = embed_dim // num_channels
+        self.reduction_power = reduction_power
         
         self.downsample = SIRENDownsampleND(embed_dim, ndim=ndim)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -706,7 +699,7 @@ class LowRankAttentionND(nn.Module):
         spatial_shape = x.shape[1:-1]
         B, C = x.shape[0], x.shape[-1]
         
-        target_shape = tuple(max(1, int(s ** 0.5)) for s in spatial_shape)
+        target_shape = tuple(max(1, int(s ** self.reduction_power)) for s in spatial_shape)
         
         x_down = self.downsample(x, target_shape)
         

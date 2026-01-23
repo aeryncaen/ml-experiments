@@ -44,7 +44,6 @@ class TelephoneAttentionND(nn.Module):
         self,
         channels: int,
         ndim: int = 1,
-        max_samples: int = 32,
         num_heads: int = 1,
         max_freq: float = 16.0,
         min_freq: float = 1.0,
@@ -52,19 +51,22 @@ class TelephoneAttentionND(nn.Module):
         chunk_size: int = 1024,
         checkpoint: bool = True,
         use_triton: bool = True,
+        scale_power: float = 0.5625,
+        max_seq_len: int = 8192,
     ):
         super().__init__()
         self.checkpoint = checkpoint
         self.use_triton = use_triton and HAS_TRITON and ndim == 1
         self.channels = channels
         self.ndim = ndim
-        self.max_samples = max_samples
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.chunk_size = chunk_size
         self.max_freq = max_freq
         self.min_freq = min_freq
         self.max_kernel_size = max_kernel_size
+        self.scale_power = scale_power
+        self.max_seq_len = max_seq_len
         
         H = num_heads
         
@@ -76,6 +78,7 @@ class TelephoneAttentionND(nn.Module):
         self.exponent_gamma = nn.Parameter(torch.ones(1))
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
+        max_samples = max(3, int(max_seq_len ** scale_power))
         samples_per_dim = max(3, int(max_samples ** (1.0 / ndim)))
         half_s = samples_per_dim // 2
         offsets_1d = torch.arange(-half_s, half_s + 1).float()
@@ -87,7 +90,7 @@ class TelephoneAttentionND(nn.Module):
             stride_grid = torch.stack([g.flatten() for g in grids], dim=-1)
         
         self.register_buffer('stride_grid', stride_grid)
-        self.num_samples = stride_grid.shape[0]
+        self.max_samples = stride_grid.shape[0]
         
         self.max_offset = half_s
         self.max_receptive = half_s * max_freq
@@ -97,7 +100,7 @@ class TelephoneAttentionND(nn.Module):
         nn.init.xavier_uniform_(self.kernel_proj.weight, gain=0.1)
         nn.init.zeros_(self.kernel_proj.bias)
         nn.init.zeros_(self.exponent_proj.weight)
-        nn.init.constant_(self.exponent_proj.bias, 0.0)  # sigmoid(0)*3.5+0.5 = 2.25
+        nn.init.constant_(self.exponent_proj.bias, 0.0)
         nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
     
     def _forward_chunk(
@@ -113,9 +116,18 @@ class TelephoneAttentionND(nn.Module):
         C = x_flat.shape[-1]
         H = self.num_heads
         D = self.head_dim
-        S = self.num_samples
         K = self.max_kernel_size
         chunk_len = chunk_end - chunk_start
+        
+        S_for_L = max(3, int(L ** self.scale_power))
+        S = min(self.max_samples, S_for_L)
+        if S < self.max_samples:
+            half = S // 2
+            center = self.max_samples // 2
+            stride_grid = self.stride_grid[center - half : center + half + 1]
+            S = stride_grid.shape[0]
+        else:
+            stride_grid = self.stride_grid
         
         # wave_proj: linear -> RMSNorm -> SiLU
         wave_pre = self.wave_proj(x_chunk)
@@ -132,17 +144,16 @@ class TelephoneAttentionND(nn.Module):
             centers = torch.arange(chunk_start, chunk_end, device=x_flat.device, dtype=x_flat.dtype)
             sample_pos = (
                 centers.view(1, chunk_len, 1, 1) + 
-                self.stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1) + 
+                stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1) + 
                 phase.unsqueeze(-1)
             )
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
-            # Soft indexing: floor, ceil, and fractional weight
             pos_clamped = sample_pos.clamp(0, L - 1.001)
             sample_floor = pos_clamped.floor().long().clamp(0, L - 1)
             sample_ceil = (sample_floor + 1).clamp(0, L - 1)
             sample_frac = pos_clamped - sample_floor.float()
             
-            rel_pos = self.stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1)
+            rel_pos = stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1)
         else:
             coords = [torch.arange(s, device=x_flat.device, dtype=x_flat.dtype) for s in spatial]
             mesh = torch.meshgrid(*coords, indexing='ij')
@@ -151,7 +162,7 @@ class TelephoneAttentionND(nn.Module):
             
             sample_pos = (
                 centers.view(1, chunk_len, 1, 1, self.ndim) + 
-                self.stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1) + 
+                stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1) + 
                 phase.view(B, chunk_len, H, 1, 1)
             )
             
@@ -168,7 +179,7 @@ class TelephoneAttentionND(nn.Module):
                 strides.insert(0, strides[0] * spatial[dim])
             sample_idx = sum(sample_coords[..., dim] * strides[dim] for dim in range(self.ndim))
             
-            rel_pos_nd = self.stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1)
+            rel_pos_nd = stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1)
             rel_pos = rel_pos_nd.norm(dim=-1)
         
         batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1, 1).expand(B, chunk_len, H, S)
@@ -323,7 +334,6 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     B, C = 4, 256
     num_heads = 8
-    max_samples = 32
     warmup_iters = 5
     bench_iters = 20
     seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768]
@@ -334,13 +344,13 @@ if __name__ == "__main__":
     print()
     
     tel_triton = TelephoneAttentionND(
-        channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads, 
+        channels=C, ndim=1, num_heads=num_heads, 
         checkpoint=True, use_triton=True
     ).to(device)
     tel_triton.train()
     
     tel_pytorch = TelephoneAttentionND(
-        channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads,
+        channels=C, ndim=1, num_heads=num_heads,
         checkpoint=True, use_triton=False
     ).to(device)
     tel_pytorch.train()
@@ -537,7 +547,7 @@ if __name__ == "__main__":
         
         for cs in chunk_sizes:
             model_cs = TelephoneAttentionND(
-                channels=C, ndim=1, max_samples=max_samples, num_heads=num_heads,
+                channels=C, ndim=1, num_heads=num_heads,
                 chunk_size=cs, use_triton=True
             ).to(device)
             model_cs.load_state_dict(tel_triton.state_dict())

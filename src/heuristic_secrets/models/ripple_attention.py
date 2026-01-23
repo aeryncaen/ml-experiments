@@ -23,7 +23,6 @@ class RippleAttention(nn.Module):
         self,
         channels: int,
         num_heads: int = 8,
-        max_samples: int = 32,
         max_kernel_size: int = 64,
         max_freq: float = 16.0,
         min_freq: float = 1.0,
@@ -31,6 +30,10 @@ class RippleAttention(nn.Module):
         use_triton: bool = True,
         eps: float = 1e-6,
         order: str = "tele,conv,lowrank",
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
     ):
         super().__init__()
         self.channels = channels
@@ -40,13 +43,14 @@ class RippleAttention(nn.Module):
         self.telephone = TelephoneAttentionND(
             channels=channels,
             ndim=1,
-            max_samples=max_samples,
             num_heads=num_heads,
             max_freq=max_freq,
             min_freq=min_freq,
             max_kernel_size=max_kernel_size,
             chunk_size=chunk_size,
             use_triton=use_triton,
+            scale_power=telephone_power,
+            max_seq_len=max_seq_len,
         )
         
         if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
@@ -55,15 +59,17 @@ class RippleAttention(nn.Module):
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
                 chunk_size=chunk_size,
+                scale_power=conv_power,
             )
         else:
             self.conv = AdaptiveLocalConv(
                 channels=channels,
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
+                scale_power=conv_power,
             )
         
-        self.lowrank = LowRankAttention(channels)
+        self.lowrank = LowRankAttention(channels, reduction_power=lowrank_power)
         
         self.norms = nn.ModuleDict({
             'tele': RMSNorm(channels, eps),
@@ -95,22 +101,28 @@ class RippleBlock(nn.Module):
         self,
         channels: int,
         num_heads: int = 8,
-        max_samples: int = 32,
         max_kernel_size: int = 64,
         mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
         order: str = "tele,conv,lowrank",
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
     ):
         super().__init__()
         self.attn = RippleAttention(
             channels=channels,
             num_heads=num_heads,
-            max_samples=max_samples,
             max_kernel_size=max_kernel_size,
             use_triton=use_triton,
             eps=eps,
             order=order,
+            lowrank_power=lowrank_power,
+            telephone_power=telephone_power,
+            conv_power=conv_power,
+            max_seq_len=max_seq_len,
         )
         
         hidden = int(channels * mlp_ratio)

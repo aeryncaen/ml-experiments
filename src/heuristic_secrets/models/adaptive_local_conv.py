@@ -10,6 +10,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SqueezeExcite1D(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.fc1 = nn.Linear(channels, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, channels, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = x.mean(dim=1)
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        return x * scale.unsqueeze(1)
+
+
 def llama_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     input_dtype = x.dtype
     x = x.to(torch.float32)
@@ -32,6 +45,7 @@ class AdaptiveLocalConv(nn.Module):
         num_heads: int = 8,
         max_kernel_size: int = 64,
         min_window: float = 1.0,
+        scale_power: float = 0.421875,
     ):
         super().__init__()
         self.channels = channels
@@ -39,6 +53,7 @@ class AdaptiveLocalConv(nn.Module):
         self.head_dim = channels // num_heads
         self.max_kernel_size = max_kernel_size
         self.min_window = min_window
+        self.scale_power = scale_power
         
         H = num_heads
         K = max_kernel_size
@@ -50,6 +65,7 @@ class AdaptiveLocalConv(nn.Module):
         self.kernel_proj = nn.Linear(channels, H * K)
         self.kernel_gamma = nn.Parameter(torch.ones(H * K))
         self.v_proj = nn.Linear(channels, channels)
+        self.se = SqueezeExcite1D(channels)
         self.out_proj = nn.Linear(channels, channels, bias=False)
         
         self._init_weights()
@@ -71,9 +87,9 @@ class AdaptiveLocalConv(nn.Module):
         D = self.head_dim
         K = self.max_kernel_size
         
-        max_window = min(int(math.sqrt(L)), K)
+        max_window = min(int(L ** self.scale_power), K)
         half_window_max = max_window // 2
-        max_offset = int(math.sqrt(L))
+        max_offset = int(L ** self.scale_power)
         
         window_pre = self.window_proj(x)
         window_normed = llama_rmsnorm(window_pre, self.window_gamma)
@@ -142,6 +158,7 @@ class AdaptiveLocalConv(nn.Module):
             
             out_head.div_(weight_sum.unsqueeze(-1).clamp(min=1.0))
         
+        output = self.se(output)
         output = F.silu(self.out_proj(output))
         
         return output, {
