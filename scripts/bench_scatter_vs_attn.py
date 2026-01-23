@@ -1087,18 +1087,18 @@ def find_config_for_params(
 
 def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False):
     
-    if model_type == 'ripple' and cross_layer:
+    if model_type == 'ripple':
         def block_factory_fn(h):
             return lambda w: None
         def classifier_factory_fn(block_factory, w):
             return RippleClassifier(
                 width=w, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=True
+                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=True
+            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
         ).to(device)
     
     if model_type == 'attention':
@@ -1116,9 +1116,6 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     elif model_type == 'gather':
         def block_factory_fn(h):
             return lambda w: TelephoneAttentionBlock(w, num_heads=h)
-    elif model_type == 'ripple':
-        def block_factory_fn(h):
-            return lambda w: RippleAttentionBlock(w, num_heads=h, order=attn_order)
     elif model_type == 'flat':
         def block_factory_fn(h):
             return lambda w: None
@@ -1170,12 +1167,12 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         def classifier_factory_fn(block_factory, width):
             return RippleClassifier(
                 width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w)
+                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w)
+            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
         ).to(device)
     elif model_type == 'flat':
         def block_factory_fn(h):
@@ -1251,12 +1248,12 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
         def classifier_factory_fn(block_factory, w):
             return RippleClassifier(
                 width=w, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer
+                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=vocab_size
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=cross_layer
+            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=vocab_size
         ).to(device)
 
     if model_type == 'attention':

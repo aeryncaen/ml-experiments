@@ -25,6 +25,7 @@ class LearnedSinusoidal2DEmbed(nn.Module):
         width: int,
         embed_dim: int,
         n_freq: int = 32,
+        vocab_size: int = 256,
     ):
         super().__init__()
         self.height = height
@@ -32,7 +33,7 @@ class LearnedSinusoidal2DEmbed(nn.Module):
         self.embed_dim = embed_dim
         self.n_freq = n_freq
         
-        self.pixel_embed = nn.Linear(1, embed_dim)
+        self.pixel_embed = nn.Embedding(vocab_size, embed_dim)
         
         self.freq_h = nn.Parameter(torch.randn(n_freq) * 0.1)
         self.freq_w = nn.Parameter(torch.randn(n_freq) * 0.1)
@@ -45,8 +46,8 @@ class LearnedSinusoidal2DEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W = x.shape
         
-        h_pos = torch.arange(H, device=x.device, dtype=x.dtype) / H
-        w_pos = torch.arange(W, device=x.device, dtype=x.dtype) / W
+        h_pos = torch.arange(H, device=x.device, dtype=torch.float) / H
+        w_pos = torch.arange(W, device=x.device, dtype=torch.float) / W
         
         freq_h = F.softplus(self.freq_h) * 10
         freq_w = F.softplus(self.freq_w) * 10
@@ -64,12 +65,12 @@ class LearnedSinusoidal2DEmbed(nn.Module):
         
         pos_embed = self.pos_proj(pos_enc)
         
-        x_flat = x.reshape(B, H * W, 1)
+        x_flat = x.reshape(B, H * W).long()
         x_embed = self.pixel_embed(x_flat)
         
         x_embed = x_embed + pos_embed.reshape(1, H * W, self.embed_dim)
         
-        return self.norm(F.silu(x_embed))
+        return self.norm(x_embed)
 
 
 class LayerHistoryAccumulator(nn.Module):
@@ -371,15 +372,21 @@ class RippleClassifier(nn.Module):
         max_seq_len: int = 8192,
         cross_layer: bool = False,
         embed_2d: tuple[int, int] | None = None,
+        vocab_size: int | None = None,
     ):
         super().__init__()
         self.cross_layer = cross_layer
         self.lowrank_power = lowrank_power
         self.embed_2d = embed_2d
+        self.vocab_size = vocab_size
         
         if embed_2d is not None:
             height, width_2d = embed_2d
             self.embed = LearnedSinusoidal2DEmbed(height, width_2d, width)
+        elif vocab_size is not None:
+            self.embed = nn.Embedding(vocab_size, width)
+            self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+            self.embed_norm = RMSNorm(width, eps)
         else:
             self.embed = nn.Linear(1, width)
             self.embed_norm = RMSNorm(width, eps)
@@ -414,6 +421,8 @@ class RippleClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.embed_2d is not None:
             x = self.embed(x)
+        elif self.vocab_size is not None:
+            x = self.embed_norm(self.embed(x.long()) + self.pos_embed)
         else:
             x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
         
