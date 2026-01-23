@@ -17,27 +17,31 @@ except ImportError:
 
 if HAS_TRITON:
     @triton.jit
-    def gather_conv_fwd_kernel(
+    def gather_conv_fwd_kernel_chunked(
         x_ptr, out_ptr,
         freq_ptr, phase_ptr,
         kernel_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive: tl.constexpr,
+        chunk_start,
+        chunk_len: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
-        pid_l = tl.program_id(1)
+        pid_l_local = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        freq_avg = tl.load(freq_ptr + pid_b * L + pid_l)
-        phase_avg = tl.load(phase_ptr + pid_b * L + pid_l)
+        pid_l = chunk_start + pid_l_local
+        
+        freq_avg = tl.load(freq_ptr + pid_b * chunk_len + pid_l_local)
+        phase_avg = tl.load(phase_ptr + pid_b * chunk_len + pid_l_local)
         
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
         out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -87,6 +91,7 @@ class TritonGatherConv(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
+        chunk_size: int = 1024,
     ):
         super().__init__()
         if not HAS_TRITON:
@@ -98,6 +103,7 @@ class TritonGatherConv(nn.Module):
         self.max_freq = max_freq
         self.min_freq = min_freq
         self.max_kernel_size = max_kernel_size
+        self.chunk_size = chunk_size
         
         self.half_s = max_samples // 2
         self.num_samples = 2 * self.half_s + 1
@@ -119,28 +125,36 @@ class TritonGatherConv(nn.Module):
         D = self.head_dim
         S = self.num_samples
         K = self.max_kernel_size
+        chunk_size = min(self.chunk_size, L)
         
-        wave_out = F.silu(self.wave_proj(x)).view(B, L, 2, H)
-        freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
-        phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-        freq_avg = freq.mean(dim=-1).contiguous()
-        phase_avg = phase.mean(dim=-1).contiguous()
-        
-        kernel = F.silu(self.kernel_proj(x)).view(B, L, H, K).contiguous()
-        
-        out = torch.zeros_like(x)
-        
+        out = torch.empty_like(x)
         BLOCK_D = triton.next_power_of_2(D)
         
-        grid = (B, L, H)
-        gather_conv_fwd_kernel[grid](
-            x, out,
-            freq_avg, phase_avg,
-            kernel,
-            B, L, C, H, D, S, K,
-            self.half_s, self.max_receptive,
-            BLOCK_D,
-        )
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            chunk_len = end - start
+            x_chunk = x[:, start:end, :]
+            
+            wave_out = F.silu(self.wave_proj(x_chunk))
+            wave_out = wave_out.view(B, chunk_len, 2, H)
+            freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
+            phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
+            freq_avg = freq.mean(dim=-1).contiguous()
+            phase_avg = phase.mean(dim=-1).contiguous()
+            
+            kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
+            
+            grid = (B, chunk_len, H)
+            gather_conv_fwd_kernel_chunked[grid](
+                x, out,
+                freq_avg, phase_avg,
+                kernel,
+                B, L, C, H, D, S, K,
+                self.half_s, self.max_receptive,
+                start,
+                chunk_len,
+                BLOCK_D,
+            )
         
         out = F.silu(self.out_proj(out))
         return out, {}
