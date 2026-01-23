@@ -387,22 +387,23 @@ if __name__ == "__main__":
     def bench(model, x, is_gather=False):
         if device == "cuda":
             torch.cuda.synchronize()
-        for _ in range(warmup_iters):
-            out = model(x)[0] if is_gather else model(x)
+        with torch.no_grad():
+            for _ in range(warmup_iters):
+                out = model(x)[0] if is_gather else model(x)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            
             if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
                 torch.cuda.synchronize()
-        
-        if device == "cuda":
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
-        
-        start = time.perf_counter()
-        for _ in range(bench_iters):
-            out = model(x)[0] if is_gather else model(x)
-            if device == "cuda":
-                torch.cuda.synchronize()
-        fwd_time = (time.perf_counter() - start) / bench_iters * 1000
-        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
+            
+            start = time.perf_counter()
+            for _ in range(bench_iters):
+                out = model(x)[0] if is_gather else model(x)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            fwd_time = (time.perf_counter() - start) / bench_iters * 1000
+            fwd_mem = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
         return fwd_time, fwd_mem
     
     def bench_bwd(model, x, is_gather=False):
