@@ -143,13 +143,15 @@ class AdaptiveLocalConv(nn.Module):
         # Gather values at floor and ceil positions
         v_flat = v.transpose(1, 2).reshape(B * H, L, D)
         
-        floor_idx = pos_floor.permute(0, 2, 1, 3).reshape(B * H, L, num_offsets)
-        ceil_idx = pos_ceil.permute(0, 2, 1, 3).reshape(B * H, L, num_offsets)
+        floor_idx = pos_floor.permute(0, 2, 1, 3).reshape(B * H, L * num_offsets)
+        ceil_idx = pos_ceil.permute(0, 2, 1, 3).reshape(B * H, L * num_offsets)
         
-        v_floor = v_flat.gather(1, floor_idx.unsqueeze(-1).expand(-1, -1, -1, D))
-        v_ceil = v_flat.gather(1, ceil_idx.unsqueeze(-1).expand(-1, -1, -1, D))
+        v_floor = v_flat.gather(1, floor_idx.unsqueeze(-1).expand(-1, -1, D))
+        v_ceil = v_flat.gather(1, ceil_idx.unsqueeze(-1).expand(-1, -1, D))
         
-        # Interpolate
+        v_floor = v_floor.view(B * H, L, num_offsets, D)
+        v_ceil = v_ceil.view(B * H, L, num_offsets, D)
+        
         pos_frac_flat = pos_frac.permute(0, 2, 1, 3).reshape(B * H, L, num_offsets, 1)
         v_neighbors = v_floor * (1 - pos_frac_flat) + v_ceil * pos_frac_flat
         v_neighbors = v_neighbors.view(B, H, L, num_offsets, D).permute(0, 2, 1, 3, 4)
