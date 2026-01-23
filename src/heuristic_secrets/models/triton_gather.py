@@ -91,7 +91,7 @@ class TritonGatherConv(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
-        chunk_size: int = 1024,
+        chunk_size: int = 256,
     ):
         super().__init__()
         if not HAS_TRITON:
