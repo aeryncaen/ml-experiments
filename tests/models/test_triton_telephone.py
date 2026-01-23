@@ -494,10 +494,10 @@ class TestTritonTelephoneAttention:
         assert x.grad is not None
         assert not torch.isnan(x.grad).any()
         
-        assert model.wave_w.grad is not None
-        assert model.kernel_w.grad is not None
-        assert model.exponent_w.grad is not None
-        assert model.out_w.grad is not None
+        assert model.wave_proj.weight.grad is not None
+        assert model.kernel_proj.weight.grad is not None
+        assert model.exponent_proj.weight.grad is not None
+        assert model.out_proj.weight.grad is not None
 
 
 # ============================================================================
