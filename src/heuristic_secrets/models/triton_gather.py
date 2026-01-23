@@ -11,13 +11,147 @@ try:
     import triton
     import triton.language as tl
     HAS_TRITON = True
-except Exception as e:
-    import sys
-    print(f"triton_gather.py: Triton import failed: {type(e).__name__}: {e}", file=sys.stderr)
+except ImportError:
     HAS_TRITON = False
 
 
 if HAS_TRITON:
+    @triton.jit
+    def gather_conv_bwd_dx_kernel(
+        d_out_ptr, d_x_ptr,
+        freq_ptr, phase_ptr,
+        kernel_ptr,
+        B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
+        H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
+        half_s: tl.constexpr, max_receptive: tl.constexpr,
+        chunk_start,
+        chunk_len: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l_local = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        pid_l = chunk_start + pid_l_local
+        
+        freq_h = tl.load(freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        phase_h = tl.load(phase_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        
+        d_offs = tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        
+        k_offs = tl.arange(0, K)
+        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
+        kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
+        
+        d_out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
+        d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
+        
+        for s_idx in range(S):
+            s_off = s_idx - half_s
+            sample_pos_f = pid_l + s_off * freq_h + phase_h
+            
+            valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
+            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
+            
+            rel_pos = tl.abs(s_off * freq_h)
+            norm_pos = rel_pos / max_receptive
+            norm_pos = tl.minimum(norm_pos, 1.0)
+            
+            idx_float = norm_pos * (K - 1)
+            idx_floor = idx_float.to(tl.int32)
+            idx_floor = tl.minimum(idx_floor, K - 2)
+            idx_ceil = idx_floor + 1
+            w_ceil = idx_float - idx_floor.to(tl.float32)
+            w_floor = 1.0 - w_ceil
+            
+            k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
+            k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
+            kernel_w = k_floor * w_floor + k_ceil * w_ceil
+            kernel_w = kernel_w * valid.to(tl.float32)
+            
+            d_x_contrib = d_out_h * kernel_w
+            d_x_base = pid_b * L * C + sample_idx * C + pid_h * D
+            tl.atomic_add(d_x_ptr + d_x_base + d_offs, d_x_contrib, mask=d_mask)
+    
+    @triton.jit
+    def gather_conv_bwd_dparams_kernel(
+        x_ptr, d_out_ptr,
+        freq_ptr, phase_ptr,
+        kernel_ptr,
+        d_freq_ptr, d_kernel_ptr,
+        B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
+        H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
+        half_s: tl.constexpr, max_receptive: tl.constexpr,
+        chunk_start,
+        chunk_len: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l_local = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        pid_l = chunk_start + pid_l_local
+        
+        freq_h = tl.load(freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        phase_h = tl.load(phase_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        
+        d_offs = tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        
+        k_offs = tl.arange(0, K)
+        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
+        kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
+        
+        d_out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
+        d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
+        
+        d_freq_acc = 0.0
+        d_kernel_acc = tl.zeros((K,), dtype=tl.float32)
+        
+        for s_idx in range(S):
+            s_off = s_idx - half_s
+            sample_pos_f = pid_l + s_off * freq_h + phase_h
+            
+            valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
+            valid_f = valid.to(tl.float32)
+            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
+            
+            rel_pos = tl.abs(s_off * freq_h)
+            norm_pos = rel_pos / max_receptive
+            not_clamped = (norm_pos < 1.0).to(tl.float32)
+            norm_pos = tl.minimum(norm_pos, 1.0)
+            
+            idx_float = norm_pos * (K - 1)
+            idx_floor = idx_float.to(tl.int32)
+            idx_floor = tl.minimum(idx_floor, K - 2)
+            idx_ceil = idx_floor + 1
+            w_ceil = idx_float - idx_floor.to(tl.float32)
+            w_floor = 1.0 - w_ceil
+            
+            k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
+            k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
+            
+            val_base = pid_b * L * C + sample_idx * C + pid_h * D
+            vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
+            
+            d_kernel_w = tl.sum(d_out_h * vals) * valid_f
+            
+            d_kernel_acc += tl.where(k_offs == idx_floor, d_kernel_w * w_floor, 0.0)
+            d_kernel_acc += tl.where(k_offs == idx_ceil, d_kernel_w * w_ceil, 0.0)
+            
+            d_w_ceil = d_kernel_w * (k_ceil - k_floor)
+            d_idx_float = d_w_ceil
+            d_norm_pos = d_idx_float * (K - 1)
+            d_rel_pos = d_norm_pos / max_receptive * not_clamped
+            
+            s_off_f = s_off * 1.0
+            sign_term = tl.where(s_off_f * freq_h >= 0, 1.0, -1.0)
+            d_freq_acc += d_rel_pos * tl.abs(s_off_f)
+        
+        tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
+        tl.store(d_freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h, d_freq_acc)
+    
     @triton.jit
     def gather_conv_fwd_kernel_chunked(
         x_ptr, out_ptr,
@@ -77,8 +211,79 @@ if HAS_TRITON:
         
         out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
-    
 
+
+class GatherConvFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive):
+        B, L, C = x.shape
+        _, chunk_len, H = freq.shape
+        K = kernel.shape[-1]
+        D = C // H
+        S = 2 * half_s + 1
+        
+        BLOCK_D = triton.next_power_of_2(D)
+        out = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
+        
+        grid = (B, chunk_len, H)
+        gather_conv_fwd_kernel_chunked[grid](
+            x, out,
+            freq, phase, kernel,
+            B, L, C, H, D, S, K,
+            half_s, max_receptive,
+            chunk_start, chunk_len, BLOCK_D,
+        )
+        
+        ctx.save_for_backward(x, freq, phase, kernel)
+        ctx.chunk_start = chunk_start
+        ctx.half_s = half_s
+        ctx.max_receptive = max_receptive
+        
+        return out
+    
+    @staticmethod
+    def backward(ctx, d_out):
+        x, freq, phase, kernel = ctx.saved_tensors
+        chunk_start = ctx.chunk_start
+        half_s = ctx.half_s
+        max_receptive = ctx.max_receptive
+        
+        B, L, C = x.shape
+        _, chunk_len, H = freq.shape
+        K = kernel.shape[-1]
+        D = C // H
+        S = 2 * half_s + 1
+        
+        BLOCK_D = triton.next_power_of_2(D)
+        d_out = d_out.contiguous()
+        
+        d_x = torch.zeros_like(x)
+        d_freq = torch.zeros_like(freq)
+        d_kernel = torch.zeros_like(kernel)
+        
+        grid = (B, chunk_len, H)
+        
+        gather_conv_bwd_dx_kernel[grid](
+            d_out, d_x,
+            freq, phase, kernel,
+            B, L, C, H, D, S, K,
+            half_s, max_receptive,
+            chunk_start, chunk_len, BLOCK_D,
+        )
+        
+        gather_conv_bwd_dparams_kernel[grid](
+            x, d_out,
+            freq, phase, kernel,
+            d_freq, d_kernel,
+            B, L, C, H, D, S, K,
+            half_s, max_receptive,
+            chunk_start, chunk_len, BLOCK_D,
+        )
+        
+        return d_x, d_freq, None, d_kernel, None, None, None
+
+
+gather_conv_fn = GatherConvFunction.apply
 
 
 class TritonGatherConv(nn.Module):
@@ -121,13 +326,10 @@ class TritonGatherConv(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
         H = self.num_heads
-        D = self.head_dim
-        S = self.num_samples
         K = self.max_kernel_size
         chunk_size = min(self.chunk_size, L)
         
         out = torch.empty_like(x)
-        BLOCK_D = triton.next_power_of_2(D)
         
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
@@ -141,18 +343,9 @@ class TritonGatherConv(nn.Module):
             
             kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
             
-            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
-            
-            grid = (B, chunk_len, H)
-            gather_conv_fwd_kernel_chunked[grid](
-                x, hidden_chunk,
-                freq.contiguous(), phase.contiguous(),
-                kernel,
-                B, L, C, H, D, S, K,
-                self.half_s, self.max_receptive,
-                start,
-                chunk_len,
-                BLOCK_D,
+            hidden_chunk = gather_conv_fn(
+                x, freq.contiguous(), phase.contiguous(), kernel,
+                start, self.half_s, self.max_receptive,
             )
             
             out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))

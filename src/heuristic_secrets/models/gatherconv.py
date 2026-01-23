@@ -190,21 +190,15 @@ class GatherConvND(nn.Module):
     
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
-        H = self.num_heads
-        D = self.head_dim
-        S = self.num_samples
         K = self.max_kernel_size
         chunk_size = min(self.chunk_size, L)
         
-        out = torch.empty_like(x)
-        BLOCK_D = 1
-        while BLOCK_D < D:
-            BLOCK_D *= 2
-        
         try:
-            from .triton_gather import gather_conv_fwd_kernel_chunked
+            from .triton_gather import gather_conv_fn
         except ImportError:
-            from triton_gather import gather_conv_fwd_kernel_chunked
+            from triton_gather import gather_conv_fn
+        
+        out = torch.empty_like(x)
         
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
@@ -212,24 +206,15 @@ class GatherConvND(nn.Module):
             x_chunk = x[:, start:end, :]
             
             wave_out = F.silu(self.wave_proj(x_chunk))
-            wave_out = wave_out.view(B, chunk_len, 2, H)
+            wave_out = wave_out.view(B, chunk_len, 2, self.num_heads)
             freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
             phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
             
-            kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
+            kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, self.num_heads, K).contiguous()
             
-            hidden_chunk = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
-            
-            grid = (B, chunk_len, H)
-            gather_conv_fwd_kernel_chunked[grid](
-                x, hidden_chunk,
-                freq.contiguous(), phase.contiguous(),
-                kernel,
-                B, L, C, H, D, S, K,
-                self.max_offset, self.max_receptive,
-                start,
-                chunk_len,
-                BLOCK_D,
+            hidden_chunk = gather_conv_fn(
+                x, freq.contiguous(), phase.contiguous(), kernel,
+                start, self.max_offset, self.max_receptive,
             )
             
             out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
@@ -329,6 +314,75 @@ if __name__ == "__main__":
     
     sdp_attn = SDPAttention(channels=C, num_heads=num_heads).to(device)
     sdp_attn.train()
+    
+    print("=" * 60)
+    print("SANITY CHECKS")
+    print("=" * 60)
+    
+    if HAS_TRITON:
+        gather_pytorch.load_state_dict(gather_triton.state_dict())
+        
+        torch.manual_seed(42)
+        x_test = torch.randn(2, 512, C, device=device)
+        
+        out_triton, _ = gather_triton(x_test)
+        out_pytorch, _ = gather_pytorch(x_test)
+        
+        fwd_diff = (out_triton - out_pytorch).abs().max().item()
+        fwd_match = fwd_diff < 1e-4
+        print(f"Forward match (Triton vs PyTorch): {'PASS' if fwd_match else 'FAIL'} (max diff: {fwd_diff:.2e})")
+        
+        x_test_tr = x_test.clone().requires_grad_(True)
+        x_test_pt = x_test.clone().requires_grad_(True)
+        
+        out_tr, _ = gather_triton(x_test_tr)
+        out_tr.sum().backward()
+        
+        out_pt, _ = gather_pytorch(x_test_pt)
+        out_pt.sum().backward()
+        
+        dx_diff = (x_test_tr.grad - x_test_pt.grad).abs().max().item()
+        dx_match = dx_diff < 1e-3
+        print(f"d_x match (Triton vs PyTorch): {'PASS' if dx_match else 'FAIL'} (max diff: {dx_diff:.2e})")
+        
+        wave_grad_tr = gather_triton.wave_proj.weight.grad.abs().sum().item()
+        wave_grad_pt = gather_pytorch.wave_proj.weight.grad.abs().sum().item()
+        kernel_grad_tr = gather_triton.kernel_proj.weight.grad.abs().sum().item()
+        kernel_grad_pt = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
+        
+        wave_grad_match = abs(wave_grad_tr - wave_grad_pt) / (wave_grad_pt + 1e-8) < 0.1
+        kernel_grad_match = abs(kernel_grad_tr - kernel_grad_pt) / (kernel_grad_pt + 1e-8) < 0.1
+        
+        print(f"wave_proj grad non-zero: {'PASS' if wave_grad_tr > 0 else 'FAIL'} (Triton: {wave_grad_tr:.2e}, PyTorch: {wave_grad_pt:.2e})")
+        print(f"kernel_proj grad non-zero: {'PASS' if kernel_grad_tr > 0 else 'FAIL'} (Triton: {kernel_grad_tr:.2e}, PyTorch: {kernel_grad_pt:.2e})")
+        print(f"wave_proj grad match: {'PASS' if wave_grad_match else 'FAIL'}")
+        print(f"kernel_proj grad match: {'PASS' if kernel_grad_match else 'FAIL'}")
+        
+        gather_triton.zero_grad()
+        gather_pytorch.zero_grad()
+        del x_test, x_test_tr, x_test_pt, out_triton, out_pytorch, out_tr, out_pt
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        torch.manual_seed(42)
+        x_test = torch.randn(2, 512, C, device=device, requires_grad=True)
+        out, _ = gather_pytorch(x_test)
+        out.sum().backward()
+        
+        wave_grad = gather_pytorch.wave_proj.weight.grad.abs().sum().item()
+        kernel_grad = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
+        
+        print(f"wave_proj grad non-zero: {'PASS' if wave_grad > 0 else 'FAIL'} ({wave_grad:.2e})")
+        print(f"kernel_proj grad non-zero: {'PASS' if kernel_grad > 0 else 'FAIL'} ({kernel_grad:.2e})")
+        print("(Triton not available, skipping Triton vs PyTorch comparison)")
+        
+        gather_pytorch.zero_grad()
+        del x_test, out
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    
+    print("=" * 60)
+    print()
     
     def bench(model, x, is_gather=False):
         if device == "cuda":
