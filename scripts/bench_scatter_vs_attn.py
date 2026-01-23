@@ -161,18 +161,39 @@ class HierarchicalBlock(nn.Module):
         return x
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 17, dropout: float = 0.1):
+class SqueezeExcite(nn.Module):
+    def __init__(self, width: int, reduction: int = 4):
         super().__init__()
-        self.norm1 = RMSNorm(width)
-        self.depthwise = nn.Conv1d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
-        self.pointwise = nn.Conv1d(width, width, 1)
+        hidden = max(width // reduction, 8)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Linear(width, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, width, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, C = x.shape
+        scale = self.pool(x.transpose(1, 2)).squeeze(-1)
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        return x * scale.unsqueeze(1)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 17):
+        super().__init__()
+        self.dwconv = nn.Conv1d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
+        self.norm = RMSNorm(width)
+        hidden = int(width * 4 * 2 / 3)
+        hidden = ((hidden + 7) // 8) * 8
+        self.pwconv1 = nn.Linear(width, hidden, bias=False)
+        self.pwconv2 = nn.Linear(hidden, width, bias=False)
+        self.se = SqueezeExcite(width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x).transpose(1, 2)
-        h = self.pointwise(self.depthwise(h)).transpose(1, 2)
-        x = x + h
-        return x
+        residual = x
+        x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
+        x = self.norm(x)
+        x = self.pwconv2(F.silu(self.pwconv1(x)))
+        x = self.se(x)
+        return residual + x
 
 
 class TelephoneAttentionBlock(nn.Module):
@@ -308,19 +329,39 @@ class HierarchicalBlock2D(nn.Module):
         return x
 
 
-class ConvBlock2D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 7, dropout: float = 0.1):
+class SqueezeExcite2D(nn.Module):
+    def __init__(self, width: int, reduction: int = 4):
         super().__init__()
-        self.norm1 = RMSNorm(width)
-        self.depthwise = nn.Conv2d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
-        self.pointwise = nn.Conv2d(width, width, 1)
+        hidden = max(width // reduction, 8)
+        self.fc1 = nn.Linear(width, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, width, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+        scale = x.mean(dim=(1, 2))
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        return x * scale.unsqueeze(1).unsqueeze(2)
+
+
+class ConvBlock2D(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 7):
+        super().__init__()
+        self.dwconv = nn.Conv2d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
+        self.norm = RMSNorm(width)
+        hidden = int(width * 4 * 2 / 3)
+        hidden = ((hidden + 7) // 8) * 8
+        self.pwconv1 = nn.Linear(width, hidden, bias=False)
+        self.pwconv2 = nn.Linear(hidden, width, bias=False)
+        self.se = SqueezeExcite2D(width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, C = x.shape
-        h = self.norm1(x).permute(0, 3, 1, 2)
-        h = self.pointwise(self.depthwise(h)).permute(0, 2, 3, 1)
-        x = x + h
-        return x
+        residual = x
+        x = self.dwconv(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = self.pwconv2(F.silu(self.pwconv1(x)))
+        x = self.se(x)
+        return residual + x
 
 
 class SequenceClassifier(nn.Module):
@@ -504,19 +545,39 @@ class HierarchicalBlock3D(nn.Module):
         return x
 
 
-class ConvBlock3D(nn.Module):
-    def __init__(self, width: int, kernel_size: int = 5, dropout: float = 0.1):
+class SqueezeExcite3D(nn.Module):
+    def __init__(self, width: int, reduction: int = 4):
         super().__init__()
-        self.norm1 = RMSNorm(width)
-        self.depthwise = nn.Conv3d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
-        self.pointwise = nn.Conv3d(width, width, 1)
+        hidden = max(width // reduction, 8)
+        self.fc1 = nn.Linear(width, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, width, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, D, C = x.shape
+        scale = x.mean(dim=(1, 2, 3))
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        return x * scale.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+
+
+class ConvBlock3D(nn.Module):
+    def __init__(self, width: int, kernel_size: int = 5):
+        super().__init__()
+        self.dwconv = nn.Conv3d(width, width, kernel_size, padding=kernel_size // 2, groups=width)
+        self.norm = RMSNorm(width)
+        hidden = int(width * 4 * 2 / 3)
+        hidden = ((hidden + 7) // 8) * 8
+        self.pwconv1 = nn.Linear(width, hidden, bias=False)
+        self.pwconv2 = nn.Linear(hidden, width, bias=False)
+        self.se = SqueezeExcite3D(width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, D, C = x.shape
-        h = self.norm1(x).permute(0, 4, 1, 2, 3)
-        h = self.pointwise(self.depthwise(h)).permute(0, 2, 3, 4, 1)
-        x = x + h
-        return x
+        residual = x
+        x = self.dwconv(x.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
+        x = self.norm(x)
+        x = self.pwconv2(F.silu(self.pwconv1(x)))
+        x = self.se(x)
+        return residual + x
 
 
 def count_params(model: nn.Module) -> int:

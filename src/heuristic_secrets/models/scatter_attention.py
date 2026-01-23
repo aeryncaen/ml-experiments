@@ -69,14 +69,35 @@ class Sine(nn.Module):
         return torch.sin(x)
 
 
+class SqueezeExciteND(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.fc1 = nn.Linear(channels, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, channels, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_dims = tuple(range(1, x.ndim - 1))
+        scale = x.mean(dim=spatial_dims)
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        for _ in spatial_dims:
+            scale = scale.unsqueeze(1)
+        return x * scale
+
+
 class SIRENDownsampleND(nn.Module):
-    """Learned depthwise strided conv with SIREN-generated kernel. Kernel size adapts to input."""
     
     def __init__(self, channels: int, ndim: int = 1, hidden: int = 32, omega_0: float = 30.0):
         super().__init__()
         self.channels = channels
         self.ndim = ndim
         self.kernel_net = KernelNetND(ndim, channels, hidden=hidden, omega_0=omega_0)
+        self.se = SqueezeExciteND(channels)
+        
+        mlp_hidden = int(channels * 8 / 3)
+        mlp_hidden = ((mlp_hidden + 7) // 8) * 8
+        self.mlp_up = nn.Linear(channels, mlp_hidden, bias=False)
+        self.mlp_down = nn.Linear(mlp_hidden, channels, bias=False)
     
     def forward(self, x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
         spatial = x.shape[1:-1]
@@ -106,7 +127,12 @@ class SIRENDownsampleND(nn.Module):
             mode = ['linear', 'bilinear', 'trilinear'][self.ndim - 1]
             x = F.interpolate(x, size=target_shape, mode=mode, align_corners=False)
         
-        return x.movedim(1, -1)
+        x = x.movedim(1, -1)
+        
+        x = self.se(x)
+        x = x + self.mlp_down(F.silu(self.mlp_up(x)))
+        
+        return x
 
 
 class KernelNetND(nn.Module):
