@@ -211,8 +211,10 @@ if HAS_TRITON:
             
             # Power-law decay: 1 / (1 + norm_dist)^exponent
             # norm_dist = rel_pos / L (normalized by sequence length)
+            # Use exp(exponent * log(x)) since tl.math.pow doesn't exist
             norm_dist = rel_pos / L
-            power_weight = 1.0 / tl.math.pow(1.0 + norm_dist, exponent)
+            one_plus_dist = 1.0 + norm_dist
+            power_weight = tl.exp(-exponent * tl.log(one_plus_dist + 1e-6))
             kernel_w = kernel_w * power_weight * valid_f
             
             # Soft gather: interpolate between floor and ceil values
@@ -297,9 +299,11 @@ if HAS_TRITON:
             kernel_interp = k_floor * w_floor + k_ceil * w_ceil
             
             # Power-law decay: 1 / (1 + norm_dist)^exponent
+            # Use exp(-exponent * log(x)) since tl.math.pow doesn't exist
             norm_dist = rel_pos / L
             one_plus_dist = 1.0 + norm_dist
-            power_weight = 1.0 / tl.math.pow(one_plus_dist, exponent)
+            log_one_plus_dist = tl.log(one_plus_dist + 1e-6)
+            power_weight = tl.exp(-exponent * log_one_plus_dist)
             kernel_w = kernel_interp * power_weight * valid_f
             
             # Load values from floor and ceil positions
