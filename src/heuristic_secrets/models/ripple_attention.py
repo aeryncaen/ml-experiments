@@ -17,6 +17,20 @@ except ImportError:
     TritonAdaptiveLocalConv = None
 
 
+class LowRankResidual(nn.Module):
+    
+    def __init__(self, dim: int, rank: int = 16):
+        super().__init__()
+        self.A = nn.Linear(dim, rank, bias=False)
+        self.B = nn.Linear(rank, dim, bias=False)
+        self.D = nn.Parameter(torch.zeros(dim))
+        nn.init.zeros_(self.A.weight)
+        nn.init.zeros_(self.B.weight)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.B(self.A(x)) + x * self.D
+
+
 class RippleAttention(nn.Module):
     
     def __init__(
@@ -30,12 +44,15 @@ class RippleAttention(nn.Module):
         chunk_size: int = 1024,
         use_triton: bool = True,
         eps: float = 1e-6,
+        residual_rank: int = 16,
     ):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         
         self.lowrank = LowRankAttention(channels)
+        self.lowrank_res1 = LowRankResidual(channels, residual_rank)
+        self.lowrank_res2 = LowRankResidual(channels, residual_rank)
         self.norm1 = RMSNorm(channels, eps)
         self.norm5 = RMSNorm(channels, eps)
         
@@ -50,6 +67,8 @@ class RippleAttention(nn.Module):
             chunk_size=chunk_size,
             use_triton=use_triton,
         )
+        self.telephone_res1 = LowRankResidual(channels, residual_rank)
+        self.telephone_res2 = LowRankResidual(channels, residual_rank)
         self.norm2 = RMSNorm(channels, eps)
         self.norm4 = RMSNorm(channels, eps)
         
@@ -72,21 +91,39 @@ class RippleAttention(nn.Module):
         B, L, C = x.shape
         
         lowrank_out, _ = self.lowrank(x)
-        h = x + self.norm1(lowrank_out)
+        h = x + self.norm1(lowrank_out + self.lowrank_res1(lowrank_out))
         
         tel_out, _ = self.telephone(h)
-        h = h + self.norm2(tel_out)
+        h = h + self.norm2(tel_out + self.telephone_res1(tel_out))
         
         conv_out, conv_info = self.adaptive_conv(h)
         h = h + self.norm3(conv_out)
         
         tel_out, _ = self.telephone(h)
-        h = h + self.norm4(tel_out)
+        h = h + self.norm4(tel_out + self.telephone_res2(tel_out))
         
         lowrank_out, _ = self.lowrank(h)
-        h = h + self.norm5(lowrank_out)
+        h = h + self.norm5(lowrank_out + self.lowrank_res2(lowrank_out))
         
         return h, conv_info
+    
+    def base_parameters(self):
+        for name, module in self.named_modules():
+            if 'res' not in name and module is not self:
+                for param in module.parameters(recurse=False):
+                    yield param
+    
+    def residual_parameters(self):
+        for name, module in self.named_modules():
+            if 'res' in name:
+                for param in module.parameters(recurse=False):
+                    yield param
+    
+    def param_groups(self, lr: float, base_lr_mult: float = 0.5):
+        return [
+            {'params': list(self.base_parameters()), 'lr': lr * base_lr_mult},
+            {'params': list(self.residual_parameters()), 'lr': lr},
+        ]
 
 
 class RippleBlock(nn.Module):

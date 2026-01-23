@@ -763,7 +763,22 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         os.makedirs(checkpoint_dir, exist_ok=True)
     
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    
+    base_params, residual_params = [], []
+    for m in model.modules():
+        if hasattr(m, 'base_parameters') and hasattr(m, 'residual_parameters'):
+            base_params.extend(m.base_parameters())
+            residual_params.extend(m.residual_parameters())
+    
+    if residual_params:
+        other_params = [p for p in model.parameters() if not any(p is bp for bp in base_params) and not any(p is rp for rp in residual_params)]
+        optimizer = torch.optim.AdamW([
+            {'params': base_params, 'lr': lr * 0.5},
+            {'params': residual_params, 'lr': lr},
+            {'params': other_params, 'lr': lr},
+        ], weight_decay=0.01)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
@@ -1412,7 +1427,22 @@ def main():
             if args.profile:
                 print(f'\nProfiling {mt}...')
                 model.train()
-                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+                
+                base_params, residual_params = [], []
+                for m in model.modules():
+                    if hasattr(m, 'base_parameters') and hasattr(m, 'residual_parameters'):
+                        base_params.extend(m.base_parameters())
+                        residual_params.extend(m.residual_parameters())
+                
+                if residual_params:
+                    other_params = [p for p in model.parameters() if not any(p is bp for bp in base_params) and not any(p is rp for rp in residual_params)]
+                    optimizer = torch.optim.AdamW([
+                        {'params': base_params, 'lr': args.lr * 0.5},
+                        {'params': residual_params, 'lr': args.lr},
+                        {'params': other_params, 'lr': args.lr},
+                    ])
+                else:
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
                 
                 # Get a batch
                 inputs, labels = next(iter(train_loader))
