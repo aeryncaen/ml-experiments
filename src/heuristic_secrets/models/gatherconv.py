@@ -192,45 +192,28 @@ class GatherConvND(nn.Module):
     
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
+        H = self.num_heads
         K = self.max_kernel_size
-        chunk_size = min(self.chunk_size, L)
         
         try:
-            from .triton_gather import gather_conv_fn, quantize_fp8, quantize_int4, HAS_FP8
+            from .triton_gather import GatherConvOp
         except ImportError:
-            from triton_gather import gather_conv_fn, quantize_fp8, quantize_int4, HAS_FP8
+            from triton_gather import GatherConvOp
         
-        out = torch.empty_like(x)
+        # Compute freq/phase/kernel for ALL positions (autograd handles these)
+        wave_out = F.silu(self.wave_proj(x))  # (B, L, 2*H)
+        wave_out = wave_out.view(B, L, 2, H)
+        freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
+        phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
+        kernel = F.silu(self.kernel_proj(x)).view(B, L, H, K)
         
-        x_q_data = None
-        if self.quantize_bwd and self.training:
-            if HAS_FP8:
-                x_q, x_scale = quantize_fp8(x)
-                x_q_data = (x_q, x_scale, None, True)
-            else:
-                x_q, x_scale, x_min = quantize_int4(x)
-                x_q_data = (x_q, x_scale, x_min, False)
+        # Single autograd boundary for gather-conv
+        hidden = GatherConvOp.apply(
+            x, freq.contiguous(), phase.contiguous(), kernel.contiguous(),
+            self.max_offset, self.max_receptive, self.quantize_bwd and self.training,
+        )
         
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            chunk_len = end - start
-            x_chunk = x[:, start:end, :]
-            
-            wave_out = F.silu(self.wave_proj(x_chunk))
-            wave_out = wave_out.view(B, chunk_len, 2, self.num_heads)
-            freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
-            phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-            
-            kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, self.num_heads, K).contiguous()
-            
-            hidden_chunk = gather_conv_fn(
-                x, freq.contiguous(), phase.contiguous(), kernel,
-                start, self.max_offset, self.max_receptive, self.quantize_bwd, x_q_data,
-            )
-            
-            out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
-        
-        return out
+        return F.silu(F.linear(hidden, self.out_proj.weight))
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B = x.shape[0]

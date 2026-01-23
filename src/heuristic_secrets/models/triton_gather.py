@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 try:
     import triton
@@ -17,35 +16,87 @@ except ImportError:
 
 if HAS_TRITON:
     @triton.jit
-    def gather_conv_bwd_kernel(
-        x_ptr, d_out_ptr, d_x_ptr,
-        freq_ptr, phase_ptr,
-        kernel_ptr,
-        d_freq_ptr, d_kernel_ptr,
+    def gather_conv_fwd_kernel(
+        x_ptr, out_ptr,
+        freq_ptr, phase_ptr, kernel_ptr,
         B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
         H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
         half_s: tl.constexpr, max_receptive: tl.constexpr,
-        chunk_start,
-        chunk_len: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
-        pid_l_local = tl.program_id(1)
+        pid_l = tl.program_id(1)
         pid_h = tl.program_id(2)
         
-        pid_l = chunk_start + pid_l_local
-        
-        freq_h = tl.load(freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
-        phase_h = tl.load(phase_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        freq_off = pid_b * L * H + pid_l * H + pid_h
+        freq_h = tl.load(freq_ptr + freq_off)
+        phase_h = tl.load(phase_ptr + freq_off)
         
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         
         k_offs = tl.arange(0, K)
-        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
+        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
-        d_out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
+        out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        
+        for s_idx in range(S):
+            s_off = s_idx - half_s
+            sample_pos_f = pid_l + s_off * freq_h + phase_h
+            
+            valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
+            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
+            
+            rel_pos = tl.abs(s_off * freq_h)
+            norm_pos = rel_pos / max_receptive
+            norm_pos = tl.minimum(norm_pos, 1.0)
+            
+            idx_float = norm_pos * (K - 1)
+            idx_floor = idx_float.to(tl.int32)
+            idx_floor = tl.minimum(idx_floor, K - 2)
+            idx_ceil = idx_floor + 1
+            w_ceil = idx_float - idx_floor.to(tl.float32)
+            w_floor = 1.0 - w_ceil
+            
+            k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
+            k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
+            kernel_w = k_floor * w_floor + k_ceil * w_ceil
+            kernel_w = kernel_w * valid.to(tl.float32)
+            
+            val_base = pid_b * L * C + sample_idx * C + pid_h * D
+            vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
+            out_h += vals * kernel_w
+        
+        out_base = pid_b * L * C + pid_l * C + pid_h * D
+        tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
+
+    @triton.jit
+    def gather_conv_bwd_kernel(
+        x_ptr, d_out_ptr, d_x_ptr,
+        freq_ptr, phase_ptr, kernel_ptr,
+        d_freq_ptr, d_kernel_ptr,
+        B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
+        H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
+        half_s: tl.constexpr, max_receptive: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        
+        freq_off = pid_b * L * H + pid_l * H + pid_h
+        freq_h = tl.load(freq_ptr + freq_off)
+        phase_h = tl.load(phase_ptr + freq_off)
+        
+        d_offs = tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        
+        k_offs = tl.arange(0, K)
+        kernel_base = pid_b * L * H * K + pid_l * H * K + pid_h * K
+        kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
+        
+        d_out_base = pid_b * L * C + pid_l * C + pid_h * D
         d_out_h = tl.load(d_out_ptr + d_out_base + d_offs, mask=d_mask, other=0.0)
         
         d_freq_acc = 0.0
@@ -79,225 +130,121 @@ if HAS_TRITON:
             val_base = pid_b * L * C + sample_idx * C + pid_h * D
             vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
             
+            # d_x via atomic add (scatter)
             d_x_contrib = d_out_h * kernel_w
-            d_x_base = pid_b * L * C + sample_idx * C + pid_h * D
-            tl.atomic_add(d_x_ptr + d_x_base + d_offs, d_x_contrib, mask=d_mask)
+            tl.atomic_add(d_x_ptr + val_base + d_offs, d_x_contrib, mask=d_mask)
             
+            # d_kernel
             d_kernel_w = tl.sum(d_out_h * vals) * valid_f
-            
             d_kernel_acc += tl.where(k_offs == idx_floor, d_kernel_w * w_floor, 0.0)
             d_kernel_acc += tl.where(k_offs == idx_ceil, d_kernel_w * w_ceil, 0.0)
             
+            # d_freq (through kernel interpolation)
             d_w_ceil = d_kernel_w * (k_ceil - k_floor)
             d_idx_float = d_w_ceil
             d_norm_pos = d_idx_float * (K - 1)
             d_rel_pos = d_norm_pos / max_receptive * not_clamped
-            
             s_off_f = s_off * 1.0
             d_freq_acc += d_rel_pos * tl.abs(s_off_f)
         
         tl.store(d_kernel_ptr + kernel_base + k_offs, d_kernel_acc, mask=k_offs < K)
-        tl.store(d_freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h, d_freq_acc)
-    
-    @triton.jit
-    def gather_conv_fwd_kernel_chunked(
-        x_ptr, out_ptr,
-        freq_ptr, phase_ptr,
-        kernel_ptr,
-        B: tl.constexpr, L: tl.constexpr, C: tl.constexpr,
-        H: tl.constexpr, D: tl.constexpr, S: tl.constexpr, K: tl.constexpr,
-        half_s: tl.constexpr, max_receptive: tl.constexpr,
-        chunk_start,
-        chunk_len: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        pid_b = tl.program_id(0)
-        pid_l_local = tl.program_id(1)
-        pid_h = tl.program_id(2)
-        
-        pid_l = chunk_start + pid_l_local
-        
-        freq_h = tl.load(freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
-        phase_h = tl.load(phase_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
-        
-        d_offs = tl.arange(0, BLOCK_D)
-        d_mask = d_offs < D
-        
-        k_offs = tl.arange(0, K)
-        kernel_base = pid_b * chunk_len * H * K + pid_l_local * H * K + pid_h * K
-        kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
-        
-        out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
-        
-        for s_idx in range(S):
-            s_off = s_idx - half_s
-            sample_pos_f = pid_l + s_off * freq_h + phase_h
-            
-            valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
-            sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
-            
-            rel_pos = tl.abs(s_off * freq_h)
-            norm_pos = rel_pos / max_receptive
-            norm_pos = tl.minimum(norm_pos, 1.0)
-            
-            idx_float = norm_pos * (K - 1)
-            idx_floor = idx_float.to(tl.int32)
-            idx_floor = tl.minimum(idx_floor, K - 2)
-            idx_ceil = idx_floor + 1
-            w_ceil = idx_float - idx_floor.to(tl.float32)
-            w_floor = 1.0 - w_ceil
-            
-            k_floor = tl.sum(tl.where(k_offs == idx_floor, kernel_vals, 0.0))
-            k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
-            kernel_w = k_floor * w_floor + k_ceil * w_ceil
-            kernel_w = kernel_w * valid.to(tl.float32)
-            
-            val_base = pid_b * L * C + sample_idx * C + pid_h * D
-            vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
-            out_h += vals * kernel_w
-        
-        out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
-        tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
+        tl.store(d_freq_ptr + freq_off, d_freq_acc)
 
 
 HAS_FP8 = hasattr(torch, 'float8_e4m3fn')
 
 
 def quantize_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = t.abs().max() / 448.0  # E4M3 max is ~448
+    scale = t.abs().max() / 448.0
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    t_scaled = t / scale
-    t_fp8 = t_scaled.to(torch.float8_e4m3fn)
-    return t_fp8, scale
+    return t.div(scale).to(torch.float8_e4m3fn), scale
 
 
 def dequantize_fp8(t_fp8: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return t_fp8.to(dtype) * scale
 
 
-def quantize_int4(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    t_min = t.min()
-    t_max = t.max()
-    scale = (t_max - t_min) / 15.0
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+class GatherConvOp(torch.autograd.Function):
+    """Single autograd boundary for gather-conv operation.
     
-    t_norm = ((t - t_min) / scale).round().clamp(0, 15).to(torch.uint8)
+    Takes pre-computed freq, phase, kernel. Returns gathered output.
+    Saves tensors ONCE for backward.
+    """
     
-    t_flat_q = t_norm.flatten()
-    if t_flat_q.numel() % 2 == 1:
-        t_flat_q = F.pad(t_flat_q, (0, 1))
-    packed = (t_flat_q[0::2] << 4) | t_flat_q[1::2]
-    
-    return packed, scale, t_min
-
-
-def dequantize_int4(packed: torch.Tensor, scale: torch.Tensor, t_min: torch.Tensor, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-    hi = (packed >> 4).to(dtype)
-    lo = (packed & 0x0F).to(dtype)
-    t_flat = torch.stack([hi, lo], dim=-1).flatten()
-    
-    numel = 1
-    for s in shape:
-        numel *= s
-    t_flat = t_flat[:numel]
-    
-    return (t_flat * scale + t_min).view(shape)
-
-
-class GatherConvFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, freq, phase, kernel, chunk_start, half_s, max_receptive, quantize_bwd, x_q_data):
+    def forward(ctx, x, freq, phase, kernel, half_s, max_receptive, quantize_bwd):
         B, L, C = x.shape
-        _, chunk_len, H = freq.shape
+        H = freq.shape[-1]
         K = kernel.shape[-1]
         D = C // H
         S = 2 * half_s + 1
-        
         BLOCK_D = triton.next_power_of_2(D)
-        out = torch.empty(B, chunk_len, C, device=x.device, dtype=x.dtype)
         
-        grid = (B, chunk_len, H)
-        gather_conv_fwd_kernel_chunked[grid](
+        out = torch.empty_like(x)
+        grid = (B, L, H)
+        
+        gather_conv_fwd_kernel[grid](
             x, out,
             freq, phase, kernel,
             B, L, C, H, D, S, K,
-            half_s, max_receptive,
-            chunk_start, chunk_len, BLOCK_D,
+            half_s, max_receptive, BLOCK_D,
         )
         
-        ctx.quantize_bwd = quantize_bwd
-        ctx.x_shape = x.shape
-        ctx.kernel_shape = kernel.shape
-        ctx.orig_dtype = x.dtype
-        
-        if quantize_bwd and x_q_data is not None:
-            x_q, x_scale, x_min, is_fp8 = x_q_data
-            ctx.use_fp8 = is_fp8
-            if is_fp8:
-                kernel_q, kernel_scale = quantize_fp8(kernel)
-                ctx.save_for_backward(x_q, x_scale, freq, phase, kernel_q, kernel_scale)
-            else:
-                kernel_q, kernel_scale, kernel_min = quantize_int4(kernel)
-                ctx.save_for_backward(x_q, x_scale, x_min, freq, phase, kernel_q, kernel_scale, kernel_min)
-        else:
-            ctx.save_for_backward(x, freq, phase, kernel)
-        
-        ctx.chunk_start = chunk_start
+        # Save for backward - ONCE
         ctx.half_s = half_s
         ctx.max_receptive = max_receptive
+        ctx.quantize_bwd = quantize_bwd
+        
+        if quantize_bwd and HAS_FP8:
+            x_q, x_scale = quantize_fp8(x)
+            kernel_q, kernel_scale = quantize_fp8(kernel)
+            ctx.save_for_backward(x_q, x_scale, freq, phase, kernel_q, kernel_scale)
+            ctx.use_quant = True
+        else:
+            ctx.save_for_backward(x, freq, phase, kernel)
+            ctx.use_quant = False
         
         return out
     
     @staticmethod
     def backward(ctx, d_out):
-        chunk_start = ctx.chunk_start
         half_s = ctx.half_s
         max_receptive = ctx.max_receptive
-        dtype = ctx.orig_dtype
         
-        if ctx.quantize_bwd:
-            if ctx.use_fp8:
-                x_q, x_scale, freq, phase, kernel_q, kernel_scale = ctx.saved_tensors
-                x = dequantize_fp8(x_q, x_scale, dtype)
-                kernel = dequantize_fp8(kernel_q, kernel_scale, dtype)
-            else:
-                x_q, x_scale, x_min, freq, phase, kernel_q, kernel_scale, kernel_min = ctx.saved_tensors
-                x = dequantize_int4(x_q, x_scale, x_min, ctx.x_shape, dtype)
-                kernel = dequantize_int4(kernel_q, kernel_scale, kernel_min, ctx.kernel_shape, dtype)
+        if ctx.use_quant:
+            x_q, x_scale, freq, phase, kernel_q, kernel_scale = ctx.saved_tensors
+            x = dequantize_fp8(x_q, x_scale, d_out.dtype)
+            kernel = dequantize_fp8(kernel_q, kernel_scale, d_out.dtype)
         else:
             x, freq, phase, kernel = ctx.saved_tensors
         
         B, L, C = x.shape
-        _, chunk_len, H = freq.shape
+        H = freq.shape[-1]
         K = kernel.shape[-1]
         D = C // H
         S = 2 * half_s + 1
-        
         BLOCK_D = triton.next_power_of_2(D)
-        d_out = d_out.contiguous()
         
+        d_out = d_out.contiguous()
         d_x = torch.zeros_like(x)
         d_freq = torch.zeros_like(freq)
         d_kernel = torch.zeros_like(kernel)
         
-        grid = (B, chunk_len, H)
-        
+        grid = (B, L, H)
         gather_conv_bwd_kernel[grid](
             x, d_out, d_x,
             freq, phase, kernel,
             d_freq, d_kernel,
             B, L, C, H, D, S, K,
-            half_s, max_receptive,
-            chunk_start, chunk_len, BLOCK_D,
+            half_s, max_receptive, BLOCK_D,
         )
         
-        return d_x, d_freq, None, d_kernel, None, None, None, None, None
-
-
-gather_conv_fn = GatherConvFunction.apply
+        return d_x, d_freq, None, d_kernel, None, None, None
 
 
 class TritonGatherConv(nn.Module):
+    """GatherConv using Triton kernels."""
+    
     def __init__(
         self,
         channels: int,
@@ -306,7 +253,7 @@ class TritonGatherConv(nn.Module):
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         max_kernel_size: int = 64,
-        chunk_size: int = 1024,
+        quantize_bwd: bool = False,
     ):
         super().__init__()
         if not HAS_TRITON:
@@ -318,7 +265,7 @@ class TritonGatherConv(nn.Module):
         self.max_freq = max_freq
         self.min_freq = min_freq
         self.max_kernel_size = max_kernel_size
-        self.chunk_size = chunk_size
+        self.quantize_bwd = quantize_bwd
         
         self.half_s = max_samples // 2
         self.num_samples = 2 * self.half_s + 1
@@ -338,29 +285,21 @@ class TritonGatherConv(nn.Module):
         B, L, C = x.shape
         H = self.num_heads
         K = self.max_kernel_size
-        chunk_size = min(self.chunk_size, L)
         
-        out = torch.empty_like(x)
+        # Compute freq/phase/kernel (autograd tracks these normally)
+        wave_out = F.silu(self.wave_proj(x))  # (B, L, 2*H)
+        wave_out = wave_out.view(B, L, 2, H)
+        freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
+        phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
+        kernel = F.silu(self.kernel_proj(x)).view(B, L, H, K)
         
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            chunk_len = end - start
-            x_chunk = x[:, start:end, :]
-            
-            wave_out = F.silu(self.wave_proj(x_chunk))
-            wave_out = wave_out.view(B, chunk_len, 2, H)
-            freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
-            phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-            
-            kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
-            
-            hidden_chunk = gather_conv_fn(
-                x, freq.contiguous(), phase.contiguous(), kernel,
-                start, self.half_s, self.max_receptive, False, None,
-            )
-            
-            out[:, start:end, :] = F.silu(F.linear(hidden_chunk, self.out_proj.weight))
+        # Single autograd boundary for gather-conv
+        hidden = GatherConvOp.apply(
+            x, freq.contiguous(), phase.contiguous(), kernel.contiguous(),
+            self.half_s, self.max_receptive, self.quantize_bwd,
+        )
         
+        out = F.silu(self.out_proj(hidden))
         return out, {}
 
 
@@ -370,64 +309,52 @@ if __name__ == "__main__":
         exit()
     
     import time
-    import sys
     
     device = "cuda"
     B, L, C = 4, 8192, 256
     H = 8
     
-    if "--trace" in sys.argv:
-        torch.cuda.reset_peak_memory_stats()
+    print(f"Config: B={B}, L={L}, C={C}, H={H}")
+    print(f"FP8 available: {HAS_FP8}")
+    print()
+    
+    for quant in [False, True]:
+        label = "Triton+Q" if quant else "Triton"
+        model = TritonGatherConv(channels=C, num_heads=H, quantize_bwd=quant).to(device)
+        x = torch.randn(B, L, C, device=device, requires_grad=True)
         
-        def mem():
-            torch.cuda.synchronize()
-            return torch.cuda.max_memory_allocated() / 1024**2
-        
-        model = TritonGatherConv(channels=C, num_heads=H).to(device)
-        print(f"After model init: {mem():.1f} MB")
-        
-        x = torch.randn(B, L, C, device=device)
-        print(f"After x alloc: {mem():.1f} MB")
-        
-        torch.cuda.reset_peak_memory_stats()
-        out = torch.empty_like(x)
-        print(f"After out alloc: {mem():.1f} MB")
-        
-        torch.cuda.reset_peak_memory_stats()
-        chunk_size = 1024
-        x_chunk = x[:, :chunk_size, :]
-        wave_out = F.silu(model.wave_proj(x_chunk))
-        print(f"After wave_proj: {mem():.1f} MB")
-        
-        torch.cuda.reset_peak_memory_stats()
-        kernel = F.silu(model.kernel_proj(x_chunk))
-        print(f"After kernel_proj: {mem():.1f} MB")
-        
-        torch.cuda.reset_peak_memory_stats()
-        out_final = F.silu(model.out_proj(x))
-        print(f"After out_proj (full L): {mem():.1f} MB")
-        
-        del wave_out, kernel, out_final, out, x_chunk
-        torch.cuda.empty_cache()
-        
-        torch.cuda.reset_peak_memory_stats()
-        out, _ = model(x)
-        print(f"Full forward: {mem():.1f} MB")
-    else:
-        model = TritonGatherConv(channels=C, num_heads=H).to(device)
-        x = torch.randn(B, L, C, device=device)
-        
-        for _ in range(10):
+        # Warmup
+        for _ in range(5):
             out, _ = model(x)
-            torch.cuda.synchronize()
+            out.sum().backward()
+            model.zero_grad()
+            if x.grad is not None:
+                x.grad.zero_()
+        
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Forward only
+        start = time.perf_counter()
+        for _ in range(20):
+            with torch.no_grad():
+                out, _ = model(x)
+        torch.cuda.synchronize()
+        fwd_time = (time.perf_counter() - start) / 20 * 1000
+        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2
         
         torch.cuda.reset_peak_memory_stats()
+        
+        # Forward + backward
         start = time.perf_counter()
         for _ in range(20):
             out, _ = model(x)
-            torch.cuda.synchronize()
-        elapsed = (time.perf_counter() - start) / 20 * 1000
-        mem = torch.cuda.max_memory_allocated() / 1024**2
+            out.sum().backward()
+            model.zero_grad()
+            x.grad.zero_()
+        torch.cuda.synchronize()
+        total_time = (time.perf_counter() - start) / 20 * 1000
+        bwd_time = total_time - fwd_time
+        bwd_mem = torch.cuda.max_memory_allocated() / 1024**2
         
-        print(f"Triton GatherConv: {elapsed:.2f} ms, {mem:.1f} MB")
-        print(f"Output shape: {out.shape}")
+        print(f"{label:10s}: Fwd {fwd_time:5.1f}ms ({fwd_mem:5.0f}MB)  Bwd {bwd_time:5.1f}ms ({bwd_mem:5.0f}MB)")
