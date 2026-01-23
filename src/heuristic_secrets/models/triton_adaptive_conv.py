@@ -802,8 +802,8 @@ if __name__ == "__main__":
         mem = torch.cuda.max_memory_allocated() / 1024**2
         return total_ms, mem
     
-    print(f"{'L':>8} {'sqrt(L)':>8} | {'PyTorch':>12} {'Triton':>12} {'Speedup':>10}")
-    print("-" * 60)
+    print(f"{'L':>8} {'sqrt(L)':>8} | {'PyT ms':>8} {'PyT MB':>8} | {'Tri ms':>8} {'Tri MB':>8} | {'Speedup':>8}")
+    print("-" * 80)
     
     seq_lengths = [256, 512, 1024, 2048, 4096, 8192]
     
@@ -815,7 +815,7 @@ if __name__ == "__main__":
             pt_ms, pt_mem = bench(pytorch_model, x)
             tr_ms, tr_mem = bench(triton_model, x)
             speedup = pt_ms / tr_ms
-            print(f"{L:>8} {int(math.sqrt(L)):>8} | {pt_ms:>10.2f}ms {tr_ms:>10.2f}ms {speedup:>9.2f}x")
+            print(f"{L:>8} {int(math.sqrt(L)):>8} | {pt_ms:>8.2f} {pt_mem:>8.0f} | {tr_ms:>8.2f} {tr_mem:>8.0f} | {speedup:>7.2f}x")
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"{L:>8} {int(math.sqrt(L)):>8} | OOM")
@@ -823,4 +823,4 @@ if __name__ == "__main__":
             else:
                 raise
     
-    print("=" * 60)
+    print("=" * 80)
