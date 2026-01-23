@@ -1,4 +1,4 @@
-"""Triton kernels for SIRENDownsampleND - all fused kernels, minimal PyTorch ops."""
+"""Triton kernels for SIRENDownsampleND - reuses triton_telephone linear kernels."""
 
 from __future__ import annotations
 
@@ -9,6 +9,11 @@ import torch.nn.functional as F
 try:
     import triton
     import triton.language as tl
+    from .triton_telephone import (
+        triton_linear,
+        linear_bwd_dx_kernel,
+        linear_bwd_dw_kernel,
+    )
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -16,78 +21,21 @@ except ImportError:
 
 if HAS_TRITON:
     @triton.jit
-    def siren_kernel_gen_fwd(
-        pos_ptr, out_ptr,
-        w0_ptr, b0_ptr,
-        w1_ptr, b1_ptr,
-        w2_ptr, b2_ptr,
-        w3_ptr, b3_ptr,
-        h0_ptr, h1_ptr, h2_ptr,
-        omega_0,
-        K: tl.constexpr,
-        hidden: tl.constexpr,
-        out_dim: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-    ):
-        """
-        Fused SIREN kernel generation: pos -> Linear -> Sin -> Linear -> Sin -> Linear -> Sin -> Linear
-        Each program handles one position. Saves pre-sin activations for backward.
-        
-        pos: (K, 1) - kernel positions
-        w0: (hidden, 1), b0: (hidden,)
-        w1, w2: (hidden, hidden), b1, b2: (hidden,)
-        w3: (out_dim, hidden), b3: (out_dim,)
-        out: (K, out_dim) - kernel weights per channel
-        h0, h1, h2: (K, hidden) - pre-sin activations for backward
-        """
-        pid_k = tl.program_id(0)
-        
-        if pid_k >= K:
-            return
-        
-        pos = tl.load(pos_ptr + pid_k) * omega_0
-        
-        h_idx = tl.arange(0, BLOCK_H)
-        h_mask = h_idx < hidden
-        
-        w0_vals = tl.load(w0_ptr + h_idx, mask=h_mask, other=0.0)
-        b0_vals = tl.load(b0_ptr + h_idx, mask=h_mask, other=0.0)
-        h0_pre = w0_vals * pos + b0_vals
-        tl.store(h0_ptr + pid_k * hidden + h_idx, h0_pre, mask=h_mask)
-        h0 = tl.sin(h0_pre)
-        
-        h1_pre = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for hh in range(hidden):
-            h0_val = tl.sum(tl.where(h_idx == hh, h0, 0.0))
-            w1_col = tl.load(w1_ptr + h_idx * hidden + hh, mask=h_mask, other=0.0)
-            h1_pre += w1_col * h0_val
-        b1_vals = tl.load(b1_ptr + h_idx, mask=h_mask, other=0.0)
-        h1_pre = h1_pre + b1_vals
-        tl.store(h1_ptr + pid_k * hidden + h_idx, h1_pre, mask=h_mask)
-        h1 = tl.sin(h1_pre)
-        
-        h2_pre = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for hh in range(hidden):
-            h1_val = tl.sum(tl.where(h_idx == hh, h1, 0.0))
-            w2_col = tl.load(w2_ptr + h_idx * hidden + hh, mask=h_mask, other=0.0)
-            h2_pre += w2_col * h1_val
-        b2_vals = tl.load(b2_ptr + h_idx, mask=h_mask, other=0.0)
-        h2_pre = h2_pre + b2_vals
-        tl.store(h2_ptr + pid_k * hidden + h_idx, h2_pre, mask=h_mask)
-        h2 = tl.sin(h2_pre)
-        
-        out_idx = tl.arange(0, BLOCK_H)
-        out_mask = out_idx < out_dim
-        
-        out_vals = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for hh in range(hidden):
-            h2_val = tl.sum(tl.where(h_idx == hh, h2, 0.0))
-            w3_col = tl.load(w3_ptr + out_idx * hidden + hh, mask=out_mask, other=0.0)
-            out_vals += w3_col * h2_val
-        b3_vals = tl.load(b3_ptr + out_idx, mask=out_mask, other=0.0)
-        out_vals = out_vals + b3_vals
-        
-        tl.store(out_ptr + pid_k * out_dim + out_idx, out_vals, mask=out_mask)
+    def sin_fwd_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(x_ptr + offs, mask=mask)
+        tl.store(out_ptr + offs, tl.sin(x), mask=mask)
+
+    @triton.jit
+    def sin_bwd_kernel(x_ptr, d_out_ptr, d_x_ptr, N, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(x_ptr + offs, mask=mask)
+        d_out = tl.load(d_out_ptr + offs, mask=mask)
+        tl.store(d_x_ptr + offs, d_out * tl.cos(x), mask=mask)
 
     @triton.jit
     def depthwise_conv1d_fwd(
@@ -96,12 +44,6 @@ if HAS_TRITON:
         L_out: tl.constexpr, K: tl.constexpr, stride: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """
-        Fused depthwise strided 1D conv.
-        x: (B, C, L_in) - channels first
-        kernel: (C, K) - kernel per channel
-        out: (B, C, L_out)
-        """
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         pid_c_block = tl.program_id(2)
@@ -110,19 +52,15 @@ if HAS_TRITON:
         c_mask = c_idx < C
         
         acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-        
         in_start = pid_l * stride
         
         for k in range(K):
             in_pos = in_start + k
             in_valid = in_pos < L_in
-            
             x_offs = pid_b * C * L_in + c_idx * L_in + in_pos
             x_vals = tl.load(x_ptr + x_offs, mask=c_mask & in_valid, other=0.0)
-            
             k_offs = c_idx * K + k
             k_vals = tl.load(kernel_ptr + k_offs, mask=c_mask, other=0.0)
-            
             acc += x_vals * k_vals
         
         out_offs = pid_b * C * L_out + c_idx * L_out + pid_l
@@ -135,9 +73,6 @@ if HAS_TRITON:
         L_out: tl.constexpr, K: tl.constexpr, stride: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """
-        Backward for x: d_x[b, c, in_pos] += d_out[b, c, l] * kernel[c, k] for all l,k where in_start + k == in_pos
-        """
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         pid_c_block = tl.program_id(2)
@@ -149,13 +84,11 @@ if HAS_TRITON:
         d_out_vals = tl.load(d_out_ptr + d_out_offs, mask=c_mask, other=0.0)
         
         in_start = pid_l * stride
-        
         for k in range(K):
             in_pos = in_start + k
             if in_pos < L_in:
                 k_offs = c_idx * K + k
                 k_vals = tl.load(kernel_ptr + k_offs, mask=c_mask, other=0.0)
-                
                 d_x_vals = d_out_vals * k_vals
                 d_x_offs = pid_b * C * L_in + c_idx * L_in + in_pos
                 tl.atomic_add(d_x_ptr + d_x_offs, d_x_vals, mask=c_mask)
@@ -167,9 +100,6 @@ if HAS_TRITON:
         L_out: tl.constexpr, K: tl.constexpr, stride: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """
-        Backward for kernel - parallelized over (b, l, c_block), atomic_add to d_kernel
-        """
         pid_b = tl.program_id(0)
         pid_l = tl.program_id(1)
         pid_c_block = tl.program_id(2)
@@ -181,223 +111,93 @@ if HAS_TRITON:
         d_out_vals = tl.load(d_out_ptr + d_out_offs, mask=c_mask, other=0.0)
         
         in_start = pid_l * stride
-        
         for k in range(K):
             in_pos = in_start + k
             if in_pos < L_in:
                 x_offs = pid_b * C * L_in + c_idx * L_in + in_pos
                 x_vals = tl.load(x_ptr + x_offs, mask=c_mask, other=0.0)
-                
                 d_k_vals = d_out_vals * x_vals
                 d_k_offs = c_idx * K + k
                 tl.atomic_add(d_kernel_ptr + d_k_offs, d_k_vals, mask=c_mask)
 
-    @triton.jit
-    def siren_kernel_gen_bwd(
-        pos_ptr, d_out_ptr,
-        w0_ptr, w1_ptr, w2_ptr, w3_ptr,
-        h0_ptr, h1_ptr, h2_ptr,
-        d_w0_ptr, d_b0_ptr,
-        d_w1_ptr, d_b1_ptr,
-        d_w2_ptr, d_b2_ptr,
-        d_w3_ptr, d_b3_ptr,
-        omega_0,
-        K: tl.constexpr,
-        hidden: tl.constexpr,
-        out_dim: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-    ):
-        """
-        Backward for SIREN kernel generation. Each program handles one position.
-        """
-        pid_k = tl.program_id(0)
-        
-        if pid_k >= K:
-            return
-        
-        pos = tl.load(pos_ptr + pid_k) * omega_0
-        
-        h_idx = tl.arange(0, BLOCK_H)
-        h_mask = h_idx < hidden
-        out_idx = tl.arange(0, BLOCK_H)
-        out_mask = out_idx < out_dim
-        
-        h0_pre = tl.load(h0_ptr + pid_k * hidden + h_idx, mask=h_mask, other=0.0)
-        h1_pre = tl.load(h1_ptr + pid_k * hidden + h_idx, mask=h_mask, other=0.0)
-        h2_pre = tl.load(h2_ptr + pid_k * hidden + h_idx, mask=h_mask, other=0.0)
-        
-        h0 = tl.sin(h0_pre)
-        h1 = tl.sin(h1_pre)
-        h2 = tl.sin(h2_pre)
-        
-        d_out = tl.load(d_out_ptr + pid_k * out_dim + out_idx, mask=out_mask, other=0.0)
-        
-        for o in range(out_dim):
-            d_o = tl.sum(tl.where(out_idx == o, d_out, 0.0))
-            tl.atomic_add(d_w3_ptr + o * hidden + h_idx, d_o * h2, mask=h_mask)
-            tl.atomic_add(d_b3_ptr + o, d_o)
-        
-        d_h2 = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for o in range(out_dim):
-            d_o = tl.sum(tl.where(out_idx == o, d_out, 0.0))
-            w3_row = tl.load(w3_ptr + o * hidden + h_idx, mask=h_mask, other=0.0)
-            d_h2 += d_o * w3_row
-        
-        d_h2_pre = d_h2 * tl.cos(h2_pre)
-        
-        for hh in range(hidden):
-            d_hh = tl.sum(tl.where(h_idx == hh, d_h2_pre, 0.0))
-            tl.atomic_add(d_w2_ptr + hh * hidden + h_idx, d_hh * h1, mask=h_mask)
-            tl.atomic_add(d_b2_ptr + hh, d_hh)
-        
-        d_h1 = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for hh in range(hidden):
-            d_hh = tl.sum(tl.where(h_idx == hh, d_h2_pre, 0.0))
-            w2_row = tl.load(w2_ptr + hh * hidden + h_idx, mask=h_mask, other=0.0)
-            d_h1 += d_hh * w2_row
-        
-        d_h1_pre = d_h1 * tl.cos(h1_pre)
-        
-        for hh in range(hidden):
-            d_hh = tl.sum(tl.where(h_idx == hh, d_h1_pre, 0.0))
-            tl.atomic_add(d_w1_ptr + hh * hidden + h_idx, d_hh * h0, mask=h_mask)
-            tl.atomic_add(d_b1_ptr + hh, d_hh)
-        
-        d_h0 = tl.zeros((BLOCK_H,), dtype=tl.float32)
-        for hh in range(hidden):
-            d_hh = tl.sum(tl.where(h_idx == hh, d_h1_pre, 0.0))
-            w1_row = tl.load(w1_ptr + hh * hidden + h_idx, mask=h_mask, other=0.0)
-            d_h0 += d_hh * w1_row
-        
-        d_h0_pre = d_h0 * tl.cos(h0_pre)
-        
-        for hh in range(hidden):
-            d_hh = tl.sum(tl.where(h_idx == hh, d_h0_pre, 0.0))
-            tl.atomic_add(d_w0_ptr + hh, d_hh * pos)
-            tl.atomic_add(d_b0_ptr + hh, d_hh)
+
+def triton_sin(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    N = x.numel()
+    BLOCK = 1024
+    grid = (triton.cdiv(N, BLOCK),)
+    sin_fwd_kernel[grid](x, out, N, BLOCK)
+    return out
 
 
-def triton_siren_kernel_gen(
-    positions: torch.Tensor,
-    w0: torch.Tensor, b0: torch.Tensor,
-    w1: torch.Tensor, b1: torch.Tensor,
-    w2: torch.Tensor, b2: torch.Tensor,
-    w3: torch.Tensor, b3: torch.Tensor,
-    omega_0: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate kernel weights using SIREN MLP. Returns (kernel, h0, h1, h2)."""
-    K = positions.shape[0]
-    hidden = w0.shape[0]
-    out_dim = w3.shape[0]
+def triton_sin_bwd(x: torch.Tensor, d_out: torch.Tensor) -> torch.Tensor:
+    d_x = torch.empty_like(x)
+    N = x.numel()
+    BLOCK = 1024
+    grid = (triton.cdiv(N, BLOCK),)
+    sin_bwd_kernel[grid](x, d_out, d_x, N, BLOCK)
+    return d_x
+
+
+def triton_linear_bwd(d_out: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
+    M, N = d_out.shape
+    K = w.shape[1]
     
-    kernel = torch.empty(K, out_dim, device=positions.device, dtype=positions.dtype)
-    h0 = torch.empty(K, hidden, device=positions.device, dtype=positions.dtype)
-    h1 = torch.empty(K, hidden, device=positions.device, dtype=positions.dtype)
-    h2 = torch.empty(K, hidden, device=positions.device, dtype=positions.dtype)
+    d_x = torch.empty(M, K, device=d_out.device, dtype=d_out.dtype)
+    d_w = torch.empty_like(w)
     
-    BLOCK_H = triton.next_power_of_2(max(hidden, out_dim))
-    grid = (K,)
+    BLOCK_M, BLOCK_K, BLOCK_N = 32, 32, 32
     
-    siren_kernel_gen_fwd[grid](
-        positions, kernel,
-        w0, b0, w1, b1, w2, b2, w3, b3,
-        h0, h1, h2,
-        omega_0,
-        K, hidden, out_dim, BLOCK_H,
+    grid_dx = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+    linear_bwd_dx_kernel[grid_dx](
+        d_out, w, d_x,
+        M, N, K,
+        d_out.stride(0), d_out.stride(1),
+        w.stride(0), w.stride(1),
+        d_x.stride(0), d_x.stride(1),
+        BLOCK_M, BLOCK_K, BLOCK_N,
     )
     
-    return kernel, h0, h1, h2
-
-
-def triton_siren_kernel_gen_bwd(
-    positions: torch.Tensor,
-    d_kernel: torch.Tensor,
-    w0: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor,
-    h0: torch.Tensor, h1: torch.Tensor, h2: torch.Tensor,
-    omega_0: float,
-) -> tuple[torch.Tensor, ...]:
-    """Backward for SIREN kernel generation."""
-    K = positions.shape[0]
-    hidden = w0.shape[0]
-    out_dim = w3.shape[0]
-    
-    d_w0 = torch.zeros_like(w0)
-    d_b0 = torch.zeros(hidden, device=positions.device, dtype=positions.dtype)
-    d_w1 = torch.zeros_like(w1)
-    d_b1 = torch.zeros(hidden, device=positions.device, dtype=positions.dtype)
-    d_w2 = torch.zeros_like(w2)
-    d_b2 = torch.zeros(hidden, device=positions.device, dtype=positions.dtype)
-    d_w3 = torch.zeros_like(w3)
-    d_b3 = torch.zeros(out_dim, device=positions.device, dtype=positions.dtype)
-    
-    BLOCK_H = triton.next_power_of_2(max(hidden, out_dim))
-    grid = (K,)
-    
-    siren_kernel_gen_bwd[grid](
-        positions, d_kernel,
-        w0, w1, w2, w3,
-        h0, h1, h2,
-        d_w0, d_b0, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3,
-        omega_0,
-        K, hidden, out_dim, BLOCK_H,
+    grid_dw = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+    linear_bwd_dw_kernel[grid_dw](
+        d_out, x, d_w,
+        M, N, K,
+        d_out.stride(0), d_out.stride(1),
+        x.stride(0), x.stride(1),
+        d_w.stride(0), d_w.stride(1),
+        BLOCK_N, BLOCK_K, BLOCK_M,
     )
     
-    return d_w0, d_b0, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3
+    d_b = d_out.sum(0)
+    
+    return d_x, d_w, d_b
 
 
-def triton_depthwise_conv1d(
-    x: torch.Tensor,
-    kernel: torch.Tensor,
-    stride: int,
-) -> torch.Tensor:
-    """Depthwise strided conv1d. x: (B, C, L_in), kernel: (C, K) -> (B, C, L_out)"""
+def triton_depthwise_conv1d(x: torch.Tensor, kernel: torch.Tensor, stride: int) -> torch.Tensor:
     B, C, L_in = x.shape
     K = kernel.shape[1]
     L_out = (L_in - K) // stride + 1
     
     out = torch.empty(B, C, L_out, device=x.device, dtype=x.dtype)
-    
     BLOCK_C = min(64, triton.next_power_of_2(C))
     grid = (B, L_out, triton.cdiv(C, BLOCK_C))
     
-    depthwise_conv1d_fwd[grid](
-        x, kernel, out,
-        B, L_in, C, L_out, K, stride,
-        BLOCK_C,
-    )
-    
+    depthwise_conv1d_fwd[grid](x, kernel, out, B, L_in, C, L_out, K, stride, BLOCK_C)
     return out
 
 
-def triton_depthwise_conv1d_bwd(
-    x: torch.Tensor,
-    kernel: torch.Tensor,
-    d_out: torch.Tensor,
-    stride: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backward for depthwise conv1d."""
+def triton_depthwise_conv1d_bwd(x: torch.Tensor, kernel: torch.Tensor, d_out: torch.Tensor, stride: int):
     B, C, L_in = x.shape
     K = kernel.shape[1]
     L_out = d_out.shape[2]
     
     d_x = torch.zeros_like(x)
     d_kernel = torch.zeros_like(kernel)
-    
     BLOCK_C = min(64, triton.next_power_of_2(C))
     
-    grid_x = (B, L_out, triton.cdiv(C, BLOCK_C))
-    depthwise_conv1d_bwd_x[grid_x](
-        d_out, kernel, d_x,
-        B, L_in, C, L_out, K, stride,
-        BLOCK_C,
-    )
-    
-    grid_k = (B, L_out, triton.cdiv(C, BLOCK_C))
-    depthwise_conv1d_bwd_kernel[grid_k](
-        x, d_out, d_kernel,
-        B, L_in, C, L_out, K, stride,
-        BLOCK_C,
-    )
+    grid = (B, L_out, triton.cdiv(C, BLOCK_C))
+    depthwise_conv1d_bwd_x[grid](d_out, kernel, d_x, B, L_in, C, L_out, K, stride, BLOCK_C)
+    depthwise_conv1d_bwd_kernel[grid](x, d_out, d_kernel, B, L_in, C, L_out, K, stride, BLOCK_C)
     
     return d_x, d_kernel
 
@@ -415,14 +215,17 @@ class _TritonSIRENDownsample1D(torch.autograd.Function):
         stride = max(1, L_in // L_out)
         K = stride
         
-        positions = torch.linspace(-1, 1, K, device=x.device, dtype=x.dtype)
+        pos = torch.linspace(-1, 1, K, device=x.device, dtype=x.dtype).unsqueeze(-1) * omega_0
         
-        kernel_flat, h0, h1, h2 = triton_siren_kernel_gen(
-            positions, w0, b0, w1, b1, w2, b2, w3, b3, omega_0
-        )
+        h0_pre = triton_linear(pos, w0) + b0
+        h0 = triton_sin(h0_pre)
+        h1_pre = triton_linear(h0, w1) + b1
+        h1 = triton_sin(h1_pre)
+        h2_pre = triton_linear(h1, w2) + b2
+        h2 = triton_sin(h2_pre)
+        kernel_flat = triton_linear(h2, w3) + b3
         
         kernel = kernel_flat.T.contiguous()
-        
         x_t = x.movedim(-1, 1).contiguous()
         out_t = triton_depthwise_conv1d(x_t, kernel, stride)
         
@@ -432,7 +235,7 @@ class _TritonSIRENDownsample1D(torch.autograd.Function):
         
         out = out_t.movedim(1, -1)
         
-        ctx.save_for_backward(x_t, positions, kernel, h0, h1, h2, w0, w1, w2, w3, b0, b1, b2, b3)
+        ctx.save_for_backward(x_t, pos, kernel, h0_pre, h0, h1_pre, h1, h2_pre, h2, w0, w1, w2, w3)
         ctx.omega_0 = omega_0
         ctx.stride = stride
         ctx.K = K
@@ -447,26 +250,25 @@ class _TritonSIRENDownsample1D(torch.autograd.Function):
         if ctx.is_identity:
             return d_out, None, None, None, None, None, None, None, None, None, None
         
-        x_t, positions, kernel, h0, h1, h2, w0, w1, w2, w3, b0, b1, b2, b3 = ctx.saved_tensors
-        omega_0 = ctx.omega_0
+        x_t, pos, kernel, h0_pre, h0, h1_pre, h1, h2_pre, h2, w0, w1, w2, w3 = ctx.saved_tensors
         stride = ctx.stride
         L_out = ctx.L_out
         L_actual = ctx.L_actual
         
-        B, C, L_in = x_t.shape
-        
         d_out_t = d_out.movedim(-1, 1).contiguous()
-        
         if L_actual != L_out:
             d_out_t = F.interpolate(d_out_t, size=L_actual, mode='linear', align_corners=False)
         
         d_x_t, d_kernel = triton_depthwise_conv1d_bwd(x_t, kernel, d_out_t, stride)
-        
         d_kernel_flat = d_kernel.T.contiguous()
         
-        d_w0, d_b0, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3 = triton_siren_kernel_gen_bwd(
-            positions, d_kernel_flat, w0, w1, w2, w3, h0, h1, h2, omega_0
-        )
+        d_h2, d_w3, d_b3 = triton_linear_bwd(d_kernel_flat, h2, w3)
+        d_h2_pre = triton_sin_bwd(h2_pre, d_h2)
+        d_h1, d_w2, d_b2 = triton_linear_bwd(d_h2_pre, h1, w2)
+        d_h1_pre = triton_sin_bwd(h1_pre, d_h1)
+        d_h0, d_w1, d_b1 = triton_linear_bwd(d_h1_pre, h0, w1)
+        d_h0_pre = triton_sin_bwd(h0_pre, d_h0)
+        _, d_w0, d_b0 = triton_linear_bwd(d_h0_pre, pos, w0)
         
         d_x = d_x_t.movedim(1, -1)
         
@@ -513,16 +315,13 @@ class TritonSIRENDownsample1D(nn.Module):
         stride = max(1, L_in // target_len)
         K = stride
         
-        positions = torch.linspace(-1, 1, K, device=x.device, dtype=x.dtype).unsqueeze(-1)
-        pos_scaled = positions * self.omega_0
-        
-        h = torch.sin(F.linear(pos_scaled, self.w0, self.b0))
+        pos = torch.linspace(-1, 1, K, device=x.device, dtype=x.dtype).unsqueeze(-1) * self.omega_0
+        h = torch.sin(F.linear(pos, self.w0, self.b0))
         h = torch.sin(F.linear(h, self.w1, self.b1))
         h = torch.sin(F.linear(h, self.w2, self.b2))
         kernel_flat = F.linear(h, self.w3, self.b3)
         
         kernel = kernel_flat.T.reshape(C, 1, K)
-        
         x_t = x.movedim(-1, 1)
         out_t = F.conv1d(x_t, kernel, stride=stride, groups=C)
         
@@ -562,9 +361,9 @@ if __name__ == "__main__":
         triton_model.w3.copy_(pytorch_model.kernel_net.net[6].weight)
         triton_model.b3.copy_(pytorch_model.kernel_net.net[6].bias)
     
-    print("=" * 70)
+    print("=" * 100)
     print("SANITY CHECKS")
-    print("=" * 70)
+    print("=" * 100)
     
     torch.manual_seed(42)
     x = torch.randn(B, L_in, C, device=device)
@@ -596,14 +395,13 @@ if __name__ == "__main__":
     print(f"w3 grad: pt={w3_grad_pt:.2e}, tr={w3_grad_tr:.2e}, match={'PASS' if abs(w3_grad_pt - w3_grad_tr) / (w3_grad_pt + 1e-8) < 0.2 else 'FAIL'}")
     
     print()
-    print("=" * 70)
+    print("=" * 100)
     print("BENCHMARKS")
-    print("=" * 70)
+    print("=" * 100)
     
-    warmup = 10
-    iters = 50
+    warmup, iters = 10, 50
     
-    def bench(model, x, target, is_triton=False):
+    def bench(model, x, target, is_triton):
         for _ in range(warmup):
             out = model(x, target) if is_triton else model(x, (target,))
         
@@ -664,4 +462,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"{L_in:>8} {L_out:>8} | ERROR: {e}")
     
-    print("=" * 70)
+    print("=" * 100)
