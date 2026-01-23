@@ -1,4 +1,4 @@
-"""RippleAttention: telephone -> conv -> telephone -> lowrank with norm+residual between each."""
+"""RippleAttention: lowrank -> telephone -> conv -> telephone -> lowrank (sandwich, weight reuse)."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ class RippleAttention(nn.Module):
         self.channels = channels
         self.num_heads = num_heads
         
-        self.telephone1 = TelephoneAttentionND(
+        self.lowrank = LowRankAttention(channels)
+        self.norm1 = RMSNorm(channels, eps)
+        self.norm5 = RMSNorm(channels, eps)
+        
+        self.telephone = TelephoneAttentionND(
             channels=channels,
             ndim=1,
             max_samples=max_samples,
@@ -46,7 +50,8 @@ class RippleAttention(nn.Module):
             chunk_size=chunk_size,
             use_triton=use_triton,
         )
-        self.norm1 = RMSNorm(channels, eps)
+        self.norm2 = RMSNorm(channels, eps)
+        self.norm4 = RMSNorm(channels, eps)
         
         if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
             self.adaptive_conv = TritonAdaptiveLocalConv(
@@ -61,38 +66,25 @@ class RippleAttention(nn.Module):
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
             )
-        self.norm2 = RMSNorm(channels, eps)
-        
-        self.telephone2 = TelephoneAttentionND(
-            channels=channels,
-            ndim=1,
-            max_samples=max_samples,
-            num_heads=num_heads,
-            max_freq=max_freq,
-            min_freq=min_freq,
-            max_kernel_size=max_kernel_size,
-            chunk_size=chunk_size,
-            use_triton=use_triton,
-        )
         self.norm3 = RMSNorm(channels, eps)
-        
-        self.lowrank_attn = LowRankAttention(channels)
-        self.norm4 = RMSNorm(channels, eps)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
         
-        tel1_out, _ = self.telephone1(x)
-        h = x + self.norm1(tel1_out)
+        lowrank_out, _ = self.lowrank(x)
+        h = x + self.norm1(lowrank_out)
+        
+        tel_out, _ = self.telephone(h)
+        h = h + self.norm2(tel_out)
         
         conv_out, conv_info = self.adaptive_conv(h)
-        h = h + self.norm2(conv_out)
+        h = h + self.norm3(conv_out)
         
-        tel2_out, _ = self.telephone2(h)
-        h = h + self.norm3(tel2_out)
+        tel_out, _ = self.telephone(h)
+        h = h + self.norm4(tel_out)
         
-        lowrank_out, _ = self.lowrank_attn(h)
-        h = h + self.norm4(lowrank_out)
+        lowrank_out, _ = self.lowrank(h)
+        h = h + self.norm5(lowrank_out)
         
         return h, conv_info
 

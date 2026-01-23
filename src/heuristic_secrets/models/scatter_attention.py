@@ -607,7 +607,6 @@ class LowRankAttentionMergeND(nn.Module):
 
 
 class LowRankAttention(nn.Module):
-    """(r,r) attention where r=sqrt(L). Returns (full_out, lowrank_out) for collapse reuse."""
     
     def __init__(self, embed_dim: int):
         super().__init__()
@@ -624,8 +623,8 @@ class LowRankAttention(nn.Module):
         
         x_down = self.downsample(x, (r,))
         
-        q = F.silu(self.q_proj(x_down))
-        k = F.silu(self.k_proj(x_down))
+        q = apply_rope(F.silu(self.q_proj(x_down)))
+        k = apply_rope(F.silu(self.k_proj(x_down)))
         v = F.silu(self.v_proj(x_down))
         
         lowrank_out = F.scaled_dot_product_attention(q, k, v)
