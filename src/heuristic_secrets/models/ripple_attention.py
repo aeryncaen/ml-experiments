@@ -65,7 +65,9 @@ class LearnedSinusoidal2DEmbed(nn.Module):
         
         pos_embed = self.pos_proj(pos_enc)
         
-        x_flat = x.reshape(B, H * W).long()
+        # Convert normalized floats [0,1] to pixel indices [0,255]
+        x_int = (x * 255).clamp(0, 255).long()
+        x_flat = x_int.reshape(B, H * W)
         x_embed = self.pixel_embed(x_flat)
         
         x_embed = x_embed + pos_embed.reshape(1, H * W, self.embed_dim)
