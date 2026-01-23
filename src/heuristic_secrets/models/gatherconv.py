@@ -107,20 +107,17 @@ class GatherConvND(nn.Module):
         freq = torch.sigmoid(freq_raw) * (self.max_freq - self.min_freq) + self.min_freq
         phase = torch.tanh(phase_raw) * self.max_freq
         
-        freq_avg = freq.mean(dim=-1)
-        phase_avg = phase.mean(dim=-1)
-        
         if self.ndim == 1:
             centers = torch.arange(chunk_start, chunk_end, device=x_flat.device, dtype=x_flat.dtype)
             sample_pos = (
-                centers.view(1, chunk_len, 1) + 
-                self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + 
-                phase_avg.unsqueeze(-1)
+                centers.view(1, chunk_len, 1, 1) + 
+                self.stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1) + 
+                phase.unsqueeze(-1)
             )
             valid_mask = (sample_pos >= 0) & (sample_pos < L)
             sample_idx = sample_pos.long().clamp(0, L - 1)
             
-            rel_pos = self.stride_grid[:, 0].view(1, 1, S) * freq_avg.unsqueeze(-1) + phase_avg.unsqueeze(-1)
+            rel_pos = self.stride_grid[:, 0].view(1, 1, 1, S) * freq.unsqueeze(-1)
         else:
             coords = [torch.arange(s, device=x_flat.device, dtype=x_flat.dtype) for s in spatial]
             mesh = torch.meshgrid(*coords, indexing='ij')
@@ -128,12 +125,12 @@ class GatherConvND(nn.Module):
             centers = centers_all[chunk_start:chunk_end]
             
             sample_pos = (
-                centers.view(1, chunk_len, 1, self.ndim) + 
-                self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, chunk_len, 1, 1) + 
-                phase_avg.view(B, chunk_len, 1, 1)
+                centers.view(1, chunk_len, 1, 1, self.ndim) + 
+                self.stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1) + 
+                phase.view(B, chunk_len, H, 1, 1)
             )
             
-            valid_mask = torch.ones(B, chunk_len, S, dtype=torch.bool, device=x_flat.device)
+            valid_mask = torch.ones(B, chunk_len, H, S, dtype=torch.bool, device=x_flat.device)
             for dim in range(self.ndim):
                 valid_mask = valid_mask & (sample_pos[..., dim] >= 0) & (sample_pos[..., dim] < spatial[dim])
             
@@ -146,14 +143,14 @@ class GatherConvND(nn.Module):
                 strides.insert(0, strides[0] * spatial[dim])
             sample_idx = sum(sample_coords[..., dim] * strides[dim] for dim in range(self.ndim))
             
-            rel_pos_nd = self.stride_grid.view(1, 1, S, self.ndim) * freq_avg.view(B, chunk_len, 1, 1)
+            rel_pos_nd = self.stride_grid.view(1, 1, 1, S, self.ndim) * freq.view(B, chunk_len, H, 1, 1)
             rel_pos = rel_pos_nd.norm(dim=-1)
         
-        batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1).expand(B, chunk_len, S)
+        batch_idx = torch.arange(B, device=x_flat.device).view(B, 1, 1, 1).expand(B, chunk_len, H, S)
         
         kernel_max = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K)
         
-        norm_pos = (rel_pos + self.max_receptive) / (2 * self.max_receptive)
+        norm_pos = (rel_pos.abs() + self.max_receptive) / (2 * self.max_receptive)
         norm_pos = norm_pos.clamp(0, 1)
         
         idx_float = norm_pos * (K - 1)
@@ -168,17 +165,22 @@ class GatherConvND(nn.Module):
         
         for h in range(H):
             km_h = kernel_max[:, :, h, :]
-            k_floor_h = km_h.gather(-1, idx_floor)
-            k_ceil_h = km_h.gather(-1, idx_ceil)
-            kernel_h = k_floor_h * w_floor + k_ceil_h * w_ceil
-            kernel_h = kernel_h * valid_mask_f
-            kernel_h = kernel_h / (kernel_h.sum(dim=-1, keepdim=True) + 1e-8)
+            idx_floor_h = idx_floor[:, :, h, :]
+            idx_ceil_h = idx_ceil[:, :, h, :]
+            w_floor_h = w_floor[:, :, h, :]
+            w_ceil_h = w_ceil[:, :, h, :]
+            
+            k_floor_h = km_h.gather(-1, idx_floor_h)
+            k_ceil_h = km_h.gather(-1, idx_ceil_h)
+            kernel_h = k_floor_h * w_floor_h + k_ceil_h * w_ceil_h
+            kernel_h = kernel_h * valid_mask_f[:, :, h, :]
             
             x_head = x_flat[..., h * D : (h + 1) * D]
             out_h = output[:, :, h * D : (h + 1) * D]
+            sample_idx_h = sample_idx[:, :, h, :]
             
             for s in range(S):
-                val_s = x_head[batch_idx[:, :, s], sample_idx[:, :, s]]
+                val_s = x_head[batch_idx[:, :, h, s], sample_idx_h[:, :, s]]
                 out_h.addcmul_(kernel_h[:, :, s : s + 1], val_s)
         
         return output
@@ -207,8 +209,6 @@ class GatherConvND(nn.Module):
             wave_out = wave_out.view(B, chunk_len, 2, H)
             freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
             phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-            freq_avg = freq.mean(dim=-1).contiguous()
-            phase_avg = phase.mean(dim=-1).contiguous()
             
             kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
             
@@ -217,7 +217,7 @@ class GatherConvND(nn.Module):
             grid = (B, chunk_len, H)
             gather_conv_fwd_kernel_chunked[grid](
                 x, hidden_chunk,
-                freq_avg, phase_avg,
+                freq.contiguous(), phase.contiguous(),
                 kernel,
                 B, L, C, H, D, S, K,
                 self.max_offset, self.max_receptive,

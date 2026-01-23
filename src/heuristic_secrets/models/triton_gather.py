@@ -34,8 +34,8 @@ if HAS_TRITON:
         
         pid_l = chunk_start + pid_l_local
         
-        freq_avg = tl.load(freq_ptr + pid_b * chunk_len + pid_l_local)
-        phase_avg = tl.load(phase_ptr + pid_b * chunk_len + pid_l_local)
+        freq_h = tl.load(freq_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
+        phase_h = tl.load(phase_ptr + pid_b * chunk_len * H + pid_l_local * H + pid_h)
         
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
@@ -45,16 +45,15 @@ if HAS_TRITON:
         kernel_vals = tl.load(kernel_ptr + kernel_base + k_offs, mask=k_offs < K, other=0.0)
         
         out_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
-        kernel_sum = 0.0
         
         for s_idx in range(S):
             s_off = s_idx - half_s
-            sample_pos_f = pid_l + s_off * freq_avg + phase_avg
+            sample_pos_f = pid_l + s_off * freq_h + phase_h
             
             valid = (sample_pos_f >= 0.0) & (sample_pos_f < L)
             sample_idx = tl.maximum(tl.minimum(sample_pos_f, L - 1.0), 0.0).to(tl.int32)
             
-            rel_pos = tl.abs(s_off * freq_avg)
+            rel_pos = tl.abs(s_off * freq_h)
             norm_pos = rel_pos / max_receptive
             norm_pos = tl.minimum(norm_pos, 1.0)
             
@@ -69,14 +68,10 @@ if HAS_TRITON:
             k_ceil = tl.sum(tl.where(k_offs == idx_ceil, kernel_vals, 0.0))
             kernel_w = k_floor * w_floor + k_ceil * w_ceil
             kernel_w = kernel_w * valid.to(tl.float32)
-            kernel_sum += kernel_w
             
             val_base = pid_b * L * C + sample_idx * C + pid_h * D
             vals = tl.load(x_ptr + val_base + d_offs, mask=d_mask, other=0.0)
             out_h += vals * kernel_w
-        
-        kernel_sum = tl.maximum(kernel_sum, 1e-8)
-        out_h = out_h / kernel_sum
         
         out_base = pid_b * chunk_len * C + pid_l_local * C + pid_h * D
         tl.store(out_ptr + out_base + d_offs, out_h, mask=d_mask)
@@ -141,8 +136,6 @@ class TritonGatherConv(nn.Module):
             wave_out = wave_out.view(B, chunk_len, 2, H)
             freq = torch.sigmoid(wave_out[:, :, 0, :]) * (self.max_freq - self.min_freq) + self.min_freq
             phase = torch.tanh(wave_out[:, :, 1, :]) * self.max_freq
-            freq_avg = freq.mean(dim=-1).contiguous()
-            phase_avg = phase.mean(dim=-1).contiguous()
             
             kernel = F.silu(self.kernel_proj(x_chunk)).view(B, chunk_len, H, K).contiguous()
             
@@ -151,7 +144,7 @@ class TritonGatherConv(nn.Module):
             grid = (B, chunk_len, H)
             gather_conv_fwd_kernel_chunked[grid](
                 x, hidden_chunk,
-                freq_avg, phase_avg,
+                freq.contiguous(), phase.contiguous(),
                 kernel,
                 B, L, C, H, D, S, K,
                 self.half_s, self.max_receptive,
