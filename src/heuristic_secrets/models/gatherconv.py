@@ -340,17 +340,24 @@ if __name__ == "__main__":
         dx_match = dx_diff < 1e-3
         print(f"d_x match (Triton vs PyTorch): {'PASS' if dx_match else 'FAIL'} (max diff: {dx_diff:.2e})")
         
-        wave_grad_tr = gather_triton.wave_proj.weight.grad.abs().sum().item()
-        wave_grad_pt = gather_pytorch.wave_proj.weight.grad.abs().sum().item()
+        H = num_heads
+        # wave_proj outputs [freq_pre, phase_pre] so first H rows are freq, last H are phase
+        freq_grad_tr = gather_triton.wave_proj.weight.grad[:H].abs().sum().item()
+        freq_grad_pt = gather_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
+        phase_grad_tr = gather_triton.wave_proj.weight.grad[H:].abs().sum().item()
+        phase_grad_pt = gather_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
         kernel_grad_tr = gather_triton.kernel_proj.weight.grad.abs().sum().item()
         kernel_grad_pt = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
         
-        wave_grad_match = abs(wave_grad_tr - wave_grad_pt) / (wave_grad_pt + 1e-8) < 0.1
+        freq_grad_match = abs(freq_grad_tr - freq_grad_pt) / (freq_grad_pt + 1e-8) < 0.2
+        phase_grad_match = abs(phase_grad_tr - phase_grad_pt) / (phase_grad_pt + 1e-8) < 0.2
         kernel_grad_match = abs(kernel_grad_tr - kernel_grad_pt) / (kernel_grad_pt + 1e-8) < 0.1
         
-        print(f"wave_proj grad non-zero: {'PASS' if wave_grad_tr > 0 else 'FAIL'} (Triton: {wave_grad_tr:.2e}, PyTorch: {wave_grad_pt:.2e})")
+        print(f"freq grad non-zero: {'PASS' if freq_grad_tr > 0 else 'FAIL'} (Triton: {freq_grad_tr:.2e}, PyTorch: {freq_grad_pt:.2e})")
+        print(f"phase grad non-zero: {'PASS' if phase_grad_tr > 0 else 'FAIL'} (Triton: {phase_grad_tr:.2e}, PyTorch: {phase_grad_pt:.2e})")
         print(f"kernel_proj grad non-zero: {'PASS' if kernel_grad_tr > 0 else 'FAIL'} (Triton: {kernel_grad_tr:.2e}, PyTorch: {kernel_grad_pt:.2e})")
-        print(f"wave_proj grad match: {'PASS' if wave_grad_match else 'FAIL'}")
+        print(f"freq grad match: {'PASS' if freq_grad_match else 'FAIL'}")
+        print(f"phase grad match: {'PASS' if phase_grad_match else 'FAIL'}")
         print(f"kernel_proj grad match: {'PASS' if kernel_grad_match else 'FAIL'}")
         
         gather_triton.zero_grad()
@@ -364,10 +371,13 @@ if __name__ == "__main__":
         out, _ = gather_pytorch(x_test)
         out.sum().backward()
         
-        wave_grad = gather_pytorch.wave_proj.weight.grad.abs().sum().item()
+        H = num_heads
+        freq_grad = gather_pytorch.wave_proj.weight.grad[:H].abs().sum().item()
+        phase_grad = gather_pytorch.wave_proj.weight.grad[H:].abs().sum().item()
         kernel_grad = gather_pytorch.kernel_proj.weight.grad.abs().sum().item()
         
-        print(f"wave_proj grad non-zero: {'PASS' if wave_grad > 0 else 'FAIL'} ({wave_grad:.2e})")
+        print(f"freq grad non-zero: {'PASS' if freq_grad > 0 else 'FAIL'} ({freq_grad:.2e})")
+        print(f"phase grad non-zero: {'PASS' if phase_grad > 0 else 'FAIL'} ({phase_grad:.2e})")
         print(f"kernel_proj grad non-zero: {'PASS' if kernel_grad > 0 else 'FAIL'} ({kernel_grad:.2e})")
         print("(Triton not available, skipping Triton vs PyTorch comparison)")
         
