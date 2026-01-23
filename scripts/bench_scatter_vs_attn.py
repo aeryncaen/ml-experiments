@@ -1147,22 +1147,6 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     WIDTH_SGSB = 64
     WIDTH_CONV = 70
     
-    if model_type == 'ripple' and cross_layer:
-        h, w = img_size
-        seq_len = h * w
-        def block_factory_fn(heads):
-            return lambda width: None
-        def classifier_factory_fn(block_factory, width):
-            return RippleClassifier(
-                width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=True, embed_2d=(h, w)
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
-        return RippleClassifier(
-            width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=True, embed_2d=(h, w)
-        ).to(device)
-    
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
         width = WIDTH_ATTN
