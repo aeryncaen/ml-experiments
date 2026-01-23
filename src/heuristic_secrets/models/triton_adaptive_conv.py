@@ -782,12 +782,24 @@ if __name__ == "__main__":
     
     def bench(model, x):
         x_grad = x.clone().requires_grad_(True)
+        
+        for _ in range(warmup):
+            out, _ = model(x_grad)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        start = time.perf_counter()
+        for _ in range(iters):
+            out, _ = model(x_grad)
+            torch.cuda.synchronize()
+        fwd_ms = (time.perf_counter() - start) / iters * 1000
+        fwd_mem = torch.cuda.max_memory_allocated() / 1024**2
+        
         for _ in range(warmup):
             out, _ = model(x_grad)
             out.sum().backward()
             model.zero_grad()
             x_grad.grad = None
-        
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         
@@ -799,11 +811,14 @@ if __name__ == "__main__":
             x_grad.grad = None
             torch.cuda.synchronize()
         total_ms = (time.perf_counter() - start) / iters * 1000
-        mem = torch.cuda.max_memory_allocated() / 1024**2
-        return total_ms, mem
+        bwd_ms = total_ms - fwd_ms
+        bwd_mem = torch.cuda.max_memory_allocated() / 1024**2
+        
+        return fwd_ms, bwd_ms, fwd_mem, bwd_mem
     
-    print(f"{'L':>8} {'sqrt(L)':>8} | {'PyT ms':>8} {'PyT MB':>8} | {'Tri ms':>8} {'Tri MB':>8} | {'Speedup':>8}")
-    print("-" * 80)
+    print(f"{'L':>6} | {'------- PyTorch -------':^24} | {'------- Triton --------':^24} | {'Speedup':^8}")
+    print(f"{'':>6} | {'Fwd':>6} {'Bwd':>6} {'FwdMB':>5} {'BwdMB':>5} | {'Fwd':>6} {'Bwd':>6} {'FwdMB':>5} {'BwdMB':>5} | {'':>8}")
+    print("-" * 90)
     
     seq_lengths = [256, 512, 1024, 2048, 4096, 8192]
     
@@ -812,15 +827,15 @@ if __name__ == "__main__":
         
         try:
             x = torch.randn(B, L, C, device=device)
-            pt_ms, pt_mem = bench(pytorch_model, x)
-            tr_ms, tr_mem = bench(triton_model, x)
-            speedup = pt_ms / tr_ms
-            print(f"{L:>8} {int(math.sqrt(L)):>8} | {pt_ms:>8.2f} {pt_mem:>8.0f} | {tr_ms:>8.2f} {tr_mem:>8.0f} | {speedup:>7.2f}x")
+            pt_fwd, pt_bwd, pt_fwd_mem, pt_bwd_mem = bench(pytorch_model, x)
+            tr_fwd, tr_bwd, tr_fwd_mem, tr_bwd_mem = bench(triton_model, x)
+            speedup = (pt_fwd + pt_bwd) / (tr_fwd + tr_bwd)
+            print(f"{L:>6} | {pt_fwd:>6.1f} {pt_bwd:>6.1f} {pt_fwd_mem:>5.0f} {pt_bwd_mem:>5.0f} | {tr_fwd:>6.1f} {tr_bwd:>6.1f} {tr_fwd_mem:>5.0f} {tr_bwd_mem:>5.0f} | {speedup:>6.2f}x")
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"{L:>8} {int(math.sqrt(L)):>8} | OOM")
+                print(f"{L:>6} | OOM")
                 torch.cuda.empty_cache()
             else:
                 raise
     
-    print("=" * 80)
+    print("=" * 90)
