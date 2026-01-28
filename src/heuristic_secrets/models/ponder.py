@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -84,7 +84,6 @@ class PonderWrapper(nn.Module):
         super().__init__()
         self.base = model
 
-        # Infer n_classes from head layer
         head = getattr(model, "head", None)
         if n_classes is None:
             if head is not None and hasattr(head, "out_features"):
@@ -92,6 +91,7 @@ class PonderWrapper(nn.Module):
             else:
                 raise ValueError("Cannot infer n_classes; pass it explicitly")
 
+        assert n_classes is not None
         self.n_classes = n_classes
         self.l_internal = InternalLossNetwork(n_classes, loss_net_layers, loss_net_width)
 
@@ -110,6 +110,8 @@ class PonderTrainConfig:
     grad_clip: float = 1.0
     epochs: int = 50
     warmup_epochs: int = 2
+    meta_warmup_epochs: int = 1
+    meta_wean_epochs: int = 1
     log_interval: int = 50
 
 
@@ -173,15 +175,24 @@ class PonderTrainer:
             images = images.squeeze(1)
         return images
 
+    def _reinforce_alpha(self, epoch: int) -> float:
+        cfg = self.config
+        if epoch < cfg.meta_warmup_epochs:
+            return 0.0
+        wean_progress = (epoch - cfg.meta_warmup_epochs) / max(cfg.meta_wean_epochs, 1)
+        return min(wean_progress, 1.0)
+
     def train_epoch(self, epoch: int) -> dict:
         self.ponder.train()
         cfg = self.config
+        alpha = self._reinforce_alpha(epoch)
 
         running: dict[str, float] = {}
         count = 0
 
         from tqdm import tqdm
-        desc = f"Epoch {epoch+1}/{cfg.epochs}"
+        phase = "CE" if alpha == 0.0 else ("WEAN" if alpha < 1.0 else "RL")
+        desc = f"Epoch {epoch+1}/{cfg.epochs} [{phase} α={alpha:.2f}]"
         pbar = tqdm(self.train_loader, desc=desc, leave=False)
 
         for batch_idx, (images, labels) in enumerate(pbar):
@@ -206,7 +217,9 @@ class PonderTrainer:
 
             self.meta_optimizer.zero_grad()
             _, predicted_loss_for_meta = self.ponder(images)
-            meta_loss = -(reward * predicted_loss_for_meta).mean()
+            reinforce_loss = -(reward * predicted_loss_for_meta).mean()
+            supervised_loss = F.mse_loss(predicted_loss_for_meta, post_ce.expand_as(predicted_loss_for_meta).detach())
+            meta_loss = alpha * reinforce_loss + (1 - alpha) * supervised_loss
             meta_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.ponder.l_internal.parameters()), cfg.grad_clip
@@ -222,6 +235,8 @@ class PonderTrainer:
                     "post_ce": post_ce.item(),
                     "reward": reward.item(),
                     "accuracy": acc.item(),
+                    "alpha": alpha,
+                    "meta_loss": meta_loss.item(),
                 }
 
             for k, v in metrics.items():
@@ -232,6 +247,7 @@ class PonderTrainer:
                 ce=f"{metrics['post_ce']:.3f}",
                 acc=f"{metrics['accuracy']:.3f}",
                 rw=f"{metrics['reward']:.4f}",
+                ml=f"{metrics['meta_loss']:.4f}",
             )
 
         return {k: v / max(count, 1) for k, v in running.items()}
@@ -262,7 +278,8 @@ class PonderTrainer:
         print(f"PonderTrainer: {epochs} epochs, device={self.device}")
         print(f"  Base model params: {sum(p.numel() for p in self.ponder.base.parameters()):,}")
         print(f"  L_internal params: {sum(p.numel() for p in self.ponder.l_internal.parameters()):,}")
-        print(f"  Meta warmup: {self.config.warmup_epochs} epochs")
+        print(f"  LR warmup: {self.config.warmup_epochs} epochs")
+        print(f"  Meta CE→RL: {self.config.meta_warmup_epochs} pure CE, {self.config.meta_wean_epochs} wean")
         print()
 
         for epoch in range(epochs):
@@ -279,7 +296,7 @@ class PonderTrainer:
                 f"Epoch {epoch+1:3d}: "
                 f"pred={train_metrics['predicted_loss']:.4f} pre_ce={train_metrics['pre_ce']:.4f} "
                 f"post_ce={train_metrics['post_ce']:.4f} reward={train_metrics['reward']:.4f} "
-                f"acc={train_metrics['accuracy']:.4f} | "
+                f"acc={train_metrics['accuracy']:.4f} α={train_metrics['alpha']:.2f} | "
                 f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")

@@ -1548,8 +1548,7 @@ def main():
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
-    parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss + iterative refinement')
-    parser.add_argument('--ponder-max-steps', type=int, default=10, help='Refine iterations (default: 10)')
+    parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss (ML3-style)')
     parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal')
     args = parser.parse_args()
 
@@ -1678,12 +1677,9 @@ def main():
             model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
             
             if args.ponder and not args.duo:
-                model = PonderWrapper(
-                    model,
-                    max_steps=args.ponder_max_steps,
-                )
+                model = PonderWrapper(model)
                 ponder_params = sum(p.numel() for p in model.l_internal.parameters())
-                print(f'  Ponder: +{ponder_params:,} params (L_internal), max_steps={args.ponder_max_steps}')
+                print(f'  Ponder: +{ponder_params:,} params (L_internal)')
 
             if args.compile:
                 model = torch.compile(model)
@@ -1749,7 +1745,6 @@ def main():
                     meta_lr=args.ponder_meta_lr,
                     model_lr=args.lr,
                     epochs=args.epochs,
-                    max_steps=args.ponder_max_steps,
                 )
                 trainer = PonderTrainer(
                     model, train_loader, test_loader, device, ponder_config,
