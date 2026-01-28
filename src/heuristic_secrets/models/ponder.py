@@ -228,7 +228,8 @@ class PonderTrainer:
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images, labels)
             per_sample_ce = F.cross_entropy(logits_for_meta, labels, reduction='none').detach()
-            reinforce_loss = -(reward * predicted_loss_for_meta).mean()
+            pred_scale = max(predicted_loss_for_meta.detach().mean().item(), 1e-4)
+            reinforce_loss = -(reward / pred_scale * predicted_loss_for_meta).mean()
             supervised_loss = F.mse_loss(predicted_loss_for_meta, per_sample_ce)
             meta_loss = alpha * reinforce_loss + (1 - alpha) * supervised_loss
             meta_loss.backward()
