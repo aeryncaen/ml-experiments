@@ -159,6 +159,7 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
+        self._reward_ema = 0.0
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -221,7 +222,9 @@ class PonderTrainer:
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                reward = (post_acc - pre_acc) * cfg.reward_scale
+                raw_reward = (post_acc - pre_acc).item()
+                self._reward_ema = 0.99 * self._reward_ema + 0.01 * raw_reward
+                reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)
@@ -260,24 +263,26 @@ class PonderTrainer:
         return {k: v / max(count, 1) for k, v in running.items()}
 
     @torch.no_grad()
-    def evaluate(self) -> tuple[float, float]:
+    def evaluate(self) -> tuple[float, float, float]:
         self.ponder.eval()
         correct = 0
         total = 0
         total_ce = 0.0
+        total_pred = 0.0
 
         from tqdm import tqdm
         for images, labels in tqdm(self.test_loader, desc="Eval", leave=False):
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            logits, _ = self.ponder(images)
+            logits, predicted_loss = self.ponder(images)
             total_ce += F.cross_entropy(logits, labels).item() * labels.size(0)
+            total_pred += predicted_loss.sum().item()
             correct += (logits.argmax(-1) == labels).sum().item()
             total += labels.size(0)
 
         n = max(total, 1)
-        return total_ce / n, correct / n
+        return total_ce / n, correct / n, total_pred / n
 
     def train(self, epochs: int | None = None) -> float:
         epochs = epochs or self.config.epochs
@@ -291,7 +296,7 @@ class PonderTrainer:
 
         for epoch in range(epochs):
             train_metrics = self.train_epoch(epoch)
-            test_ce, test_acc = self.evaluate()
+            test_ce, test_acc, test_pred = self.evaluate()
 
             if test_acc > self.best_acc:
                 self.best_acc = test_acc
@@ -304,7 +309,7 @@ class PonderTrainer:
                 f"pred={train_metrics['predicted_loss']:.4f} ce={train_metrics['ce']:.4f} "
                 f"rw={train_metrics['reward']:.4f} "
                 f"acc={train_metrics['accuracy']:.4f} α={train_metrics['alpha']:.2f} | "
-                f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
+                f"test_ce={test_ce:.4f} test_pred={test_pred:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")
             )
