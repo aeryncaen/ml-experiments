@@ -276,6 +276,7 @@ class PonderTrainConfig:
     warmup_epochs: int = 2
 
     lambda_energy: float = 0.05
+    energy_warmup_epochs: int = 10
 
     # PonderNet KL against geometric prior  (E[steps] ~ 1/λ_p)
     geometric_prior_lambda: float = 0.3
@@ -295,11 +296,13 @@ def compute_ponder_loss(
     targets: torch.Tensor,
     info: dict,
     config: PonderTrainConfig,
+    epoch: int = 0,
 ) -> tuple[torch.Tensor, dict]:
     ce = F.cross_entropy(expected_logits, targets, reduction="none")  # [B]
 
     expected_steps = info["expected_steps"]  # [B] differentiable
-    reward = -ce - config.lambda_energy * expected_steps
+    energy_scale = min(1.0, epoch / max(config.energy_warmup_epochs, 1))
+    reward = -ce - config.lambda_energy * energy_scale * expected_steps
 
     # KL(p_halt || geometric prior)
     p_halt = info["p_halt"]  # [T, B] detached
@@ -434,7 +437,7 @@ class PonderTrainer:
             expected_logits, info = self.ponder.forward_train(images, max_steps=max_steps)
 
             loss, metrics = compute_ponder_loss(
-                expected_logits, labels, info, cfg,
+                expected_logits, labels, info, cfg, epoch=epoch,
             )
 
             loss.backward()
