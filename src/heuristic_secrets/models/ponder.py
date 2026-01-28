@@ -111,6 +111,7 @@ class PonderTrainConfig:
     warmup_epochs: int = 2
     meta_warmup_epochs: int = 1
     meta_wean_epochs: int = 1
+    reward_scale: float = 100.0
     log_interval: int = 50
 
 
@@ -215,7 +216,7 @@ class PonderTrainer:
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                reward = post_acc - pre_acc
+                reward = (post_acc - pre_acc) * cfg.reward_scale
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)
