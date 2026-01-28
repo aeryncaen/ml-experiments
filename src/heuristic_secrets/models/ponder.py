@@ -63,7 +63,7 @@ class InternalLossNetwork(nn.Module):
         x = self.proj_in(x)
         for block in self.blocks:
             x = block(x)
-        return self.head(x.squeeze(1)).squeeze(-1)
+        return F.softplus(self.head(x.squeeze(1)).squeeze(-1))
 
 
 class PonderWrapper(nn.Module):
@@ -205,7 +205,11 @@ class PonderTrainer:
 
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder(images)
-            predicted_loss.mean().backward()
+            if alpha == 0.0:
+                base_loss = F.cross_entropy(logits, labels)
+            else:
+                base_loss = alpha * predicted_loss.mean() + (1 - alpha) * F.cross_entropy(logits, labels)
+            base_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
             self.model_optimizer.step()
             self.model_scheduler.step()
