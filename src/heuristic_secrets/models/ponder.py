@@ -162,6 +162,10 @@ class PonderWrapper(nn.Module):
         h = self.base.embed(x)
         h_0 = h
 
+        # Step-0 baseline: what decode produces with no iteration
+        h_0_refined = self.base.refine(h_0.detach())
+        baseline_logits = self.base.decode(h_0_refined)
+
         halt_lambdas: list[torch.Tensor] = []
         step_logits: list[torch.Tensor] = []
         loss_values: list[torch.Tensor] = []
@@ -214,6 +218,7 @@ class PonderWrapper(nn.Module):
         info = {
             "p_halt": p_halt,                                                # [T, B] differentiable
             "expected_steps": expected_steps,                                # [B] differentiable
+            "baseline_logits": baseline_logits,                              # [B, C] detached from base
             "loss_values": torch.stack(loss_values, dim=0),                  # [T, B]
             "halt_lambdas": torch.stack([l.detach() for l in halt_lambdas], dim=0),  # [T, B]
         }
@@ -305,12 +310,16 @@ def compute_ponder_loss(
     max_steps: int = 10,
 ) -> tuple[torch.Tensor, dict]:
     ce = F.cross_entropy(expected_logits, targets, reduction="none")  # [B]
+    baseline_ce = F.cross_entropy(
+        info["baseline_logits"], targets, reduction="none"
+    ).detach()  # [B] no gradient to baseline path
 
     expected_steps = info["expected_steps"]  # [B] differentiable
     energy_scale = min(1.0, epoch / max(config.energy_warmup_epochs, 1))
-    # Cost is fraction of budget used, not absolute step count
     energy_fraction = expected_steps / max(max_steps, 1)
-    reward = -ce - config.lambda_energy * energy_scale * energy_fraction
+    # Reward = how much iteration improved CE, minus energy cost
+    improvement = baseline_ce - ce
+    reward = improvement - config.lambda_energy * energy_scale * energy_fraction
 
     # KL(p_halt || geometric prior)
     p_halt = info["p_halt"]  # [T, B] detached
@@ -331,8 +340,9 @@ def compute_ponder_loss(
         metrics = {
             "meta_loss": meta_loss.item(),
             "ce": ce.mean().item(),
+            "baseline_ce": baseline_ce.mean().item(),
+            "improvement": improvement.mean().item(),
             "reward": reward.mean().item(),
-            "energy": expected_steps.mean().item(),
             "expected_steps": expected_steps.mean().item(),
             "kl": kl.mean().item(),
             "accuracy": acc.item(),
@@ -519,10 +529,11 @@ class PonderTrainer:
 
             print(
                 f"Epoch {epoch+1:3d} [{regime[:5]} T={max_steps:2d}]: "
-                f"train_ce={train_metrics['ce']:.4f} train_acc={train_metrics['accuracy']:.4f} "
+                f"train_ce={train_metrics['ce']:.4f} base_ce={train_metrics['baseline_ce']:.4f} "
+                f"improv={train_metrics['improvement']:.4f} acc={train_metrics['accuracy']:.4f} "
                 f"E[steps]={train_metrics['expected_steps']:.1f} | "
                 f"test_acc={test_acc:.4f} test_steps={avg_steps:.1f} | "
-                f"reward={train_metrics['reward']:.2f} "
+                f"reward={train_metrics['reward']:.3f} "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")
             )
