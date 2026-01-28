@@ -284,12 +284,10 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            # Accuracy before
             with torch.no_grad():
                 pre_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
-                pre_acc = (pre_logits.argmax(-1) == labels).float().mean()
+                pre_ce = F.cross_entropy(pre_logits, labels)
 
-            # Train base model on L_internal's predicted loss
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder.forward_steps(images, max_steps=max_steps)
             predicted_loss.mean().backward()
@@ -297,13 +295,11 @@ class PonderTrainer:
             self.model_optimizer.step()
             self.model_scheduler.step()
 
-            # Accuracy after
             with torch.no_grad():
                 post_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
-                post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                reward = post_acc - pre_acc
+                post_ce = F.cross_entropy(post_logits, labels)
+                reward = pre_ce - post_ce
 
-            # Train L_internal: REINFORCE with accuracy improvement as reward
             self.meta_optimizer.zero_grad()
             _, predicted_loss_for_meta = self.ponder.forward_steps(images, max_steps=max_steps)
             meta_loss = -(reward * predicted_loss_for_meta).mean()
@@ -315,14 +311,13 @@ class PonderTrainer:
             self.meta_scheduler.step()
 
             with torch.no_grad():
-                real_ce = F.cross_entropy(post_logits, labels)
+                acc = (post_logits.argmax(-1) == labels).float().mean()
                 metrics = {
                     "predicted_loss": predicted_loss.mean().item(),
-                    "real_ce": real_ce.item(),
-                    "pre_acc": pre_acc.item(),
-                    "post_acc": post_acc.item(),
+                    "pre_ce": pre_ce.item(),
+                    "post_ce": post_ce.item(),
                     "reward": reward.item(),
-                    "accuracy": post_acc.item(),
+                    "accuracy": acc.item(),
                 }
 
             for k, v in metrics.items():
@@ -330,9 +325,9 @@ class PonderTrainer:
             count += 1
 
             pbar.set_postfix(
-                ce=f"{metrics['real_ce']:.3f}",
+                ce=f"{metrics['post_ce']:.3f}",
                 acc=f"{metrics['accuracy']:.3f}",
-                reward=f"{metrics['reward']:.3f}",
+                rw=f"{metrics['reward']:.4f}",
             )
 
         return {k: v / max(count, 1) for k, v in running.items()}
@@ -378,8 +373,9 @@ class PonderTrainer:
 
             print(
                 f"Epoch {epoch+1:3d}: "
-                f"pred_loss={train_metrics['predicted_loss']:.4f} real_ce={train_metrics['real_ce']:.4f} "
-                f"reward={train_metrics['reward']:.4f} acc={train_metrics['accuracy']:.4f} | "
+                f"pred={train_metrics['predicted_loss']:.4f} pre_ce={train_metrics['pre_ce']:.4f} "
+                f"post_ce={train_metrics['post_ce']:.4f} reward={train_metrics['reward']:.4f} "
+                f"acc={train_metrics['accuracy']:.4f} | "
                 f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")
