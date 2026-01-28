@@ -113,6 +113,7 @@ class PonderTrainConfig:
     meta_wean_epochs: int = 1
     reward_scale: float = 100.0
     meta_min_supervised: float = 0.0
+    drop_ce_epoch: int = 5
     log_interval: int = 50
 
 
@@ -158,7 +159,6 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
-        self._reward_ema = 0.0
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -208,7 +208,10 @@ class PonderTrainer:
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder(images)
             ce = F.cross_entropy(logits, labels)
-            base_loss = ce + predicted_loss.mean()
+            if epoch < cfg.drop_ce_epoch:
+                base_loss = ce + predicted_loss.mean()
+            else:
+                base_loss = predicted_loss.mean()
             base_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
             self.model_optimizer.step()
@@ -218,9 +221,7 @@ class PonderTrainer:
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                raw_reward = (post_acc - pre_acc).item()
-                self._reward_ema = 0.99 * self._reward_ema + 0.01 * raw_reward
-                reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
+                reward = (post_acc - pre_acc) * cfg.reward_scale
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)

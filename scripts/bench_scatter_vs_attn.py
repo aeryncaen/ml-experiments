@@ -1552,6 +1552,7 @@ def main():
     parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal')
     parser.add_argument('--ponder-reward-scale', type=float, default=100.0, help='Reward multiplier for REINFORCE')
     parser.add_argument('--ponder-min-supervised', type=float, default=0.0, help='Min CE supervision ratio for L_internal (0=full RL, 0.2=always 20%% CE)')
+    parser.add_argument('--ponder-drop-ce', type=int, default=5, help='Epoch to drop CE from base loss (default: 5)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1749,6 +1750,7 @@ def main():
                     epochs=args.epochs,
                     reward_scale=args.ponder_reward_scale,
                     meta_min_supervised=args.ponder_min_supervised,
+                    drop_ce_epoch=args.ponder_drop_ce,
                 )
                 trainer = PonderTrainer(
                     model, train_loader, test_loader, device, ponder_config,
