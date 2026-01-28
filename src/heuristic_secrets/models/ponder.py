@@ -156,7 +156,6 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
-        self._reward_ema_mean = 0.0
         self._reward_ema_var = 1.0
         self._reward_ema_decay = 0.99
 
@@ -220,10 +219,9 @@ class PonderTrainer:
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
                 raw_reward = (post_acc - pre_acc).item()
                 d = self._reward_ema_decay
-                self._reward_ema_mean = d * self._reward_ema_mean + (1 - d) * raw_reward
-                self._reward_ema_var = d * self._reward_ema_var + (1 - d) * (raw_reward - self._reward_ema_mean) ** 2
-                reward_std = max(self._reward_ema_var ** 0.5, 1e-6)
-                reward = torch.tensor((raw_reward - self._reward_ema_mean) / reward_std, device=self.device)
+                self._reward_ema_var = d * self._reward_ema_var + (1 - d) * raw_reward ** 2
+                reward_rms = max(self._reward_ema_var ** 0.5, 1e-6)
+                reward = torch.tensor(raw_reward / reward_rms, device=self.device)
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)
