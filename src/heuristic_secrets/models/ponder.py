@@ -101,7 +101,8 @@ class InternalLossNetwork(nn.Module):
     def __init__(self, hidden_dim: int, n_layers: int = 1, width: int | None = None, n_heads: int = 2):
         super().__init__()
         if width is None:
-            width = max(8, hidden_dim // 4)
+            width = max(n_heads, hidden_dim // 4)
+            width = width - (width % n_heads)
         self.proj_in = nn.Linear(hidden_dim, width) if hidden_dim != width else nn.Identity()
         self.blocks = nn.ModuleList([
             SiLUAttentionBlock(width, n_heads=n_heads) for _ in range(n_layers)
