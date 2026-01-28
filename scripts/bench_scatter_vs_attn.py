@@ -1553,7 +1553,6 @@ def main():
     parser.add_argument('--ponder-inner-lr', type=float, default=0.05, help='Inner learning rate for L_internal gradient step')
     parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal + halt net')
     parser.add_argument('--ponder-lambda-energy', type=float, default=0.05, help='Energy cost per iteration step')
-    parser.add_argument('--ponder-max-reward', type=float, default=10.0, help='Initial reward ceiling')
     parser.add_argument('--ponder-gluttony-steps', type=int, default=15, help='Max steps during gluttony phase')
     parser.add_argument('--ponder-starvation-steps', type=int, default=3, help='Max steps during starvation phase')
     parser.add_argument('--ponder-block-length', type=int, default=10, help='Epochs per starvation/gluttony block')
@@ -1759,7 +1758,6 @@ def main():
                     model_lr=args.lr,
                     epochs=args.epochs,
                     lambda_energy=args.ponder_lambda_energy,
-                    max_reward_initial=args.ponder_max_reward,
                     gluttony_max_steps=args.ponder_gluttony_steps,
                     starvation_max_steps=args.ponder_starvation_steps,
                     block_length=args.ponder_block_length,

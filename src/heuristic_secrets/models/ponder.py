@@ -275,8 +275,6 @@ class PonderTrainConfig:
     warmup_epochs: int = 2
 
     lambda_energy: float = 0.05
-    max_reward_initial: float = 10.0
-    reward_decay_rate: float = 0.95
 
     # PonderNet KL against geometric prior  (E[steps] ~ 1/λ_p)
     geometric_prior_lambda: float = 0.3
@@ -296,12 +294,11 @@ def compute_ponder_loss(
     targets: torch.Tensor,
     info: dict,
     config: PonderTrainConfig,
-    current_max_reward: float,
 ) -> tuple[torch.Tensor, dict]:
     ce = F.cross_entropy(expected_logits, targets, reduction="none")  # [B]
 
     expected_steps = info["expected_steps"]  # [B] differentiable
-    reward = (current_max_reward - ce) - config.lambda_energy * expected_steps
+    reward = -ce - config.lambda_energy * expected_steps
 
     # KL(p_halt || geometric prior)
     p_halt = info["p_halt"]  # [T, B] detached
@@ -329,7 +326,6 @@ def compute_ponder_loss(
             "accuracy": acc.item(),
             "l_internal_mean": info["loss_values"].mean().item(),
             "halt_lambda_mean": info["halt_lambdas"].mean().item(),
-            "max_reward": current_max_reward,
         }
 
     return meta_loss, metrics
@@ -383,7 +379,6 @@ class PonderTrainer:
             self._make_lr_lambda(total_steps, warmup_steps),
         )
 
-        self.current_max_reward = self.config.max_reward_initial
         self.best_acc = 0.0
 
     @staticmethod
@@ -438,7 +433,7 @@ class PonderTrainer:
             expected_logits, info = self.ponder.forward_train(images, max_steps=max_steps)
 
             loss, metrics = compute_ponder_loss(
-                expected_logits, labels, info, cfg, self.current_max_reward
+                expected_logits, labels, info, cfg,
             )
 
             loss.backward()
@@ -504,7 +499,6 @@ class PonderTrainer:
 
             if test_acc > self.best_acc:
                 self.best_acc = test_acc
-                self.current_max_reward *= cfg.reward_decay_rate
 
             regime = self._get_regime(epoch)
             max_steps = self._get_max_steps(epoch)
@@ -516,7 +510,7 @@ class PonderTrainer:
                 f"train_ce={train_metrics['ce']:.4f} train_acc={train_metrics['accuracy']:.4f} "
                 f"E[steps]={train_metrics['expected_steps']:.1f} | "
                 f"test_acc={test_acc:.4f} test_steps={avg_steps:.1f} | "
-                f"reward={train_metrics['reward']:.2f} max_R={self.current_max_reward:.2f} "
+                f"reward={train_metrics['reward']:.2f} "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")
             )
