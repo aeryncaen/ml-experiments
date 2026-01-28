@@ -157,6 +157,9 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
+        self._reward_ema_mean = 0.0
+        self._reward_ema_var = 1.0
+        self._reward_ema_decay = 0.99
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -217,12 +220,18 @@ class PonderTrainer:
             with torch.no_grad():
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
-                reward = pre_ce - post_ce
+                raw_reward = (pre_ce - post_ce).item()
+                d = self._reward_ema_decay
+                self._reward_ema_mean = d * self._reward_ema_mean + (1 - d) * raw_reward
+                self._reward_ema_var = d * self._reward_ema_var + (1 - d) * (raw_reward - self._reward_ema_mean) ** 2
+                reward_std = max(self._reward_ema_var ** 0.5, 1e-6)
+                reward = torch.tensor((raw_reward - self._reward_ema_mean) / reward_std, device=self.device)
 
             self.meta_optimizer.zero_grad()
-            _, predicted_loss_for_meta = self.ponder(images)
+            logits_for_meta, predicted_loss_for_meta = self.ponder(images)
+            per_sample_ce = F.cross_entropy(logits_for_meta, labels, reduction='none').detach()
             reinforce_loss = -(reward * predicted_loss_for_meta).mean()
-            supervised_loss = F.mse_loss(predicted_loss_for_meta, post_ce.expand_as(predicted_loss_for_meta).detach())
+            supervised_loss = F.mse_loss(predicted_loss_for_meta, per_sample_ce)
             meta_loss = alpha * reinforce_loss + (1 - alpha) * supervised_loss
             meta_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -237,6 +246,7 @@ class PonderTrainer:
                     "predicted_loss": predicted_loss.mean().item(),
                     "pre_ce": pre_ce.item(),
                     "post_ce": post_ce.item(),
+                    "raw_reward": raw_reward,
                     "reward": reward.item(),
                     "accuracy": acc.item(),
                     "alpha": alpha,
@@ -299,7 +309,7 @@ class PonderTrainer:
             print(
                 f"Epoch {epoch+1:3d}: "
                 f"pred={train_metrics['predicted_loss']:.4f} pre_ce={train_metrics['pre_ce']:.4f} "
-                f"post_ce={train_metrics['post_ce']:.4f} reward={train_metrics['reward']:.4f} "
+                f"post_ce={train_metrics['post_ce']:.4f} rw={train_metrics['raw_reward']:.4f} nrw={train_metrics['reward']:.2f} "
                 f"acc={train_metrics['accuracy']:.4f} α={train_metrics['alpha']:.2f} | "
                 f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
