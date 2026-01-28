@@ -67,11 +67,10 @@ class InternalLossNetwork(nn.Module):
 
 
 class PonderWrapper(nn.Module):
-    """Wraps a classifier with a learned loss function (ML3-style).
+    """Wraps a classifier with a learned auxiliary loss.
 
-    Two models trained together per batch:
-      - Base classifier trains on L_internal's predicted loss
-      - L_internal trains via REINFORCE on CE improvement
+    Base minimizes CE + predicted_loss. L_internal learns via REINFORCE
+    on accuracy improvement — a secondary objective beyond CE.
     """
 
     def __init__(
@@ -204,14 +203,12 @@ class PonderTrainer:
 
             with torch.no_grad():
                 pre_logits = self.ponder(images)[0]
-                pre_ce = F.cross_entropy(pre_logits, labels)
+                pre_acc = (pre_logits.argmax(-1) == labels).float().mean()
 
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder(images)
-            if alpha == 0.0:
-                base_loss = F.cross_entropy(logits, labels)
-            else:
-                base_loss = alpha * predicted_loss.mean() + (1 - alpha) * F.cross_entropy(logits, labels)
+            ce = F.cross_entropy(logits, labels)
+            base_loss = ce + predicted_loss.mean()
             base_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
             self.model_optimizer.step()
@@ -220,7 +217,8 @@ class PonderTrainer:
             with torch.no_grad():
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
-                raw_reward = (pre_ce - post_ce).item()
+                post_acc = (post_logits.argmax(-1) == labels).float().mean()
+                raw_reward = (post_acc - pre_acc).item()
                 d = self._reward_ema_decay
                 self._reward_ema_mean = d * self._reward_ema_mean + (1 - d) * raw_reward
                 self._reward_ema_var = d * self._reward_ema_var + (1 - d) * (raw_reward - self._reward_ema_mean) ** 2
@@ -241,14 +239,12 @@ class PonderTrainer:
             self.meta_scheduler.step()
 
             with torch.no_grad():
-                acc = (post_logits.argmax(-1) == labels).float().mean()
                 metrics = {
                     "predicted_loss": predicted_loss.mean().item(),
-                    "pre_ce": pre_ce.item(),
-                    "post_ce": post_ce.item(),
+                    "ce": post_ce.item(),
                     "raw_reward": raw_reward,
                     "reward": reward.item(),
-                    "accuracy": acc.item(),
+                    "accuracy": post_acc.item(),
                     "alpha": alpha,
                     "meta_loss": meta_loss.item(),
                 }
@@ -258,10 +254,10 @@ class PonderTrainer:
             count += 1
 
             pbar.set_postfix(
-                ce=f"{metrics['post_ce']:.3f}",
+                ce=f"{metrics['ce']:.3f}",
                 acc=f"{metrics['accuracy']:.3f}",
-                rw=f"{metrics['reward']:.4f}",
-                ml=f"{metrics['meta_loss']:.4f}",
+                rw=f"{metrics['reward']:.3f}",
+                pl=f"{metrics['predicted_loss']:.3f}",
             )
 
         return {k: v / max(count, 1) for k, v in running.items()}
@@ -308,8 +304,8 @@ class PonderTrainer:
 
             print(
                 f"Epoch {epoch+1:3d}: "
-                f"pred={train_metrics['predicted_loss']:.4f} pre_ce={train_metrics['pre_ce']:.4f} "
-                f"post_ce={train_metrics['post_ce']:.4f} rw={train_metrics['raw_reward']:.4f} nrw={train_metrics['reward']:.2f} "
+                f"pred={train_metrics['predicted_loss']:.4f} ce={train_metrics['ce']:.4f} "
+                f"rw={train_metrics['raw_reward']:.4f} nrw={train_metrics['reward']:.2f} "
                 f"acc={train_metrics['accuracy']:.4f} α={train_metrics['alpha']:.2f} | "
                 f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
