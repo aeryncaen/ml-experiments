@@ -302,12 +302,15 @@ def compute_ponder_loss(
     info: dict,
     config: PonderTrainConfig,
     epoch: int = 0,
+    max_steps: int = 10,
 ) -> tuple[torch.Tensor, dict]:
     ce = F.cross_entropy(expected_logits, targets, reduction="none")  # [B]
 
     expected_steps = info["expected_steps"]  # [B] differentiable
     energy_scale = min(1.0, epoch / max(config.energy_warmup_epochs, 1))
-    reward = -ce - config.lambda_energy * energy_scale * expected_steps
+    # Cost is fraction of budget used, not absolute step count
+    energy_fraction = expected_steps / max(max_steps, 1)
+    reward = -ce - config.lambda_energy * energy_scale * energy_fraction
 
     # KL(p_halt || geometric prior)
     p_halt = info["p_halt"]  # [T, B] detached
@@ -442,7 +445,7 @@ class PonderTrainer:
             expected_logits, info = self.ponder.forward_train(images, max_steps=max_steps)
 
             loss, metrics = compute_ponder_loss(
-                expected_logits, labels, info, cfg, epoch=epoch,
+                expected_logits, labels, info, cfg, epoch=epoch, max_steps=max_steps,
             )
 
             loss.backward()
