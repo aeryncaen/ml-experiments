@@ -144,7 +144,8 @@ class PonderWrapper(nn.Module):
 
         self.l_internal = InternalLossNetwork(hidden_dim, loss_net_layers, loss_net_width)
         self.halt_net = HaltNetwork(hidden_dim, halt_net_width)
-        self.residual_proj = nn.Identity()
+        self.iter_norm = nn.LayerNorm(hidden_dim)
+        self.residual_gate = nn.Parameter(torch.zeros(1))
 
     def _pool_hidden(self, h: torch.Tensor) -> torch.Tensor:
         if h.dim() > 2:
@@ -181,7 +182,9 @@ class PonderWrapper(nn.Module):
             # Normalize gradient so update magnitude is independent of L_internal scale
             grad_norm = grad_h.norm() + 1e-8
             h_updated = h_for_grad - self.inner_lr * (grad_h / grad_norm)
-            h_new = self.base.refine(h_updated) + self.residual_proj(h_0.detach())
+            h_normed = self.iter_norm(h_updated)
+            alpha = torch.sigmoid(self.residual_gate)
+            h_new = self.base.refine(h_normed) + alpha * h_0.detach()
 
             h_pooled = self._pool_hidden(h_new)
             loss_val = self.l_internal(h_new)
@@ -237,7 +240,9 @@ class PonderWrapper(nn.Module):
             with torch.no_grad():
                 grad_norm = grad_h.norm() + 1e-8
                 h_updated = h - self.inner_lr * (grad_h / grad_norm)
-                h_new = self.base.refine(h_updated) + self.residual_proj(h_0)
+                h_normed = self.iter_norm(h_updated)
+                alpha = torch.sigmoid(self.residual_gate)
+                h_new = self.base.refine(h_normed) + alpha * h_0
 
                 h_pooled = self._pool_hidden(h_new)
                 loss_val = self.l_internal(h_new)
