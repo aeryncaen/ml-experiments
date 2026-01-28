@@ -11,60 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PonderableModel(Protocol):
-    def embed(self, x: torch.Tensor) -> torch.Tensor: ...
-    def refine(self, h: torch.Tensor) -> torch.Tensor: ...
-    def decode(self, h: torch.Tensor) -> torch.Tensor: ...
-
-
-class AutoSplitModel(nn.Module):
-    """Splits embed->layers->norm->pool->head classifiers into three phases."""
-
-    def __init__(self, model: nn.Module, pool_dims: tuple[int, ...] = (1, 2)):
-        super().__init__()
-        self.model = model
-        self.pool_dims = pool_dims
-
-    @staticmethod
-    def from_classifier(model: nn.Module) -> "AutoSplitModel":
-        if hasattr(model, "img_size"):
-            pool_dims = (1, 2)
-        elif hasattr(model, "vol_size"):
-            pool_dims = (1, 2, 3)
-        else:
-            pool_dims = (1,)
-        return AutoSplitModel(model, pool_dims=pool_dims)
-
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        m = self.model
-        B = x.shape[0]
-        if hasattr(m, "img_size"):
-            x = x.view(B, *m.img_size, 1)
-            return m.embed_norm(F.silu(m.patch_embed(x))) + m.pos_norm(
-                F.silu(m.pos_embed)
-            )
-        elif hasattr(m, "vol_size"):
-            x = x.permute(0, 2, 3, 1).unsqueeze(-1)
-            return m.embed_norm(F.silu(m.patch_embed(x))) + m.pos_norm(
-                F.silu(m.pos_embed)
-            )
-        else:
-            return m.embed_norm(F.silu(m.embed(x.unsqueeze(-1)))) + m.pos_norm(
-                F.silu(m.pos_embed)
-            )
-
-    def refine(self, h: torch.Tensor) -> torch.Tensor:
-        for layer in self.model.layers:
-            h = layer(h)
-        return self.model.norm(h)
-
-    def decode(self, h: torch.Tensor) -> torch.Tensor:
-        pooled = h.mean(dim=self.pool_dims)
-        return self.model.head(pooled)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode(self.refine(self.embed(x)))
-
 
 class SiLUAttentionBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int = 4):
@@ -121,48 +67,32 @@ class InternalLossNetwork(nn.Module):
 
 
 class PonderWrapper(nn.Module):
-    """Wraps a classifier with a learned loss function + iterative refinement.
+    """Wraps a classifier with a learned loss function (ML3-style).
 
     Two models trained together per batch:
       - Base classifier trains on L_internal's predicted loss
-      - L_internal trains via REINFORCE on accuracy improvement
+      - L_internal trains via REINFORCE on CE improvement
     """
 
     def __init__(
         self,
         model: nn.Module,
         n_classes: int | None = None,
-        hidden_dim: int | None = None,
         loss_net_width: int | None = None,
         loss_net_layers: int = 1,
-        max_steps: int = 10,
     ):
         super().__init__()
+        self.base = model
 
-        if isinstance(model, AutoSplitModel):
-            self.base = model
-        elif hasattr(model, "embed") and hasattr(model, "refine") and hasattr(model, "decode"):
-            self.base = model
-        else:
-            self.base = AutoSplitModel.from_classifier(model)
-
-        head = getattr(self.base, "head", None) or getattr(getattr(self.base, "model", None), "head", None)
+        # Infer n_classes from head layer
+        head = getattr(model, "head", None)
         if n_classes is None:
             if head is not None and hasattr(head, "out_features"):
                 n_classes = head.out_features
             else:
                 raise ValueError("Cannot infer n_classes; pass it explicitly")
-        if hidden_dim is None:
-            if head is not None and hasattr(head, "in_features"):
-                hidden_dim = head.in_features
-            else:
-                raise ValueError("Cannot infer hidden_dim; pass it explicitly")
 
-        assert n_classes is not None and hidden_dim is not None
-        self.hidden_dim = hidden_dim
         self.n_classes = n_classes
-        self.max_steps = max_steps
-
         self.l_internal = InternalLossNetwork(n_classes, loss_net_layers, loss_net_width)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,7 +110,6 @@ class PonderTrainConfig:
     grad_clip: float = 1.0
     epochs: int = 50
     warmup_epochs: int = 2
-    max_steps: int = 10
     log_interval: int = 50
 
 
@@ -203,11 +132,7 @@ class PonderTrainer:
         self.flatten_input = flatten_input
         self.squeeze_channel = squeeze_channel
 
-        base_params = (
-            list(ponder.base.parameters())
-            + list(ponder.iter_norm.parameters())
-            + [ponder.residual_gate]
-        )
+        base_params = list(ponder.base.parameters())
         meta_params = list(ponder.l_internal.parameters())
 
         self.model_optimizer = torch.optim.AdamW(
@@ -251,13 +176,12 @@ class PonderTrainer:
     def train_epoch(self, epoch: int) -> dict:
         self.ponder.train()
         cfg = self.config
-        max_steps = cfg.max_steps
 
         running: dict[str, float] = {}
         count = 0
 
         from tqdm import tqdm
-        desc = f"Epoch {epoch+1}/{cfg.epochs} [T={max_steps}]"
+        desc = f"Epoch {epoch+1}/{cfg.epochs}"
         pbar = tqdm(self.train_loader, desc=desc, leave=False)
 
         for batch_idx, (images, labels) in enumerate(pbar):
@@ -269,19 +193,19 @@ class PonderTrainer:
                 pre_ce = F.cross_entropy(pre_logits, labels)
 
             self.model_optimizer.zero_grad()
-            logits, predicted_loss = self.ponder.forward_steps(images, max_steps=max_steps)
+            logits, predicted_loss = self.ponder(images)
             predicted_loss.mean().backward()
             torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
             self.model_optimizer.step()
             self.model_scheduler.step()
 
             with torch.no_grad():
-                post_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
+                post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 reward = pre_ce - post_ce
 
             self.meta_optimizer.zero_grad()
-            _, predicted_loss_for_meta = self.ponder.forward_steps(images, max_steps=max_steps)
+            _, predicted_loss_for_meta = self.ponder(images)
             meta_loss = -(reward * predicted_loss_for_meta).mean()
             meta_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -324,7 +248,7 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            logits = self.ponder(images)
+            logits, _ = self.ponder(images)
             total_ce += F.cross_entropy(logits, labels).item() * labels.size(0)
             correct += (logits.argmax(-1) == labels).sum().item()
             total += labels.size(0)
@@ -338,7 +262,7 @@ class PonderTrainer:
         print(f"PonderTrainer: {epochs} epochs, device={self.device}")
         print(f"  Base model params: {sum(p.numel() for p in self.ponder.base.parameters()):,}")
         print(f"  L_internal params: {sum(p.numel() for p in self.ponder.l_internal.parameters()):,}")
-        print(f"  Refine steps: {self.config.max_steps}")
+        print(f"  Meta warmup: {self.config.warmup_epochs} epochs")
         print()
 
         for epoch in range(epochs):
