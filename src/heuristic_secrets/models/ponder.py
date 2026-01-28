@@ -229,10 +229,10 @@ class PonderWrapper(nn.Module):
             h_0 = h.clone()
 
         for t in range(max_steps):
-            # Local grad for L_internal direction (needs grad enabled)
             h_for_grad = h.detach().requires_grad_(True)
-            loss_inner = self.l_internal(h_for_grad)
-            grad_h = torch.autograd.grad(loss_inner.sum(), h_for_grad)[0]
+            with torch.enable_grad():
+                loss_inner = self.l_internal(h_for_grad)
+                grad_h = torch.autograd.grad(loss_inner.sum(), h_for_grad)[0]
 
             with torch.no_grad():
                 h_updated = h - self.inner_lr * grad_h
