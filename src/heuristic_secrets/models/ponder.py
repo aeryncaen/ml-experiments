@@ -156,8 +156,6 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
-        self._reward_ema_var = 1.0
-        self._reward_ema_decay = 0.99
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -217,11 +215,7 @@ class PonderTrainer:
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                raw_reward = (post_acc - pre_acc).item()
-                d = self._reward_ema_decay
-                self._reward_ema_var = d * self._reward_ema_var + (1 - d) * raw_reward ** 2
-                reward_rms = max(self._reward_ema_var ** 0.5, 1e-6)
-                reward = torch.tensor(raw_reward / reward_rms, device=self.device)
+                reward = post_acc - pre_acc
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)
@@ -240,7 +234,6 @@ class PonderTrainer:
                 metrics = {
                     "predicted_loss": predicted_loss.mean().item(),
                     "ce": post_ce.item(),
-                    "raw_reward": raw_reward,
                     "reward": reward.item(),
                     "accuracy": post_acc.item(),
                     "alpha": alpha,
@@ -303,7 +296,7 @@ class PonderTrainer:
             print(
                 f"Epoch {epoch+1:3d}: "
                 f"pred={train_metrics['predicted_loss']:.4f} ce={train_metrics['ce']:.4f} "
-                f"rw={train_metrics['raw_reward']:.4f} nrw={train_metrics['reward']:.2f} "
+                f"rw={train_metrics['reward']:.4f} "
                 f"acc={train_metrics['accuracy']:.4f} α={train_metrics['alpha']:.2f} | "
                 f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
