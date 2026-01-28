@@ -212,7 +212,7 @@ class PonderWrapper(nn.Module):
         expected_steps = (p_halt * steps.unsqueeze(-1)).sum(dim=0)  # [B]
 
         info = {
-            "p_halt": p_halt.detach(),                                       # [T, B]
+            "p_halt": p_halt,                                                # [T, B] differentiable
             "expected_steps": expected_steps,                                # [B] differentiable
             "loss_values": torch.stack(loss_values, dim=0),                  # [T, B]
             "halt_lambdas": torch.stack([l.detach() for l in halt_lambdas], dim=0),  # [T, B]
