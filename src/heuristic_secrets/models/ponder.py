@@ -89,9 +89,7 @@ class SiLUAttentionBlock(nn.Module):
         q = F.silu(self.q(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = F.silu(self.k(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = F.silu(self.v(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, L, C)
         x = x + self.out(out)
         x = x + self.mlp(self.norm2(x))
         return x
