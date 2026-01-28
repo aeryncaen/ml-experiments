@@ -166,12 +166,11 @@ class PonderWrapper(nn.Module):
         loss_values: list[torch.Tensor] = []
 
         for t in range(max_steps):
-            h_for_grad = h
-            if not h_for_grad.requires_grad:
-                h_for_grad = h_for_grad.requires_grad_(True)
+            # Detach h so base model ONLY gets gradients through L_internal
+            h_for_grad = h.detach().requires_grad_(True)
 
             loss_inner = self.l_internal(h_for_grad)
-            # create_graph=True: meta-gradients must flow through this
+            # create_graph=True: meta-gradients to L_internal flow through this
             grad_h = torch.autograd.grad(
                 loss_inner.sum(),
                 h_for_grad,
@@ -182,7 +181,7 @@ class PonderWrapper(nn.Module):
             # Normalize gradient so update magnitude is independent of L_internal scale
             grad_norm = grad_h.norm() + 1e-8
             h_updated = h_for_grad - self.inner_lr * (grad_h / grad_norm)
-            h_new = self.base.refine(h_updated) + self.residual_proj(h_0)
+            h_new = self.base.refine(h_updated) + self.residual_proj(h_0.detach())
 
             h_pooled = self._pool_hidden(h_new)
             loss_val = self.l_internal(h_new)
