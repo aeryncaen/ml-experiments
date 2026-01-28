@@ -164,32 +164,12 @@ class PonderWrapper(nn.Module):
         self.max_steps = max_steps
 
         self.l_internal = InternalLossNetwork(n_classes, loss_net_layers, loss_net_width)
-        self.iter_norm = nn.LayerNorm(hidden_dim)
-        self.residual_gate = nn.Parameter(torch.zeros(1))
 
-    def forward_steps(
-        self,
-        x: torch.Tensor,
-        max_steps: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (final_logits [B, C], predicted_loss [B])."""
-        max_steps = max_steps or self.max_steps
-
-        h = self.base.embed(x)
-        h_0 = h
-
-        for t in range(max_steps):
-            h = self.iter_norm(h)
-            alpha = torch.sigmoid(self.residual_gate)
-            h = self.base.refine(h) + alpha * h_0
-
-        logits = self.base.decode(h)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (logits [B, C], predicted_loss [B])."""
+        logits = self.base(x)
         predicted_loss = self.l_internal(logits)
         return logits, predicted_loss
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits, _ = self.forward_steps(x)
-        return logits
 
 
 @dataclass
@@ -285,7 +265,7 @@ class PonderTrainer:
             labels = labels.to(self.device)
 
             with torch.no_grad():
-                pre_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
+                pre_logits = self.ponder(images)[0]
                 pre_ce = F.cross_entropy(pre_logits, labels)
 
             self.model_optimizer.zero_grad()
