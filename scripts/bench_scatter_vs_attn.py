@@ -1548,13 +1548,9 @@ def main():
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
-    parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss + PonderNet halting')
-    parser.add_argument('--ponder-max-steps', type=int, default=10, help='Max ponder iterations (default: 10)')
-    parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal + halt net')
-    parser.add_argument('--ponder-lambda-energy', type=float, default=0.05, help='Energy cost per iteration step')
-    parser.add_argument('--ponder-gluttony-steps', type=int, default=15, help='Max steps during gluttony phase')
-    parser.add_argument('--ponder-starvation-steps', type=int, default=3, help='Max steps during starvation phase')
-    parser.add_argument('--ponder-block-length', type=int, default=10, help='Epochs per starvation/gluttony block')
+    parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss + iterative refinement')
+    parser.add_argument('--ponder-max-steps', type=int, default=10, help='Refine iterations (default: 10)')
+    parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1686,8 +1682,8 @@ def main():
                     model,
                     max_steps=args.ponder_max_steps,
                 )
-                ponder_params = sum(p.numel() for p in model.l_internal.parameters()) + sum(p.numel() for p in model.halt_net.parameters())
-                print(f'  Ponder: +{ponder_params:,} params (L_internal + halt_net), max_steps={args.ponder_max_steps}')
+                ponder_params = sum(p.numel() for p in model.l_internal.parameters())
+                print(f'  Ponder: +{ponder_params:,} params (L_internal), max_steps={args.ponder_max_steps}')
 
             if args.compile:
                 model = torch.compile(model)
@@ -1753,10 +1749,7 @@ def main():
                     meta_lr=args.ponder_meta_lr,
                     model_lr=args.lr,
                     epochs=args.epochs,
-                    lambda_energy=args.ponder_lambda_energy,
-                    gluttony_max_steps=args.ponder_gluttony_steps,
-                    starvation_max_steps=args.ponder_starvation_steps,
-                    block_length=args.ponder_block_length,
+                    max_steps=args.ponder_max_steps,
                 )
                 trainer = PonderTrainer(
                     model, train_loader, test_loader, device, ponder_config,
