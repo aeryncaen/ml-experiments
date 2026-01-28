@@ -96,13 +96,14 @@ class PonderWrapper(nn.Module):
         self.n_classes = n_classes
         self.l_internal = InternalLossNetwork(n_classes, loss_net_layers, loss_net_width)
 
-    def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         logits = self.base(x)
         if targets is not None:
             raw_pred = self.l_internal(logits, targets)
-            predicted_loss = raw_pred / (raw_pred.detach().mean() + 1e-8)
-            return logits, predicted_loss
-        return logits, None
+            ce_scale = F.cross_entropy(logits.detach(), targets).detach()
+            predicted_loss = raw_pred / (raw_pred.detach().mean() + 1e-8) * ce_scale
+            return logits, predicted_loss, raw_pred
+        return logits, None, None
 
 
 @dataclass
@@ -210,7 +211,7 @@ class PonderTrainer:
                 pre_acc = (self.ponder(images, labels)[0].argmax(-1) == labels).float().mean()
 
             self.model_optimizer.zero_grad()
-            logits, predicted_loss = self.ponder(images, labels)
+            logits, predicted_loss, raw_pred = self.ponder(images, labels)
             ce = F.cross_entropy(logits, labels)
             base_loss = ce + predicted_loss.mean()
             base_loss.backward()
@@ -227,7 +228,7 @@ class PonderTrainer:
                 reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
 
             self.meta_optimizer.zero_grad()
-            logits_for_meta, predicted_loss_for_meta = self.ponder(images, labels)
+            logits_for_meta, predicted_loss_for_meta, _ = self.ponder(images, labels)
             per_sample_ce = F.cross_entropy(logits_for_meta, labels, reduction='none').detach()
             reinforce_loss = -(reward * predicted_loss_for_meta).mean()
             supervised_loss = F.mse_loss(predicted_loss_for_meta, per_sample_ce)
@@ -241,7 +242,7 @@ class PonderTrainer:
 
             with torch.no_grad():
                 metrics = {
-                    "predicted_loss": predicted_loss.mean().item(),
+                    "predicted_loss": raw_pred.detach().mean().item(),
                     "ce": post_ce.item(),
                     "reward": reward.item(),
                     "accuracy": post_acc.item(),
@@ -275,9 +276,9 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            logits, predicted_loss = self.ponder(images, labels)
+            logits, _, raw_pred = self.ponder(images, labels)
             total_ce += F.cross_entropy(logits, labels).item() * labels.size(0)
-            total_pred += predicted_loss.sum().item()
+            total_pred += raw_pred.sum().item()
             correct += (logits.argmax(-1) == labels).sum().item()
             total += labels.size(0)
 
