@@ -27,6 +27,7 @@ from heuristic_secrets.models.ripple_attention import RippleAttention, RippleCla
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.models.telephone_attention import TelephoneAttentionND
+from heuristic_secrets.models.ponder import PonderWrapper, PonderTrainer, PonderTrainConfig
 from heuristic_secrets.data.synthetic import load_task, TASKS
 
 
@@ -1547,6 +1548,15 @@ def main():
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
+    parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss + PonderNet halting')
+    parser.add_argument('--ponder-max-steps', type=int, default=10, help='Max ponder iterations (default: 10)')
+    parser.add_argument('--ponder-inner-lr', type=float, default=0.05, help='Inner learning rate for L_internal gradient step')
+    parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal + halt net')
+    parser.add_argument('--ponder-lambda-energy', type=float, default=0.05, help='Energy cost per iteration step')
+    parser.add_argument('--ponder-max-reward', type=float, default=10.0, help='Initial reward ceiling')
+    parser.add_argument('--ponder-gluttony-steps', type=int, default=15, help='Max steps during gluttony phase')
+    parser.add_argument('--ponder-starvation-steps', type=int, default=3, help='Max steps during starvation phase')
+    parser.add_argument('--ponder-block-length', type=int, default=10, help='Epochs per starvation/gluttony block')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1673,6 +1683,17 @@ def main():
             # In 1D mode, ripple/flat needs flattened 1D sequence input
             model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
             
+            if args.ponder and not args.duo:
+                width = model.head.in_features if hasattr(model, 'head') else None
+                model = PonderWrapper(
+                    model,
+                    hidden_dim=width,
+                    inner_lr=args.ponder_inner_lr,
+                    max_steps=args.ponder_max_steps,
+                )
+                ponder_params = sum(p.numel() for p in model.l_internal.parameters()) + sum(p.numel() for p in model.halt_net.parameters())
+                print(f'  Ponder: +{ponder_params:,} params (L_internal + halt_net), max_steps={args.ponder_max_steps}')
+
             if args.compile:
                 model = torch.compile(model)
             
@@ -1732,15 +1753,33 @@ def main():
                 
                 continue  # Skip training for this model
             
-            acc = train_model(
-                model, train_loader, test_loader, device, args.epochs, args.lr,
-                cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
-                swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
-                hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
-                wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
-                verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp,
-                label_smoothing=args.label_smoothing
-            )
+            if args.ponder and not args.duo:
+                ponder_config = PonderTrainConfig(
+                    meta_lr=args.ponder_meta_lr,
+                    model_lr=args.lr,
+                    epochs=args.epochs,
+                    lambda_energy=args.ponder_lambda_energy,
+                    max_reward_initial=args.ponder_max_reward,
+                    gluttony_max_steps=args.ponder_gluttony_steps,
+                    starvation_max_steps=args.ponder_starvation_steps,
+                    block_length=args.ponder_block_length,
+                )
+                trainer = PonderTrainer(
+                    model, train_loader, test_loader, device, ponder_config,
+                    flatten_input=model_flatten,
+                    squeeze_channel=not model_flatten,
+                )
+                acc = trainer.train()
+            else:
+                acc = train_model(
+                    model, train_loader, test_loader, device, args.epochs, args.lr,
+                    cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
+                    swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
+                    hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
+                    wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
+                    verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp,
+                    label_smoothing=args.label_smoothing
+                )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
 
