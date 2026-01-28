@@ -194,9 +194,9 @@ class PonderWrapper(nn.Module):
         h = self.base.embed(x)
         h_0 = h
 
-        # Step-0 baseline: what decode produces with no iteration
-        h_0_refined = self.base.refine(h_0.detach())
-        baseline_logits = self.base.decode(h_0_refined)
+        # Step-0 baseline: what decode produces with no iteration (detach so baseline doesn't train the model)
+        with torch.no_grad():
+            baseline_logits = self.base.decode(self.base.refine(h_0))
 
         halt_lambdas: list[torch.Tensor] = []
         step_logits: list[torch.Tensor] = []
@@ -220,7 +220,7 @@ class PonderWrapper(nn.Module):
             h_updated = h_for_grad - self.inner_lr * (grad_h / grad_norm)
             h_normed = self.iter_norm(h_updated)
             alpha = torch.sigmoid(self.residual_gate)
-            h_new = self.base.refine(h_normed) + alpha * h_0.detach()
+            h_new = self.base.refine(h_normed) + alpha * h_0
 
             h_pooled = self._pool_hidden(h_new)
             loss_val = self.l_internal(h_new)
