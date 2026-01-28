@@ -358,7 +358,7 @@ class PonderTrainer:
 
             if batch_idx % cfg.log_interval == 0:
                 pbar.set_postfix(
-                    ce=f"{metrics['ce']:.3f}",
+                    ce=f"{metrics['post_ce']:.3f}",
                     acc=f"{metrics['accuracy']:.3f}",
                     improv=f"{metrics['improvement']:.3f}",
                 )
@@ -409,7 +409,7 @@ class PonderTrainer:
 
             print(
                 f"Epoch {epoch+1:3d}: "
-                f"train_ce={train_metrics['ce']:.4f} base_ce={train_metrics['baseline_ce']:.4f} "
+                f"pre_ce={train_metrics['pre_ce']:.4f} post_ce={train_metrics['post_ce']:.4f} "
                 f"improv={train_metrics['improvement']:.4f} acc={train_metrics['accuracy']:.4f} | "
                 f"test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
