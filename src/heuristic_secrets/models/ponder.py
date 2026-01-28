@@ -89,6 +89,8 @@ class PonderWrapper(nn.Module):
                 n_classes = head.out_features
             else:
                 raise ValueError("Cannot infer n_classes; pass it explicitly")
+        if loss_net_width is None and head is not None and hasattr(head, "in_features"):
+            loss_net_width = head.in_features
 
         assert n_classes is not None
         self.n_classes = n_classes
@@ -114,7 +116,6 @@ class PonderTrainConfig:
     meta_wean_epochs: int = 1
     reward_scale: float = 100.0
     meta_min_supervised: float = 0.0
-    drop_ce_epoch: int = 5
     log_interval: int = 50
 
 
@@ -209,10 +210,7 @@ class PonderTrainer:
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder(images, labels)
             ce = F.cross_entropy(logits, labels)
-            if epoch < cfg.drop_ce_epoch:
-                base_loss = ce + predicted_loss.mean()
-            else:
-                base_loss = predicted_loss.mean()
+            base_loss = ce + predicted_loss.mean()
             base_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
             self.model_optimizer.step()
