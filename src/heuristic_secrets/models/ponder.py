@@ -98,8 +98,10 @@ class SiLUAttentionBlock(nn.Module):
 
 
 class InternalLossNetwork(nn.Module):
-    def __init__(self, hidden_dim: int, n_layers: int = 2, width: int = 128, n_heads: int = 4):
+    def __init__(self, hidden_dim: int, n_layers: int = 1, width: int | None = None, n_heads: int = 2):
         super().__init__()
+        if width is None:
+            width = max(8, hidden_dim // 4)
         self.proj_in = nn.Linear(hidden_dim, width) if hidden_dim != width else nn.Identity()
         self.blocks = nn.ModuleList([
             SiLUAttentionBlock(width, n_heads=n_heads) for _ in range(n_layers)
@@ -148,8 +150,8 @@ class PonderWrapper(nn.Module):
         self,
         model: nn.Module,
         hidden_dim: int | None = None,
-        loss_net_layers: int = 2,
-        loss_net_width: int = 128,
+        loss_net_layers: int = 1,
+        loss_net_width: int | None = None,
         halt_net_width: int = 64,
         inner_lr: float = 0.05,
         max_steps: int = 10,
