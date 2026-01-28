@@ -329,12 +329,11 @@ class PonderTrainer:
                 running[k] = running.get(k, 0.0) + v
             count += 1
 
-            if batch_idx % cfg.log_interval == 0:
-                pbar.set_postfix(
-                    ce=f"{metrics['real_ce']:.3f}",
-                    acc=f"{metrics['accuracy']:.3f}",
-                    reward=f"{metrics['reward']:.3f}",
-                )
+            pbar.set_postfix(
+                ce=f"{metrics['real_ce']:.3f}",
+                acc=f"{metrics['accuracy']:.3f}",
+                reward=f"{metrics['reward']:.3f}",
+            )
 
         return {k: v / max(count, 1) for k, v in running.items()}
 
