@@ -1687,7 +1687,6 @@ def main():
                 model = PonderWrapper(
                     model,
                     hidden_dim=width,
-                    inner_lr=args.ponder_inner_lr,
                     max_steps=args.ponder_max_steps,
                 )
                 ponder_params = sum(p.numel() for p in model.l_internal.parameters()) + sum(p.numel() for p in model.halt_net.parameters())

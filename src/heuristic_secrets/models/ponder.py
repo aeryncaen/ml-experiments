@@ -110,23 +110,18 @@ class InternalLossNetwork(nn.Module):
         nn.init.zeros_(self.head.bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """h: [B, *spatial, C] -> [B]"""
         if h.dim() > 2:
-            # Flatten spatial dims into sequence: [B, H, W, C] -> [B, H*W, C]
-            B = h.shape[0]
-            C = h.shape[-1]
+            B, C = h.shape[0], h.shape[-1]
             x = h.reshape(B, -1, C)
         else:
-            x = h.unsqueeze(1)  # [B, C] -> [B, 1, C]
+            x = h.unsqueeze(1)
         x = self.proj_in(x)
         for block in self.blocks:
             x = block(x)
-        return self.head(x.mean(dim=1)).squeeze(-1)  # [B]
+        return self.head(x.mean(dim=1)).squeeze(-1)
 
 
 class HaltNetwork(nn.Module):
-    """PonderNet halting: λ_t = σ(f(h_t, L_internal(h_t)))"""
-
     def __init__(self, hidden_dim: int, width: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -143,7 +138,15 @@ class HaltNetwork(nn.Module):
 
 
 class PonderWrapper(nn.Module):
-    """Wraps any classifier with learned internal loss + PonderNet halting."""
+    """Wraps any classifier with learned internal loss + PonderNet halting.
+
+    Training: two alternating phases per batch.
+      1. Inner: base model trains by minimizing L_internal (standard backprop)
+      2. Outer: L_internal + halt_net train by maximizing reward (improvement - energy)
+
+    Iteration: repeated forward passes through refine (weight-shared depth).
+    Halting: L_internal value feeds halt_net, which produces PonderNet distribution.
+    """
 
     def __init__(
         self,
@@ -152,7 +155,6 @@ class PonderWrapper(nn.Module):
         loss_net_layers: int = 1,
         loss_net_width: int | None = None,
         halt_net_width: int = 64,
-        inner_lr: float = 0.05,
         max_steps: int = 10,
     ):
         super().__init__()
@@ -172,7 +174,6 @@ class PonderWrapper(nn.Module):
                 raise ValueError("Cannot infer hidden_dim; pass it explicitly")
 
         self.hidden_dim = hidden_dim
-        self.inner_lr = inner_lr
         self.max_steps = max_steps
 
         self.l_internal = InternalLossNetwork(hidden_dim, loss_net_layers, loss_net_width)
@@ -185,54 +186,38 @@ class PonderWrapper(nn.Module):
             return h.mean(dim=tuple(range(1, h.dim() - 1)))
         return h
 
-    def forward_train(
+    def forward_pondering(
         self,
         x: torch.Tensor,
         max_steps: int | None = None,
     ) -> tuple[torch.Tensor, dict]:
+        """Forward with pondering: repeated refine passes + halting distribution.
+
+        Used during both inner loop (to get L_internal values) and outer loop
+        (to compute expected output under halting distribution for reward).
+        """
         max_steps = max_steps or self.max_steps
 
         h = self.base.embed(x)
         h_0 = h
-
-        # Step-0 baseline: what decode produces with no iteration (detach so baseline doesn't train the model)
-        with torch.no_grad():
-            baseline_logits = self.base.decode(self.base.refine(h_0))
 
         halt_lambdas: list[torch.Tensor] = []
         step_logits: list[torch.Tensor] = []
         loss_values: list[torch.Tensor] = []
 
         for t in range(max_steps):
-            # Detach h so base model ONLY gets gradients through L_internal
-            h_for_grad = h.detach().requires_grad_(True)
-
-            loss_inner = self.l_internal(h_for_grad)
-            # create_graph=True: meta-gradients to L_internal flow through this
-            grad_h = torch.autograd.grad(
-                loss_inner.sum(),
-                h_for_grad,
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-
-            # Normalize gradient so update magnitude is independent of L_internal scale
-            grad_norm = grad_h.norm() + 1e-8
-            h_updated = h_for_grad - self.inner_lr * (grad_h / grad_norm)
-            h_normed = self.iter_norm(h_updated)
+            h = self.iter_norm(h)
             alpha = torch.sigmoid(self.residual_gate)
-            h_new = self.base.refine(h_normed) + alpha * h_0
+            h = self.base.refine(h) + alpha * h_0
 
-            h_pooled = self._pool_hidden(h_new)
-            loss_val = self.l_internal(h_new)
+            h_pooled = self._pool_hidden(h)
+            loss_val = self.l_internal(h)
             halt_logit = self.halt_net(h_pooled, loss_val)
             lam = torch.sigmoid(halt_logit)
 
             halt_lambdas.append(lam)
-            step_logits.append(self.base.decode(h_new))
-            loss_values.append(loss_val.detach())
-
-            h = h_new
+            step_logits.append(self.base.decode(h))
+            loss_values.append(loss_val)
 
         # p(halt at t) = λ_t * Π_{i<t}(1 - λ_i)
         p_halt = []
@@ -249,14 +234,16 @@ class PonderWrapper(nn.Module):
         expected_steps = (p_halt * steps.unsqueeze(-1)).sum(dim=0)  # [B]
 
         info = {
-            "p_halt": p_halt,                                                # [T, B] differentiable
-            "expected_steps": expected_steps,                                # [B] differentiable
-            "baseline_logits": baseline_logits,                              # [B, C] detached from base
-            "loss_values": torch.stack(loss_values, dim=0),                  # [T, B]
-            "halt_lambdas": torch.stack([l.detach() for l in halt_lambdas], dim=0),  # [T, B]
+            "p_halt": p_halt,                                    # [T, B]
+            "expected_steps": expected_steps,                    # [B]
+            "loss_values": torch.stack(loss_values, dim=0),      # [T, B]
+            "halt_lambdas": torch.stack(
+                [l.detach() for l in halt_lambdas], dim=0
+            ),                                                   # [T, B]
         }
         return expected_logits, info
 
+    @torch.no_grad()
     def forward_inference(
         self,
         x: torch.Tensor,
@@ -265,39 +252,27 @@ class PonderWrapper(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         max_steps = max_steps or self.max_steps
 
-        with torch.no_grad():
-            h = self.base.embed(x)
-            h_0 = h.clone()
+        h = self.base.embed(x)
+        h_0 = h
 
         for t in range(max_steps):
-            h_for_grad = h.detach().requires_grad_(True)
-            with torch.enable_grad():
-                loss_inner = self.l_internal(h_for_grad)
-                grad_h = torch.autograd.grad(loss_inner.sum(), h_for_grad)[0]
+            h = self.iter_norm(h)
+            alpha = torch.sigmoid(self.residual_gate)
+            h = self.base.refine(h) + alpha * h_0
 
-            with torch.no_grad():
-                grad_norm = grad_h.norm() + 1e-8
-                h_updated = h - self.inner_lr * (grad_h / grad_norm)
-                h_normed = self.iter_norm(h_updated)
-                alpha = torch.sigmoid(self.residual_gate)
-                h_new = self.base.refine(h_normed) + alpha * h_0
+            h_pooled = self._pool_hidden(h)
+            loss_val = self.l_internal(h)
+            halt_logit = self.halt_net(h_pooled, loss_val)
+            halt_prob = torch.sigmoid(halt_logit)
 
-                h_pooled = self._pool_hidden(h_new)
-                loss_val = self.l_internal(h_new)
-                halt_logit = self.halt_net(h_pooled, loss_val)
-                halt_prob = torch.sigmoid(halt_logit)
+            if halt_prob.mean().item() > halt_threshold:
+                return self.base.decode(h), t + 1
 
-                if halt_prob.mean().item() > halt_threshold:
-                    return self.base.decode(h_new), t + 1
-
-                h = h_new
-
-        with torch.no_grad():
-            return self.base.decode(h), max_steps
+        return self.base.decode(h), max_steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
-            logits, _ = self.forward_train(x)
+            logits, _ = self.forward_pondering(x)
             return logits
         else:
             logits, _ = self.forward_inference(x)
@@ -305,7 +280,7 @@ class PonderWrapper(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Reward + meta-loss
+# Config + reward
 # ---------------------------------------------------------------------------
 
 
@@ -313,6 +288,7 @@ class PonderWrapper(nn.Module):
 class PonderTrainConfig:
     meta_lr: float = 3e-4
     model_lr: float = 1e-3
+    inner_steps: int = 1
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     epochs: int = 50
@@ -321,7 +297,6 @@ class PonderTrainConfig:
     lambda_energy: float = 0.05
     energy_warmup_epochs: int = 10
 
-    # PonderNet KL against geometric prior  (E[steps] ~ 1/λ_p)
     geometric_prior_lambda: float = 0.3
     kl_weight: float = 0.01
 
@@ -330,64 +305,11 @@ class PonderTrainConfig:
     block_length: int = 10
     gluttony_fraction: float = 0.4
 
-    use_first_order: bool = True
     log_interval: int = 50
 
 
-def compute_ponder_loss(
-    expected_logits: torch.Tensor,
-    targets: torch.Tensor,
-    info: dict,
-    config: PonderTrainConfig,
-    epoch: int = 0,
-    max_steps: int = 10,
-) -> tuple[torch.Tensor, dict]:
-    ce = F.cross_entropy(expected_logits, targets, reduction="none")  # [B]
-    baseline_ce = F.cross_entropy(
-        info["baseline_logits"], targets, reduction="none"
-    ).detach()  # [B] no gradient to baseline path
-
-    expected_steps = info["expected_steps"]  # [B] differentiable
-    energy_scale = min(1.0, epoch / max(config.energy_warmup_epochs, 1))
-    energy_fraction = expected_steps / max(max_steps, 1)
-    # Reward = how much iteration improved CE, minus energy cost
-    improvement = baseline_ce - ce
-    reward = improvement - config.lambda_energy * energy_scale * energy_fraction
-
-    # KL(p_halt || geometric prior)
-    p_halt = info["p_halt"]  # [T, B] detached
-    T = p_halt.shape[0]
-    lp = config.geometric_prior_lambda
-    t_idx = torch.arange(T, device=p_halt.device, dtype=torch.float32)
-    p_geometric = lp * ((1 - lp) ** t_idx)
-    p_geometric = p_geometric / p_geometric.sum()
-    p_geometric = p_geometric.unsqueeze(-1).expand_as(p_halt)
-
-    kl = (p_halt * (torch.log(p_halt + 1e-8) - torch.log(p_geometric + 1e-8))).sum(dim=0)
-
-    meta_loss = (-reward + config.kl_weight * kl).mean()
-
-    with torch.no_grad():
-        preds = expected_logits.argmax(dim=-1)
-        acc = (preds == targets).float().mean()
-        metrics = {
-            "meta_loss": meta_loss.item(),
-            "ce": ce.mean().item(),
-            "baseline_ce": baseline_ce.mean().item(),
-            "improvement": improvement.mean().item(),
-            "reward": reward.mean().item(),
-            "expected_steps": expected_steps.mean().item(),
-            "kl": kl.mean().item(),
-            "accuracy": acc.item(),
-            "l_internal_mean": info["loss_values"].mean().item(),
-            "halt_lambda_mean": info["halt_lambdas"].mean().item(),
-        }
-
-    return meta_loss, metrics
-
-
 # ---------------------------------------------------------------------------
-# Trainer
+# Trainer: alternating inner/outer optimization
 # ---------------------------------------------------------------------------
 
 
@@ -410,9 +332,14 @@ class PonderTrainer:
         self.flatten_input = flatten_input
         self.squeeze_channel = squeeze_channel
 
-        base_params = list(ponder.base.parameters())
-        meta_params = list(ponder.l_internal.parameters()) + list(
-            ponder.halt_net.parameters()
+        base_params = (
+            list(ponder.base.parameters())
+            + list(ponder.iter_norm.parameters())
+            + [ponder.residual_gate]
+        )
+        meta_params = (
+            list(ponder.l_internal.parameters())
+            + list(ponder.halt_net.parameters())
         )
 
         self.model_optimizer = torch.optim.AdamW(
@@ -482,22 +409,70 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            self.model_optimizer.zero_grad()
+            # === INNER LOOP: train base model using L_internal as loss ===
+            for _ in range(cfg.inner_steps):
+                self.model_optimizer.zero_grad()
+                _, info = self.ponder.forward_pondering(images, max_steps=max_steps)
+                # L_internal averaged across steps, weighted by halt distribution
+                inner_loss = (info["p_halt"] * info["loss_values"]).sum(dim=0).mean()
+                inner_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.ponder.base.parameters(), cfg.grad_clip
+                )
+                self.model_optimizer.step()
+                self.model_scheduler.step()
+
+            # === OUTER LOOP: train L_internal + halt_net using reward ===
             self.meta_optimizer.zero_grad()
 
-            expected_logits, info = self.ponder.forward_train(images, max_steps=max_steps)
+            # Baseline: single refine pass, no pondering (detached)
+            with torch.no_grad():
+                h_base = self.ponder.base.embed(images)
+                baseline_logits = self.ponder.base.decode(self.ponder.base.refine(h_base))
+                baseline_ce = F.cross_entropy(baseline_logits, labels, reduction="none")
 
-            loss, metrics = compute_ponder_loss(
-                expected_logits, labels, info, cfg, epoch=epoch, max_steps=max_steps,
+            expected_logits, info = self.ponder.forward_pondering(images, max_steps=max_steps)
+            ce = F.cross_entropy(expected_logits, labels, reduction="none")
+
+            improvement = baseline_ce - ce
+            expected_steps = info["expected_steps"]
+            energy_scale = min(1.0, epoch / max(cfg.energy_warmup_epochs, 1))
+            energy_fraction = expected_steps / max(max_steps, 1)
+            reward = improvement - cfg.lambda_energy * energy_scale * energy_fraction
+
+            # KL(p_halt || geometric prior)
+            p_halt = info["p_halt"]
+            T = p_halt.shape[0]
+            lp = cfg.geometric_prior_lambda
+            t_idx = torch.arange(T, device=p_halt.device, dtype=torch.float32)
+            p_geometric = lp * ((1 - lp) ** t_idx)
+            p_geometric = (p_geometric / p_geometric.sum()).unsqueeze(-1).expand_as(p_halt)
+            kl = (p_halt * (torch.log(p_halt + 1e-8) - torch.log(p_geometric + 1e-8))).sum(dim=0)
+
+            meta_loss = (-reward + cfg.kl_weight * kl).mean()
+            meta_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.ponder.l_internal.parameters()) + list(self.ponder.halt_net.parameters()),
+                cfg.grad_clip,
             )
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.ponder.parameters(), cfg.grad_clip)
-
-            self.model_optimizer.step()
             self.meta_optimizer.step()
-            self.model_scheduler.step()
             self.meta_scheduler.step()
+
+            with torch.no_grad():
+                preds = expected_logits.argmax(dim=-1)
+                acc = (preds == labels).float().mean()
+                metrics = {
+                    "meta_loss": meta_loss.item(),
+                    "inner_loss": inner_loss.item(),
+                    "ce": ce.mean().item(),
+                    "baseline_ce": baseline_ce.mean().item(),
+                    "improvement": improvement.mean().item(),
+                    "reward": reward.mean().item(),
+                    "expected_steps": expected_steps.mean().item(),
+                    "kl": kl.mean().item(),
+                    "accuracy": acc.item(),
+                    "l_internal_mean": info["loss_values"].mean().item(),
+                }
 
             for k, v in metrics.items():
                 running[k] = running.get(k, 0.0) + v
@@ -505,10 +480,10 @@ class PonderTrainer:
 
             if batch_idx % cfg.log_interval == 0:
                 pbar.set_postfix(
-                    loss=f"{metrics['meta_loss']:.3f}",
                     ce=f"{metrics['ce']:.3f}",
                     acc=f"{metrics['accuracy']:.3f}",
                     steps=f"{metrics['expected_steps']:.1f}",
+                    improv=f"{metrics['improvement']:.3f}",
                 )
 
         return {k: v / max(count, 1) for k, v in running.items()}
@@ -544,6 +519,7 @@ class PonderTrainer:
         print(f"  Base model params: {sum(p.numel() for p in self.ponder.base.parameters()):,}")
         print(f"  L_internal params: {sum(p.numel() for p in self.ponder.l_internal.parameters()):,}")
         print(f"  Halt net params:   {sum(p.numel() for p in self.ponder.halt_net.parameters()):,}")
+        print(f"  Inner steps per batch: {cfg.inner_steps}")
         print(f"  Gluttony steps: {cfg.gluttony_max_steps}, Starvation steps: {cfg.starvation_max_steps}")
         print(f"  Block length: {cfg.block_length} epochs, Gluttony fraction: {cfg.gluttony_fraction}")
         print()
