@@ -66,29 +66,61 @@ class AutoSplitModel(nn.Module):
         return self.decode(self.refine(self.embed(x)))
 
 
-class InternalLossNetwork(nn.Module):
-    """Hidden state -> scalar. Trained via meta-gradients from reward."""
-
-    def __init__(self, hidden_dim: int, n_layers: int = 2, width: int = 128):
+class SiLUAttentionBlock(nn.Module):
+    def __init__(self, dim: int, n_heads: int = 4):
         super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = hidden_dim
-        for _ in range(n_layers):
-            layers.extend([nn.Linear(in_dim, width), nn.ReLU()])
-            in_dim = width
-        layers.append(nn.Linear(in_dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.out = nn.Linear(dim, dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
 
-        nn.init.xavier_normal_(self.net[-1].weight, gain=0.1)
-        nn.init.zeros_(self.net[-1].bias)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, C = x.shape
+        h = self.norm1(x)
+        q = F.silu(self.q(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = F.silu(self.k(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        v = F.silu(self.v(h)).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        x = x + self.out(out)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class InternalLossNetwork(nn.Module):
+    def __init__(self, hidden_dim: int, n_layers: int = 2, width: int = 128, n_heads: int = 4):
+        super().__init__()
+        self.proj_in = nn.Linear(hidden_dim, width) if hidden_dim != width else nn.Identity()
+        self.blocks = nn.ModuleList([
+            SiLUAttentionBlock(width, n_heads=n_heads) for _ in range(n_layers)
+        ])
+        self.head = nn.Linear(width, 1)
+        nn.init.xavier_normal_(self.head.weight, gain=0.1)
+        nn.init.zeros_(self.head.bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """h: [B, *spatial, C] -> [B]"""
         if h.dim() > 2:
-            pooled = h.mean(dim=tuple(range(1, h.dim() - 1)))
+            # Flatten spatial dims into sequence: [B, H, W, C] -> [B, H*W, C]
+            B = h.shape[0]
+            C = h.shape[-1]
+            x = h.reshape(B, -1, C)
         else:
-            pooled = h
-        return self.net(pooled).squeeze(-1)
+            x = h.unsqueeze(1)  # [B, C] -> [B, 1, C]
+        x = self.proj_in(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.head(x.mean(dim=1)).squeeze(-1)  # [B]
 
 
 class HaltNetwork(nn.Module):
