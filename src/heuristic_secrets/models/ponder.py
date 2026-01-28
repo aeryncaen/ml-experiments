@@ -161,6 +161,7 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
+        self._reward_ema = 0.0
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -220,7 +221,9 @@ class PonderTrainer:
                 post_logits = self.ponder(images, labels)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                reward = (post_acc - pre_acc) * cfg.reward_scale
+                raw_reward = (post_acc - pre_acc).item()
+                self._reward_ema = 0.99 * self._reward_ema + 0.01 * raw_reward
+                reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images, labels)
