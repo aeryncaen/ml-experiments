@@ -1550,7 +1550,6 @@ def main():
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
     parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss + PonderNet halting')
     parser.add_argument('--ponder-max-steps', type=int, default=10, help='Max ponder iterations (default: 10)')
-    parser.add_argument('--ponder-inner-lr', type=float, default=0.05, help='Inner learning rate for L_internal gradient step')
     parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal + halt net')
     parser.add_argument('--ponder-lambda-energy', type=float, default=0.05, help='Energy cost per iteration step')
     parser.add_argument('--ponder-gluttony-steps', type=int, default=15, help='Max steps during gluttony phase')
@@ -1683,10 +1682,8 @@ def main():
             model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
             
             if args.ponder and not args.duo:
-                width = model.head.in_features if hasattr(model, 'head') else None
                 model = PonderWrapper(
                     model,
-                    hidden_dim=width,
                     max_steps=args.ponder_max_steps,
                 )
                 ponder_params = sum(p.numel() for p in model.l_internal.parameters()) + sum(p.numel() for p in model.halt_net.parameters())
