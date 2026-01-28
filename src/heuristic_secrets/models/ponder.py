@@ -79,8 +79,7 @@ class InternalLossNetwork(nn.Module):
         layers.append(nn.Linear(in_dim, 1))
         self.net = nn.Sequential(*layers)
 
-        # Zero-init output so L_internal starts near zero (stable init)
-        nn.init.zeros_(self.net[-1].weight)
+        nn.init.xavier_normal_(self.net[-1].weight, gain=0.1)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -180,7 +179,9 @@ class PonderWrapper(nn.Module):
                 retain_graph=True,
             )[0]
 
-            h_updated = h_for_grad - self.inner_lr * grad_h
+            # Normalize gradient so update magnitude is independent of L_internal scale
+            grad_norm = grad_h.norm() + 1e-8
+            h_updated = h_for_grad - self.inner_lr * (grad_h / grad_norm)
             h_new = self.base.refine(h_updated) + self.residual_proj(h_0)
 
             h_pooled = self._pool_hidden(h_new)
@@ -235,7 +236,8 @@ class PonderWrapper(nn.Module):
                 grad_h = torch.autograd.grad(loss_inner.sum(), h_for_grad)[0]
 
             with torch.no_grad():
-                h_updated = h - self.inner_lr * grad_h
+                grad_norm = grad_h.norm() + 1e-8
+                h_updated = h - self.inner_lr * (grad_h / grad_norm)
                 h_new = self.base.refine(h_updated) + self.residual_proj(h_0)
 
                 h_pooled = self._pool_hidden(h_new)
