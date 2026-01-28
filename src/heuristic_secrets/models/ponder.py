@@ -57,13 +57,13 @@ class InternalLossNetwork(nn.Module):
         nn.init.xavier_normal_(self.head.weight, gain=0.1)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        """[B, n_classes] → [B]"""
-        x = logits.unsqueeze(1)
-        x = self.proj_in(x)
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """logits [B, C], targets [B] (class indices) → [B]"""
+        onehot = torch.zeros_like(logits).scatter_(1, targets.unsqueeze(1), 1.0)
+        x = torch.stack([self.proj_in(logits), self.proj_in(onehot)], dim=1)
         for block in self.blocks:
             x = block(x)
-        return F.softplus(self.head(x.squeeze(1)).squeeze(-1))
+        return F.softplus(self.head(x.mean(dim=1)).squeeze(-1))
 
 
 class PonderWrapper(nn.Module):
@@ -94,11 +94,12 @@ class PonderWrapper(nn.Module):
         self.n_classes = n_classes
         self.l_internal = InternalLossNetwork(n_classes, loss_net_layers, loss_net_width)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (logits [B, C], predicted_loss [B])."""
+    def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         logits = self.base(x)
-        predicted_loss = self.l_internal(logits)
-        return logits, predicted_loss
+        if targets is not None:
+            predicted_loss = self.l_internal(logits, targets)
+            return logits, predicted_loss
+        return logits, None
 
 
 @dataclass
@@ -204,10 +205,10 @@ class PonderTrainer:
             labels = labels.to(self.device)
 
             with torch.no_grad():
-                pre_acc = (self.ponder(images)[0].argmax(-1) == labels).float().mean()
+                pre_acc = (self.ponder(images, labels)[0].argmax(-1) == labels).float().mean()
 
             self.model_optimizer.zero_grad()
-            logits, predicted_loss = self.ponder(images)
+            logits, predicted_loss = self.ponder(images, labels)
             ce = F.cross_entropy(logits, labels)
             if epoch < cfg.drop_ce_epoch:
                 base_loss = ce + predicted_loss.mean()
@@ -219,7 +220,7 @@ class PonderTrainer:
             self.model_scheduler.step()
 
             with torch.no_grad():
-                post_logits = self.ponder(images)[0]
+                post_logits = self.ponder(images, labels)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
                 raw_reward = (post_acc - pre_acc).item()
@@ -227,7 +228,7 @@ class PonderTrainer:
                 reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
 
             self.meta_optimizer.zero_grad()
-            logits_for_meta, predicted_loss_for_meta = self.ponder(images)
+            logits_for_meta, predicted_loss_for_meta = self.ponder(images, labels)
             per_sample_ce = F.cross_entropy(logits_for_meta, labels, reduction='none').detach()
             reinforce_loss = -(reward * predicted_loss_for_meta).mean()
             supervised_loss = F.mse_loss(predicted_loss_for_meta, per_sample_ce)
@@ -275,7 +276,7 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            logits, predicted_loss = self.ponder(images)
+            logits, predicted_loss = self.ponder(images, labels)
             total_ce += F.cross_entropy(logits, labels).item() * labels.size(0)
             total_pred += predicted_loss.sum().item()
             correct += (logits.argmax(-1) == labels).sum().item()
