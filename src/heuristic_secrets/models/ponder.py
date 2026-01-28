@@ -96,7 +96,7 @@ class SiLUAttentionBlock(nn.Module):
 
 
 class InternalLossNetwork(nn.Module):
-    """Mφ(fθ(x)) → per-logit gradients [B, n_classes] (ML3, Bechtle et al. 2021)."""
+    """Learned loss function: logits [B, n_classes] → scalar loss [B]."""
 
     def __init__(self, n_classes: int, n_layers: int = 1, width: int | None = None, n_heads: int = 2):
         super().__init__()
@@ -107,27 +107,25 @@ class InternalLossNetwork(nn.Module):
         self.blocks = nn.ModuleList([
             SiLUAttentionBlock(width, n_heads=n_heads) for _ in range(n_layers)
         ])
-        self.head = nn.Linear(width, n_classes)
+        self.head = nn.Linear(width, 1)
         nn.init.xavier_normal_(self.head.weight, gain=0.1)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        """[B, n_classes] → [B, n_classes]"""
+        """[B, n_classes] → [B]"""
         x = logits.unsqueeze(1)
         x = self.proj_in(x)
         for block in self.blocks:
             x = block(x)
-        return self.head(x.squeeze(1))
+        return self.head(x.squeeze(1)).squeeze(-1)
 
 
 class PonderWrapper(nn.Module):
-    """Wraps any classifier with learned internal loss + iterative refinement.
+    """Wraps a classifier with a learned loss function + iterative refinement.
 
-    Training: two alternating phases per batch.
-      1. Inner: base model trains by minimizing L_internal (standard backprop)
-      2. Outer: L_internal trains by maximizing reward (improvement over baseline CE)
-
-    Iteration: repeated forward passes through refine (weight-shared depth).
+    Two models trained together per batch:
+      - Base classifier trains on L_internal's predicted loss
+      - L_internal trains via REINFORCE on accuracy improvement
     """
 
     def __init__(
@@ -148,7 +146,7 @@ class PonderWrapper(nn.Module):
         else:
             self.base = AutoSplitModel.from_classifier(model)
 
-        head = getattr(getattr(self.base, "model", None), "head", None)
+        head = getattr(self.base, "head", None) or getattr(getattr(self.base, "model", None), "head", None)
         if n_classes is None:
             if head is not None and hasattr(head, "out_features"):
                 n_classes = head.out_features
@@ -173,51 +171,31 @@ class PonderWrapper(nn.Module):
         self,
         x: torch.Tensor,
         max_steps: int | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (final_logits [B, C], predicted_loss [B])."""
         max_steps = max_steps or self.max_steps
 
         h = self.base.embed(x)
         h_0 = h
-
-        step_logits: list[torch.Tensor] = []
-        loss_grads: list[torch.Tensor] = []
 
         for t in range(max_steps):
             h = self.iter_norm(h)
             alpha = torch.sigmoid(self.residual_gate)
             h = self.base.refine(h) + alpha * h_0
 
-            logits_t = self.base.decode(h)
-            loss_grad = self.l_internal(logits_t)
-
-            step_logits.append(logits_t)
-            loss_grads.append(loss_grad)
-
-        all_logits = torch.stack(step_logits, dim=0)        # [T, B, C]
-        all_loss_grads = torch.stack(loss_grads, dim=0)      # [T, B, C]
-        final_logits = all_logits[-1]                         # [B, C]
-
-        info = {
-            "loss_grads": all_loss_grads,                     # [T, B, C]
-            "step_logits": all_logits,                        # [T, B, C]
-        }
-        return final_logits, info
+        logits = self.base.decode(h)
+        predicted_loss = self.l_internal(logits)
+        return logits, predicted_loss
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            logits, _ = self.forward_steps(x)
-            return logits
-        else:
-            with torch.no_grad():
-                logits, _ = self.forward_steps(x)
-            return logits
+        logits, _ = self.forward_steps(x)
+        return logits
 
 
 @dataclass
 class PonderTrainConfig:
     meta_lr: float = 3e-4
     model_lr: float = 1e-3
-    inner_steps: int = 1
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     epochs: int = 50
@@ -306,32 +284,29 @@ class PonderTrainer:
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            # CE before inner loop updates
+            # Accuracy before
             with torch.no_grad():
                 pre_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
-                pre_ce = F.cross_entropy(pre_logits, labels, reduction="none")
+                pre_acc = (pre_logits.argmax(-1) == labels).float().mean()
 
-            # INNER: update base model via L_internal
-            for _ in range(cfg.inner_steps):
-                self.model_optimizer.zero_grad()
-                _, info = self.ponder.forward_steps(images, max_steps=max_steps)
-                per_step_loss = (info["loss_grads"] * info["step_logits"]).sum(dim=-1)
-                inner_loss = per_step_loss.mean()
-                inner_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.ponder.base.parameters(), cfg.grad_clip
-                )
-                self.model_optimizer.step()
-                self.model_scheduler.step()
+            # Train base model on L_internal's predicted loss
+            self.model_optimizer.zero_grad()
+            logits, predicted_loss = self.ponder.forward_steps(images, max_steps=max_steps)
+            predicted_loss.mean().backward()
+            torch.nn.utils.clip_grad_norm_(self.ponder.base.parameters(), cfg.grad_clip)
+            self.model_optimizer.step()
+            self.model_scheduler.step()
 
-            # CE after inner loop updates
-            post_logits, info = self.ponder.forward_steps(images, max_steps=max_steps)
-            post_ce = F.cross_entropy(post_logits, labels, reduction="none")
+            # Accuracy after
+            with torch.no_grad():
+                post_logits = self.ponder.forward_steps(images, max_steps=max_steps)[0]
+                post_acc = (post_logits.argmax(-1) == labels).float().mean()
+                reward = post_acc - pre_acc
 
-            # OUTER: train L_internal to maximize improvement
+            # Train L_internal: REINFORCE with accuracy improvement as reward
             self.meta_optimizer.zero_grad()
-            improvement = pre_ce - post_ce
-            meta_loss = -improvement.mean()
+            _, predicted_loss_for_meta = self.ponder.forward_steps(images, max_steps=max_steps)
+            meta_loss = -(reward * predicted_loss_for_meta).mean()
             meta_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.ponder.l_internal.parameters()), cfg.grad_clip
@@ -340,16 +315,14 @@ class PonderTrainer:
             self.meta_scheduler.step()
 
             with torch.no_grad():
-                preds = post_logits.argmax(dim=-1)
-                acc = (preds == labels).float().mean()
+                real_ce = F.cross_entropy(post_logits, labels)
                 metrics = {
-                    "meta_loss": meta_loss.item(),
-                    "inner_loss": inner_loss.item(),
-                    "pre_ce": pre_ce.mean().item(),
-                    "post_ce": post_ce.mean().item(),
-                    "improvement": improvement.mean().item(),
-                    "accuracy": acc.item(),
-                    "l_internal_norm": info["loss_grads"].norm(dim=-1).mean().item(),
+                    "predicted_loss": predicted_loss.mean().item(),
+                    "real_ce": real_ce.item(),
+                    "pre_acc": pre_acc.item(),
+                    "post_acc": post_acc.item(),
+                    "reward": reward.item(),
+                    "accuracy": post_acc.item(),
                 }
 
             for k, v in metrics.items():
@@ -358,9 +331,9 @@ class PonderTrainer:
 
             if batch_idx % cfg.log_interval == 0:
                 pbar.set_postfix(
-                    ce=f"{metrics['post_ce']:.3f}",
+                    ce=f"{metrics['real_ce']:.3f}",
                     acc=f"{metrics['accuracy']:.3f}",
-                    improv=f"{metrics['improvement']:.3f}",
+                    reward=f"{metrics['reward']:.3f}",
                 )
 
         return {k: v / max(count, 1) for k, v in running.items()}
@@ -368,38 +341,35 @@ class PonderTrainer:
     @torch.no_grad()
     def evaluate(self) -> tuple[float, float]:
         self.ponder.eval()
-        total_loss = 0.0
         correct = 0
         total = 0
+        total_ce = 0.0
 
         from tqdm import tqdm
         for images, labels in tqdm(self.test_loader, desc="Eval", leave=False):
             images = self._prep_input(images)
             labels = labels.to(self.device)
 
-            logits, _ = self.ponder.forward_steps(images)
-            loss = F.cross_entropy(logits, labels)
-            total_loss += loss.item() * labels.size(0)
-            correct += (logits.argmax(dim=-1) == labels).sum().item()
+            logits = self.ponder(images)
+            total_ce += F.cross_entropy(logits, labels).item() * labels.size(0)
+            correct += (logits.argmax(-1) == labels).sum().item()
             total += labels.size(0)
 
         n = max(total, 1)
-        return total_loss / n, correct / n
+        return total_ce / n, correct / n
 
     def train(self, epochs: int | None = None) -> float:
         epochs = epochs or self.config.epochs
-        cfg = self.config
 
         print(f"PonderTrainer: {epochs} epochs, device={self.device}")
         print(f"  Base model params: {sum(p.numel() for p in self.ponder.base.parameters()):,}")
         print(f"  L_internal params: {sum(p.numel() for p in self.ponder.l_internal.parameters()):,}")
-        print(f"  Inner steps per batch: {cfg.inner_steps}")
-        print(f"  Refine steps: {cfg.max_steps}")
+        print(f"  Refine steps: {self.config.max_steps}")
         print()
 
         for epoch in range(epochs):
             train_metrics = self.train_epoch(epoch)
-            test_loss, test_acc = self.evaluate()
+            test_ce, test_acc = self.evaluate()
 
             if test_acc > self.best_acc:
                 self.best_acc = test_acc
@@ -409,9 +379,9 @@ class PonderTrainer:
 
             print(
                 f"Epoch {epoch+1:3d}: "
-                f"pre_ce={train_metrics['pre_ce']:.4f} post_ce={train_metrics['post_ce']:.4f} "
-                f"improv={train_metrics['improvement']:.4f} acc={train_metrics['accuracy']:.4f} | "
-                f"test_acc={test_acc:.4f} | "
+                f"pred_loss={train_metrics['predicted_loss']:.4f} real_ce={train_metrics['real_ce']:.4f} "
+                f"reward={train_metrics['reward']:.4f} acc={train_metrics['accuracy']:.4f} | "
+                f"test_ce={test_ce:.4f} test_acc={test_acc:.4f} | "
                 f"lr={model_lr:.1e}/{meta_lr:.1e}"
                 + (" *BEST*" if test_acc >= self.best_acc else "")
             )
