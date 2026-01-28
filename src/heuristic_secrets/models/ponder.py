@@ -112,6 +112,7 @@ class PonderTrainConfig:
     meta_warmup_epochs: int = 1
     meta_wean_epochs: int = 1
     reward_scale: float = 100.0
+    meta_min_supervised: float = 0.0
     log_interval: int = 50
 
 
@@ -157,6 +158,7 @@ class PonderTrainer:
         )
 
         self.best_acc = 0.0
+        self._reward_ema = 0.0
 
     @staticmethod
     def _make_lr_lambda(total_steps: int, warmup_steps: int) -> Callable[[int], float]:
@@ -180,7 +182,7 @@ class PonderTrainer:
         if epoch < cfg.meta_warmup_epochs:
             return 0.0
         wean_progress = (epoch - cfg.meta_warmup_epochs) / max(cfg.meta_wean_epochs, 1)
-        return min(wean_progress, 1.0)
+        return min(wean_progress, 1.0 - cfg.meta_min_supervised)
 
     def train_epoch(self, epoch: int) -> dict:
         self.ponder.train()
@@ -193,6 +195,7 @@ class PonderTrainer:
         from tqdm import tqdm
         phase = "CE" if alpha == 0.0 else ("WEAN" if alpha < 1.0 else "RL")
         desc = f"Epoch {epoch+1}/{cfg.epochs} [{phase} α={alpha:.2f}]"
+
         pbar = tqdm(self.train_loader, desc=desc, leave=False)
 
         for batch_idx, (images, labels) in enumerate(pbar):
@@ -200,8 +203,7 @@ class PonderTrainer:
             labels = labels.to(self.device)
 
             with torch.no_grad():
-                pre_logits = self.ponder(images)[0]
-                pre_acc = (pre_logits.argmax(-1) == labels).float().mean()
+                pre_acc = (self.ponder(images)[0].argmax(-1) == labels).float().mean()
 
             self.model_optimizer.zero_grad()
             logits, predicted_loss = self.ponder(images)
@@ -216,7 +218,9 @@ class PonderTrainer:
                 post_logits = self.ponder(images)[0]
                 post_ce = F.cross_entropy(post_logits, labels)
                 post_acc = (post_logits.argmax(-1) == labels).float().mean()
-                reward = (post_acc - pre_acc) * cfg.reward_scale
+                raw_reward = (post_acc - pre_acc).item()
+                self._reward_ema = 0.99 * self._reward_ema + 0.01 * raw_reward
+                reward = torch.tensor((raw_reward - self._reward_ema) * cfg.reward_scale, device=self.device)
 
             self.meta_optimizer.zero_grad()
             logits_for_meta, predicted_loss_for_meta = self.ponder(images)
