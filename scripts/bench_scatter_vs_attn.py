@@ -1301,18 +1301,21 @@ def find_config_for_params(
     return best_config
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False, router_top_k=0, jacobi_iters=12, siren_conv=False):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None):
     
     if model_type == 'ripple':
-        def block_factory_fn(h):
-            return lambda w: None
-        def classifier_factory_fn(block_factory, w):
-            return RippleClassifier(
-                width=w, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256,
-                jacobi_iters=jacobi_iters, siren_conv=siren_conv,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(h):
+                return lambda w: None
+            def classifier_factory_fn(block_factory, w):
+                return RippleClassifier(
+                    width=w, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+                    num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256,
+                    jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256,
@@ -1320,15 +1323,18 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         ).to(device)
     
     if model_type == 'ripple-channel':
-        def block_factory_fn(h):
-            return lambda w: None
-        def classifier_factory_fn(block_factory, w):
-            return RippleChannelClassifier(
-                width=w, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-                topology=attn_order, num_heads=num_channels, vocab_size=256, router_top_k=router_top_k,
-                siren_conv=siren_conv, jacobi_iters=jacobi_iters,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(h):
+                return lambda w: None
+            def classifier_factory_fn(block_factory, w):
+                return RippleChannelClassifier(
+                    width=w, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+                    topology=attn_order, num_heads=num_channels, vocab_size=256, router_top_k=router_top_k,
+                    siren_conv=siren_conv, jacobi_iters=jacobi_iters,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleChannelClassifier(
             width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
             topology=attn_order, num_heads=num_channels, vocab_size=256, router_top_k=router_top_k,
@@ -1351,11 +1357,14 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         def block_factory_fn(h):
             return lambda w: TelephoneAttentionBlock(w, num_heads=h)
     elif model_type == 'flat':
-        def block_factory_fn(h):
-            return lambda w: None
-        def classifier_factory_fn(block_factory, w):
-            return FlatRippleClassifierND(embed_dim=w, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(h):
+                return lambda w: None
+            def classifier_factory_fn(block_factory, w):
+                return FlatRippleClassifierND(embed_dim=w, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return FlatRippleClassifierND(embed_dim=width, n_classes=n_classes, iterations=layers, kernel_size=kernel_size, ndim=1, num_channels=num_channels).to(device)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
@@ -1366,17 +1375,21 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
         return model
     
-    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    if target_width:
+        width, num_heads = target_width, num_channels
+    else:
+        width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
     block_factory = block_factory_fn(num_heads)
     return classifier_factory_fn(block_factory, width).to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, router_top_k=0, jacobi_iters=12, siren_conv=False):
-    WIDTH_ATTN = 64
-    WIDTH_LOCAL = 64
-    WIDTH_HIER = 64
-    WIDTH_SGSB = 64
-    WIDTH_CONV = 70
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None):
+    W = target_width
+    WIDTH_ATTN = W or 64
+    WIDTH_LOCAL = W or 64
+    WIDTH_HIER = W or 64
+    WIDTH_SGSB = W or 64
+    WIDTH_CONV = W or 70
     
     if model_type == 'attention':
         block_fn = lambda: AttentionBlock2D(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
@@ -1396,15 +1409,18 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     elif model_type == 'ripple':
         h, w = img_size
         seq_len = h * w
-        def block_factory_fn(heads):
-            return lambda width: None
-        def classifier_factory_fn(block_factory, width):
-            return RippleClassifier(
-                width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w),
-                jacobi_iters=jacobi_iters, siren_conv=siren_conv,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(heads):
+                return lambda width: None
+            def classifier_factory_fn(block_factory, width):
+                return RippleClassifier(
+                    width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
+                    num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w),
+                    jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w),
@@ -1413,29 +1429,35 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
     elif model_type == 'ripple-channel':
         h, w = img_size
         seq_len = h * w
-        def block_factory_fn(heads):
-            return lambda width: None
-        def classifier_factory_fn(block_factory, width):
-            return RippleChannelClassifier(
-                width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-                topology=attn_order, num_heads=num_channels, embed_2d=(h, w), router_top_k=router_top_k,
-                siren_conv=siren_conv, jacobi_iters=jacobi_iters,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(heads):
+                return lambda width: None
+            def classifier_factory_fn(block_factory, width):
+                return RippleChannelClassifier(
+                    width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+                    topology=attn_order, num_heads=num_channels, embed_2d=(h, w), router_top_k=router_top_k,
+                    siren_conv=siren_conv, jacobi_iters=jacobi_iters,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleChannelClassifier(
             width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
             topology=attn_order, num_heads=num_channels, embed_2d=(h, w), router_top_k=router_top_k,
             siren_conv=siren_conv, jacobi_iters=jacobi_iters,
         ).to(device)
     elif model_type == 'flat':
-        def block_factory_fn(h):
-            return lambda w: None
-        def classifier_factory_fn(block_factory, w):
-            return FlatRippleClassifierND(
-                embed_dim=w, n_classes=n_classes, iterations=layers,
-                kernel_size=kernel_size, ndim=2, num_channels=num_channels,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(h):
+                return lambda w: None
+            def classifier_factory_fn(block_factory, w):
+                return FlatRippleClassifierND(
+                    embed_dim=w, n_classes=n_classes, iterations=layers,
+                    kernel_size=kernel_size, ndim=2, num_channels=num_channels,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return FlatRippleClassifierND(
             embed_dim=width, n_classes=n_classes, iterations=layers,
             kernel_size=kernel_size, ndim=2, num_channels=num_channels,
@@ -1488,7 +1510,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False, target_width=None):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_SGSB = 128
@@ -1496,15 +1518,18 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
     WIDTH_GATHER = 128
 
     if model_type == 'ripple':
-        def block_factory_fn(h):
-            return lambda w: None
-        def classifier_factory_fn(block_factory, w):
-            return RippleLM(
-                width=w, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order,
-                jacobi_iters=jacobi_iters, siren_conv=siren_conv,
-            )
-        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        if target_width:
+            width = target_width
+        else:
+            def block_factory_fn(h):
+                return lambda w: None
+            def classifier_factory_fn(block_factory, w):
+                return RippleLM(
+                    width=w, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
+                    num_heads=num_channels, order=attn_order,
+                    jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                )
+            width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleLM(
             width=width, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
             num_heads=num_channels, order=attn_order,
@@ -1535,12 +1560,15 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
         model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
         return model
 
-    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    if target_width:
+        width, num_heads = target_width, num_channels
+    else:
+        width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
     block_factory = block_factory_fn(num_heads)
     return classifier_factory_fn(block_factory, width).to(device)
 
 
-def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False):
+def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False, target_width=None):
     
     if model_type == 'attention':
         def block_factory_fn(h):
@@ -1569,7 +1597,10 @@ def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channe
         model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
         return model
     
-    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    if target_width:
+        width, num_heads = target_width, num_channels
+    else:
+        width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
     block_factory = block_factory_fn(num_heads)
     return classifier_factory_fn(block_factory, width).to(device)
 
@@ -1807,7 +1838,8 @@ def main():
     parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
     parser.add_argument('--attn-order', type=str, default='jacobi,attn', help='Order of attention layers for ripple model (default: jacobi,attn)')
-    parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
+    parser.add_argument('--target-params', type=int, default=400_000, help='Target body (layer) params (default: 400000)')
+    parser.add_argument('--target-width', type=int, default=None, help='Set model width directly instead of targeting params')
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
@@ -1884,7 +1916,7 @@ def main():
         vocab_size = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'conv', 'gather', 'ripple']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv)
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv, args.target_width)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
@@ -1892,7 +1924,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv)
+        builder = lambda mt: build_model_audio(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv, args.target_width)
         shape_str = f'seq_len={seq_len}, n_classes={n_classes}'
         flatten = False
         print(f'Task type: Audio Classification')
@@ -1908,7 +1940,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.with_router, args.jacobi_iters, args.siren_conv)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width)
         shape_str = f'img_size={img_size}'
         flatten = args.model not in ('ripple', 'ripple-channel')
         print(f'Task type: 2D Classification')
@@ -1916,7 +1948,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'ripple-channel', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer, args.with_router, args.jacobi_iters, args.siren_conv)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
