@@ -1266,7 +1266,7 @@ def find_config_for_params(
             try:
                 block_factory = block_factory_fn(num_heads)
                 model = classifier_factory_fn(block_factory, mid)
-                params = sum(p.numel() for p in model.parameters())
+                params = sum(p.numel() for p in model.layers.parameters())
             except:
                 hi = mid - align
                 continue
