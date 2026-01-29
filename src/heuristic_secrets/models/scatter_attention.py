@@ -161,10 +161,14 @@ class SIRENUpsampleND(nn.Module):
         
         current = x.shape[2:]
         if current != target_shape:
-            x = x[..., :target_shape[0]] if self.ndim == 1 else x
-            if self.ndim > 1:
-                slices = [slice(None), slice(None)] + [slice(0, t) for t in target_shape]
-                x = x[slices]
+            slices = [slice(None), slice(None)] + [slice(0, min(c, t)) for c, t in zip(current, target_shape)]
+            x = x[slices]
+            pad_needed = [t - x.shape[2 + i] for i, t in enumerate(target_shape)]
+            if any(p > 0 for p in pad_needed):
+                pad_args = []
+                for p in reversed(pad_needed):
+                    pad_args.extend([0, p])
+                x = F.pad(x, pad_args, mode='replicate')
         
         x = x.movedim(1, -1)
         return self.se(x)
