@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
-from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, interpolate_nd, apply_rope
+from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
@@ -444,6 +444,251 @@ class RippleClassifier(nn.Module):
         else:
             for layer in self.layers:
                 x, _ = layer(x)
+        
+        x = self.norm(x)
+        if self.vocab_size is not None:
+            return self.head(x)
+        return self.head(x.mean(dim=1))
+
+
+def _make_channel_op(
+    name: str,
+    channels: int,
+    num_heads: int,
+    max_kernel_size: int,
+    use_triton: bool,
+    lowrank_power: float,
+    telephone_power: float,
+    conv_power: float,
+    max_seq_len: int,
+    chunk_size: int = 1024,
+    max_freq: float = 16.0,
+    min_freq: float = 1.0,
+) -> nn.Module:
+    if name == 'tele':
+        return TelephoneAttentionND(
+            channels=channels, ndim=1, num_heads=num_heads,
+            max_freq=max_freq, min_freq=min_freq,
+            max_kernel_size=max_kernel_size, chunk_size=chunk_size,
+            use_triton=use_triton, scale_power=telephone_power,
+            max_seq_len=max_seq_len,
+        )
+    elif name == 'conv':
+        if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
+            return TritonAdaptiveLocalConv(
+                channels=channels, num_heads=num_heads,
+                max_kernel_size=max_kernel_size, chunk_size=chunk_size,
+                scale_power=conv_power,
+            )
+        return AdaptiveLocalConv(
+            channels=channels, num_heads=num_heads,
+            max_kernel_size=max_kernel_size, scale_power=conv_power,
+        )
+    elif name == 'lowrank':
+        return LowRankAttention(
+            channels, num_heads=num_heads, reduction_power=lowrank_power,
+        )
+    else:
+        raise ValueError(f"Unknown op: {name}")
+
+
+class ChannelSegment(nn.Module):
+    
+    def __init__(
+        self,
+        op_names: list[str],
+        n_channels: int,
+        channel_width: int,
+        num_heads: int = 8,
+        max_kernel_size: int = 64,
+        use_triton: bool = True,
+        eps: float = 1e-6,
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
+    ):
+        super().__init__()
+        self.n_channels = n_channels
+        self.channel_width = channel_width
+        self.op_names = op_names
+        
+        self.channels = nn.ModuleList()
+        for _ in range(n_channels):
+            ops = nn.ModuleList()
+            norms = nn.ModuleList()
+            for name in op_names:
+                ops.append(_make_channel_op(
+                    name, channel_width, num_heads, max_kernel_size,
+                    use_triton, lowrank_power, telephone_power, conv_power,
+                    max_seq_len,
+                ))
+                norms.append(RMSNorm(channel_width, eps))
+            self.channels.append(nn.ModuleDict({'ops': ops, 'norms': norms}))
+    
+    def forward(self, x: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
+        B, L, C = x.shape
+        slices = x.split(self.channel_width, dim=-1)
+        
+        outputs = []
+        for i, ch in enumerate(self.channels):
+            h = slices[i]
+            if routing_weights is not None:
+                w = routing_weights[:, i].unsqueeze(1).unsqueeze(2)
+                if w.sum() == 0:
+                    outputs.append(h)
+                    continue
+                for op, norm in zip(ch['ops'], ch['norms']):
+                    out, _ = op(h)
+                    h = h + norm(out)
+                outputs.append(h * w)
+            else:
+                for op, norm in zip(ch['ops'], ch['norms']):
+                    out, _ = op(h)
+                    h = h + norm(out)
+                outputs.append(h)
+        
+        return torch.cat(outputs, dim=-1)
+
+
+class ChannelMixer(nn.Module):
+    
+    def __init__(self, width: int, n_channels: int = 0, mlp_ratio: float = 4.0, eps: float = 1e-6):
+        super().__init__()
+        self.se = SqueezeExciteND(width)
+        self.norm = RMSNorm(width, eps)
+        hidden = int(width * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(width, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, width),
+        )
+        self.mlp_norm = RMSNorm(width, eps)
+        self.router = nn.Linear(width, n_channels) if n_channels > 0 else None
+    
+    def forward(self, x: torch.Tensor, top_k: int = 0) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        x = x + self.norm(self.se(x) - x)
+        x = x + self.mlp_norm(self.mlp(x))
+        if self.router is not None and top_k > 0:
+            pooled = x.mean(dim=1)
+            logits = self.router(pooled)
+            routing_weights = self._top_k_route(logits, top_k)
+            return x, routing_weights
+        return x
+    
+    def _top_k_route(self, logits: torch.Tensor, k: int) -> torch.Tensor:
+        topk_vals, topk_idx = logits.topk(k, dim=-1)
+        weights = torch.zeros_like(logits)
+        weights.scatter_(1, topk_idx, F.softmax(topk_vals, dim=-1))
+        return weights
+
+
+class RippleChannelClassifier(nn.Module):
+    
+    def __init__(
+        self,
+        width: int,
+        n_channels: int,
+        n_classes: int,
+        seq_len: int,
+        topology: str = "tele,conv,lowrank,se,tele,conv,lowrank,se",
+        num_heads: int = 8,
+        max_kernel_size: int = 64,
+        mlp_ratio: float = 4.0,
+        use_triton: bool = True,
+        eps: float = 1e-6,
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
+        embed_2d: tuple[int, int] | None = None,
+        vocab_size: int | None = None,
+        router_top_k: int = 0,
+    ):
+        super().__init__()
+        self.embed_2d = embed_2d
+        self.vocab_size = vocab_size
+        self.router_top_k = router_top_k
+        self.n_channels = n_channels
+        
+        assert width % n_channels == 0, f"width ({width}) must be divisible by n_channels ({n_channels})"
+        channel_width = width // n_channels
+        
+        if embed_2d is not None:
+            height, width_2d = embed_2d
+            self.embed = LearnedSinusoidal2DEmbed(height, width_2d, width)
+        elif vocab_size is not None:
+            self.embed = nn.Embedding(vocab_size, width)
+            self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+            self.embed_norm = RMSNorm(width, eps)
+        else:
+            self.embed = nn.Linear(1, width)
+            self.embed_norm = RMSNorm(width, eps)
+            self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
+            self.pos_norm = RMSNorm(width, eps)
+        
+        tokens = [t.strip() for t in topology.split(",")]
+        
+        self.stages = nn.ModuleList()
+        current_ops: list[str] = []
+        for token in tokens:
+            if token == 'se':
+                if current_ops:
+                    self.stages.append(ChannelSegment(
+                        current_ops, n_channels, channel_width, num_heads,
+                        max_kernel_size, use_triton, eps, lowrank_power,
+                        telephone_power, conv_power, max_seq_len,
+                    ))
+                    current_ops = []
+                self.stages.append(ChannelMixer(width, n_channels=n_channels if router_top_k > 0 else 0, mlp_ratio=mlp_ratio, eps=eps))
+            else:
+                current_ops.append(token)
+        if current_ops:
+            self.stages.append(ChannelSegment(
+                current_ops, n_channels, channel_width, num_heads,
+                max_kernel_size, use_triton, eps, lowrank_power,
+                telephone_power, conv_power, max_seq_len,
+            ))
+        
+        self.norm = RMSNorm(width, eps)
+        self.head = nn.Linear(width, n_classes)
+        
+        if router_top_k > 0:
+            self.embed_router = nn.Linear(width, n_channels)
+        else:
+            self.embed_router = None
+    
+    def _top_k_route(self, logits: torch.Tensor) -> torch.Tensor:
+        topk_vals, topk_idx = logits.topk(self.router_top_k, dim=-1)
+        weights = torch.zeros_like(logits)
+        weights.scatter_(1, topk_idx, F.softmax(topk_vals, dim=-1))
+        return weights
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.embed_2d is not None:
+            x = self.embed(x)
+        elif self.vocab_size is not None:
+            x_long = x.long()
+            x = self.embed_norm(self.embed(x_long) + self.pos_embed)
+        else:
+            x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
+        
+        routing = None
+        if self.embed_router is not None:
+            routing = self._top_k_route(self.embed_router(x.mean(dim=1)))
+        
+        for stage in self.stages:
+            if isinstance(stage, ChannelSegment):
+                x = stage(x, routing_weights=routing)
+                routing = None
+            elif isinstance(stage, ChannelMixer):
+                result = stage(x, top_k=self.router_top_k)
+                if isinstance(result, tuple):
+                    x, routing = result
+                else:
+                    x = result
+            else:
+                x = stage(x)
         
         x = self.norm(x)
         if self.vocab_size is not None:

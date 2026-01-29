@@ -24,7 +24,7 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
-from heuristic_secrets.models.ripple_attention import RippleAttention, RippleClassifier
+from heuristic_secrets.models.ripple_attention import RippleAttention, RippleClassifier, RippleChannelClassifier
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.models.telephone_attention import TelephoneAttentionND
@@ -1137,6 +1137,20 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256
         ).to(device)
     
+    if model_type == 'ripple-channel':
+        def block_factory_fn(h):
+            return lambda w: None
+        def classifier_factory_fn(block_factory, w):
+            return RippleChannelClassifier(
+                width=w, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+                topology=attn_order, num_heads=num_channels, vocab_size=256
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return RippleChannelClassifier(
+            width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+            topology=attn_order, num_heads=num_channels, vocab_size=256
+        ).to(device)
+    
     if model_type == 'attention':
         def block_factory_fn(h):
             return lambda w: AttentionBlock(w, num_heads=h, use_ssm=use_ssm)
@@ -1209,6 +1223,21 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w)
+        ).to(device)
+    elif model_type == 'ripple-channel':
+        h, w = img_size
+        seq_len = h * w
+        def block_factory_fn(heads):
+            return lambda width: None
+        def classifier_factory_fn(block_factory, width):
+            return RippleChannelClassifier(
+                width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+                topology=attn_order, num_heads=num_channels, embed_2d=(h, w)
+            )
+        width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+        return RippleChannelClassifier(
+            width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
+            topology=attn_order, num_heads=num_channels, embed_2d=(h, w)
         ).to(device)
     elif model_type == 'flat':
         def block_factory_fn(h):
@@ -1590,6 +1619,7 @@ def main():
 
     parser.add_argument('--ponder-meta-warmup', type=int, default=1, help='Epochs of pure CE supervision for L_internal (default: 1)')
     parser.add_argument('--ponder-meta-wean', type=int, default=1, help='Epochs to wean L_internal from CE to RL (default: 1)')
+    parser.add_argument('--with-router', type=int, default=0, help='Top-K channel routing for ripple-channel (0=disabled)')
     parser.add_argument('--self-distill', action='store_true', help='Enable self-distillation: each epoch distills from previous epoch model')
     parser.add_argument('--distill-alpha', type=float, default=0.5, help='Distillation loss weight (default: 0.5)')
     parser.add_argument('--distill-temp', type=float, default=2.0, help='Distillation temperature (default: 2.0)')
@@ -1668,12 +1698,12 @@ def main():
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
         builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params)
         shape_str = f'img_size={img_size}'
-        flatten = args.model != 'ripple'
+        flatten = args.model not in ('ripple', 'ripple-channel')
         print(f'Task type: 2D Classification')
     else:
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
-        all_model_types = ['attention', 'sgsb', 'ripple', 'flat', 'conv', 'gather']
+        all_model_types = ['attention', 'sgsb', 'ripple', 'ripple-channel', 'flat', 'conv', 'gather']
         builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer)
         shape_str = f'seq_len={seq_len}'
         flatten = True
@@ -1719,7 +1749,7 @@ def main():
             
             # RippleClassifierND/FlatRippleClassifierND in 2D/3D mode expects spatial input, not flattened
             # In 1D mode, ripple/flat needs flattened 1D sequence input
-            model_flatten = flatten and not (mt in ('ripple', 'flat') and (args.mode_2d or args.mode_3d))
+            model_flatten = flatten and not (mt in ('ripple', 'ripple-channel', 'flat') and (args.mode_2d or args.mode_3d))
             
             if args.ponder and not args.duo:
                 model = PonderWrapper(model)
