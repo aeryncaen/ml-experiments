@@ -1312,7 +1312,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         state_dim: int = 64,
         mimo_rank: int = 4,
         ndim: int = 2,
-        n_iters: int = 1,
+        n_iters: int = 12,
     ):
         super().__init__()
         self.D = dim
@@ -1326,6 +1326,10 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_X = nn.Linear(dim, mimo_rank)
         self.to_decay = nn.Linear(dim, state_dim)
         self.to_theta = nn.Linear(dim, state_dim // 2)
+        self.to_lambda = nn.Linear(dim, 1)
+        
+        self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
+        self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         
         if ndim == 1:
             self.diffuse = nn.Conv1d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
@@ -1356,55 +1360,74 @@ class MIMOJacobiSSM_ND(nn.Module):
         # H layout: (B, R, *spatial, N) - R second for easy flatten to (B*R, *spatial, N)
         return torch.zeros(B, self.R, *spatial_shape, self.N, device=x.device, dtype=x.dtype)
     
-    def step(self, x: torch.Tensor, H: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_inject(self, x: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute injection, decay, lambda, and C for a given iteration."""
         spatial_shape = x.shape[1:-1]
         B = x.shape[0]
-        
-        # Project and reshape to (B, R, *spatial, N)
-        B_proj = F.silu(self.to_B(x)).view(B, *spatial_shape, self.N, self.R)
-        C_proj = F.silu(self.to_C(x)).view(B, *spatial_shape, self.N, self.R)
-        # Move R to position 1: (B, R, *spatial, N)
         ndim = len(spatial_shape)
+
+        B_proj = F.silu(self.to_B(x) + self.B_bias).view(B, *spatial_shape, self.N, self.R)
+        C_proj = F.silu(self.to_C(x) + self.C_bias).view(B, *spatial_shape, self.N, self.R)
         perm_to_BR = (0, ndim + 2) + tuple(range(1, ndim + 1)) + (ndim + 1,)
         B_base = B_proj.permute(*perm_to_BR).contiguous()
         C_base = C_proj.permute(*perm_to_BR).contiguous()
-        
-        X_r = F.silu(self.to_X(x))  # (B, *spatial, R)
-        decay = torch.sigmoid(self.to_decay(x))  # (B, *spatial, N)
-        theta = self.to_theta(x)  # (B, *spatial, N//2)
-        
+
+        X_r = F.silu(self.to_X(x))
+        decay = torch.sigmoid(self.to_decay(x))
+        theta = self.to_theta(x)
+        lam = torch.sigmoid(self.to_lambda(x))
+
         theta_k = theta * (layer_idx + 1)
         B_rot = self._apply_rope(B_base, theta_k.unsqueeze(1))
-        # X_r is (B, *spatial, R), need (B, R, *spatial, 1) for broadcast
+        C_rot = self._apply_rope(C_base, theta_k.unsqueeze(1))
+
         perm_Xr = (0, ndim + 1) + tuple(range(1, ndim + 1))
         X_r_bcast = X_r.permute(*perm_Xr).unsqueeze(-1)
         inject = B_rot * X_r_bcast
-        
-        H_flat = H.view(B * self.R, *spatial_shape, self.N)
+
+        return inject, decay, lam, C_rot
+
+    def _diffuse_state(self, H: torch.Tensor, batch_size: int, spatial_shape: tuple) -> torch.Tensor:
+        H_flat = H.view(batch_size * self.R, *spatial_shape, self.N)
         if self._diffuse_ndim == 1:
             H_flat = self.diffuse(H_flat.transpose(1, 2)).transpose(1, 2)
         elif self._diffuse_ndim == 2:
             H_flat = self.diffuse(H_flat.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         else:
             H_flat = self.diffuse(H_flat.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
-        H = H_flat.view(B, self.R, *spatial_shape, self.N)
-        
-        # decay is (B, *spatial, N), need (B, 1, *spatial, N) for broadcast
-        H = decay.unsqueeze(1) * H + inject
-        
-        # Output: flatten to (B, *spatial, N*R)
-        # H is (B, R, *spatial, N), need (B, *spatial, N*R)
+        return H_flat.view(batch_size, self.R, *spatial_shape, self.N)
+
+    def _readout(self, H: torch.Tensor, C_rot: torch.Tensor, spatial_shape: tuple, batch_size: int) -> torch.Tensor:
+        ndim = len(spatial_shape)
+        H_gated = C_rot * H
         perm_to_spatial = (0,) + tuple(range(2, ndim + 2)) + (1, ndim + 2)
-        H_out = H.permute(*perm_to_spatial).reshape(B, *spatial_shape, self.N * self.R)
-        out = F.silu(self.out_proj(H_out))
-        
-        return H, out
-    
+        H_out = H_gated.permute(*perm_to_spatial).reshape(batch_size, *spatial_shape, self.N * self.R)
+        return F.silu(self.out_proj(H_out))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = x.shape[1:-1]
+        B = x.shape[0]
         H = self.init_state(x)
-        out = x
+        prev_inject = None
+
         for i in range(self.n_iters):
-            H, out = self.step(x, H, i)
+            inject, decay, lam, C_rot = self._compute_inject(x, i)
+
+            H = self._diffuse_state(H, B, spatial_shape)
+
+            # Trapezoidal: h = α*H + β*prev_inject + γ*curr_inject
+            # β = (1-λ)*α, γ = λ  (α folded into decay)
+            alpha = decay.unsqueeze(1)
+            gamma = lam.unsqueeze(1)  # (B, 1, *spatial, 1)
+            if prev_inject is not None:
+                beta = (1.0 - gamma) * alpha
+                H = alpha * H + beta * prev_inject + gamma * inject
+            else:
+                H = alpha * H + inject
+
+            prev_inject = inject
+
+        out = self._readout(H, C_rot, spatial_shape, B)
         return out
 
 
@@ -1415,7 +1438,7 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
-        n_iters: int = 1,
+        n_iters: int = 12,
     ):
         super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters)
 

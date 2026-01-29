@@ -243,7 +243,7 @@ class RippleAttention(nn.Module):
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
-        jacobi_iters: int = 1,
+        jacobi_iters: int = 12,
         siren_conv: bool = False,
     ):
         super().__init__()
@@ -344,7 +344,7 @@ class RippleBlock(nn.Module):
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         cross_layer: bool = False,
-        jacobi_iters: int = 1,
+        jacobi_iters: int = 12,
         siren_conv: bool = False,
     ):
         super().__init__()
@@ -422,7 +422,7 @@ class RippleClassifier(nn.Module):
         cross_layer: bool = False,
         embed_2d: tuple[int, int] | None = None,
         vocab_size: int | None = None,
-        jacobi_iters: int = 1,
+        jacobi_iters: int = 12,
         siren_conv: bool = False,
     ):
         super().__init__()
@@ -515,7 +515,7 @@ def _make_channel_op(
     max_freq: float = 16.0,
     min_freq: float = 1.0,
     siren_conv: bool = False,
-    jacobi_iters: int = 1,
+    jacobi_iters: int = 12,
 ) -> nn.Module:
     if name == 'tele':
         return TelephoneAttentionND(
@@ -567,7 +567,7 @@ class ChannelSegment(nn.Module):
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         siren_conv: bool = False,
-        jacobi_iters: int = 1,
+        jacobi_iters: int = 12,
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -673,7 +673,7 @@ class RippleChannelClassifier(nn.Module):
         vocab_size: int | None = None,
         router_top_k: int = 0,
         siren_conv: bool = False,
-        jacobi_iters: int = 1,
+        jacobi_iters: int = 12,
     ):
         super().__init__()
         self.embed_2d = embed_2d
