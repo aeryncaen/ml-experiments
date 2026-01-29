@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
-from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, interpolate_nd, apply_rope
+from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, interpolate_nd, apply_rope
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
@@ -139,6 +139,7 @@ class CrossLayerAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps)
         self.out_proj = nn.Linear(channels, channels, bias=False)
         self.out_norm = RMSNorm(channels, eps)
+        self.upsample = SIRENUpsampleND(channels, ndim=1)
     
     def _apply_depth_rope(self, x: torch.Tensor, depth: int, base: float = 10000.0) -> torch.Tensor:
         """Apply same rotation to all positions based on a scalar depth."""
@@ -198,7 +199,7 @@ class CrossLayerAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, L_q, C)
         out = self.out_proj(out)
         
-        out = interpolate_nd(out, (L,))
+        out = self.upsample(out, (L,))
         
         return x + self.out_norm(out)
 

@@ -119,11 +119,54 @@ class SIRENDownsampleND(nn.Module):
         
         current = x.shape[2:]
         if current != target_shape:
-            mode = ['linear', 'bilinear', 'trilinear'][self.ndim - 1]
-            x = F.interpolate(x, size=target_shape, mode=mode, align_corners=False)
+            x = F.interpolate(x, size=target_shape, mode='nearest')
         
         x = x.movedim(1, -1)
         
+        return self.se(x)
+
+
+class SIRENUpsampleND(nn.Module):
+    
+    def __init__(self, channels: int, ndim: int = 1, hidden: int = 32, omega_0: float = 30.0):
+        super().__init__()
+        self.channels = channels
+        self.ndim = ndim
+        self.kernel_net = KernelNetND(ndim, channels, hidden=hidden, omega_0=omega_0)
+        self.se = SqueezeExciteND(channels)
+    
+    def forward(self, x: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+        spatial = x.shape[1:-1]
+        B, C = x.shape[0], x.shape[-1]
+        
+        if spatial == target_shape:
+            return x
+        
+        stride = tuple(max(1, t // s) for s, t in zip(spatial, target_shape))
+        kernel_size = stride
+        
+        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
+        if self.ndim == 1:
+            positions = grids[0].unsqueeze(-1)
+        else:
+            mesh = torch.meshgrid(*grids, indexing='ij')
+            positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
+        
+        kernel_flat = self.kernel_net(positions)
+        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
+        
+        x = x.movedim(-1, 1)
+        conv_t_fn = [F.conv_transpose1d, F.conv_transpose2d, F.conv_transpose3d][self.ndim - 1]
+        x = conv_t_fn(x, kernel, stride=stride, groups=C)
+        
+        current = x.shape[2:]
+        if current != target_shape:
+            x = x[..., :target_shape[0]] if self.ndim == 1 else x
+            if self.ndim > 1:
+                slices = [slice(None), slice(None)] + [slice(0, t) for t in target_shape]
+                x = x[slices]
+        
+        x = x.movedim(1, -1)
         return self.se(x)
 
 
@@ -647,6 +690,7 @@ class LowRankAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         
         self.downsample = SIRENDownsampleND(embed_dim, ndim=1)
+        self.upsample = SIRENUpsampleND(embed_dim, ndim=1)
         
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -708,16 +752,17 @@ class LowRankAttention(nn.Module):
         lowrank_out = diff_attn.reshape(B, seq_len, C)
         lowrank_out = F.silu(self.out_proj(lowrank_out))
         
-        full_out = interpolate_nd(lowrank_out, (L,))
+        full_out = self.upsample(lowrank_out, (L,))
         
         return full_out, lowrank_out
 
 
 class LowRankCollapseMerge(nn.Module):
-    """Merge low-rank representations during collapse. Interpolates coarser to finer size."""
+    """Merge low-rank representations during collapse. Upsamples coarser to finer size."""
     
     def __init__(self, embed_dim: int):
         super().__init__()
+        self.upsample = SIRENUpsampleND(embed_dim, ndim=1)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -726,7 +771,7 @@ class LowRankCollapseMerge(nn.Module):
     def forward(self, finer: torch.Tensor, coarser: torch.Tensor) -> torch.Tensor:
         target_shape = finer.shape[1:-1]
         
-        coarser_up = interpolate_nd(coarser, target_shape)
+        coarser_up = self.upsample(coarser, target_shape)
         
         q = self.q_proj(coarser_up)
         k = self.k_proj(finer)
@@ -749,6 +794,7 @@ class LowRankAttentionND(nn.Module):
         self.reduction_power = reduction_power
         
         self.downsample = SIRENDownsampleND(embed_dim, ndim=ndim)
+        self.upsample = SIRENUpsampleND(embed_dim, ndim=ndim)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -775,7 +821,7 @@ class LowRankAttentionND(nn.Module):
         out = F.silu(self.out_proj(out))
         
         out = out.reshape(B, *target_shape, C)
-        out = interpolate_nd(out, spatial_shape)
+        out = self.upsample(out, spatial_shape)
         
         return out
 
