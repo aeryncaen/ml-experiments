@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 import torchaudio
+import wandb
 
 from heuristic_secrets.models.scatter_attention import (
     FlatRippleClassifierND,
@@ -1222,6 +1223,20 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             if teacher is not None and distill_ensemble:
                 sd_str = f' [SD-E{len(ensemble_logits_history)}]'
             print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{merge_str}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}{duo_str}{sd_str}')
+            if wandb.run is not None:
+                wb_log = {
+                    "epoch": epoch + 1,
+                    "train/loss": train_loss,
+                    "train/acc": train_acc,
+                    "test/loss": test_loss,
+                    "test/acc": test_acc,
+                    "lr": current_lr,
+                }
+                if swa_acc is not None:
+                    wb_log["test/swa_acc"] = swa_acc
+                if merge_acc is not None:
+                    wb_log["test/merge_acc"] = merge_acc
+                wandb.log(wb_log)
         
         if checkpoint_dir:
             ckpt = {
@@ -1816,6 +1831,9 @@ def main():
     parser.add_argument('--task-vocab-size', type=int, default=None, help='Override vocab size for synthetic LM tasks like mqar (default: 256)')
     parser.add_argument('--siren-conv', action='store_true', help='Use AdaptiveConvND (SIREN-based) instead of AdaptiveLocalConv for conv ops in ripple')
     parser.add_argument('--jacobi-iters', type=int, default=1, help='Number of Jacobi iterations for jacobi attention op (default: 1)')
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='bench-scatter-vs-attn', help='W&B project name')
+    parser.add_argument('--wandb-entity', type=str, default=None, help='W&B entity/team')
 
     args = parser.parse_args()
 
@@ -1940,6 +1958,23 @@ def main():
             else:
                 model = builder(mt)
                 print(f'\nTraining {mt}...')
+
+            if args.wandb:
+                run_name = f"{mt}-{args.dataset}-L{args.layers}-lr{args.lr}-s{seed}"
+                wb_config = vars(args).copy()
+                wb_config['model_type'] = mt
+                wb_config['run'] = run
+                wb_config['seed'] = seed
+                wb_config['total_params'] = sum(p.numel() for p in model.parameters())
+                wb_config['body_params'] = sum(p.numel() for p in model.layers.parameters()) if hasattr(model, 'layers') else wb_config['total_params']
+                wb_config['model_class'] = type(model).__name__
+                wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=run_name,
+                    config=wb_config,
+                    reinit=True,
+                )
             
             # RippleClassifierND/FlatRippleClassifierND in 2D/3D mode expects spatial input, not flattened
             # In 1D mode, ripple/flat needs flattened 1D sequence input
@@ -2043,6 +2078,9 @@ def main():
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
+            if wandb.run is not None:
+                wandb.log({"final/acc": acc})
+                wandb.finish()
 
     print(f'\n{"="*60}')
     print('Final Results')
