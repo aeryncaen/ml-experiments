@@ -474,9 +474,11 @@ class RippleBlock(nn.Module):
         diff_inject: bool = True,
         diff_readout: bool = True,
         bc_norm: bool = True,
+        resid_dropout: float = 0.0,
     ):
         super().__init__()
         self.cross_layer = cross_layer
+        self.resid_dropout = nn.Dropout(resid_dropout) if resid_dropout > 0 else nn.Identity()
         self.attn = RippleAttention(
             channels=channels,
             num_heads=num_heads,
@@ -515,7 +517,7 @@ class RippleBlock(nn.Module):
             x = self.cross_layer_attn(x, history)
         
         attn_out, info = self.attn(x)
-        x = x + attn_out
+        x = x + self.resid_dropout(attn_out)
         
         if self.cross_layer:
             x_lowrank = self.history_accum(x)
@@ -552,12 +554,15 @@ class RippleClassifier(nn.Module):
         diff_inject: bool = True,
         diff_readout: bool = True,
         bc_norm: bool = True,
+        embed_dropout: float = 0.1,
+        resid_dropout: float = 0.0,
     ):
         super().__init__()
         self.cross_layer = cross_layer
         self.lowrank_power = lowrank_power
         self.embed_2d = embed_2d
         self.vocab_size = vocab_size
+        self.embed_drop = nn.Dropout(embed_dropout) if embed_dropout > 0 else nn.Identity()
         
         if embed_2d is not None:
             height, width_2d = embed_2d
@@ -591,6 +596,7 @@ class RippleClassifier(nn.Module):
                 diff_inject=diff_inject,
                 diff_readout=diff_readout,
                 bc_norm=bc_norm,
+                resid_dropout=resid_dropout,
             )
             for _ in range(n_layers)
         ])
@@ -604,14 +610,14 @@ class RippleClassifier(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.embed_2d is not None:
-            x = self.embed(x)
+            x = self.embed_drop(self.embed(x))
         elif self.vocab_size is not None:
             x_long = x.long()
             assert x_long.min() >= 0 and x_long.max() < self.vocab_size, \
                 f"Token indices out of bounds: min={x_long.min().item()}, max={x_long.max().item()}, vocab_size={self.vocab_size}"
-            x = self.embed_norm(self.embed(x_long) + self.pos_embed)
+            x = self.embed_drop(self.embed_norm(self.embed(x_long) + self.pos_embed))
         else:
-            x = self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed))
+            x = self.embed_drop(self.embed_norm(F.silu(self.embed(x.unsqueeze(-1)))) + self.pos_norm(F.silu(self.pos_embed)))
         
         if self.cross_layer:
             history: list[torch.Tensor] = [self.embed_accum(x)]
@@ -655,6 +661,8 @@ class RippleLM(nn.Module):
         diff_inject: bool = True,
         diff_readout: bool = True,
         bc_norm: bool = True,
+        embed_dropout: float = 0.1,
+        resid_dropout: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -663,6 +671,7 @@ class RippleLM(nn.Module):
 
         self.token_embed = nn.Embedding(vocab_size, width)
         self.pos_embed = nn.Embedding(seq_len, width)
+        self.embed_drop = nn.Dropout(embed_dropout) if embed_dropout > 0 else nn.Identity()
 
         self.layers = nn.ModuleList([
             RippleBlock(
@@ -682,6 +691,7 @@ class RippleLM(nn.Module):
                 diff_inject=diff_inject,
                 diff_readout=diff_readout,
                 bc_norm=bc_norm,
+                resid_dropout=resid_dropout,
             )
             for _ in range(n_layers)
         ])
@@ -710,7 +720,7 @@ class RippleLM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L = x.shape
         pos = torch.arange(L, device=x.device)
-        x = self.token_embed(x) + self.pos_embed(pos)
+        x = self.embed_drop(self.token_embed(x) + self.pos_embed(pos))
 
         for layer in self.layers:
             x, _ = layer(x)
