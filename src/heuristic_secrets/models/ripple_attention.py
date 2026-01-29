@@ -19,6 +19,32 @@ class ReLUSquared(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(x).square()
 
+
+class DifferentialSwiGLU(nn.Module):
+
+    def __init__(self, width: int, mult: int = 4, lambda_init: float = 0.5):
+        super().__init__()
+        hidden = int(width * mult * 2 / 3)
+        hidden = ((hidden + 7) // 8) * 8
+        self.lambda_init = lambda_init
+        self.gate1 = nn.Linear(width, hidden, bias=False)
+        self.up1 = nn.Linear(width, hidden, bias=False)
+        self.gate2 = nn.Linear(width, hidden, bias=False)
+        self.up2 = nn.Linear(width, hidden, bias=False)
+        self.down = nn.Linear(hidden, width, bias=False)
+        self.lambda_q1 = nn.Parameter(torch.randn(hidden) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(hidden) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(hidden) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(hidden) * 0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h1 = F.silu(self.gate1(x)) * self.up1(x)
+        h2 = F.silu(self.gate2(x)) * self.up2(x)
+        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+               + self.lambda_init)
+        return self.down(h1 - lam * h2)
+
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
 except ImportError:
@@ -398,6 +424,9 @@ class RippleAttention(nn.Module):
 
         if 'jacobi' in unique_ops:
             self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
+
+        if 'mlp' in unique_ops:
+            self.mlp = DifferentialSwiGLU(channels)
         
         self.norms = nn.ModuleDict({
             name: RMSNorm(channels, eps)
@@ -422,6 +451,8 @@ class RippleAttention(nn.Module):
                 out, _ = self.attn_op(h)
             elif name == 'jacobi':
                 out = self.jacobi(h)
+            elif name == 'mlp':
+                out = self.mlp(h)
             else:
                 raise ValueError(f"Unknown layer: {name}")
             h = h + self.norms[name](out)
