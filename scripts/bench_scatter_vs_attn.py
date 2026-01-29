@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import os
 from contextlib import nullcontext
 import torch
 import torch.nn as nn
@@ -767,19 +768,18 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
 @torch.no_grad()
 def generate_teacher_logits(model, loader, device, flatten=True, task_type='classification'):
     model.eval()
-    # Use a non-shuffled loader so logits are in dataset order
-    ordered_loader = DataLoader(loader.dataset, batch_size=loader.batch_size, shuffle=False,
-                                num_workers=getattr(loader, 'num_workers', 0))
-    all_logits = []
+    teacher_map = {}
     with torch.no_grad():
-        for inputs, labels in tqdm(ordered_loader, desc="Distill", leave=False):
+        for inputs, labels in tqdm(loader, desc="Distill", leave=False):
             inputs = inputs.to(device)
             if flatten and task_type == 'classification':
                 inputs = inputs.view(inputs.size(0), -1)
             elif not flatten and task_type == 'classification' and inputs.dim() == 4:
                 inputs = inputs.squeeze(1)
-            all_logits.append(model(inputs).cpu())
-    return torch.cat(all_logits)
+            logits = model(inputs).cpu()
+            for i in range(inputs.size(0)):
+                teacher_map[inputs[i].cpu().numpy().tobytes()] = logits[i]
+    return teacher_map
 
 
 def distillation_loss(student_logits, teacher_logits, temperature=2.0):
@@ -802,7 +802,6 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
     if teacher_logits is not None:
         desc += " [SD]"
     pbar = tqdm(loader, desc=desc, leave=False)
-    sample_idx = 0
     for inputs, labels in pbar:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -869,11 +868,10 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                 total_t += labels.size(0)
 
             if teacher_logits is not None:
-                bs = inputs.size(0)
-                t_logits = teacher_logits[sample_idx:sample_idx + bs].to(device)
+                t_list = [teacher_logits[inputs[i].cpu().numpy().tobytes()] for i in range(inputs.size(0))]
+                t_logits = torch.stack(t_list).to(device)
                 kd_loss = distillation_loss(logits, t_logits, distill_temp)
                 loss = (1 - distill_alpha) * loss + distill_alpha * kd_loss
-                sample_idx += bs
 
         if scaler:
             scaler.scale(loss).backward()
@@ -1025,21 +1023,17 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             hard_pct = get_hard_pct(epoch)
         
         teacher = None
-        epoch_loader = current_loader
         if self_distill and epoch > 0:
             teacher = generate_teacher_logits(model, current_loader, device, flatten=flatten, task_type=task_type)
-            # Must use non-shuffled loader so sample_idx aligns with teacher logits
-            epoch_loader = DataLoader(current_loader.dataset, batch_size=current_loader.batch_size,
-                                      shuffle=False, num_workers=getattr(current_loader, 'num_workers', 0))
         
         if is_duo:
             train_loss, train_acc = train_epoch_duo(
-                model, epoch_loader, optimizer, device, active_scheduler,
+                model, current_loader, optimizer, device, active_scheduler,
                 flatten=flatten, task_type=task_type, hard_pct=hard_pct, label_smoothing=label_smoothing
             )
         else:
             train_loss, train_acc = train_epoch(
-                model, epoch_loader, optimizer, device, active_scheduler, 
+                model, current_loader, optimizer, device, active_scheduler, 
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
                 hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing,
                 teacher_logits=teacher, distill_alpha=distill_alpha, distill_temp=distill_temp,
@@ -1612,6 +1606,8 @@ def main():
         # For full determinism (slower)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     
     seed_everything(args.seed)
 
