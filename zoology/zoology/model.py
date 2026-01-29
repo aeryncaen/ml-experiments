@@ -313,7 +313,7 @@ class LanguageModel(nn.Module):
             self.lm_head.weight = self.backbone.embeddings.word_embeddings.weight
 
     def forward(
-        self, input_ids, position_ids=None, state=None, return_embeddings=True
+        self, input_ids, position_ids=None, state=None, return_embeddings=False
     ): 
         hidden_states = self.backbone(input_ids, position_ids=position_ids)
         if return_embeddings:
