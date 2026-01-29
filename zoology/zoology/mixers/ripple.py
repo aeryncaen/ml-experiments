@@ -46,6 +46,7 @@ class RippleMixer(nn.Module):
         diff_inject: bool = False,
         diff_readout: bool = False,
         bc_norm: bool = False,
+        relu2: bool = False,
     ):
         super().__init__()
         import math
@@ -73,6 +74,7 @@ class RippleMixer(nn.Module):
             diff_inject=diff_inject,
             diff_readout=diff_readout,
             bc_norm=bc_norm,
+            relu2=relu2,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -81,17 +81,22 @@ class Sine(nn.Module):
         return torch.sin(x)
 
 
+def relu_squared(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x).square()
+
+
 class SqueezeExciteND(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4):
+    def __init__(self, channels: int, reduction: int = 4, relu2: bool = False):
         super().__init__()
         hidden = max(channels // reduction, 8)
         self.fc1 = nn.Linear(channels, hidden, bias=False)
         self.fc2 = nn.Linear(hidden, channels, bias=False)
+        self.act = relu_squared if relu2 else F.silu
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_dims = tuple(range(1, x.ndim - 1))
         scale = x.mean(dim=spatial_dims)
-        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(scale))))
+        scale = torch.sigmoid(self.fc2(self.act(self.fc1(scale))))
         for _ in spatial_dims:
             scale = scale.unsqueeze(1)
         return x * scale
@@ -1321,6 +1326,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         diff_inject: bool = False,
         diff_readout: bool = False,
         bc_norm: bool = False,
+        relu2: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -1331,6 +1337,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.diff_inject = diff_inject
         self.diff_readout = diff_readout
         self.bc_norm = bc_norm
+        self.act = relu_squared if relu2 else F.silu
         
         self.to_B = nn.Linear(dim, state_dim * mimo_rank)
         self.to_C = nn.Linear(dim, state_dim * mimo_rank)
@@ -1356,7 +1363,7 @@ class MIMOJacobiSSM_ND(nn.Module):
             self.diffuse = nn.Conv2d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
         else:
             self.diffuse = nn.Conv3d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
-        self.diffuse_se = SqueezeExciteND(state_dim) if diffuse_se else None
+        self.diffuse_se = SqueezeExciteND(state_dim, relu2=relu2) if diffuse_se else None
         self._diffuse_ndim = ndim
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
@@ -1386,8 +1393,8 @@ class MIMOJacobiSSM_ND(nn.Module):
         B = x.shape[0]
         ndim = len(spatial_shape)
 
-        B_proj = F.silu(self.to_B(x) + self.B_bias).view(B, *spatial_shape, self.N, self.R)
-        C_proj = F.silu(self.to_C(x) + self.C_bias).view(B, *spatial_shape, self.N, self.R)
+        B_proj = self.act(self.to_B(x) + self.B_bias).view(B, *spatial_shape, self.N, self.R)
+        C_proj = self.act(self.to_C(x) + self.C_bias).view(B, *spatial_shape, self.N, self.R)
         perm_to_BR = (0, ndim + 2) + tuple(range(1, ndim + 1)) + (ndim + 1,)
         B_base = B_proj.permute(*perm_to_BR).contiguous()
         C_base = C_proj.permute(*perm_to_BR).contiguous()
@@ -1396,7 +1403,7 @@ class MIMOJacobiSSM_ND(nn.Module):
             B_base = self.b_norm(B_base)
             C_base = self.c_norm(C_base)
 
-        X_r = F.silu(self.to_X(x))
+        X_r = self.act(self.to_X(x))
         decay = torch.sigmoid(self.to_decay(x))
         theta = self.to_theta(x)
         lam = torch.sigmoid(self.to_lambda(x))
@@ -1446,7 +1453,7 @@ class MIMOJacobiSSM_ND(nn.Module):
             H_gated = C_rot * H
         perm_to_spatial = (0,) + tuple(range(2, ndim + 2)) + (1, ndim + 2)
         H_out = H_gated.permute(*perm_to_spatial).reshape(batch_size, *spatial_shape, self.N * self.R)
-        return F.silu(self.out_proj(H_out))
+        return self.act(self.out_proj(H_out))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
@@ -1487,8 +1494,9 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         diff_inject: bool = False,
         diff_readout: bool = False,
         bc_norm: bool = False,
+        relu2: bool = False,
     ):
-        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
 
 
 class MIMOJacobiBlock_ND(nn.Module):

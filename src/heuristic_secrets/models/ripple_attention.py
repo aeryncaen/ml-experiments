@@ -10,6 +10,15 @@ from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
 from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope, MIMOJacobiSSM, AdaptiveConvND
 
+
+def relu_squared(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x).square()
+
+
+class ReLUSquared(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x).square()
+
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
 except ImportError:
@@ -116,7 +125,7 @@ class CausalSelfAttention(nn.Module):
     where Q,K are split into two halves and λ is a learnable scalar.
     """
 
-    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0, differential: bool = True):
+    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0, differential: bool = True, relu2: bool = False):
         super().__init__()
         import math as _math
         self.num_heads = num_heads
@@ -124,6 +133,8 @@ class CausalSelfAttention(nn.Module):
         self.half_dim = self.head_dim // 2
         self.dropout = dropout
         self.differential = differential
+        self.relu2 = relu2
+        self.act = relu_squared if relu2 else F.silu
         self.lambda_init = 0.8 - 0.6 * _math.exp(-0.3 * layer_idx)
 
         self.qkv = nn.Linear(channels, 3 * channels, bias=True)
@@ -147,7 +158,7 @@ class CausalSelfAttention(nn.Module):
         B, L, C = x.shape
         H, D, D2 = self.num_heads, self.head_dim, self.half_dim
 
-        qkv = F.silu(self.qkv(x))
+        qkv = self.act(self.qkv(x))
         q, k, v = qkv.reshape(B, L, 3, H, D).unbind(2)
         drop_p = self.dropout if self.training else 0.0
 
@@ -178,7 +189,7 @@ class CausalSelfAttention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
             out = out.transpose(1, 2).reshape(B, L, C)
 
-        return F.silu(self.out_proj(out)), {}
+        return self.act(self.out_proj(out)), {}
 
 
 class CrossLayerAttention(nn.Module):
@@ -302,6 +313,7 @@ class RippleAttention(nn.Module):
         diff_inject: bool = False,
         diff_readout: bool = False,
         bc_norm: bool = False,
+        relu2: bool = False,
     ):
         super().__init__()
         import math
@@ -310,6 +322,7 @@ class RippleAttention(nn.Module):
         self.channels = channels
         self.num_heads = num_heads
         self.embed_residual = embed_residual
+        self.relu2 = relu2
         self.order = [s.strip() for s in order.split(",")]
         
         unique_ops = list(dict.fromkeys(self.order))
@@ -363,10 +376,10 @@ class RippleAttention(nn.Module):
             )
         
         if 'attn' in unique_ops:
-            self.attn_op = CausalSelfAttention(channels, num_heads=num_heads, differential=differential)
+            self.attn_op = CausalSelfAttention(channels, num_heads=num_heads, differential=differential, relu2=relu2)
 
         if 'jacobi' in unique_ops:
-            self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm)
+            self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
         
         self.norms = nn.ModuleDict({
             name: RMSNorm(channels, eps)
