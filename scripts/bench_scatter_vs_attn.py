@@ -1767,7 +1767,7 @@ def main():
     parser.add_argument('--merge-mode', type=str, default='lowrank', choices=['gate', 'learned', 'lowrank'], help='Merge mode for residuals (default: lowrank)')
     parser.add_argument('--lowrank-hier', action='store_true', default=True, help='Use low-rank full attention instead of windowed attention at each hierarchy level (default: True)')
     parser.add_argument('--no-attn-residual', action='store_true', help='Disable attention residual connection')
-    parser.add_argument('--attn-order', type=str, default='tele,conv,lowrank', help='Order of attention layers for ripple model (default: tele,conv,lowrank)')
+    parser.add_argument('--attn-order', type=str, default='jacobi,attn', help='Order of attention layers for ripple model (default: jacobi,attn)')
     parser.add_argument('--target-params', type=int, default=400_000, help='Target total model params (default: 400000)')
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
