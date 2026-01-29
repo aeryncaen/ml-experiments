@@ -943,7 +943,8 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                         topk_losses, _ = valid_losses.topk(k)
                         loss = topk_losses.mean()
                     else:
-                        loss = per_token_loss.mean()
+                        valid_mask_loss = labels_flat != -100
+                        loss = per_token_loss[valid_mask_loss].mean()
                 mask = labels_flat != -100
                 preds = logits_flat.argmax(dim=-1)
                 correct_t += (preds[mask] == labels_flat[mask]).sum()
