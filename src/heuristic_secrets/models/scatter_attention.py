@@ -101,29 +101,38 @@ class SIRENDownsampleND(nn.Module):
         if spatial == target_shape:
             return x
         
-        kernel_size = tuple(max(1, s // t) for s, t in zip(spatial, target_shape))
+        S = 1
+        for s in spatial:
+            S *= s
+        T = 1
+        for t in target_shape:
+            T *= t
         
-        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
+        tgt_pos = [torch.linspace(-1, 1, t, device=x.device, dtype=x.dtype) for t in target_shape]
+        src_pos = [torch.linspace(-1, 1, s, device=x.device, dtype=x.dtype) for s in spatial]
+        
         if self.ndim == 1:
-            positions = grids[0].unsqueeze(-1)
+            tgt_positions = tgt_pos[0].unsqueeze(-1)
+            src_positions = src_pos[0].unsqueeze(-1)
         else:
-            mesh = torch.meshgrid(*grids, indexing='ij')
-            positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
+            tgt_mesh = torch.meshgrid(*tgt_pos, indexing='ij')
+            tgt_positions = torch.stack(tgt_mesh, dim=-1).reshape(-1, self.ndim)
+            src_mesh = torch.meshgrid(*src_pos, indexing='ij')
+            src_positions = torch.stack(src_mesh, dim=-1).reshape(-1, self.ndim)
         
-        kernel_flat = self.kernel_net(positions)
-        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
+        tgt_w = self.kernel_net(tgt_positions)
+        tgt_w = tgt_w / (tgt_w.norm(dim=0, keepdim=True) + 1e-6)
+        src_w = self.kernel_net(src_positions)
+        src_w = src_w / (src_w.norm(dim=0, keepdim=True) + 1e-6)
         
-        x = x.movedim(-1, 1)
-        conv_fn = [F.conv1d, F.conv2d, F.conv3d][self.ndim - 1]
-        x = conv_fn(x, kernel, stride=kernel_size, groups=C)
+        mix = tgt_w @ src_w.T
+        mix = F.softmax(mix, dim=-1)
         
-        current = x.shape[2:]
-        if current != target_shape:
-            x = F.interpolate(x, size=target_shape, mode='nearest')
+        x_flat = x.reshape(B, S, C)
+        out = torch.bmm(mix.unsqueeze(0).expand(B, -1, -1), x_flat)
+        out = out.reshape(B, *target_shape, C)
         
-        x = x.movedim(1, -1)
-        
-        return self.se(x)
+        return self.se(out)
 
 
 class SIRENUpsampleND(nn.Module):
