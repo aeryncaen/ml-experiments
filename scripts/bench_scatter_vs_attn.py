@@ -821,13 +821,32 @@ def generate_teacher_logits(model, loader, device, flatten=True, task_type='clas
     return teacher_map
 
 
-def distillation_loss(student_logits, teacher_logits, temperature=2.0):
-    s = F.log_softmax(student_logits / temperature, dim=-1)
-    t = F.softmax(teacher_logits / temperature, dim=-1)
+def slerp_logits(a, b, t):
+    a_flat, b_flat = a.flatten(1), b.flatten(1)
+    na = torch.linalg.norm(a_flat, dim=-1, keepdim=True).clamp(min=1e-8)
+    nb = torch.linalg.norm(b_flat, dim=-1, keepdim=True).clamp(min=1e-8)
+    a_norm, b_norm = a_flat / na, b_flat / nb
+    dot = (a_norm * b_norm).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega).clamp(min=1e-6)
+    sa = torch.sin((1 - t) * omega) / sin_omega
+    sb = torch.sin(t * omega) / sin_omega
+    mag = (1 - t) * na + t * nb
+    return ((sa * a_norm + sb * b_norm) * mag).reshape(a.shape)
+
+
+def distillation_loss(student_logits, teacher_logits, temperature=2.0, merge_logits=False):
+    if merge_logits:
+        blended = slerp_logits(teacher_logits, student_logits, 0.5)
+        s = F.log_softmax(student_logits / temperature, dim=-1)
+        t = F.softmax(blended / temperature, dim=-1)
+    else:
+        s = F.log_softmax(student_logits / temperature, dim=-1)
+        t = F.softmax(teacher_logits / temperature, dim=-1)
     return F.kl_div(s, t, reduction='batchmean') * (temperature ** 2)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0, distill_merge_logits=False):
     model.train()
     total_loss_t = torch.tensor(0.0, device=device)
     correct_t = torch.tensor(0, device=device)
@@ -909,7 +928,7 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             if teacher_logits is not None:
                 t_list = [teacher_logits[inputs[i].cpu().numpy().tobytes()] for i in range(inputs.size(0))]
                 t_logits = torch.stack(t_list).to(device)
-                kd_loss = distillation_loss(logits, t_logits, distill_temp)
+                kd_loss = distillation_loss(logits, t_logits, distill_temp, merge_logits=distill_merge_logits)
                 loss = (1 - distill_alpha) * loss + distill_alpha * kd_loss
 
         if scaler:
@@ -1000,7 +1019,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_merge_logits=False):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -1081,6 +1100,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
                 hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing,
                 teacher_logits=teacher, distill_alpha=distill_alpha, distill_temp=distill_temp,
+                distill_merge_logits=distill_merge_logits,
             )
         
         if use_swa_sched:
@@ -1680,6 +1700,7 @@ def main():
     parser.add_argument('--distill-merge', type=str, default=None, choices=['ema', 'slerp', 'lerp'], help='Merge teacher/student weights each epoch (default: disabled)')
     parser.add_argument('--distill-merge-alpha', type=float, default=0.5, help='Merge ratio: 0=all teacher, 1=all student (default: 0.5)')
     parser.add_argument('--distill-from-merged', action='store_true', help='Use merged model as teacher for next epoch distillation')
+    parser.add_argument('--distill-merge-logits', action='store_true', help='SLERP teacher and student logits before computing KD loss')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1900,7 +1921,7 @@ def main():
                     label_smoothing=args.label_smoothing,
                     self_distill=args.self_distill, distill_alpha=args.distill_alpha, distill_temp=args.distill_temp,
                     distill_merge=args.distill_merge, distill_merge_alpha=args.distill_merge_alpha,
-                    distill_from_merged=args.distill_from_merged
+                    distill_from_merged=args.distill_from_merged, distill_merge_logits=args.distill_merge_logits
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
