@@ -26,17 +26,15 @@ class DifferentialSwiGLU(nn.Module):
         super().__init__()
         hidden = int(width * mult * 2 / 3)
         hidden = ((hidden + 7) // 8) * 8
-        self.gate_up = nn.Linear(width, 2 * hidden, bias=False)
+        self.gate = nn.Linear(width, hidden, bias=False)
+        self.up = nn.Linear(width, hidden, bias=False)
         self.down = nn.Linear(hidden, 2 * width, bias=False)
         self.lambda_logit = nn.Parameter(torch.tensor(0.0))
         self.lambda_init = lambda_init
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gu = self.gate_up(x)
-        g, u = gu.chunk(2, dim=-1)
-        h = F.silu(g) * u
-        o = self.down(h)
-        o1, o2 = o.chunk(2, dim=-1)
+        h = F.silu(self.gate(x)) * self.up(x)
+        o1, o2 = self.down(h).chunk(2, dim=-1)
         lam = torch.sigmoid(self.lambda_logit) + self.lambda_init
         return o1 - lam * o2
 
