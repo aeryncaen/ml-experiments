@@ -43,6 +43,8 @@ class RippleMixer(nn.Module):
         embed_residual: bool = True,
         plain_conv_size: int = 0,
         diffuse_se: bool = False,
+        diff_inject: bool = False,
+        diff_readout: bool = False,
     ):
         super().__init__()
         import math
@@ -67,6 +69,8 @@ class RippleMixer(nn.Module):
             embed_residual=embed_residual,
             plain_conv_size=plain_conv_size,
             diffuse_se=diffuse_se,
+            diff_inject=diff_inject,
+            diff_readout=diff_readout,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

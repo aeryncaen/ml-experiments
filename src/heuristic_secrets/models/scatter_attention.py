@@ -1318,6 +1318,8 @@ class MIMOJacobiSSM_ND(nn.Module):
         ndim: int = 2,
         n_iters: int = 12,
         diffuse_se: bool = False,
+        diff_inject: bool = False,
+        diff_readout: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -1325,6 +1327,8 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.R = mimo_rank
         self.ndim = ndim
         self.n_iters = n_iters
+        self.diff_inject = diff_inject
+        self.diff_readout = diff_readout
         
         self.to_B = nn.Linear(dim, state_dim * mimo_rank)
         self.to_C = nn.Linear(dim, state_dim * mimo_rank)
@@ -1335,6 +1339,11 @@ class MIMOJacobiSSM_ND(nn.Module):
         
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
+        
+        if diff_inject:
+            self.inject_lambda = nn.Parameter(torch.tensor(0.5))
+        if diff_readout:
+            self.readout_lambda = nn.Parameter(torch.tensor(0.5))
         
         if ndim == 1:
             self.diffuse = nn.Conv1d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
@@ -1389,7 +1398,16 @@ class MIMOJacobiSSM_ND(nn.Module):
 
         perm_Xr = (0, ndim + 1) + tuple(range(1, ndim + 1))
         X_r_bcast = X_r.permute(*perm_Xr).unsqueeze(-1)
-        inject = B_rot * X_r_bcast
+
+        if self.diff_inject:
+            half_N = self.N // 2
+            B1, B2 = B_rot[..., :half_N], B_rot[..., half_N:]
+            inject1 = B1 * X_r_bcast
+            inject2 = B2 * X_r_bcast
+            inject = torch.cat([inject1 - self.inject_lambda * inject2,
+                                inject1 + self.inject_lambda * inject2], dim=-1)
+        else:
+            inject = B_rot * X_r_bcast
 
         return inject, decay, lam, C_rot
 
@@ -1407,7 +1425,16 @@ class MIMOJacobiSSM_ND(nn.Module):
 
     def _readout(self, H: torch.Tensor, C_rot: torch.Tensor, spatial_shape: tuple, batch_size: int) -> torch.Tensor:
         ndim = len(spatial_shape)
-        H_gated = C_rot * H
+        if self.diff_readout:
+            half_N = self.N // 2
+            C1, C2 = C_rot[..., :half_N], C_rot[..., half_N:]
+            H1, H2 = H[..., :half_N], H[..., half_N:]
+            gated1 = C1 * H1
+            gated2 = C2 * H2
+            H_gated = torch.cat([gated1 - self.readout_lambda * gated2,
+                                 gated1 + self.readout_lambda * gated2], dim=-1)
+        else:
+            H_gated = C_rot * H
         perm_to_spatial = (0,) + tuple(range(2, ndim + 2)) + (1, ndim + 2)
         H_out = H_gated.permute(*perm_to_spatial).reshape(batch_size, *spatial_shape, self.N * self.R)
         return F.silu(self.out_proj(H_out))
@@ -1448,8 +1475,10 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         mimo_rank: int = 4,
         n_iters: int = 12,
         diffuse_se: bool = False,
+        diff_inject: bool = False,
+        diff_readout: bool = False,
     ):
-        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout)
 
 
 class MIMOJacobiBlock_ND(nn.Module):
