@@ -487,6 +487,8 @@ def _make_channel_op(
     chunk_size: int = 1024,
     max_freq: float = 16.0,
     min_freq: float = 1.0,
+    siren_conv: bool = False,
+    jacobi_iters: int = 1,
 ) -> nn.Module:
     if name == 'tele':
         return TelephoneAttentionND(
@@ -497,6 +499,9 @@ def _make_channel_op(
             max_seq_len=max_seq_len,
         )
     elif name == 'conv':
+        if siren_conv:
+            from math import sqrt
+            return AdaptiveConvND(channels, ndim=1, max_samples=int(sqrt(max_seq_len)), num_channels=num_heads)
         if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
             return TritonAdaptiveLocalConv(
                 channels=channels, num_heads=num_heads,
@@ -512,7 +517,7 @@ def _make_channel_op(
             channels, num_heads=num_heads, reduction_power=lowrank_power,
         )
     elif name == 'jacobi':
-        return MIMOJacobiSSM(channels)
+        return MIMOJacobiSSM(channels, n_iters=jacobi_iters)
     else:
         raise ValueError(f"Unknown op: {name}")
 
@@ -532,6 +537,8 @@ class ChannelSegment(nn.Module):
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
+        siren_conv: bool = False,
+        jacobi_iters: int = 1,
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -546,7 +553,7 @@ class ChannelSegment(nn.Module):
                 ops.append(_make_channel_op(
                     name, channel_width, num_heads, max_kernel_size,
                     use_triton, lowrank_power, telephone_power, conv_power,
-                    max_seq_len,
+                    max_seq_len, siren_conv=siren_conv, jacobi_iters=jacobi_iters,
                 ))
                 norms.append(RMSNorm(channel_width, eps))
             self.channels.append(nn.ModuleDict({'ops': ops, 'norms': norms}))
@@ -636,6 +643,8 @@ class RippleChannelClassifier(nn.Module):
         embed_2d: tuple[int, int] | None = None,
         vocab_size: int | None = None,
         router_top_k: int = 0,
+        siren_conv: bool = False,
+        jacobi_iters: int = 1,
     ):
         super().__init__()
         self.embed_2d = embed_2d
@@ -674,6 +683,7 @@ class RippleChannelClassifier(nn.Module):
                         current_ops, n_channels, channel_width, num_heads,
                         max_kernel_size, use_triton, eps, lowrank_power,
                         telephone_power, conv_power, max_seq_len,
+                        siren_conv=siren_conv, jacobi_iters=jacobi_iters,
                     ))
                     current_ops = []
                 self.stages.append(ChannelMixer(width, n_channels=n_channels if router_top_k > 0 else 0, mlp_ratio=mlp_ratio, eps=eps))
@@ -684,6 +694,7 @@ class RippleChannelClassifier(nn.Module):
                 current_ops, n_channels, channel_width, num_heads,
                 max_kernel_size, use_triton, eps, lowrank_power,
                 telephone_power, conv_power, max_seq_len,
+                siren_conv=siren_conv, jacobi_iters=jacobi_iters,
             ))
         
         self.norm = RMSNorm(width, eps)
