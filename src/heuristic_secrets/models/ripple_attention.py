@@ -26,20 +26,21 @@ class DifferentialSwiGLU(nn.Module):
         super().__init__()
         hidden = int(width * mult * 2 / 3)
         hidden = ((hidden + 7) // 8) * 8
+        self.half = hidden // 2
         self.lambda_init = lambda_init
-        self.gate1 = nn.Linear(width, hidden, bias=False)
-        self.up1 = nn.Linear(width, hidden, bias=False)
-        self.gate2 = nn.Linear(width, hidden, bias=False)
-        self.up2 = nn.Linear(width, hidden, bias=False)
-        self.down = nn.Linear(hidden, width, bias=False)
-        self.lambda_q1 = nn.Parameter(torch.randn(hidden) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(hidden) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(hidden) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(hidden) * 0.1)
+        self.gate = nn.Linear(width, hidden, bias=False)
+        self.up = nn.Linear(width, hidden, bias=False)
+        self.down = nn.Linear(hidden // 2, width, bias=False)
+        self.lambda_q1 = nn.Parameter(torch.randn(self.half) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.half) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.half) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.half) * 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h1 = F.silu(self.gate1(x)) * self.up1(x)
-        h2 = F.silu(self.gate2(x)) * self.up2(x)
+        g = F.silu(self.gate(x))
+        u = self.up(x)
+        h = g * u
+        h1, h2 = h[..., :self.half], h[..., self.half:]
         lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
                + self.lambda_init)
