@@ -38,7 +38,7 @@ class RippleMixer(nn.Module):
         use_triton: bool = True,
         jacobi_iters: int = 12,
         siren_conv: bool = False,
-        dim_divisor: int = 2,
+        dim_divisor: int = 1,
     ):
         super().__init__()
         import math
