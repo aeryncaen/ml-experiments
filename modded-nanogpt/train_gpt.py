@@ -1037,6 +1037,88 @@ class MLP(nn.Module):
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
+def _apply_rope_jacobi(x, theta):
+    N = x.shape[-1]
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    cos = theta.cos()
+    sin = theta.sin()
+    out = torch.empty_like(x)
+    out[..., ::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+def jacobi_ssm_forward(
+    x, W_B, W_C, W_out_T, W_small, B_bias, C_bias, conv_w,
+    se_fc1_w, se_fc2_w, b_norm_w, c_norm_w, inject_lam, readout_lam,
+    n_iters=2, state_dim=64, mimo_rank=4,
+):
+    B, L, D = x.shape
+    N = state_dim
+    R = mimo_rank
+    P = N * R
+
+    small = F.linear(x, W_small)
+    X_r = F.silu(small[..., :R])
+    decay_raw = small[..., R:R+N]
+    theta_raw = small[..., R+N:R+N+N//2]
+    lam_raw = small[..., R+N+N//2:R+N+N//2+1]
+
+    B_proj = F.silu(F.linear(x, W_B) + B_bias)
+    C_proj = F.silu(F.linear(x, W_C) + C_bias)
+
+    B_base = B_proj.view(B, L, N, R).permute(0, 3, 1, 2).contiguous()
+    C_base = C_proj.view(B, L, N, R).permute(0, 3, 1, 2).contiguous()
+
+    B_base = F.rms_norm(B_base, (N,)) * b_norm_w
+    C_base = F.rms_norm(C_base, (N,)) * c_norm_w
+
+    H = torch.zeros(B, R, L, N, device=x.device, dtype=x.dtype)
+    prev_inject = None
+    half_N = N // 2
+
+    for it in range(n_iters):
+        decay = torch.sigmoid(decay_raw)
+        theta = theta_raw * (it + 1)
+        lam = torch.sigmoid(lam_raw)
+
+        theta_bc = theta.unsqueeze(1).expand(B, R, L, half_N)
+        B_rot = _apply_rope_jacobi(B_base, theta_bc)
+        C_rot = _apply_rope_jacobi(C_base, theta_bc)
+
+        X_r_bcast = X_r.permute(0, 2, 1).unsqueeze(-1)
+
+        B1, B2 = B_rot[..., :half_N], B_rot[..., half_N:]
+        inject1 = B1 * X_r_bcast
+        inject2 = B2 * X_r_bcast
+        inject = torch.cat([inject1 - inject_lam * inject2,
+                           inject1 + inject_lam * inject2], dim=-1)
+
+        H_flat = H.view(B * R, L, N)
+        H_flat = F.conv1d(H_flat.transpose(1, 2), conv_w, padding=1, groups=N).transpose(1, 2)
+        se_scale = H_flat.mean(dim=1)
+        se_scale = torch.sigmoid(F.linear(F.silu(F.linear(se_scale, se_fc1_w)), se_fc2_w))
+        H_flat = H_flat * se_scale.unsqueeze(1)
+        H = H_flat.view(B, R, L, N)
+
+        alpha = decay.unsqueeze(1)
+        gamma = lam.unsqueeze(1)
+        if prev_inject is not None:
+            beta = (1.0 - gamma) * alpha
+            H = alpha * H + beta * prev_inject + gamma * inject
+        else:
+            H = alpha * H + inject
+        prev_inject = inject
+
+    C1, C2 = C_rot[..., :half_N], C_rot[..., half_N:]
+    H1, H2 = H[..., :half_N], H[..., half_N:]
+    gated1 = C1 * H1
+    gated2 = C2 * H2
+    H_gated = torch.cat([gated1 - readout_lam * gated2,
+                         gated1 + readout_lam * gated2], dim=-1)
+
+    H_out = H_gated.permute(0, 2, 1, 3).reshape(B, L, P)
+    return F.silu(H_out @ W_out_T)
+
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
         super().__init__()
@@ -1051,7 +1133,9 @@ class Block(nn.Module):
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP() if has_mlp else None
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None, jacobi_out: Tensor = None):
+        if jacobi_out is not None:
+            x = x + jacobi_out
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
@@ -1133,6 +1217,47 @@ class GPT(nn.Module):
         self.mlp_bank.label = 'mlp'
         self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
+        # Jacobi SSM parameter banks
+        num_attn = len(self.attn_layer_indices)  # 10
+        jacobi_state_dim = 64
+        jacobi_rank = 4
+        jacobi_P = jacobi_state_dim * jacobi_rank  # 256
+
+        # Big projections: to_B, to_C, out_proj per layer -> (30, 256, 768) padded for 8-GPU
+        jacobi_big_pad = next_multiple_of_n(num_attn * 3, n=8)  # 30 -> 32
+        self.jacobi_big_bank = nn.Parameter(torch.empty(jacobi_big_pad, jacobi_P, model_dim))
+        self.jacobi_big_bank.label = 'jacobi_big'
+        self.jacobi_big_bank.reshape = (jacobi_big_pad, jacobi_P, model_dim)
+
+        # Small projections: (to_X=4, to_decay=64, to_theta=32, to_lambda=1) = 101 per layer
+        jacobi_small_pad = next_multiple_of_n(num_attn, n=8)  # 10 -> 16
+        self.jacobi_small_bank = nn.Parameter(torch.zeros(jacobi_small_pad, 101, model_dim))
+        self.jacobi_small_bank.label = 'jacobi_small'
+
+        # Bias: B_bias and C_bias per layer -> (10, 2, 256)
+        self.jacobi_bias_bank = nn.Parameter(torch.ones(num_attn, 2, jacobi_P))
+        self.jacobi_bias_bank.label = 'jacobi_bias'
+
+        # Depthwise conv weights per layer -> (10, 64, 1, 3)
+        self.jacobi_conv_bank = nn.Parameter(torch.zeros(num_attn, jacobi_state_dim, 1, 3))
+        self.jacobi_conv_bank.label = 'jacobi_conv'
+
+        # Squeeze-excite: fc1(64->16) + fc2(16->64) packed flat -> (10, 2048)
+        self.jacobi_se_bank = nn.Parameter(torch.randn(num_attn, 2048) * 0.01)
+        self.jacobi_se_bank.label = 'jacobi_se'
+
+        # BC norms: b_norm(64) + c_norm(64) -> (10, 128)
+        self.jacobi_norms_bank = nn.Parameter(torch.ones(num_attn, 128))
+        self.jacobi_norms_bank.label = 'jacobi_norms'
+
+        # Inject/readout lambdas -> (10, 2)
+        self.jacobi_lambdas = nn.Parameter(0.5 * torch.ones(num_attn, 2))
+        self.jacobi_lambdas.label = 'jacobi_lambdas'
+
+        # Per-op RMSNorm weights for jacobi + attn per layer -> (10, 2, 768)
+        self.ripple_norms_bank = nn.Parameter(torch.ones(num_attn, 2, model_dim))
+        self.ripple_norms_bank.label = 'ripple_norms'
+
         # improved init scale by @YouJiacheng
         # Attention uses dim^-0.5, MLP uses 0.5 * dim^-0.5
         attn_std = model_dim ** -0.5
@@ -1146,6 +1271,13 @@ class GPT(nn.Module):
             # Init MLP bank (c_fc uniform, c_proj zero) 
             self.mlp_bank[:, 0, :, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            # Init jacobi_big_bank
+            self.jacobi_big_bank[:num_attn * 2].uniform_(-attn_bound, attn_bound)
+            self.jacobi_big_bank[num_attn * 2:num_attn * 3].zero_()
+            if jacobi_big_pad > num_attn * 3:
+                self.jacobi_big_bank[num_attn * 3:].zero_()
+            if jacobi_small_pad > num_attn:
+                self.jacobi_small_bank[num_attn:].zero_()
 
         # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
@@ -1253,6 +1385,17 @@ class GPT(nn.Module):
         mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
         mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
 
+        # unbind jacobi banks
+        num_attn = len(self.attn_layer_indices)
+        jacobi_big_weights = self.jacobi_big_bank.unbind(0)  # (32,) of (256, 768)
+        jacobi_small_weights = self.jacobi_small_bank.unbind(0)  # (16,) of (101, 768)
+        jacobi_bias_weights = self.jacobi_bias_bank.unbind(0)  # (10,) of (2, 256)
+        jacobi_conv_weights = self.jacobi_conv_bank.unbind(0)  # (10,) of (64, 1, 3)
+        jacobi_se_weights = self.jacobi_se_bank.unbind(0)  # (10,) of (2048,)
+        jacobi_norms_weights = self.jacobi_norms_bank.unbind(0)  # (10,) of (128,)
+        jacobi_lambda_weights = self.jacobi_lambdas.unbind(0)  # (10,) of (2,)
+        ripple_norms_weights = self.ripple_norms_bank.unbind(0)  # (10,) of (2, 768)
+
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1273,12 +1416,46 @@ class GPT(nn.Module):
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
             
+            # Compute Jacobi SSM for attention layers
+            jacobi_out = None
+            if i in self.layer_to_attn_idx:
+                bidx = self.layer_to_attn_idx[i]
+                W_B = jacobi_big_weights[bidx]
+                W_C = jacobi_big_weights[num_attn + bidx]
+                W_out_T = jacobi_big_weights[num_attn * 2 + bidx]
+                W_small = jacobi_small_weights[bidx]
+                bias_pair = jacobi_bias_weights[bidx]
+                B_bias = bias_pair[0]
+                C_bias = bias_pair[1]
+                conv_w = jacobi_conv_weights[bidx]
+                se_flat = jacobi_se_weights[bidx]
+                se_fc1_w = se_flat[:1024].view(16, 64)
+                se_fc2_w = se_flat[1024:].view(64, 16)
+                norms_flat = jacobi_norms_weights[bidx]
+                b_norm_w = norms_flat[:64]
+                c_norm_w = norms_flat[64:]
+                lams = jacobi_lambda_weights[bidx]
+                inject_lam = lams[0]
+                readout_lam = lams[1]
+                rn = ripple_norms_weights[bidx]
+                jacobi_norm_w = rn[0]
+
+                j_out = jacobi_ssm_forward(
+                    norm(x),
+                    W_B.type_as(x), W_C.type_as(x), W_out_T.type_as(x), W_small.type_as(x),
+                    B_bias.type_as(x), C_bias.type_as(x), conv_w.type_as(x),
+                    se_fc1_w.type_as(x), se_fc2_w.type_as(x),
+                    b_norm_w.type_as(x), c_norm_w.type_as(x),
+                    inject_lam, readout_lam,
+                )
+                jacobi_out = F.rms_norm(j_out, (j_out.size(-1),)) * jacobi_norm_w.type_as(x)
+
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             
-            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
+            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, jacobi_out)
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1588,15 +1765,25 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "jacobi_big":     {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "jacobi_small":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "jacobi_bias":    {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "jacobi_conv":    {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "jacobi_se":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "jacobi_norms":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "jacobi_lambdas": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "ripple_norms":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "jacobi_bias", "jacobi_conv", "jacobi_se", "jacobi_norms", "jacobi_lambdas", "ripple_norms",  # Small jacobi
             "ve0", "ve1", "ve2", "ve3", "ve4", "bigram_embed",  # Medium
+            "jacobi_small",  # Medium jacobi (sharded adam)
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "attn", "mlp", "jacobi_big",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1807,6 +1994,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.jacobi_big_bank.data = model.jacobi_big_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
