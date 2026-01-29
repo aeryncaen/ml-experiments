@@ -1000,7 +1000,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -1067,7 +1067,8 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         teacher = None
         if self_distill and epoch > 0:
-            teacher = generate_teacher_logits(model, current_loader, device, flatten=flatten, task_type=task_type)
+            teacher_model = merged_model if (distill_from_merged and merged_model is not None and prev_sd is not None) else model
+            teacher = generate_teacher_logits(teacher_model, current_loader, device, flatten=flatten, task_type=task_type)
         
         if is_duo:
             train_loss, train_acc = train_epoch_duo(
@@ -1678,6 +1679,7 @@ def main():
     parser.add_argument('--distill-temp', type=float, default=2.0, help='Distillation temperature (default: 2.0)')
     parser.add_argument('--distill-merge', type=str, default=None, choices=['ema', 'slerp', 'lerp'], help='Merge teacher/student weights each epoch (default: disabled)')
     parser.add_argument('--distill-merge-alpha', type=float, default=0.5, help='Merge ratio: 0=all teacher, 1=all student (default: 0.5)')
+    parser.add_argument('--distill-from-merged', action='store_true', help='Use merged model as teacher for next epoch distillation')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1897,7 +1899,8 @@ def main():
                     verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp,
                     label_smoothing=args.label_smoothing,
                     self_distill=args.self_distill, distill_alpha=args.distill_alpha, distill_temp=args.distill_temp,
-                    distill_merge=args.distill_merge, distill_merge_alpha=args.distill_merge_alpha
+                    distill_merge=args.distill_merge, distill_merge_alpha=args.distill_merge_alpha,
+                    distill_from_merged=args.distill_from_merged
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
