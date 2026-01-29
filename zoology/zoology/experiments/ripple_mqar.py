@@ -98,8 +98,9 @@ for input_seq_len, num_kv_pairs in [
                 else:
                     block_type = "TransformerBlock"
 
+                ripple_d = d_model // 2 if "ripple" in sequence_mixer else d_model
                 model = ModelConfig(
-                    d_model=d_model,
+                    d_model=ripple_d,
                     n_layers=2,
                     block_type=block_type,
                     max_position_embeddings=input_seq_len if sequence_mixer == "attention" else 0,
@@ -112,7 +113,7 @@ for input_seq_len, num_kv_pairs in [
                     data=data,
                     learning_rate=lr,
                     max_epochs=64,
-                    run_id=f"{sequence_mixer}-seqlen{input_seq_len}-dmodel{d_model}-lr{lr:.6f}-kv{num_kv_pairs}",
+                    run_id=f"{sequence_mixer}-seqlen{input_seq_len}-dmodel{ripple_d}-lr{lr:.6f}-kv{num_kv_pairs}",
                     logger=LoggerConfig(
                         project_name="ripple-zoology",
                     ),
