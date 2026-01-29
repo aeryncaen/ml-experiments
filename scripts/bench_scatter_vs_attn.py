@@ -764,7 +764,31 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1):
+@torch.no_grad()
+def generate_teacher_logits(model, loader, device, flatten=True, task_type='classification'):
+    model.eval()
+    # Use a non-shuffled loader so logits are in dataset order
+    ordered_loader = DataLoader(loader.dataset, batch_size=loader.batch_size, shuffle=False,
+                                num_workers=getattr(loader, 'num_workers', 0))
+    all_logits = []
+    with torch.no_grad():
+        for inputs, labels in tqdm(ordered_loader, desc="Distill", leave=False):
+            inputs = inputs.to(device)
+            if flatten and task_type == 'classification':
+                inputs = inputs.view(inputs.size(0), -1)
+            elif not flatten and task_type == 'classification' and inputs.dim() == 4:
+                inputs = inputs.squeeze(1)
+            all_logits.append(model(inputs).cpu())
+    return torch.cat(all_logits)
+
+
+def distillation_loss(student_logits, teacher_logits, temperature=2.0):
+    s = F.log_softmax(student_logits / temperature, dim=-1)
+    t = F.softmax(teacher_logits / temperature, dim=-1)
+    return F.kl_div(s, t, reduction='batchmean') * (temperature ** 2)
+
+
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0):
     model.train()
     total_loss_t = torch.tensor(0.0, device=device)
     correct_t = torch.tensor(0, device=device)
@@ -775,7 +799,10 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         desc += " [WTF]"
     if hard_pct is not None:
         desc += f" [H{int(hard_pct*100)}%]"
+    if teacher_logits is not None:
+        desc += " [SD]"
     pbar = tqdm(loader, desc=desc, leave=False)
+    sample_idx = 0
     for inputs, labels in pbar:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -840,6 +867,13 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
                         loss = per_sample_loss.mean()
                 correct_t += (logits.argmax(dim=-1) == labels).sum()
                 total_t += labels.size(0)
+
+            if teacher_logits is not None:
+                bs = inputs.size(0)
+                t_logits = teacher_logits[sample_idx:sample_idx + bs].to(device)
+                kd_loss = distillation_loss(logits, t_logits, distill_temp)
+                loss = (1 - distill_alpha) * loss + distill_alpha * kd_loss
+                sample_idx += bs
 
         if scaler:
             scaler.scale(loss).backward()
@@ -929,7 +963,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -984,25 +1018,31 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             in_swa_phase = True
         
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
-        # First epoch uses first_epoch_pct if set, otherwise use cosine hard mining
         is_duo = isinstance(model, DuoModel)
-        # Compute curriculum percentage (used by both duo and hard mining)
         if epoch == 0 and first_epoch_pct is not None:
             hard_pct = first_epoch_pct
         else:
             hard_pct = get_hard_pct(epoch)
         
+        teacher = None
+        epoch_loader = current_loader
+        if self_distill and epoch > 0:
+            teacher = generate_teacher_logits(model, current_loader, device, flatten=flatten, task_type=task_type)
+            # Must use non-shuffled loader so sample_idx aligns with teacher logits
+            epoch_loader = DataLoader(current_loader.dataset, batch_size=current_loader.batch_size,
+                                      shuffle=False, num_workers=getattr(current_loader, 'num_workers', 0))
+        
         if is_duo:
-            # Duo mode: hard model gets top hard_pct%, easy model gets bottom (1-hard_pct)%
             train_loss, train_acc = train_epoch_duo(
-                model, current_loader, optimizer, device, active_scheduler,
+                model, epoch_loader, optimizer, device, active_scheduler,
                 flatten=flatten, task_type=task_type, hard_pct=hard_pct, label_smoothing=label_smoothing
             )
         else:
             train_loss, train_acc = train_epoch(
-                model, current_loader, optimizer, device, active_scheduler, 
+                model, epoch_loader, optimizer, device, active_scheduler, 
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
-                hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing
+                hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing,
+                teacher_logits=teacher, distill_alpha=distill_alpha, distill_temp=distill_temp,
             )
         
         if use_swa_sched:
@@ -1021,7 +1061,8 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
             phase_str = ' [SWA]' if in_swa_phase else ''
             mine_str = ' [HEM]' if hard_mining else ''
             duo_str = f' [DUO h{int(hard_pct*100)}%/e{int((1-hard_pct)*100)}%]' if is_duo else ''
-            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}{duo_str}')
+            sd_str = ' [SD]' if teacher is not None else ''
+            print(f'Epoch {epoch+1:2d}: train_acc={train_acc:.4f} test_acc={test_acc:.4f}{swa_str} lr={current_lr:.2e}{phase_str}{mine_str}{duo_str}{sd_str}')
         
         if checkpoint_dir:
             ckpt = {
@@ -1555,6 +1596,9 @@ def main():
 
     parser.add_argument('--ponder-meta-warmup', type=int, default=1, help='Epochs of pure CE supervision for L_internal (default: 1)')
     parser.add_argument('--ponder-meta-wean', type=int, default=1, help='Epochs to wean L_internal from CE to RL (default: 1)')
+    parser.add_argument('--self-distill', action='store_true', help='Enable self-distillation: each epoch distills from previous epoch model')
+    parser.add_argument('--distill-alpha', type=float, default=0.5, help='Distillation loss weight (default: 0.5)')
+    parser.add_argument('--distill-temp', type=float, default=2.0, help='Distillation temperature (default: 2.0)')
     args = parser.parse_args()
 
     def seed_everything(seed):
@@ -1770,7 +1814,8 @@ def main():
                     hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                     wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
                     verbose=(args.runs == 1), flatten=model_flatten, task_type=task_type, use_amp=args.amp,
-                    label_smoothing=args.label_smoothing
+                    label_smoothing=args.label_smoothing,
+                    self_distill=args.self_distill, distill_alpha=args.distill_alpha, distill_temp=args.distill_temp
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
