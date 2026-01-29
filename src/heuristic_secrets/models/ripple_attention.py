@@ -125,7 +125,7 @@ class CausalSelfAttention(nn.Module):
     where Q,K are split into two halves and λ is a learnable scalar.
     """
 
-    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0, differential: bool = True, relu2: bool = False):
+    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0, differential: bool = True, relu2: bool = False, use_rope: bool = True, rope_base: float = 10000.0):
         super().__init__()
         import math as _math
         self.num_heads = num_heads
@@ -134,6 +134,8 @@ class CausalSelfAttention(nn.Module):
         self.dropout = dropout
         self.differential = differential
         self.relu2 = relu2
+        self.use_rope = use_rope
+        self.rope_base = rope_base
         self.act = relu_squared if relu2 else F.silu
         self.lambda_init = 0.8 - 0.6 * _math.exp(-0.3 * layer_idx)
 
@@ -166,10 +168,21 @@ class CausalSelfAttention(nn.Module):
             q1, q2 = q[..., :D2], q[..., D2:]
             k1, k2 = k[..., :D2], k[..., D2:]
 
-            q1 = self.q_norm(q1).transpose(1, 2)
-            q2 = self.q_norm(q2).transpose(1, 2)
-            k1 = self.k_norm(k1).transpose(1, 2)
-            k2 = self.k_norm(k2).transpose(1, 2)
+            q1 = self.q_norm(q1)
+            q2 = self.q_norm(q2)
+            k1 = self.k_norm(k1)
+            k2 = self.k_norm(k2)
+
+            if self.use_rope:
+                q1 = apply_rope(q1, base=self.rope_base)
+                q2 = apply_rope(q2, base=self.rope_base)
+                k1 = apply_rope(k1, base=self.rope_base)
+                k2 = apply_rope(k2, base=self.rope_base)
+
+            q1 = q1.transpose(1, 2)
+            q2 = q2.transpose(1, 2)
+            k1 = k1.transpose(1, 2)
+            k2 = k2.transpose(1, 2)
             v = v.transpose(1, 2)
 
             lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
@@ -183,8 +196,13 @@ class CausalSelfAttention(nn.Module):
             diff = self.head_norm(diff) * (1 - self.lambda_init)
             out = diff.transpose(1, 2).reshape(B, L, C)
         else:
-            q = self.q_norm(q).transpose(1, 2)
-            k = self.k_norm(k).transpose(1, 2)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if self.use_rope:
+                q = apply_rope(q, base=self.rope_base)
+                k = apply_rope(k, base=self.rope_base)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
             out = out.transpose(1, 2).reshape(B, L, C)
