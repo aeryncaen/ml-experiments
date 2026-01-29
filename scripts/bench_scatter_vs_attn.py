@@ -836,12 +836,17 @@ def generate_teacher_logits_indexed(model, loader, device, flatten=True, task_ty
     return torch.cat(all_logits, dim=0)
 
 
-def ensemble_teacher_logits(logit_history, loss_history):
+def ensemble_teacher_logits(logit_history, loss_history, top_k=3):
     stacked_logits = torch.stack(logit_history)
     stacked_losses = torch.stack(loss_history)
-    weights = 1.0 / (stacked_losses + 1e-8)
+    E, N = stacked_losses.shape
+    k = min(top_k, E)
+    _, best_idx = stacked_losses.topk(k, dim=0, largest=False)
+    selected_logits = torch.gather(stacked_logits, 0, best_idx.unsqueeze(-1).expand(-1, -1, stacked_logits.shape[-1]))
+    selected_losses = torch.gather(stacked_losses, 0, best_idx)
+    weights = 1.0 / (selected_losses + 1e-8)
     weights = weights / weights.sum(dim=0, keepdim=True)
-    return (stacked_logits * weights.unsqueeze(-1)).sum(dim=0)
+    return (selected_logits * weights.unsqueeze(-1)).sum(dim=0)
 
 
 def indexed_to_hashmap(logits_tensor, loader, device, flatten=True, task_type='classification'):
@@ -1039,7 +1044,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False, distill_ensemble_k=3):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -1113,7 +1118,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
                 epoch_losses = F.cross_entropy(epoch_logits, current_loader.y[:len(epoch_logits)], reduction='none')
                 ensemble_logits_history.append(epoch_logits)
                 ensemble_loss_history.append(epoch_losses)
-                combined = ensemble_teacher_logits(ensemble_logits_history, ensemble_loss_history)
+                combined = ensemble_teacher_logits(ensemble_logits_history, ensemble_loss_history, top_k=distill_ensemble_k)
                 teacher = indexed_to_hashmap(combined, current_loader, device, flatten=flatten, task_type=task_type)
             else:
                 teacher_model = merged_model if (distill_from_merged and merged_model is not None and prev_sd is not None) else model
@@ -1732,6 +1737,7 @@ def main():
     parser.add_argument('--distill-merge-alpha', type=float, default=0.5, help='Merge ratio: 0=all teacher, 1=all student (default: 0.5)')
     parser.add_argument('--distill-from-merged', action='store_true', help='Use merged model as teacher for next epoch distillation')
     parser.add_argument('--distill-ensemble', action='store_true', help='Ensemble distillation: accumulate logits across epochs, weight by inverse loss')
+    parser.add_argument('--distill-ensemble-k', type=int, default=3, help='Top-K best epochs per sample for ensemble (default: 3)')
 
     args = parser.parse_args()
 
@@ -1953,7 +1959,8 @@ def main():
                     label_smoothing=args.label_smoothing,
                     self_distill=args.self_distill, distill_alpha=args.distill_alpha, distill_temp=args.distill_temp,
                     distill_merge=args.distill_merge, distill_merge_alpha=args.distill_merge_alpha,
-                    distill_from_merged=args.distill_from_merged, distill_ensemble=args.distill_ensemble
+                    distill_from_merged=args.distill_from_merged,
+                    distill_ensemble=args.distill_ensemble, distill_ensemble_k=args.distill_ensemble_k
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
