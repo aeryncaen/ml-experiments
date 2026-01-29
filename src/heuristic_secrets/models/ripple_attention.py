@@ -516,6 +516,7 @@ class RippleBlock(nn.Module):
         diff_readout: bool = True,
         bc_norm: bool = True,
         resid_dropout: float = 0.0,
+        share_duplicate_weights: bool = False,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -538,6 +539,7 @@ class RippleBlock(nn.Module):
             diff_readout=diff_readout,
             bc_norm=bc_norm,
             embed_residual=False,
+            share_duplicate_weights=share_duplicate_weights,
         )
         
         if cross_layer:
@@ -597,6 +599,7 @@ class RippleClassifier(nn.Module):
         bc_norm: bool = True,
         embed_dropout: float = 0.1,
         resid_dropout: float = 0.0,
+        share_duplicate_weights: bool = False,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -638,6 +641,7 @@ class RippleClassifier(nn.Module):
                 diff_readout=diff_readout,
                 bc_norm=bc_norm,
                 resid_dropout=resid_dropout,
+                share_duplicate_weights=share_duplicate_weights,
             )
             for _ in range(n_layers)
         ])
@@ -704,6 +708,7 @@ class RippleLM(nn.Module):
         bc_norm: bool = True,
         embed_dropout: float = 0.1,
         resid_dropout: float = 0.0,
+        share_duplicate_weights: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -732,6 +737,7 @@ class RippleLM(nn.Module):
                 diff_readout=diff_readout,
                 bc_norm=bc_norm,
                 resid_dropout=resid_dropout,
+                share_duplicate_weights=share_duplicate_weights,
             )
             for _ in range(n_layers)
         ])

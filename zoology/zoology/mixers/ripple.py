@@ -47,6 +47,7 @@ class RippleMixer(nn.Module):
         diff_readout: bool = False,
         bc_norm: bool = False,
         relu2: bool = False,
+        share_duplicate_weights: bool = False,
     ):
         super().__init__()
         import math
@@ -75,6 +76,7 @@ class RippleMixer(nn.Module):
             diff_readout=diff_readout,
             bc_norm=bc_norm,
             relu2=relu2,
+            share_duplicate_weights=share_duplicate_weights,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

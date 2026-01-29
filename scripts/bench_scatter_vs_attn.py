@@ -701,7 +701,7 @@ class DuoModel(nn.Module):
             raise ValueError(f"Unknown merge strategy: {self.merge}")
 
 
-def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', hard_pct=0.5, label_smoothing=0.1):
+def train_epoch_duo(duo_model, loader, optimizer, device, flatten=True, task_type='classification', hard_pct=0.5, label_smoothing=0.1):
     """Train duo model with inverse curriculum: hard model on top hard_pct%, easy model on bottom (1-hard_pct)%."""
     duo_model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -772,10 +772,7 @@ def train_epoch_duo(duo_model, loader, optimizer, device, scheduler=None, flatte
             total += labels.size(0)
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(duo_model.parameters(), 1.0)
         optimizer.step()
-        if scheduler:
-            scheduler.step()
         
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}", acc=f"{correct/max(total,1):.4f}")
@@ -891,7 +888,7 @@ def distillation_loss(student_logits, teacher_logits, temperature=2.0):
     return F.kl_div(s, t, reduction='batchmean') * (temperature ** 2)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0, distill_adaptive=False):
+def train_epoch(model, loader, optimizer, device, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0, distill_adaptive=False):
     model.train()
     total_loss_t = torch.tensor(0.0, device=device)
     correct_t = torch.tensor(0, device=device)
@@ -1011,15 +1008,11 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
         if scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-        if scheduler:
-            scheduler.step()
 
         total_loss_t += loss.detach()
         
@@ -1096,7 +1089,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False, distill_ensemble_k=3, distill_adaptive=False):
+def train_model(model, train_loader, test_loader, device, epochs, lr, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False, distill_ensemble_k=3, distill_adaptive=False):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -1106,22 +1099,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
 
-    total_steps = epochs * len(train_loader)
-    warmup_steps = warmup_epochs * len(train_loader)
-    post_warmup = total_steps - warmup_steps
-    static_steps = int(post_warmup * cosine_start)
-    decay_steps = post_warmup - static_steps
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        step_after_warmup = step - warmup_steps
-        if step_after_warmup < static_steps:
-            return 1.0
-        decay_progress = (step_after_warmup - static_steps) / decay_steps
-        return 0.5 * (1 + math.cos(math.pi * decay_progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.0)
     
     swa_model = AveragedModel(model) if swa else None
     swa_epoch = int(epochs * swa_start) if swa else None
@@ -1137,17 +1115,9 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
     current_loader = train_loader
     batch_size = train_loader.batch_size
 
-    # Compute epoch-level cosine schedule for hard mining %
-    post_warmup_epochs = epochs - warmup_epochs
-    static_epochs = int(post_warmup_epochs * cosine_start)
-    decay_epochs = post_warmup_epochs - static_epochs
-    
     def get_hard_pct(ep):
-        """Cosine-annealed hard mining: hard_start at warmup end → hard_end at training end"""
-        if ep < warmup_epochs:
-            return hard_start
-        # Cosine decay from hard_start to hard_end over post-warmup phase
-        progress = (ep - warmup_epochs) / max(epochs - warmup_epochs, 1)
+        """Cosine-annealed hard mining: hard_start → hard_end over training"""
+        progress = ep / max(epochs - 1, 1)
         cosine_mult = 0.5 * (1 + math.cos(math.pi * progress))
         return hard_end + (hard_start - hard_end) * cosine_mult
 
@@ -1155,8 +1125,6 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         use_swa_sched = swa and epoch >= swa_epoch
         if use_swa_sched and not in_swa_phase:
             in_swa_phase = True
-        
-        active_scheduler = swa_scheduler if in_swa_phase else scheduler
         is_duo = isinstance(model, DuoModel)
         if epoch == 0 and first_epoch_pct is not None:
             hard_pct = first_epoch_pct
@@ -1181,12 +1149,12 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         if is_duo:
             train_loss, train_acc = train_epoch_duo(
-                model, current_loader, optimizer, device, active_scheduler,
+                model, current_loader, optimizer, device,
                 flatten=flatten, task_type=task_type, hard_pct=hard_pct, label_smoothing=label_smoothing
             )
         else:
             train_loss, train_acc = train_epoch(
-                model, current_loader, optimizer, device, active_scheduler, 
+                model, current_loader, optimizer, device,
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
                 hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing,
                 teacher_logits=teacher, distill_alpha=distill_alpha, distill_temp=distill_temp,
@@ -1195,6 +1163,9 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         if use_swa_sched:
             swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
         
         test_loss, test_acc = evaluate(model, test_loader, device, flatten=flatten, task_type=task_type)
         
@@ -1301,7 +1272,7 @@ def find_config_for_params(
     return best_config
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None, share_duplicate_weights=False):
     
     if model_type == 'ripple':
         if target_width:
@@ -1314,12 +1285,14 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
                     width=w, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
                     num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256,
                     jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                    share_duplicate_weights=share_duplicate_weights,
                 )
             width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=256,
             jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+            share_duplicate_weights=share_duplicate_weights,
         ).to(device)
     
     if model_type == 'ripple-channel':
@@ -1383,7 +1356,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return classifier_factory_fn(block_factory, width).to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, router_top_k=0, jacobi_iters=12, siren_conv=False, target_width=None, share_duplicate_weights=False):
     W = target_width
     WIDTH_ATTN = W or 64
     WIDTH_LOCAL = W or 64
@@ -1419,12 +1392,14 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
                     width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
                     num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w),
                     jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                    share_duplicate_weights=share_duplicate_weights,
                 )
             width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleClassifier(
             width=width, n_layers=layers, n_classes=n_classes, seq_len=seq_len,
             num_heads=num_channels, order=attn_order, cross_layer=cross_layer, embed_2d=(h, w),
             jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+            share_duplicate_weights=share_duplicate_weights,
         ).to(device)
     elif model_type == 'ripple-channel':
         h, w = img_size
@@ -1510,7 +1485,7 @@ def build_model_3d(model_type, layers, n_classes, vol_size, device, num_channels
     return model.to(device)
 
 
-def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False, target_width=None):
+def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False, target_width=None, share_duplicate_weights=False):
     WIDTH_ATTN = 128
     WIDTH_HIER = 128
     WIDTH_SGSB = 128
@@ -1528,12 +1503,14 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
                     width=w, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
                     num_heads=num_channels, order=attn_order,
                     jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+                    share_duplicate_weights=share_duplicate_weights,
                 )
             width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleLM(
             width=width, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
             num_heads=num_channels, order=attn_order,
             jacobi_iters=jacobi_iters, siren_conv=siren_conv,
+            share_duplicate_weights=share_duplicate_weights,
         ).to(device)
 
     if model_type == 'attention':
@@ -1868,6 +1845,7 @@ def main():
     parser.add_argument('--random-non-queries', action='store_true', default=False, help='Fill non-query positions with random tokens (default: False to match zoology)')
     parser.add_argument('--siren-conv', action='store_true', help='Use AdaptiveConvND (SIREN-based) instead of AdaptiveLocalConv for conv ops in ripple')
     parser.add_argument('--jacobi-iters', type=int, default=1, help='Number of Jacobi iterations for jacobi attention op (default: 1)')
+    parser.add_argument('--share-duplicate-weights', action='store_true', help='Share weights for duplicate ops in order string (default: independent weights)')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='bench-scatter-vs-attn', help='W&B project name')
     parser.add_argument('--wandb-entity', type=str, default=None, help='W&B entity/team')
@@ -1922,7 +1900,7 @@ def main():
         vocab_size = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'conv', 'gather', 'ripple']
-        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv, args.target_width)
+        builder = lambda mt: build_model_lm(mt, args.layers, vocab_size, seq_len, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.jacobi_iters, args.siren_conv, args.target_width, args.share_duplicate_weights)
         shape_str = f'seq_len={seq_len}, vocab={vocab_size}'
         flatten = False
         print(f'Task type: Language Modeling (token prediction)')
@@ -1946,7 +1924,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width, args.share_duplicate_weights)
         shape_str = f'img_size={img_size}'
         flatten = args.model not in ('ripple', 'ripple-channel')
         print(f'Task type: 2D Classification')
@@ -1954,7 +1932,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'ripple-channel', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer, args.with_router, args.jacobi_iters, args.siren_conv, args.target_width, args.share_duplicate_weights)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
@@ -2102,7 +2080,7 @@ def main():
             else:
                 acc = train_model(
                     model, train_loader, test_loader, device, args.epochs, args.lr,
-                    cosine_start=args.cosine_start, swa=args.swa, swa_start=args.swa_start,
+                    swa=args.swa, swa_start=args.swa_start,
                     swa_lr=args.swa_lr, hard_mining=args.hard_mining, hard_start=args.hard_start,
                     hard_end=args.hard_end, first_epoch_pct=args.first_epoch_pct,
                     wtf_mode=args.wtf_mode, checkpoint_dir=args.checkpoint_dir, model_name=f'{mt}_run{run}',
