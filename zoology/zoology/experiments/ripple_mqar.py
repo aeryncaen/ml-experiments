@@ -177,6 +177,24 @@ for input_seq_len, num_kv_pairs in [
                         "max_seq_len": input_seq_len,
                     },
                 ),
+                "ripple-c3a": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "conv,attn",
+                        "max_seq_len": input_seq_len,
+                        "plain_conv_size": 3,
+                    },
+                ),
+                "ripple-c5a": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "conv,attn",
+                        "max_seq_len": input_seq_len,
+                        "plain_conv_size": 5,
+                    },
+                ),
                 "ripple-cl": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
@@ -198,6 +216,9 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-caj",
                 "ripple-ja",
                 "ripple-cja",
+                "ripple-jl",
+                "ripple-c3a",
+                "ripple-c5a",
                 "ripple-cl",
             ]:
                 if "mamba" in sequence_mixer:

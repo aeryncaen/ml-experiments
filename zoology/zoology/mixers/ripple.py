@@ -41,6 +41,7 @@ class RippleMixer(nn.Module):
         dim_divisor: int = 1,
         differential: bool = True,
         embed_residual: bool = True,
+        plain_conv_size: int = 0,
     ):
         super().__init__()
         import math
@@ -63,6 +64,7 @@ class RippleMixer(nn.Module):
             siren_conv=siren_conv,
             differential=differential,
             embed_residual=embed_residual,
+            plain_conv_size=plain_conv_size,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

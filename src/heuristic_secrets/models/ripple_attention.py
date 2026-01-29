@@ -297,6 +297,7 @@ class RippleAttention(nn.Module):
         siren_conv: bool = False,
         differential: bool = True,
         embed_residual: bool = True,
+        plain_conv_size: int = 0,
     ):
         super().__init__()
         import math
@@ -324,10 +325,14 @@ class RippleAttention(nn.Module):
             )
         
         if 'conv' in unique_ops:
-            if siren_conv:
+            if plain_conv_size > 0:
+                self.conv = nn.Conv1d(channels, channels, plain_conv_size, padding=plain_conv_size // 2, groups=channels)
+                self._plain_conv = True
+            elif siren_conv:
                 import math
                 siren_samples = int(math.sqrt(max_seq_len))
                 self.conv = AdaptiveConvND(channels, ndim=1, max_samples=siren_samples, num_channels=num_heads)
+                self._plain_conv = False
             elif use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
                 self.conv = TritonAdaptiveLocalConv(
                     channels=channels,
@@ -336,6 +341,7 @@ class RippleAttention(nn.Module):
                     chunk_size=chunk_size,
                     scale_power=conv_power,
                 )
+                self._plain_conv = False
             else:
                 self.conv = AdaptiveLocalConv(
                     channels=channels,
@@ -343,6 +349,7 @@ class RippleAttention(nn.Module):
                     max_kernel_size=max_kernel_size,
                     scale_power=conv_power,
                 )
+                self._plain_conv = False
         
         if 'lowrank' in unique_ops:
             self.lowrank = LowRankAttention(
@@ -370,7 +377,10 @@ class RippleAttention(nn.Module):
             if name == 'tele':
                 out, _ = self.telephone(h)
             elif name == 'conv':
-                out, info = self.conv(h)
+                if getattr(self, '_plain_conv', False):
+                    out = self.conv(h.transpose(1, 2)).transpose(1, 2)
+                else:
+                    out, info = self.conv(h)
             elif name == 'lowrank':
                 out, _ = self.lowrank(h)
             elif name == 'attn':
