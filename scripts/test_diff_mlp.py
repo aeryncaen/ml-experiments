@@ -88,7 +88,7 @@ def make_nonlinear_boundary(n, dim=16, seed=42):
     return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def run(name, mlp_factory, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr=1e-3, seed=42):
+def run_single(name, mlp_factory, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr=1e-3, seed=42, verbose=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
 
@@ -118,9 +118,26 @@ def run(name, mlp_factory, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr
             with torch.no_grad():
                 acc = (model(x_test).argmax(-1) == y_test).float().mean().item()
             best_acc = max(best_acc, acc)
-            print(f"  [{name:12s}] ep {ep+1:3d}  loss={loss.item():.4f}  test_acc={acc:.4f}  best={best_acc:.4f}")
+            if verbose:
+                print(f"  [{name:12s}] ep {ep+1:3d}  loss={loss.item():.4f}  test_acc={acc:.4f}  best={best_acc:.4f}")
 
     return best_acc, params
+
+
+def run(name, mlp_factory, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr=1e-3, n_runs=5):
+    accs = []
+    params = None
+    for i in range(n_runs):
+        seed = 42 + i * 1000
+        acc, params = run_single(name, mlp_factory, task_fn, in_dim, width=width,
+                                 n_layers=n_layers, epochs=epochs, lr=lr, seed=seed,
+                                 verbose=(i == 0))
+        accs.append(acc)
+        print(f"  [{name:12s}] run {i+1}/{n_runs}  seed={seed}  best_acc={acc:.4f}")
+    mean = np.mean(accs)
+    std = np.std(accs)
+    print(f"  [{name:12s}] mean={mean:.4f} ± {std:.4f}  (n={n_runs})")
+    return mean, std, params
 
 
 if __name__ == "__main__":
@@ -154,9 +171,9 @@ if __name__ == "__main__":
         for width in [64, 128]:
             for n_layers in [2, 4]:
                 print(f"\n--- width={width}, layers={n_layers} ---")
-                acc_s, p_s = run("SwiGLU", SwiGLU, task_fn, in_dim, width=width, n_layers=n_layers)
-                acc_d, p_d = run("DiffSwiGLU", matched_diff_factory, task_fn, in_dim, width=width, n_layers=n_layers)
-                print(f"  SwiGLU:     params={p_s:>7,}  acc={acc_s:.4f}")
-                print(f"  DiffSwiGLU: params={p_d:>7,}  acc={acc_d:.4f}")
-                winner = "DiffSwiGLU" if acc_d > acc_s else ("SwiGLU" if acc_s > acc_d else "TIE")
-                print(f"  Winner: {winner}")
+                m_s, s_s, p_s = run("SwiGLU", SwiGLU, task_fn, in_dim, width=width, n_layers=n_layers)
+                m_d, s_d, p_d = run("DiffSwiGLU", matched_diff_factory, task_fn, in_dim, width=width, n_layers=n_layers)
+                print(f"\n  SwiGLU:     params={p_s:>7,}  acc={m_s:.4f} ± {s_s:.4f}")
+                print(f"  DiffSwiGLU: params={p_d:>7,}  acc={m_d:.4f} ± {s_d:.4f}")
+                delta = m_d - m_s
+                print(f"  Δ(Diff-Swi): {delta:+.4f}  {'✓ Diff wins' if delta > 0 else '✗ Swi wins' if delta < 0 else 'TIE'}")
