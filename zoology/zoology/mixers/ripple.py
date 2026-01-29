@@ -38,12 +38,17 @@ class RippleMixer(nn.Module):
         use_triton: bool = True,
         jacobi_iters: int = 12,
         siren_conv: bool = False,
+        dim_divisor: int = 2,
     ):
         super().__init__()
+        channels = d_model // dim_divisor
         self.d_model = d_model
+        self.channels = channels
         self.layer_idx = layer_idx
+        self.proj_in = nn.Linear(d_model, channels)
+        self.proj_out = nn.Linear(channels, d_model)
         self.attn = RippleAttention(
-            channels=d_model,
+            channels=channels,
             num_heads=num_heads,
             max_kernel_size=max_kernel_size,
             use_triton=use_triton,
@@ -54,8 +59,9 @@ class RippleMixer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _info = self.attn(x)
-        return out
+        h = self.proj_in(x)
+        out, _info = self.attn(h)
+        return self.proj_out(out)
 
     def state_size(self, sequence_length: int = 2048, **kwargs) -> int:
         return 0
