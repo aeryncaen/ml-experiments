@@ -23,13 +23,20 @@ configs = []
 
 for input_seq_len, num_kv_pairs in [
     (64, 4),
-    (128, 8),
     (256, 16),
+    (1024, 64),
+    (4096, 256),
 ]:
-    if input_seq_len == 256:
-        batch_size = 256
-    else:
+    if input_seq_len <= 128:
         batch_size = 512
+    elif input_seq_len <= 512:
+        batch_size = 256
+    elif input_seq_len <= 2048:
+        batch_size = 128
+    elif input_seq_len <= 4096:
+        batch_size = 64
+    else:
+        batch_size = 32
 
     factory_kwargs = {
         "num_kv_pairs": num_kv_pairs,
@@ -44,11 +51,13 @@ for input_seq_len, num_kv_pairs in [
         batch_size=batch_size,
     )
 
-    for d_model in [64, 128, 256, 512]:
+    for d_model in [32, 64, 128, 256, 512]:
         for lr in np.logspace(-4, -2, 4)[1:]:
 
             # Determine num_heads: keep head_dim ~16-32 range
-            if d_model <= 64:
+            if d_model <= 32:
+                num_heads = 2
+            elif d_model <= 64:
                 num_heads = 4
             elif d_model <= 128:
                 num_heads = 8
@@ -105,8 +114,6 @@ for input_seq_len, num_kv_pairs in [
             for sequence_mixer in [
                 "attention",
                 "ripple-tcl",
-                "ripple-tclj",
-                "ripple-aj",
                 "ripple-tca",
             ]:
                 if "mamba" in sequence_mixer:
