@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 from datetime import datetime
 from typing import List, Union
@@ -182,6 +183,7 @@ class Trainer:
     def fit(self):
         self.model.to(self.device)
         self.loss_fn = nn.CrossEntropyLoss()
+        self.best_metrics = {}
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
@@ -193,6 +195,9 @@ class Trainer:
         for epoch_idx in range(self.max_epochs):
             self.train_epoch(epoch_idx)
             metrics = self.test(epoch_idx)
+
+            if metrics.get("valid/accuracy", 0) >= self.best_metrics.get("valid/accuracy", 0):
+                self.best_metrics = {**metrics, "epoch": epoch_idx}
 
             # early stopping
             if (self.early_stopping_metric is not None) and metrics[
@@ -224,6 +229,32 @@ def compute_metrics(
     return results
 
 
+CSV_PATH = os.environ.get("ZOOLOGY_CSV", "zoology_results.csv")
+
+
+def _append_csv(config: TrainConfig, best_metrics: dict, n_params: int):
+    import csv
+    header_needed = not os.path.exists(CSV_PATH)
+    row = {
+        "run_id": config.run_id,
+        "mixer": config.model.sequence_mixer.name if config.model.sequence_mixer else "",
+        "d_model": config.model.d_model,
+        "n_layers": config.model.n_layers,
+        "vocab_size": config.model.vocab_size,
+        "seq_len": config.data.train_configs[0].input_seq_len if config.data.train_configs else "",
+        "lr": config.learning_rate,
+        "n_params": n_params,
+        "best_acc": best_metrics.get("valid/accuracy", ""),
+        "best_loss": best_metrics.get("valid/loss", ""),
+        "best_epoch": best_metrics.get("epoch", ""),
+    }
+    with open(CSV_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if header_needed:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def train(config: TrainConfig):
     set_determinism(config.seed)
     
@@ -241,6 +272,7 @@ def train(config: TrainConfig):
         model = LanguageModel(config.model)
         train_dataloader, test_dataloader = prepare_data(config.data)
 
+    n_params = sum(p.numel() for p in model.parameters())
     logger.log_model(model, config=config)
 
     task = Trainer(
@@ -259,6 +291,7 @@ def train(config: TrainConfig):
         logger=logger,
     )
     task.fit()
+    _append_csv(config, task.best_metrics, n_params)
     logger.finish()
 
 

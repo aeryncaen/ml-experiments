@@ -74,7 +74,6 @@ for input_seq_len, num_kv_pairs in [
                         "num_heads": num_heads,
                         "order": "tele,conv,lowrank",
                         "max_seq_len": input_seq_len,
-                        "use_triton": False,
                     },
                 ),
                 "ripple-tclj": dict(
@@ -83,7 +82,6 @@ for input_seq_len, num_kv_pairs in [
                         "num_heads": num_heads,
                         "order": "tele,conv,lowrank,jacobi",
                         "max_seq_len": input_seq_len,
-                        "use_triton": False,
                     },
                 ),
             }
