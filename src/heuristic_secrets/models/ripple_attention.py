@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
-from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope
+from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope, MIMOJacobiSSM
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
@@ -227,45 +227,52 @@ class RippleAttention(nn.Module):
         self.num_heads = num_heads
         self.order = [s.strip() for s in order.split(",")]
         
-        self.telephone = TelephoneAttentionND(
-            channels=channels,
-            ndim=1,
-            num_heads=num_heads,
-            max_freq=max_freq,
-            min_freq=min_freq,
-            max_kernel_size=max_kernel_size,
-            chunk_size=chunk_size,
-            use_triton=use_triton,
-            scale_power=telephone_power,
-            max_seq_len=max_seq_len,
-        )
+        unique_ops = list(dict.fromkeys(self.order))
         
-        if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
-            self.conv = TritonAdaptiveLocalConv(
+        if 'tele' in unique_ops:
+            self.telephone = TelephoneAttentionND(
                 channels=channels,
+                ndim=1,
                 num_heads=num_heads,
+                max_freq=max_freq,
+                min_freq=min_freq,
                 max_kernel_size=max_kernel_size,
                 chunk_size=chunk_size,
-                scale_power=conv_power,
-            )
-        else:
-            self.conv = AdaptiveLocalConv(
-                channels=channels,
-                num_heads=num_heads,
-                max_kernel_size=max_kernel_size,
-                scale_power=conv_power,
+                use_triton=use_triton,
+                scale_power=telephone_power,
+                max_seq_len=max_seq_len,
             )
         
-        self.lowrank = LowRankAttention(
-            channels,
-            num_heads=num_heads,
-            reduction_power=lowrank_power,
-        )
+        if 'conv' in unique_ops:
+            if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
+                self.conv = TritonAdaptiveLocalConv(
+                    channels=channels,
+                    num_heads=num_heads,
+                    max_kernel_size=max_kernel_size,
+                    chunk_size=chunk_size,
+                    scale_power=conv_power,
+                )
+            else:
+                self.conv = AdaptiveLocalConv(
+                    channels=channels,
+                    num_heads=num_heads,
+                    max_kernel_size=max_kernel_size,
+                    scale_power=conv_power,
+                )
+        
+        if 'lowrank' in unique_ops:
+            self.lowrank = LowRankAttention(
+                channels,
+                num_heads=num_heads,
+                reduction_power=lowrank_power,
+            )
+        
+        if 'jacobi' in unique_ops:
+            self.jacobi = MIMOJacobiSSM(channels)
         
         self.norms = nn.ModuleDict({
-            'tele': RMSNorm(channels, eps),
-            'conv': RMSNorm(channels, eps),
-            'lowrank': RMSNorm(channels, eps),
+            name: RMSNorm(channels, eps)
+            for name in unique_ops
         })
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
@@ -279,6 +286,8 @@ class RippleAttention(nn.Module):
                 out, info = self.conv(h)
             elif name == 'lowrank':
                 out, _ = self.lowrank(h)
+            elif name == 'jacobi':
+                out = self.jacobi(h)
             else:
                 raise ValueError(f"Unknown layer: {name}")
             h = h + self.norms[name](out)
@@ -488,6 +497,8 @@ def _make_channel_op(
         return LowRankAttention(
             channels, num_heads=num_heads, reduction_power=lowrank_power,
         )
+    elif name == 'jacobi':
+        return MIMOJacobiSSM(channels)
     else:
         raise ValueError(f"Unknown op: {name}")
 

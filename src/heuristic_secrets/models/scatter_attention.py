@@ -28,6 +28,18 @@ except ImportError:
     HAS_TRITON = False
     TritonScatterConv = None
     TritonLocalWindowAttn = None
+
+try:
+    from .triton_adaptive_conv import TritonAdaptiveLocalConv
+    HAS_TRITON_ADAPTIVE = True
+except ImportError:
+    HAS_TRITON_ADAPTIVE = False
+    TritonAdaptiveLocalConv = None
+
+try:
+    from .adaptive_local_conv import AdaptiveLocalConv
+except ImportError:
+    AdaptiveLocalConv = None
     TritonSSMStep = None
 
 
@@ -1313,7 +1325,12 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_decay = nn.Linear(dim, state_dim)
         self.to_theta = nn.Linear(dim, state_dim // 2)
         
-        self.diffuse = AdaptiveConvND(state_dim, ndim=ndim)
+        if ndim == 1 and HAS_TRITON_ADAPTIVE and TritonAdaptiveLocalConv is not None:
+            self.diffuse = TritonAdaptiveLocalConv(state_dim, num_heads=max(1, state_dim // 8), max_kernel_size=32)
+        elif ndim == 1 and AdaptiveLocalConv is not None:
+            self.diffuse = AdaptiveLocalConv(state_dim, num_heads=max(1, state_dim // 8), max_kernel_size=32)
+        else:
+            self.diffuse = AdaptiveConvND(state_dim, ndim=ndim)
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
     
@@ -1360,7 +1377,6 @@ class MIMOJacobiSSM_ND(nn.Module):
         X_r_bcast = X_r.permute(*perm_Xr).unsqueeze(-1)
         inject = B_rot * X_r_bcast
         
-        # Diffuse: flatten (B, R) -> (B*R), no permute needed since R is already dim 1
         H_flat = H.view(B * self.R, *spatial_shape, self.N)
         H_flat, _ = self.diffuse(H_flat)
         H = H_flat.view(B, self.R, *spatial_shape, self.N)
