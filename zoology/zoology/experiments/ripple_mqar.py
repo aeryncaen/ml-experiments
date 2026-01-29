@@ -92,6 +92,14 @@ for input_seq_len, num_kv_pairs in [
                         "max_seq_len": input_seq_len,
                     },
                 ),
+                "ripple-tca": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "tele,conv,attn",
+                        "max_seq_len": input_seq_len,
+                    },
+                ),
             }
 
             for sequence_mixer in [
@@ -99,6 +107,7 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-tcl",
                 "ripple-tclj",
                 "ripple-aj",
+                "ripple-tca",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"
