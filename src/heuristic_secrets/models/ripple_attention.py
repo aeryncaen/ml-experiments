@@ -109,6 +109,28 @@ class LayerHistoryAccumulator(nn.Module):
         return self.norm(x_down)
 
 
+class CausalSelfAttention(nn.Module):
+    """Standard causal multi-head self-attention, usable as a channel op."""
+
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.qkv = nn.Linear(channels, 3 * channels, bias=False)
+        self.out_proj = nn.Linear(channels, channels, bias=False)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        B, L, C = x.shape
+        H, D = self.num_heads, self.head_dim
+        q, k, v = self.qkv(x).reshape(B, L, 3, H, D).unbind(2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).reshape(B, L, C)
+        return self.out_proj(out), {}
+
+
 class CrossLayerAttention(nn.Module):
     """Attends across accumulated layer history at the START of each layer.
     
@@ -516,6 +538,8 @@ def _make_channel_op(
         return LowRankAttention(
             channels, num_heads=num_heads, reduction_power=lowrank_power,
         )
+    elif name == 'attn':
+        return CausalSelfAttention(channels, num_heads=num_heads)
     elif name == 'jacobi':
         return MIMOJacobiSSM(channels, n_iters=jacobi_iters)
     else:
