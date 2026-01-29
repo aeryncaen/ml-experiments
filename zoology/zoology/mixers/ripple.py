@@ -33,7 +33,7 @@ class RippleMixer(nn.Module):
         layer_idx: int = None,
         num_heads: int = 4,
         order: str = "tele,conv,lowrank",
-        max_kernel_size: int = 64,
+        max_kernel_size: int = None,
         max_seq_len: int = 8192,
         use_triton: bool = True,
         jacobi_iters: int = 12,
@@ -41,12 +41,15 @@ class RippleMixer(nn.Module):
         dim_divisor: int = 2,
     ):
         super().__init__()
+        import math
+        if max_kernel_size is None:
+            max_kernel_size = int(math.isqrt(max_seq_len))
         channels = d_model // dim_divisor
         self.d_model = d_model
         self.channels = channels
         self.layer_idx = layer_idx
-        self.proj_in = nn.Linear(d_model, channels)
-        self.proj_out = nn.Linear(channels, d_model)
+        self.proj_in = nn.Linear(d_model, channels) if dim_divisor > 1 else nn.Identity()
+        self.proj_out = nn.Linear(channels, d_model) if dim_divisor > 1 else nn.Identity()
         self.attn = RippleAttention(
             channels=channels,
             num_heads=num_heads,

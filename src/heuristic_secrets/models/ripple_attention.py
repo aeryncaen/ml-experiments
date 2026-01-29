@@ -118,19 +118,22 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = channels // num_heads
         self.dropout = dropout
         self.qkv = nn.Linear(channels, 3 * channels, bias=True)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.out_proj = nn.Linear(channels, channels, bias=True)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
         H, D = self.num_heads, self.head_dim
-        q, k, v = self.qkv(x).reshape(B, L, 3, H, D).unbind(2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        qkv = F.silu(self.qkv(x))
+        q, k, v = qkv.reshape(B, L, 3, H, D).unbind(2)
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         drop_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
         out = out.transpose(1, 2).reshape(B, L, C)
-        return self.out_proj(out), {}
+        return F.silu(self.out_proj(out)), {}
 
 
 class CrossLayerAttention(nn.Module):
@@ -234,7 +237,7 @@ class RippleAttention(nn.Module):
         self,
         channels: int,
         num_heads: int = 8,
-        max_kernel_size: int = 64,
+        max_kernel_size: int = None,
         max_freq: float = 16.0,
         min_freq: float = 1.0,
         chunk_size: int = 1024,
@@ -249,6 +252,9 @@ class RippleAttention(nn.Module):
         siren_conv: bool = False,
     ):
         super().__init__()
+        import math
+        if max_kernel_size is None:
+            max_kernel_size = int(math.isqrt(max_seq_len))
         self.channels = channels
         self.num_heads = num_heads
         self.order = [s.strip() for s in order.split(",")]
