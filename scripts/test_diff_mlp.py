@@ -176,4 +176,9 @@ if __name__ == "__main__":
                 print(f"\n  SwiGLU:     params={p_s:>7,}  acc={m_s:.4f} ± {s_s:.4f}")
                 print(f"  DiffSwiGLU: params={p_d:>7,}  acc={m_d:.4f} ± {s_d:.4f}")
                 delta = m_d - m_s
-                print(f"  Δ(Diff-Swi): {delta:+.4f}  {'✓ Diff wins' if delta > 0 else '✗ Swi wins' if delta < 0 else 'TIE'}")
+                se = np.sqrt(s_s**2 + s_d**2)
+                if se > 0 and abs(delta) > se:
+                    verdict = '✓ Diff wins' if delta > 0 else '✗ Swi wins'
+                else:
+                    verdict = '≈ within noise'
+                print(f"  Δ(Diff-Swi): {delta:+.4f}  (±{se:.4f})  {verdict}")
