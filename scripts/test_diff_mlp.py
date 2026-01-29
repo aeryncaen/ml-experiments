@@ -88,6 +88,44 @@ def make_nonlinear_boundary(n, dim=16, seed=42):
     return torch.from_numpy(x), torch.from_numpy(y)
 
 
+import time
+
+
+def bench_perf(name, mlp_factory, in_dim, width=64, n_layers=3, batch=8192, warmup=20, iters=100):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_cuda = device == "cuda"
+    torch.manual_seed(0)
+    model = MLPClassifier(in_dim, width, n_layers, 2, mlp_factory).to(device)
+    x = torch.randn(batch, in_dim, device=device)
+    y = torch.zeros(batch, dtype=torch.long, device=device)
+
+    for _ in range(warmup):
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+        model.zero_grad()
+
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+        model.zero_grad()
+    if use_cuda:
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    ms_per_iter = elapsed / iters * 1000
+    if use_cuda:
+        peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    else:
+        peak_mb = 0.0
+    print(f"  [{name:12s}] {ms_per_iter:.2f} ms/iter  peak_mem={peak_mb:.1f} MB")
+    return ms_per_iter, peak_mb
+
+
 def run_single(name, mlp_factory, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr=1e-3, seed=42, verbose=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
@@ -163,6 +201,8 @@ if __name__ == "__main__":
         ("quadratic boundary (dim=16)", make_nonlinear_boundary, 16),
     ]
 
+    results = []
+
     for task_name, task_fn, in_dim in tasks:
         print(f"\n{'='*60}")
         print(f"Task: {task_name}")
@@ -171,6 +211,8 @@ if __name__ == "__main__":
         for width in [64, 128]:
             for n_layers in [2, 4]:
                 print(f"\n--- width={width}, layers={n_layers} ---")
+                ms_s, mem_s = bench_perf("SwiGLU", SwiGLU, in_dim, width=width, n_layers=n_layers)
+                ms_d, mem_d = bench_perf("DiffSwiGLU", matched_diff_factory, in_dim, width=width, n_layers=n_layers)
                 m_s, s_s, p_s = run("SwiGLU", SwiGLU, task_fn, in_dim, width=width, n_layers=n_layers)
                 m_d, s_d, p_d = run("DiffSwiGLU", matched_diff_factory, task_fn, in_dim, width=width, n_layers=n_layers)
                 print(f"\n  SwiGLU:     params={p_s:>7,}  acc={m_s:.4f} ± {s_s:.4f}")
@@ -178,7 +220,46 @@ if __name__ == "__main__":
                 delta = m_d - m_s
                 se = np.sqrt(s_s**2 + s_d**2)
                 if se > 0 and abs(delta) > se:
-                    verdict = '✓ Diff wins' if delta > 0 else '✗ Swi wins'
+                    verdict = 'Diff wins' if delta > 0 else 'Swi wins'
                 else:
-                    verdict = '≈ within noise'
+                    verdict = 'within noise'
                 print(f"  Δ(Diff-Swi): {delta:+.4f}  (±{se:.4f})  {verdict}")
+                results.append(dict(
+                    task=task_name, width=width, layers=n_layers,
+                    params_s=p_s, params_d=p_d,
+                    acc_s=m_s, std_s=s_s, acc_d=m_d, std_d=s_d,
+                    delta=delta, se=se, verdict=verdict,
+                    ms_s=ms_s, ms_d=ms_d, mem_s=mem_s, mem_d=mem_d,
+                ))
+
+    print(f"\n\n{'='*80}")
+    print("FINAL REPORT")
+    print(f"{'='*80}")
+
+    print(f"\n{'Task':<30s} {'Config':<12s} {'SwiGLU':>14s} {'DiffSwiGLU':>14s} {'Δ':>8s} {'Verdict':<14s}")
+    print("-" * 96)
+    for r in results:
+        cfg = f"w{r['width']}×L{r['layers']}"
+        swi = f"{r['acc_s']:.4f}±{r['std_s']:.4f}"
+        diff = f"{r['acc_d']:.4f}±{r['std_d']:.4f}"
+        print(f"{r['task']:<30s} {cfg:<12s} {swi:>14s} {diff:>14s} {r['delta']:>+8.4f} {r['verdict']:<14s}")
+
+    print(f"\n{'Task':<30s} {'Config':<12s} {'SwiGLU ms':>10s} {'Diff ms':>10s} {'Δ%':>8s} {'SwiGLU MB':>10s} {'Diff MB':>10s} {'Δ%':>8s}")
+    print("-" * 96)
+    for r in results:
+        cfg = f"w{r['width']}×L{r['layers']}"
+        ms_pct = (r['ms_d'] / r['ms_s'] - 1) * 100 if r['ms_s'] > 0 else 0
+        mem_pct = (r['mem_d'] / r['mem_s'] - 1) * 100 if r['mem_s'] > 0 else 0
+        print(f"{r['task']:<30s} {cfg:<12s} {r['ms_s']:>10.2f} {r['ms_d']:>10.2f} {ms_pct:>+7.1f}% {r['mem_s']:>10.1f} {r['mem_d']:>10.1f} {mem_pct:>+7.1f}%")
+
+    n_total = len(results)
+    n_diff = sum(1 for r in results if r['verdict'] == 'Diff wins')
+    n_swi = sum(1 for r in results if r['verdict'] == 'Swi wins')
+    n_noise = sum(1 for r in results if r['verdict'] == 'within noise')
+    avg_delta = np.mean([r['delta'] for r in results])
+    avg_ms_pct = np.mean([(r['ms_d'] / r['ms_s'] - 1) * 100 for r in results if r['ms_s'] > 0])
+
+    print(f"\nSummary ({n_total} comparisons):")
+    print(f"  Diff wins: {n_diff}  |  Swi wins: {n_swi}  |  Within noise: {n_noise}")
+    print(f"  Avg accuracy Δ(Diff-Swi): {avg_delta:+.4f}")
+    print(f"  Avg speed overhead: {avg_ms_pct:+.1f}%")
