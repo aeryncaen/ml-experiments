@@ -494,6 +494,7 @@ class RippleBlock(nn.Module):
             diff_inject=diff_inject,
             diff_readout=diff_readout,
             bc_norm=bc_norm,
+            embed_residual=False,
         )
         
         if cross_layer:

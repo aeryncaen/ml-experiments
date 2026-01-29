@@ -1104,7 +1104,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         os.makedirs(checkpoint_dir, exist_ok=True)
     
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
 
     total_steps = epochs * len(train_loader)
     warmup_steps = warmup_epochs * len(train_loader)
@@ -1841,7 +1841,7 @@ def main():
     parser.add_argument('--target-params', type=int, default=400_000, help='Target body (layer) params (default: 400000)')
     parser.add_argument('--target-width', type=int, default=None, help='Set model width directly instead of targeting params')
     parser.add_argument('--ml-decoder', action='store_true', help='Use ML-Decoder classification head instead of GAP+Linear')
-    parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default: 0.1, 0 to disable)')
+    parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor (default: 0, e.g. 0.1 for classification)')
     parser.add_argument('--cross-layer', action='store_true', help='Enable cross-layer attention for ripple model (accumulates layer history)')
     parser.add_argument('--ponder', action='store_true', help='Wrap model with learned internal loss (ML3-style)')
     parser.add_argument('--ponder-meta-lr', type=float, default=3e-4, help='Meta learning rate for L_internal')
