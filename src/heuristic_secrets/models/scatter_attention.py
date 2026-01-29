@@ -1343,7 +1343,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_C = nn.Linear(dim, state_dim * mimo_rank)
         self.to_X = nn.Linear(dim, mimo_rank)
         self.to_decay = nn.Linear(dim, state_dim)
-        self.to_theta = nn.Linear(dim, state_dim // 2)
+        self.to_theta = nn.Linear(dim, state_dim // 4)
         self.to_lambda = nn.Linear(dim, 1)
         
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
@@ -1369,17 +1369,19 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
     
     def _apply_rope(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        # Half-truncated RoPE: only rotate first N//2 dims, leave rest stationary.
         # x: (B, R, *spatial, N)
-        # theta: (B, 1, *spatial, N//2) - broadcasts to R dim
-        # x[..., ::2] gets even N indices (N//2), x[..., 1::2] gets odd (N//2)
-        x1, x2 = x[..., ::2], x[..., 1::2]
+        # theta: (B, 1, *spatial, N//4) - covers pairs in the rotary half
+        half_N = self.N // 2
+        x_rot = x[..., :half_N]
+        x_pass = x[..., half_N:]
+        x1, x2 = x_rot[..., ::2], x_rot[..., 1::2]
         cos = theta.cos()
         sin = theta.sin()
-        # Interleave back: x1*cos - x2*sin for even, x1*sin + x2*cos for odd
-        out = torch.empty_like(x)
-        out[..., ::2] = x1 * cos - x2 * sin
-        out[..., 1::2] = x1 * sin + x2 * cos
-        return out
+        rot_out = torch.empty_like(x_rot)
+        rot_out[..., ::2] = x1 * cos - x2 * sin
+        rot_out[..., 1::2] = x1 * sin + x2 * cos
+        return torch.cat([rot_out, x_pass], dim=-1)
     
     def init_state(self, x: torch.Tensor) -> torch.Tensor:
         spatial_shape = x.shape[1:-1]
@@ -1411,6 +1413,11 @@ class MIMOJacobiSSM_ND(nn.Module):
         theta_k = theta * (layer_idx + 1)
         B_rot = self._apply_rope(B_base, theta_k.unsqueeze(1))
         C_rot = self._apply_rope(C_base, theta_k.unsqueeze(1))
+
+        half_N = self.N // 2
+        B_stat = B_rot[..., half_N:]
+        B_stat_shifted = torch.cat([B_stat[:, :, :1], B_stat[:, :, :-1]], dim=2)
+        B_rot = torch.cat([B_rot[..., :half_N], B_stat_shifted], dim=-1)
 
         perm_Xr = (0, ndim + 1) + tuple(range(1, ndim + 1))
         X_r_bcast = X_r.permute(*perm_Xr).unsqueeze(-1)

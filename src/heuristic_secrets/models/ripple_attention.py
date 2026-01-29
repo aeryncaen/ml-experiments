@@ -131,6 +131,7 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.half_dim = self.head_dim // 2
+        self.rope_dim = self.head_dim // 2
         self.dropout = dropout
         self.differential = differential
         self.relu2 = relu2
@@ -143,7 +144,6 @@ class CausalSelfAttention(nn.Module):
             self.k_norm = RMSNorm(self.half_dim)
             self.head_norm = RMSNorm(self.head_dim)
 
-            # λ reparameterization: exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
             self.lambda_q1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
             self.lambda_k1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
             self.lambda_q2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
@@ -154,6 +154,15 @@ class CausalSelfAttention(nn.Module):
 
         self.out_proj = nn.Linear(channels, channels, bias=True)
 
+    def _apply_half_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        rd = self.rope_dim
+        half = rd // 2
+        x_rot = x[..., :rd]
+        x_pass = x[..., rd:]
+        x1, x2 = x_rot[..., :half], x_rot[..., half:]
+        rot_out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        return torch.cat([rot_out, x_pass], dim=-1)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
         H, D, D2 = self.num_heads, self.head_dim, self.half_dim
@@ -161,6 +170,21 @@ class CausalSelfAttention(nn.Module):
         qkv = self.act(self.qkv(x))
         q, k, v = qkv.reshape(B, L, 3, H, D).unbind(2)
         drop_p = self.dropout if self.training else 0.0
+
+        half_rope = self.rope_dim // 2
+        dim_idx = torch.arange(half_rope, device=x.device, dtype=x.dtype)
+        freqs = 1.0 / (10000.0 ** (dim_idx / max(half_rope, 1)))
+        positions = torch.arange(L, device=x.device, dtype=x.dtype)
+        angles = positions.unsqueeze(-1) * freqs.unsqueeze(0)
+        cos = angles.cos().view(1, L, 1, half_rope)
+        sin = angles.sin().view(1, L, 1, half_rope)
+
+        q = self._apply_half_rope(q, cos, sin)
+        k = self._apply_half_rope(k, cos, sin)
+
+        k_stat = k[..., D // 2:]
+        k_stat_shifted = torch.cat([k_stat[:, :1], k_stat[:, :-1]], dim=1)
+        k = torch.cat([k[..., :D // 2], k_stat_shifted], dim=-1)
 
         if self.differential:
             q1, q2 = q[..., :D2], q[..., D2:]
