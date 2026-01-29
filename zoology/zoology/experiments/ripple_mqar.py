@@ -115,7 +115,6 @@ for input_seq_len, num_kv_pairs in [
                     run_id=f"{sequence_mixer}-seqlen{input_seq_len}-dmodel{d_model}-lr{lr:.6f}-kv{num_kv_pairs}",
                     logger=LoggerConfig(
                         project_name="ripple-zoology",
-                        entity=None,
                     ),
                 )
                 configs.append(config)
