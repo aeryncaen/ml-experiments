@@ -325,7 +325,7 @@ class RippleAttention(nn.Module):
                 out = self.jacobi(h)
             else:
                 raise ValueError(f"Unknown layer: {name}")
-            h = h + self.norms[name](out)
+            h = x + self.norms[name](out)
         
         return h, info
 
