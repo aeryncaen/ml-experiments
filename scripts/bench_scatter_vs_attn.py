@@ -1387,19 +1387,18 @@ class PreloadedDataset:
             all_y.append(y)
         self.x = torch.cat(all_x, dim=0)
         self.y = torch.cat(all_y, dim=0)
+        if augment:
+            print('  Applying augmentation...')
+            self.x = augment(self.x)
         self.batch_size = loader.batch_size
         self.device = device
-        self.augment = augment
         print(f'  Loaded {len(self.x)} samples ({self.x.element_size() * self.x.numel() / 1e9:.2f} GB)')
     
     def __iter__(self):
         indices = torch.randperm(len(self.x))
         for i in range(0, len(self.x), self.batch_size):
             idx = indices[i:i+self.batch_size]
-            x_batch = self.x[idx]
-            if self.augment:
-                x_batch = self.augment(x_batch)
-            yield x_batch.to(self.device), self.y[idx].to(self.device)
+            yield self.x[idx].to(self.device), self.y[idx].to(self.device)
     
     def __len__(self):
         return (len(self.x) + self.batch_size - 1) // self.batch_size
@@ -1595,7 +1594,8 @@ def main():
     parser.add_argument('--amp', action='store_true', help='Enable automatic mixed precision (fp16)')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for kernel fusion')
     parser.add_argument('--profile', action='store_true', help='Profile 1 batch after 10 warmup, then exit')
-    parser.add_argument('--preload', action='store_true', help='Preload entire dataset to GPU memory')
+    parser.add_argument('--no-preload', dest='preload', action='store_false', help='Disable preloading dataset to memory')
+    parser.set_defaults(preload=True)
     parser.add_argument('--hard-mining', action='store_true', help='Enable hard example mining (reweight samples by previous epoch loss)')
     parser.add_argument('--hard-start', type=float, default=0.5, help='Hard mining start %% (default: 0.5 = 50%%)')
     parser.add_argument('--hard-end', type=float, default=0.05, help='Hard mining end %% (default: 0.05 = 5%%)')
