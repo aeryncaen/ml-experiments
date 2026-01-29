@@ -295,6 +295,9 @@ class RippleAttention(nn.Module):
                 reduction_power=lowrank_power,
             )
         
+        if 'attn' in unique_ops:
+            self.attn_op = CausalSelfAttention(channels, num_heads=num_heads)
+
         if 'jacobi' in unique_ops:
             self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters)
         
@@ -314,6 +317,8 @@ class RippleAttention(nn.Module):
                 out, info = self.conv(h)
             elif name == 'lowrank':
                 out, _ = self.lowrank(h)
+            elif name == 'attn':
+                out, _ = self.attn_op(h)
             elif name == 'jacobi':
                 out = self.jacobi(h)
             else:
