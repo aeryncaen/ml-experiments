@@ -351,6 +351,7 @@ class RippleAttention(nn.Module):
         diff_readout: bool = True,
         bc_norm: bool = True,
         relu2: bool = False,
+        share_duplicate_weights: bool = False,
     ):
         super().__init__()
         import math
@@ -361,6 +362,7 @@ class RippleAttention(nn.Module):
         self.embed_residual = embed_residual
         self.relu2 = relu2
         self.order = [s.strip() for s in order.split(",")]
+        self.share_duplicate_weights = share_duplicate_weights
         
         unique_ops = list(dict.fromkeys(self.order))
         
@@ -421,34 +423,73 @@ class RippleAttention(nn.Module):
         if 'mlp' in unique_ops:
             self.mlp = DifferentialSwiGLU(channels)
         
+        self._dup_ops = nn.ModuleDict()
+        self._dup_norms = nn.ModuleDict()
+        self._op_schedule = []
+        seen = {}
+        for name in self.order:
+            seen[name] = seen.get(name, 0) + 1
+            if seen[name] == 1:
+                self._op_schedule.append((name, name))
+            elif share_duplicate_weights:
+                self._op_schedule.append((name, name))
+            else:
+                key = f"{name}_{seen[name]}"
+                self._op_schedule.append((name, key))
+                if name == 'attn':
+                    self._dup_ops[key] = CausalSelfAttention(channels, num_heads=num_heads, differential=differential, relu2=relu2)
+                elif name == 'jacobi':
+                    self._dup_ops[key] = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
+                elif name == 'mlp':
+                    self._dup_ops[key] = DifferentialSwiGLU(channels)
+                elif name == 'tele':
+                    self._dup_ops[key] = TelephoneAttentionND(channels=channels, ndim=1, num_heads=num_heads, max_freq=max_freq, min_freq=min_freq, max_kernel_size=max_kernel_size, chunk_size=chunk_size, use_triton=use_triton, scale_power=telephone_power, max_seq_len=max_seq_len)
+                elif name == 'lowrank':
+                    self._dup_ops[key] = LowRankAttention(channels, num_heads=num_heads, reduction_power=lowrank_power)
+                self._dup_norms[key] = RMSNorm(channels, eps)
+
         self.norms = nn.ModuleDict({
             name: RMSNorm(channels, eps)
             for name in unique_ops
         })
     
+    def _run_op(self, name: str, key: str, h: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        is_dup = key in self._dup_ops
+        info = {}
+        if name == 'tele':
+            op = self._dup_ops[key] if is_dup else self.telephone
+            out, _ = op(h)
+        elif name == 'conv':
+            if getattr(self, '_plain_conv', False):
+                out = self.conv(h.transpose(1, 2)).transpose(1, 2)
+            else:
+                out, info = self.conv(h)
+        elif name == 'lowrank':
+            op = self._dup_ops[key] if is_dup else self.lowrank
+            out, _ = op(h)
+        elif name == 'attn':
+            op = self._dup_ops[key] if is_dup else self.attn_op
+            out, _ = op(h)
+        elif name == 'jacobi':
+            op = self._dup_ops[key] if is_dup else self.jacobi
+            out = op(h)
+        elif name == 'mlp':
+            op = self._dup_ops[key] if is_dup else self.mlp
+            out = op(h)
+        else:
+            raise ValueError(f"Unknown layer: {name}")
+        norm = self._dup_norms[key] if is_dup else self.norms[name]
+        return norm(out), info
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         h = x
         info = {}
         
-        for name in self.order:
-            if name == 'tele':
-                out, _ = self.telephone(h)
-            elif name == 'conv':
-                if getattr(self, '_plain_conv', False):
-                    out = self.conv(h.transpose(1, 2)).transpose(1, 2)
-                else:
-                    out, info = self.conv(h)
-            elif name == 'lowrank':
-                out, _ = self.lowrank(h)
-            elif name == 'attn':
-                out, _ = self.attn_op(h)
-            elif name == 'jacobi':
-                out = self.jacobi(h)
-            elif name == 'mlp':
-                out = self.mlp(h)
-            else:
-                raise ValueError(f"Unknown layer: {name}")
-            h = h + self.norms[name](out)
+        for name, key in self._op_schedule:
+            out, step_info = self._run_op(name, key, h)
+            if step_info:
+                info = step_info
+            h = h + out
         
         return (x + h, info) if self.embed_residual else (h, info)
 

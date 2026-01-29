@@ -36,7 +36,7 @@ def mqar(
     num_kv_pairs: int = 8,
     num_examples: int = 10000,
     power_a: float = 0.01,
-    random_non_queries: bool = True,
+    random_non_queries: bool = False,
     seed: int = 42,
 ) -> SyntheticData:
     """

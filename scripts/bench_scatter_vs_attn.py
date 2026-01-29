@@ -1676,7 +1676,7 @@ def make_crop_flip_augment(padding=4, pack_rgb=False):
     return augment
 
 
-def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0, no_augment=False, task_vocab_size=None):
+def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0, no_augment=False, task_vocab_size=None, num_kv_pairs=None, random_non_queries=False):
     task_type = 'classification'
     vocab_size = None
 
@@ -1686,8 +1686,11 @@ def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_wor
         task_kwargs = {}
         if task_vocab_size is not None:
             task_kwargs['vocab_size'] = task_vocab_size
+        if num_kv_pairs is not None:
+            task_kwargs['num_kv_pairs'] = num_kv_pairs
+        task_kwargs['random_non_queries'] = random_non_queries
         train_loader, test_loader, config = load_task(
-            name, seq_len=sl, num_train=100000, num_test=10000, batch_size=batch_size, **task_kwargs
+            name, seq_len=sl, num_train=100000, num_test=3000, batch_size=batch_size, **task_kwargs
         )
         vocab_size = config.get('vocab_size', 2)
         return train_loader, test_loader, vocab_size, sl, None, task_type
@@ -1861,6 +1864,8 @@ def main():
     parser.add_argument('--distill-ensemble-k', type=int, default=3, help='Top-K best epochs per sample for ensemble (default: 3)')
     parser.add_argument('--distill-adaptive', action='store_true', help='Adaptive KD/CE blend: easy samples get teacher, hard get ground truth, middle blends (uses hard_pct for thresholds)')
     parser.add_argument('--task-vocab-size', type=int, default=None, help='Override vocab size for synthetic LM tasks like mqar (default: 256)')
+    parser.add_argument('--num-kv-pairs', type=int, default=None, help='Number of KV pairs for MQAR tasks')
+    parser.add_argument('--random-non-queries', action='store_true', default=False, help='Fill non-query positions with random tokens (default: False to match zoology)')
     parser.add_argument('--siren-conv', action='store_true', help='Use AdaptiveConvND (SIREN-based) instead of AdaptiveLocalConv for conv ops in ripple')
     parser.add_argument('--jacobi-iters', type=int, default=1, help='Number of Jacobi iterations for jacobi attention op (default: 1)')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -1895,7 +1900,8 @@ def main():
 
     train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
         args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers,
-        no_augment=args.preload, task_vocab_size=args.task_vocab_size
+        no_augment=args.preload, task_vocab_size=args.task_vocab_size,
+        num_kv_pairs=args.num_kv_pairs, random_non_queries=args.random_non_queries
     )
 
     if args.preload:
