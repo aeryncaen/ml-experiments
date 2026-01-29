@@ -488,19 +488,36 @@ class VolumeClassifier(nn.Module):
 class SequenceLM(nn.Module):
     def __init__(self, block: nn.Module, width: int, n_layers: int, vocab_size: int, seq_len: int):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, width)
-        self.embed_norm = RMSNorm(width)
-        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, width) * 0.02)
-        self.pos_norm = RMSNorm(width)
+        self.n_layers = n_layers
+        self.token_embed = nn.Embedding(vocab_size, width)
+        self.pos_embed = nn.Embedding(seq_len, width)
         self.layers = nn.ModuleList([block for _ in range(n_layers)])
         self.norm = RMSNorm(width)
-        self.head = nn.Linear(width, vocab_size)
+        self.lm_head = nn.Linear(width, vocab_size, bias=False)
+        self.lm_head.weight = self.token_embed.weight
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.token_embed.weight, std=0.02)
+        nn.init.normal_(self.pos_embed.weight, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        for layer in self.layers:
+            for name, p in layer.named_parameters():
+                if "out_proj.weight" in name:
+                    with torch.no_grad():
+                        p.mul_(1.0 / (2 * self.n_layers) ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed_norm(self.embed(x)) + self.pos_norm(F.silu(self.pos_embed))
+        B, L = x.shape
+        pos = torch.arange(L, device=x.device)
+        x = self.token_embed(x) + self.pos_embed(pos)
         for layer in self.layers:
             x = layer(x)
-        return self.head(self.norm(x))
+        return self.lm_head(self.norm(x))
 
 
 class AudioClassifier(nn.Module):
