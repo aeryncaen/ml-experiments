@@ -77,11 +77,11 @@ for input_seq_len, num_kv_pairs in [
                         "use_triton": False,
                     },
                 ),
-                "ripple-tl": dict(
+                "ripple-tclj": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
                         "num_heads": num_heads,
-                        "order": "tele,lowrank",
+                        "order": "tele,conv,lowrank,jacobi",
                         "max_seq_len": input_seq_len,
                         "use_triton": False,
                     },
@@ -91,7 +91,7 @@ for input_seq_len, num_kv_pairs in [
             for sequence_mixer in [
                 "attention",
                 "ripple-tcl",
-                "ripple-tl",
+                "ripple-tclj",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"
