@@ -871,7 +871,7 @@ def distillation_loss(student_logits, teacher_logits, temperature=2.0):
     return F.kl_div(s, t, reduction='batchmean') * (temperature ** 2)
 
 
-def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0, distill_keep_pct=1.0):
+def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, task_type='classification', wtf_mode=False, hard_pct=None, scaler=None, label_smoothing=0.1, teacher_logits=None, distill_alpha=0.5, distill_temp=2.0, distill_adaptive=False):
     model.train()
     total_loss_t = torch.tensor(0.0, device=device)
     correct_t = torch.tensor(0, device=device)
@@ -953,15 +953,11 @@ def train_epoch(model, loader, optimizer, device, scheduler=None, flatten=True, 
             if teacher_logits is not None:
                 t_list = [teacher_logits[inputs[i].cpu().numpy().tobytes()] for i in range(inputs.size(0))]
                 t_logits = torch.stack(t_list).to(device)
-                if distill_keep_pct < 1.0 and task_type != 'lm':
-                    teacher_ce = F.cross_entropy(t_logits, labels, reduction='none')
-                    keep_n = max(1, int(distill_keep_pct * teacher_ce.size(0)))
-                    _, keep_idx = teacher_ce.topk(keep_n, largest=False)
-                    distill_mask = torch.zeros(teacher_ce.size(0), device=device, dtype=torch.bool)
-                    distill_mask[keep_idx] = True
+                if task_type != 'lm':
+                    distill_mask = t_logits.argmax(dim=-1) == labels
                 else:
                     distill_mask = None
-                if hard_pct is not None and task_type != 'lm':
+                if distill_adaptive and hard_pct is not None and task_type != 'lm':
                     ce_per = F.cross_entropy(logits, labels, reduction='none', label_smoothing=label_smoothing)
                     rank = ce_per.argsort().argsort().float() / max(ce_per.size(0) - 1, 1)
                     s = F.log_softmax(logits / distill_temp, dim=-1)
@@ -1079,7 +1075,7 @@ def evaluate(model, loader, device, desc="Eval", flatten=True, task_type='classi
     return total_loss / len(loader), correct / max(total, 1)
 
 
-def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False, distill_ensemble_k=3, distill_keep_pct=1.0):
+def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epochs=2, cosine_start=0.1, swa=False, swa_start=0.8, swa_lr=1e-5, hard_mining=False, hard_start=0.5, hard_end=0.05, first_epoch_pct=None, wtf_mode=False, checkpoint_dir=None, model_name='model', verbose=True, flatten=True, task_type='classification', use_amp=False, label_smoothing=0.1, self_distill=False, distill_alpha=0.5, distill_temp=2.0, distill_merge=None, distill_merge_alpha=0.5, distill_from_merged=False, distill_ensemble=False, distill_ensemble_k=3, distill_adaptive=False):
     import os
     from torch.utils.data import DataLoader, WeightedRandomSampler
     
@@ -1170,7 +1166,7 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
                 flatten=flatten, task_type=task_type, wtf_mode=wtf_mode, 
                 hard_pct=hard_pct if hard_mining else None, scaler=scaler, label_smoothing=label_smoothing,
                 teacher_logits=teacher, distill_alpha=distill_alpha, distill_temp=distill_temp,
-                distill_keep_pct=distill_keep_pct,
+                distill_adaptive=distill_adaptive,
             )
         
         if use_swa_sched:
@@ -1774,7 +1770,7 @@ def main():
     parser.add_argument('--distill-from-merged', action='store_true', help='Use merged model as teacher for next epoch distillation')
     parser.add_argument('--distill-ensemble', action='store_true', help='Ensemble distillation: accumulate logits across epochs, weight by inverse loss')
     parser.add_argument('--distill-ensemble-k', type=int, default=3, help='Top-K best epochs per sample for ensemble (default: 3)')
-    parser.add_argument('--distill-keep-pct', type=float, default=1.0, help='Only distill from teacher on the easiest N%% of samples per batch (default: 1.0 = all)')
+    parser.add_argument('--distill-adaptive', action='store_true', help='Adaptive KD/CE blend: easy samples get teacher, hard get ground truth, middle blends (uses hard_pct for thresholds)')
 
     args = parser.parse_args()
 
@@ -1998,7 +1994,7 @@ def main():
                     distill_merge=args.distill_merge, distill_merge_alpha=args.distill_merge_alpha,
                     distill_from_merged=args.distill_from_merged,
                     distill_ensemble=args.distill_ensemble, distill_ensemble_k=args.distill_ensemble_k,
-                    distill_keep_pct=args.distill_keep_pct
+                    distill_adaptive=args.distill_adaptive
                 )
             results[mt].append(acc)
             print(f'{mt}: {acc:.4f}')
