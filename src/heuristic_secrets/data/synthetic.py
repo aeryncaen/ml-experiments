@@ -31,7 +31,7 @@ class SyntheticDataset(Dataset):
 
 
 def mqar(
-    vocab_size: int = 256,
+    vocab_size: int = 8192,
     seq_len: int = 64,
     num_kv_pairs: int = 8,
     num_examples: int = 10000,
@@ -40,57 +40,54 @@ def mqar(
     seed: int = 42,
 ) -> SyntheticData:
     """
-    Multi-Query Associative Recall.
-    
-    Format: K1 V1 K2 V2 ... padding ... Q1 ... Q2 ...
-    Labels: -100 for non-query positions, V_i at query Q_i position.
-    
-    Tests: in-context associative memory retrieval.
+    Multi-Query Associative Recall (zoology-compatible).
+
+    Format matches HazyResearch/zoology exactly:
+    - KV context: K1 V1 K2 V2 ... (num_kv_pairs * 2 tokens)
+    - Query region: queries scattered via power-law gaps, filler elsewhere
+    - Labels: next-token prediction (inputs = seq[:-1], labels = seq[1:])
+    - Each key queried exactly once, values distinct
     """
-    rng = np.random.default_rng(seed)
-    
+    np.random.seed(seed)
+
+    context_size = num_kv_pairs * 2
     key_vocab_size = vocab_size // 2
-    
-    all_inputs = []
-    all_labels = []
-    
-    for _ in range(num_examples):
-        keys = rng.choice(key_vocab_size, size=num_kv_pairs, replace=False)
-        values = rng.integers(key_vocab_size, vocab_size, size=num_kv_pairs)
-        
-        kv_section = np.empty(num_kv_pairs * 2, dtype=np.int64)
-        kv_section[0::2] = keys
-        kv_section[1::2] = values
-        
-        remaining = seq_len - num_kv_pairs * 3
-        
-        if power_a > 0:
-            p = np.arange(1, num_kv_pairs + 1, dtype=np.float64) ** (-power_a)
-            p = p / p.sum()
-        else:
-            p = None
-        
-        query_indices = rng.choice(num_kv_pairs, size=num_kv_pairs, replace=True, p=p)
-        queries = keys[query_indices]
-        answers = values[query_indices]
-        
-        if random_non_queries:
-            padding = rng.integers(0, key_vocab_size, size=remaining)
-        else:
-            padding = np.zeros(remaining, dtype=np.int64)
-        
-        inp = np.concatenate([kv_section, padding, queries])
-        
-        labels = np.full(seq_len, -100, dtype=np.int64)
-        query_start = seq_len - num_kv_pairs
-        labels[query_start:] = answers
-        
-        all_inputs.append(inp)
-        all_labels.append(labels)
-    
+    key_choices = np.arange(1, key_vocab_size)
+    value_choices = np.arange(key_vocab_size, vocab_size)
+
+    keys_unshuffled = np.tile(key_choices, (num_examples, 1))
+    keys = np.apply_along_axis(np.random.choice, 1, keys_unshuffled, replace=False, size=num_kv_pairs)
+
+    values_unshuffled = np.tile(value_choices, (num_examples, 1))
+    values = np.apply_along_axis(np.random.choice, 1, values_unshuffled, replace=False, size=num_kv_pairs)
+
+    kvs = np.zeros((num_examples, context_size), dtype=np.int64)
+    kvs[:, 0::2] = keys
+    kvs[:, 1::2] = values
+
+    space = (seq_len - context_size) // 2
+    p = power_a * np.arange(1, space + 1) ** (power_a - 1)
+    p = p / p.sum()
+
+    x = np.stack([np.arange(space, dtype=int)] * num_examples)
+    gaps = np.apply_along_axis(np.random.choice, axis=1, arr=x, replace=False, p=p, size=num_kv_pairs)
+
+    queries = np.zeros((num_examples, seq_len - context_size + 1), dtype=np.int64)
+    np.put_along_axis(queries, (gaps * 2), values=keys, axis=1)
+    examples = np.concatenate([kvs, queries], axis=1)
+
+    labels = np.full((num_examples, seq_len + 1), -100, dtype=np.int64)
+    np.put_along_axis(labels, (gaps * 2) + context_size + 1, values=values, axis=1)
+
+    inputs = torch.tensor(examples[:, :-1], dtype=torch.long)
+    labels = torch.tensor(labels[:, 1:], dtype=torch.long)
+
+    if random_non_queries:
+        inputs[inputs == 0] = torch.randint(vocab_size, size=inputs.shape)[inputs == 0]
+
     return SyntheticData(
-        inputs=torch.tensor(np.array(all_inputs), dtype=torch.long),
-        labels=torch.tensor(np.array(all_labels), dtype=torch.long),
+        inputs=inputs,
+        labels=labels,
         task="mqar",
         config=dict(vocab_size=vocab_size, seq_len=seq_len, num_kv_pairs=num_kv_pairs),
     )
@@ -499,7 +496,9 @@ def load_task(
     task_fn = TASKS[task]
     
     common_kwargs = dict(seq_len=seq_len, **kwargs)
-    if "vocab_size" not in kwargs and task not in ("parity", "cumulative_parity", "majority", "cumulative_majority"):
+    no_vocab_tasks = ("parity", "cumulative_parity", "majority", "cumulative_majority")
+    mqar_tasks = ("mqar", "compositional_mqar", "forgetting_mqar")
+    if "vocab_size" not in kwargs and task not in no_vocab_tasks and task not in mqar_tasks:
         common_kwargs["vocab_size"] = 256
     
     train_data = task_fn(num_examples=num_train, seed=seed, **common_kwargs)
