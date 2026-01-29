@@ -161,6 +161,14 @@ for input_seq_len, num_kv_pairs in [
                         "max_seq_len": input_seq_len,
                     },
                 ),
+                "ripple-cja": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "conv,jacobi,attn",
+                        "max_seq_len": input_seq_len,
+                    },
+                ),
                 "ripple-cl": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
@@ -181,6 +189,7 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-a",
                 "ripple-caj",
                 "ripple-ja",
+                "ripple-cja",
                 "ripple-cl",
             ]:
                 if "mamba" in sequence_mixer:
