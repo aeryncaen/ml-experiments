@@ -1606,15 +1606,18 @@ def make_crop_flip_augment(padding=4, pack_rgb=False):
     return augment
 
 
-def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0, no_augment=False):
+def load_dataset(name, batch_size, mode_3d=False, seq_len_override=None, num_workers=0, no_augment=False, task_vocab_size=None):
     task_type = 'classification'
     vocab_size = None
 
     if name in TASKS:
         task_type = 'lm'
         sl = seq_len_override or 256
+        task_kwargs = {}
+        if task_vocab_size is not None:
+            task_kwargs['vocab_size'] = task_vocab_size
         train_loader, test_loader, config = load_task(
-            name, seq_len=sl, num_train=100000, num_test=10000, batch_size=batch_size
+            name, seq_len=sl, num_train=100000, num_test=10000, batch_size=batch_size, **task_kwargs
         )
         vocab_size = config.get('vocab_size', 2)
         return train_loader, test_loader, vocab_size, sl, None, task_type
@@ -1786,6 +1789,7 @@ def main():
     parser.add_argument('--distill-ensemble', action='store_true', help='Ensemble distillation: accumulate logits across epochs, weight by inverse loss')
     parser.add_argument('--distill-ensemble-k', type=int, default=3, help='Top-K best epochs per sample for ensemble (default: 3)')
     parser.add_argument('--distill-adaptive', action='store_true', help='Adaptive KD/CE blend: easy samples get teacher, hard get ground truth, middle blends (uses hard_pct for thresholds)')
+    parser.add_argument('--task-vocab-size', type=int, default=None, help='Override vocab size for synthetic LM tasks like mqar (default: 256)')
     parser.add_argument('--siren-conv', action='store_true', help='Use AdaptiveConvND (SIREN-based) instead of AdaptiveLocalConv for conv ops in ripple')
     parser.add_argument('--jacobi-iters', type=int, default=1, help='Number of Jacobi iterations for jacobi attention op (default: 1)')
 
@@ -1817,7 +1821,7 @@ def main():
 
     train_loader, test_loader, n_classes_or_vocab, seq_len, img_size, task_type = load_dataset(
         args.dataset, args.batch_size, args.mode_3d, args.seq_len, num_workers=args.workers,
-        no_augment=args.preload
+        no_augment=args.preload, task_vocab_size=args.task_vocab_size
     )
 
     if args.preload:
