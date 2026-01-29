@@ -670,7 +670,6 @@ class RippleLM(nn.Module):
         self.n_layers = n_layers
 
         self.token_embed = nn.Embedding(vocab_size, width)
-        self.pos_embed = nn.Embedding(seq_len, width)
         self.embed_drop = nn.Dropout(embed_dropout) if embed_dropout > 0 else nn.Identity()
 
         self.layers = nn.ModuleList([
@@ -705,7 +704,6 @@ class RippleLM(nn.Module):
 
     def _init_weights(self):
         nn.init.normal_(self.token_embed.weight, std=0.02)
-        nn.init.normal_(self.pos_embed.weight, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=0.02)
@@ -719,8 +717,7 @@ class RippleLM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L = x.shape
-        pos = torch.arange(L, device=x.device)
-        x = self.embed_drop(self.token_embed(x) + self.pos_embed(pos))
+        x = self.embed_drop(self.token_embed(x))
 
         for layer in self.layers:
             x, _ = layer(x)
