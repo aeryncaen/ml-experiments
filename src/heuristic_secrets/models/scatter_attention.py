@@ -1317,6 +1317,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         mimo_rank: int = 4,
         ndim: int = 2,
         n_iters: int = 12,
+        diffuse_se: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -1341,6 +1342,7 @@ class MIMOJacobiSSM_ND(nn.Module):
             self.diffuse = nn.Conv2d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
         else:
             self.diffuse = nn.Conv3d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
+        self.diffuse_se = SqueezeExciteND(state_dim) if diffuse_se else None
         self._diffuse_ndim = ndim
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
@@ -1399,6 +1401,8 @@ class MIMOJacobiSSM_ND(nn.Module):
             H_flat = self.diffuse(H_flat.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         else:
             H_flat = self.diffuse(H_flat.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
+        if self.diffuse_se is not None:
+            H_flat = self.diffuse_se(H_flat)
         return H_flat.view(batch_size, self.R, *spatial_shape, self.N)
 
     def _readout(self, H: torch.Tensor, C_rot: torch.Tensor, spatial_shape: tuple, batch_size: int) -> torch.Tensor:
@@ -1443,8 +1447,9 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         state_dim: int = 64,
         mimo_rank: int = 4,
         n_iters: int = 12,
+        diffuse_se: bool = False,
     ):
-        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se)
 
 
 class MIMOJacobiBlock_ND(nn.Module):

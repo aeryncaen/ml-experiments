@@ -298,6 +298,7 @@ class RippleAttention(nn.Module):
         differential: bool = True,
         embed_residual: bool = True,
         plain_conv_size: int = 0,
+        diffuse_se: bool = False,
     ):
         super().__init__()
         import math
@@ -362,7 +363,7 @@ class RippleAttention(nn.Module):
             self.attn_op = CausalSelfAttention(channels, num_heads=num_heads, differential=differential)
 
         if 'jacobi' in unique_ops:
-            self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters)
+            self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se)
         
         self.norms = nn.ModuleDict({
             name: RMSNorm(channels, eps)
