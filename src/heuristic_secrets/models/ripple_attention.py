@@ -528,27 +528,34 @@ class ChannelSegment(nn.Module):
     
     def forward(self, x: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
         B, L, C = x.shape
-        slices = x.split(self.channel_width, dim=-1)
         
-        outputs = []
-        for i, ch in enumerate(self.channels):
-            h = slices[i]
-            if routing_weights is not None:
-                w = routing_weights[:, i].unsqueeze(1).unsqueeze(2)
-                if w.sum() == 0:
-                    outputs.append(h)
-                    continue
+        if routing_weights is not None:
+            active_mask = routing_weights > 0
+            active_indices = [i for i in range(self.n_channels) if active_mask[0, i].item()]
+            n_active = len(active_indices)
+            slices = x.split(self.channel_width, dim=-1)
+            
+            outputs = []
+            for slot, ch_idx in enumerate(active_indices):
+                ch = self.channels[ch_idx]
+                h = slices[slot]
+                w = routing_weights[:, ch_idx].unsqueeze(1).unsqueeze(2)
                 for op, norm in zip(ch['ops'], ch['norms']):
                     out, _ = op(h)
                     h = h + norm(out)
                 outputs.append(h * w)
-            else:
+            
+            return torch.cat(outputs, dim=-1)
+        else:
+            slices = x.split(self.channel_width, dim=-1)
+            outputs = []
+            for i, ch in enumerate(self.channels):
+                h = slices[i]
                 for op, norm in zip(ch['ops'], ch['norms']):
                     out, _ = op(h)
                     h = h + norm(out)
                 outputs.append(h)
-        
-        return torch.cat(outputs, dim=-1)
+            return torch.cat(outputs, dim=-1)
 
 
 class ChannelMixer(nn.Module):
@@ -611,8 +618,12 @@ class RippleChannelClassifier(nn.Module):
         self.router_top_k = router_top_k
         self.n_channels = n_channels
         
-        assert width % n_channels == 0, f"width ({width}) must be divisible by n_channels ({n_channels})"
-        channel_width = width // n_channels
+        if router_top_k > 0:
+            assert width % router_top_k == 0, f"width ({width}) must be divisible by router_top_k ({router_top_k})"
+            channel_width = width // router_top_k
+        else:
+            assert width % n_channels == 0, f"width ({width}) must be divisible by n_channels ({n_channels})"
+            channel_width = width // n_channels
         
         if embed_2d is not None:
             height, width_2d = embed_2d

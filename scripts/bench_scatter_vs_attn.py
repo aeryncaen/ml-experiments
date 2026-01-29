@@ -1121,7 +1121,7 @@ def find_config_for_params(
     return best_config
 
 
-def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False):
+def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, no_mlp=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, ml_decoder=False, cross_layer=False, router_top_k=0):
     
     if model_type == 'ripple':
         def block_factory_fn(h):
@@ -1143,12 +1143,12 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
         def classifier_factory_fn(block_factory, w):
             return RippleChannelClassifier(
                 width=w, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-                topology=attn_order, num_heads=num_channels, vocab_size=256
+                topology=attn_order, num_heads=num_channels, vocab_size=256, router_top_k=router_top_k
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleChannelClassifier(
             width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-            topology=attn_order, num_heads=num_channels, vocab_size=256
+            topology=attn_order, num_heads=num_channels, vocab_size=256, router_top_k=router_top_k
         ).to(device)
     
     if model_type == 'attention':
@@ -1187,7 +1187,7 @@ def build_model(model_type, layers, n_classes, seq_len, device, num_channels=4, 
     return classifier_factory_fn(block_factory, width).to(device)
 
 
-def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000):
+def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=7, cross_layer=False, attn_order='tele,conv,lowrank', target_params=400_000, router_top_k=0):
     WIDTH_ATTN = 64
     WIDTH_LOCAL = 64
     WIDTH_HIER = 64
@@ -1232,12 +1232,12 @@ def build_model_2d(model_type, layers, n_classes, img_size, device, num_channels
         def classifier_factory_fn(block_factory, width):
             return RippleChannelClassifier(
                 width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-                topology=attn_order, num_heads=num_channels, embed_2d=(h, w)
+                topology=attn_order, num_heads=num_channels, embed_2d=(h, w), router_top_k=router_top_k
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
         return RippleChannelClassifier(
             width=width, n_channels=layers, n_classes=n_classes, seq_len=seq_len,
-            topology=attn_order, num_heads=num_channels, embed_2d=(h, w)
+            topology=attn_order, num_heads=num_channels, embed_2d=(h, w), router_top_k=router_top_k
         ).to(device)
     elif model_type == 'flat':
         def block_factory_fn(h):
@@ -1696,7 +1696,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 7
         all_model_types = ['attention', 'local', 'sgsb', 'ripple', 'flat', 'conv']
-        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params)
+        builder = lambda mt: build_model_2d(mt, args.layers, n_classes, img_size, device, args.channels, args.ssm, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.cross_layer, args.attn_order, args.target_params, args.with_router)
         shape_str = f'img_size={img_size}'
         flatten = args.model not in ('ripple', 'ripple-channel')
         print(f'Task type: 2D Classification')
@@ -1704,7 +1704,7 @@ def main():
         n_classes = n_classes_or_vocab
         kernel_size = args.kernel_size or 17
         all_model_types = ['attention', 'sgsb', 'ripple', 'ripple-channel', 'flat', 'conv', 'gather']
-        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer)
+        builder = lambda mt: build_model(mt, args.layers, n_classes, seq_len, device, args.channels, args.ssm, False, args.conv_position, attn_residual, args.merge_mode, args.lowrank_hier, kernel_size, args.attn_order, args.target_params, args.ml_decoder, args.cross_layer, args.with_router)
         shape_str = f'seq_len={seq_len}'
         flatten = True
         print(f'Task type: 1D Classification')
