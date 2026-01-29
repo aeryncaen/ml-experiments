@@ -1320,6 +1320,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         diffuse_se: bool = False,
         diff_inject: bool = False,
         diff_readout: bool = False,
+        bc_norm: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -1329,6 +1330,7 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.n_iters = n_iters
         self.diff_inject = diff_inject
         self.diff_readout = diff_readout
+        self.bc_norm = bc_norm
         
         self.to_B = nn.Linear(dim, state_dim * mimo_rank)
         self.to_C = nn.Linear(dim, state_dim * mimo_rank)
@@ -1344,6 +1346,9 @@ class MIMOJacobiSSM_ND(nn.Module):
             self.inject_lambda = nn.Parameter(torch.tensor(0.5))
         if diff_readout:
             self.readout_lambda = nn.Parameter(torch.tensor(0.5))
+        if bc_norm:
+            self.b_norm = RMSNorm(state_dim)
+            self.c_norm = RMSNorm(state_dim)
         
         if ndim == 1:
             self.diffuse = nn.Conv1d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
@@ -1386,6 +1391,10 @@ class MIMOJacobiSSM_ND(nn.Module):
         perm_to_BR = (0, ndim + 2) + tuple(range(1, ndim + 1)) + (ndim + 1,)
         B_base = B_proj.permute(*perm_to_BR).contiguous()
         C_base = C_proj.permute(*perm_to_BR).contiguous()
+
+        if self.bc_norm:
+            B_base = self.b_norm(B_base)
+            C_base = self.c_norm(C_base)
 
         X_r = F.silu(self.to_X(x))
         decay = torch.sigmoid(self.to_decay(x))
@@ -1477,8 +1486,9 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         diffuse_se: bool = False,
         diff_inject: bool = False,
         diff_readout: bool = False,
+        bc_norm: bool = False,
     ):
-        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm)
 
 
 class MIMOJacobiBlock_ND(nn.Module):

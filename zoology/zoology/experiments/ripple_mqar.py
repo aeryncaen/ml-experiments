@@ -201,6 +201,18 @@ for input_seq_len, num_kv_pairs in [
                         "diff_readout": True,
                     },
                 ),
+                "ripple-ja-dir-bcn": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "jacobi,attn",
+                        "max_seq_len": input_seq_len,
+                        "diffuse_se": True,
+                        "diff_inject": True,
+                        "diff_readout": True,
+                        "bc_norm": True,
+                    },
+                ),
                 "ripple-ja-se": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
@@ -241,6 +253,7 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-ja-di",
                 "ripple-ja-dr",
                 "ripple-ja-dir",
+                "ripple-ja-dir-bcn",
                 "ripple-ja-se",
                 "ripple-cja",
                 "ripple-jl",
