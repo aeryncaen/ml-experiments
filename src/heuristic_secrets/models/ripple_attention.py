@@ -317,20 +317,20 @@ class RippleAttention(nn.Module):
         chunk_size: int = 1024,
         use_triton: bool = True,
         eps: float = 1e-6,
-        order: str = "tele,conv,lowrank",
+        order: str = "jacobi,attn",
         lowrank_power: float = 0.75,
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
-        jacobi_iters: int = 12,
+        jacobi_iters: int = 2,
         siren_conv: bool = False,
         differential: bool = True,
         embed_residual: bool = True,
         plain_conv_size: int = 0,
-        diffuse_se: bool = False,
-        diff_inject: bool = False,
-        diff_readout: bool = False,
-        bc_norm: bool = False,
+        diffuse_se: bool = True,
+        diff_inject: bool = True,
+        diff_readout: bool = True,
+        bc_norm: bool = True,
         relu2: bool = False,
     ):
         super().__init__()
@@ -439,14 +439,18 @@ class RippleBlock(nn.Module):
         mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
-        order: str = "tele,conv,lowrank",
+        order: str = "jacobi,attn",
         lowrank_power: float = 0.75,
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         cross_layer: bool = False,
-        jacobi_iters: int = 12,
+        jacobi_iters: int = 2,
         siren_conv: bool = False,
+        diffuse_se: bool = True,
+        diff_inject: bool = True,
+        diff_readout: bool = True,
+        bc_norm: bool = True,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -463,6 +467,10 @@ class RippleBlock(nn.Module):
             max_seq_len=max_seq_len,
             jacobi_iters=jacobi_iters,
             siren_conv=siren_conv,
+            diffuse_se=diffuse_se,
+            diff_inject=diff_inject,
+            diff_readout=diff_readout,
+            bc_norm=bc_norm,
         )
         
         hidden = int(channels * mlp_ratio)
@@ -515,7 +523,7 @@ class RippleClassifier(nn.Module):
         mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
-        order: str = "tele,conv,lowrank",
+        order: str = "jacobi,attn",
         lowrank_power: float = 0.75,
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
@@ -523,8 +531,12 @@ class RippleClassifier(nn.Module):
         cross_layer: bool = False,
         embed_2d: tuple[int, int] | None = None,
         vocab_size: int | None = None,
-        jacobi_iters: int = 12,
+        jacobi_iters: int = 2,
         siren_conv: bool = False,
+        diffuse_se: bool = True,
+        diff_inject: bool = True,
+        diff_readout: bool = True,
+        bc_norm: bool = True,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -561,6 +573,10 @@ class RippleClassifier(nn.Module):
                 cross_layer=cross_layer,
                 jacobi_iters=jacobi_iters,
                 siren_conv=siren_conv,
+                diffuse_se=diffuse_se,
+                diff_inject=diff_inject,
+                diff_readout=diff_readout,
+                bc_norm=bc_norm,
             )
             for _ in range(n_layers)
         ])
