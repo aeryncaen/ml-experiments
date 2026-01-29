@@ -923,7 +923,19 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+try:
+    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+except Exception:
+    from flash_attn import flash_attn_varlen_func as _fa2_varlen
+    class _FA2Shim:
+        @staticmethod
+        def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                   max_seqlen_q, max_seqlen_k, causal=True,
+                                   softmax_scale=None, window_size=(-1, -1)):
+            return _fa2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                               max_seqlen_q, max_seqlen_k, causal=causal,
+                               softmax_scale=softmax_scale, window_size=window_size)
+    flash_attn_interface = _FA2Shim()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -1935,6 +1947,18 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+# Smoke test mode: SMOKE_TEST=1 torchrun --standalone --nproc_per_node=1 train_gpt.py
+SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", False))
+if SMOKE_TEST:
+    args.num_scheduled_iterations = 10
+    args.num_extension_iterations = 0
+    args.num_iterations = 10
+    args.val_loss_every = 5
+    args.train_bs_schedule = (8 * 2048 * 1,)
+    args.train_bs_extension = 8 * 2048 * 1
+    args.val_batch_size = 64 * 1024
+    args.val_tokens = args.val_batch_size
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
@@ -1998,7 +2022,8 @@ model.jacobi_big_bank.data = model.jacobi_big_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if not SMOKE_TEST:
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
