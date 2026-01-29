@@ -142,36 +142,42 @@ class SIRENUpsampleND(nn.Module):
         if spatial == target_shape:
             return x
         
-        stride = tuple(max(1, t // s) for s, t in zip(spatial, target_shape))
-        kernel_size = stride
+        S = 1
+        for s in spatial:
+            S *= s
+        T = 1
+        for t in target_shape:
+            T *= t
         
-        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
+        src_pos = [torch.linspace(-1, 1, s, device=x.device, dtype=x.dtype) for s in spatial]
+        tgt_pos = [torch.linspace(-1, 1, t, device=x.device, dtype=x.dtype) for t in target_shape]
+        
         if self.ndim == 1:
-            positions = grids[0].unsqueeze(-1)
+            positions = tgt_pos[0].unsqueeze(-1)
         else:
-            mesh = torch.meshgrid(*grids, indexing='ij')
+            mesh = torch.meshgrid(*tgt_pos, indexing='ij')
             positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
         
-        kernel_flat = self.kernel_net(positions)
-        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
+        weights = self.kernel_net(positions)
+        weights = weights / (weights.norm(dim=0, keepdim=True) + 1e-6)
         
-        x = x.movedim(-1, 1)
-        conv_t_fn = [F.conv_transpose1d, F.conv_transpose2d, F.conv_transpose3d][self.ndim - 1]
-        x = conv_t_fn(x, kernel, stride=stride, groups=C)
+        if self.ndim == 1:
+            src_positions = src_pos[0].unsqueeze(-1)
+        else:
+            src_mesh = torch.meshgrid(*src_pos, indexing='ij')
+            src_positions = torch.stack(src_mesh, dim=-1).reshape(-1, self.ndim)
         
-        current = x.shape[2:]
-        if current != target_shape:
-            slices = [slice(None), slice(None)] + [slice(0, min(c, t)) for c, t in zip(current, target_shape)]
-            x = x[slices]
-            pad_needed = [t - x.shape[2 + i] for i, t in enumerate(target_shape)]
-            if any(p > 0 for p in pad_needed):
-                pad_args = []
-                for p in reversed(pad_needed):
-                    pad_args.extend([0, p])
-                x = F.pad(x, pad_args, mode='replicate')
+        src_weights = self.kernel_net(src_positions)
+        src_weights = src_weights / (src_weights.norm(dim=0, keepdim=True) + 1e-6)
         
-        x = x.movedim(1, -1)
-        return self.se(x)
+        mix = weights @ src_weights.T
+        mix = F.softmax(mix, dim=-1)
+        
+        x_flat = x.reshape(B, S, C)
+        out = torch.bmm(mix.unsqueeze(0).expand(B, -1, -1), x_flat)
+        out = out.reshape(B, *target_shape, C)
+        
+        return self.se(out)
 
 
 class KernelNetND(nn.Module):
