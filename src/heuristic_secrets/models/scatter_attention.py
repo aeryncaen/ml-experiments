@@ -101,38 +101,29 @@ class SIRENDownsampleND(nn.Module):
         if spatial == target_shape:
             return x
         
-        S = 1
-        for s in spatial:
-            S *= s
-        T = 1
-        for t in target_shape:
-            T *= t
+        kernel_size = tuple(max(1, s // t) for s, t in zip(spatial, target_shape))
         
-        tgt_pos = [torch.linspace(-1, 1, t, device=x.device, dtype=x.dtype) for t in target_shape]
-        src_pos = [torch.linspace(-1, 1, s, device=x.device, dtype=x.dtype) for s in spatial]
-        
+        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
         if self.ndim == 1:
-            tgt_positions = tgt_pos[0].unsqueeze(-1)
-            src_positions = src_pos[0].unsqueeze(-1)
+            positions = grids[0].unsqueeze(-1)
         else:
-            tgt_mesh = torch.meshgrid(*tgt_pos, indexing='ij')
-            tgt_positions = torch.stack(tgt_mesh, dim=-1).reshape(-1, self.ndim)
-            src_mesh = torch.meshgrid(*src_pos, indexing='ij')
-            src_positions = torch.stack(src_mesh, dim=-1).reshape(-1, self.ndim)
+            mesh = torch.meshgrid(*grids, indexing='ij')
+            positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
         
-        tgt_w = self.kernel_net(tgt_positions)
-        tgt_w = tgt_w / (tgt_w.norm(dim=0, keepdim=True) + 1e-6)
-        src_w = self.kernel_net(src_positions)
-        src_w = src_w / (src_w.norm(dim=0, keepdim=True) + 1e-6)
+        kernel_flat = self.kernel_net(positions)
+        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
         
-        mix = tgt_w @ src_w.T
-        mix = F.softmax(mix, dim=-1)
+        x = x.movedim(-1, 1)
+        conv_fn = [F.conv1d, F.conv2d, F.conv3d][self.ndim - 1]
+        x = conv_fn(x, kernel, stride=kernel_size, groups=C)
         
-        x_flat = x.reshape(B, S, C)
-        out = torch.bmm(mix.unsqueeze(0).expand(B, -1, -1), x_flat)
-        out = out.reshape(B, *target_shape, C)
+        current = x.shape[2:]
+        if current != target_shape:
+            x = F.interpolate(x, size=target_shape, mode='nearest')
         
-        return self.se(out)
+        x = x.movedim(1, -1)
+        
+        return self.se(x)
 
 
 class SIRENUpsampleND(nn.Module):
@@ -151,42 +142,29 @@ class SIRENUpsampleND(nn.Module):
         if spatial == target_shape:
             return x
         
-        S = 1
-        for s in spatial:
-            S *= s
-        T = 1
-        for t in target_shape:
-            T *= t
+        stride = tuple(max(1, t // s) for s, t in zip(spatial, target_shape))
+        kernel_size = stride
         
-        src_pos = [torch.linspace(-1, 1, s, device=x.device, dtype=x.dtype) for s in spatial]
-        tgt_pos = [torch.linspace(-1, 1, t, device=x.device, dtype=x.dtype) for t in target_shape]
-        
+        grids = [torch.linspace(-1, 1, k, device=x.device, dtype=x.dtype) for k in kernel_size]
         if self.ndim == 1:
-            positions = tgt_pos[0].unsqueeze(-1)
+            positions = grids[0].unsqueeze(-1)
         else:
-            mesh = torch.meshgrid(*tgt_pos, indexing='ij')
+            mesh = torch.meshgrid(*grids, indexing='ij')
             positions = torch.stack(mesh, dim=-1).reshape(-1, self.ndim)
         
-        weights = self.kernel_net(positions)
-        weights = weights / (weights.norm(dim=0, keepdim=True) + 1e-6)
+        kernel_flat = self.kernel_net(positions)
+        kernel = kernel_flat.T.reshape(C, 1, *kernel_size)
         
-        if self.ndim == 1:
-            src_positions = src_pos[0].unsqueeze(-1)
-        else:
-            src_mesh = torch.meshgrid(*src_pos, indexing='ij')
-            src_positions = torch.stack(src_mesh, dim=-1).reshape(-1, self.ndim)
+        x = x.movedim(-1, 1)
+        conv_t_fn = [F.conv_transpose1d, F.conv_transpose2d, F.conv_transpose3d][self.ndim - 1]
+        x = conv_t_fn(x, kernel, stride=stride, groups=C)
         
-        src_weights = self.kernel_net(src_positions)
-        src_weights = src_weights / (src_weights.norm(dim=0, keepdim=True) + 1e-6)
+        current = x.shape[2:]
+        if current != target_shape:
+            x = F.interpolate(x, size=target_shape, mode='nearest')
         
-        mix = weights @ src_weights.T
-        mix = F.softmax(mix, dim=-1)
-        
-        x_flat = x.reshape(B, S, C)
-        out = torch.bmm(mix.unsqueeze(0).expand(B, -1, -1), x_flat)
-        out = out.reshape(B, *target_shape, C)
-        
-        return self.se(out)
+        x = x.movedim(1, -1)
+        return self.se(x)
 
 
 class KernelNetND(nn.Module):
