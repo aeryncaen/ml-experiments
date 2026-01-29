@@ -171,6 +171,7 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-ca-nodiff",
                 "ripple-ca-noembed",
                 "ripple-a",
+                "ripple-caj",
                 "ripple-cl",
             ]:
                 if "mamba" in sequence_mixer:
