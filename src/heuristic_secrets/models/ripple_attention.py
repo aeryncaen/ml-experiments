@@ -22,7 +22,7 @@ class ReLUSquared(nn.Module):
 
 class DifferentialSwiGLU(nn.Module):
 
-    def __init__(self, width: int, mult: int = 4, lambda_init: float = 0.5):
+    def __init__(self, width: int, mult: float = 4.8, lambda_init: float = 0.5):
         super().__init__()
         hidden = int(width * mult * 2 / 3)
         hidden = ((hidden + 7) // 8) * 8
