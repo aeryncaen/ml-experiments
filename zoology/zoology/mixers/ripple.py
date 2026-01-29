@@ -36,7 +36,7 @@ class RippleMixer(nn.Module):
         max_kernel_size: int = None,
         max_seq_len: int = 8192,
         use_triton: bool = True,
-        jacobi_iters: int = 12,
+        jacobi_iters: int = 4,
         siren_conv: bool = False,
         dim_divisor: int = 1,
         differential: bool = True,
