@@ -224,6 +224,7 @@ for input_seq_len, num_kv_pairs in [
                 "ripple-a",
                 "ripple-caj",
                 "ripple-ja",
+                "ripple-ja-se",
                 "ripple-cja",
                 "ripple-jl",
                 "ripple-c3a",
