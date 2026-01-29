@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .telephone_attention import TelephoneAttentionND
 from .adaptive_local_conv import AdaptiveLocalConv
-from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope, MIMOJacobiSSM
+from .scatter_attention import LowRankAttention, RMSNorm, SIRENDownsampleND, SIRENUpsampleND, SqueezeExciteND, interpolate_nd, apply_rope, MIMOJacobiSSM, AdaptiveConvND
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
@@ -222,6 +222,7 @@ class RippleAttention(nn.Module):
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         jacobi_iters: int = 1,
+        siren_conv: bool = False,
     ):
         super().__init__()
         self.channels = channels
@@ -245,7 +246,11 @@ class RippleAttention(nn.Module):
             )
         
         if 'conv' in unique_ops:
-            if use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
+            if siren_conv:
+                import math
+                siren_samples = int(math.sqrt(max_seq_len))
+                self.conv = AdaptiveConvND(channels, ndim=1, max_samples=siren_samples, num_channels=num_heads)
+            elif use_triton and HAS_TRITON and TritonAdaptiveLocalConv is not None:
                 self.conv = TritonAdaptiveLocalConv(
                     channels=channels,
                     num_heads=num_heads,
@@ -313,6 +318,7 @@ class RippleBlock(nn.Module):
         max_seq_len: int = 8192,
         cross_layer: bool = False,
         jacobi_iters: int = 1,
+        siren_conv: bool = False,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -328,6 +334,7 @@ class RippleBlock(nn.Module):
             conv_power=conv_power,
             max_seq_len=max_seq_len,
             jacobi_iters=jacobi_iters,
+            siren_conv=siren_conv,
         )
         
         hidden = int(channels * mlp_ratio)
@@ -389,6 +396,7 @@ class RippleClassifier(nn.Module):
         embed_2d: tuple[int, int] | None = None,
         vocab_size: int | None = None,
         jacobi_iters: int = 1,
+        siren_conv: bool = False,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -424,6 +432,7 @@ class RippleClassifier(nn.Module):
                 max_seq_len=max_seq_len,
                 cross_layer=cross_layer,
                 jacobi_iters=jacobi_iters,
+                siren_conv=siren_conv,
             )
             for _ in range(n_layers)
         ])
