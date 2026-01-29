@@ -1479,26 +1479,32 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
         ).to(device)
 
     if model_type == 'attention':
-        block_fn = lambda: AttentionBlock(WIDTH_ATTN, num_heads=num_channels, use_ssm=use_ssm)
-        width = WIDTH_ATTN
+        def block_factory_fn(h):
+            return lambda w: AttentionBlock(w, num_heads=h, use_ssm=use_ssm)
     elif model_type == 'hier':
-        block_fn = lambda: HierarchicalBlock(WIDTH_HIER, window_size=kernel_size, num_channels=num_channels, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
-        width = WIDTH_HIER
+        def block_factory_fn(h):
+            return lambda w: HierarchicalBlock(w, window_size=kernel_size, num_channels=h, use_ssm=use_ssm, conv_position=conv_position, attn_residual=attn_residual, merge_mode=merge_mode, lowrank_hier=lowrank_hier)
     elif model_type == 'sgsb':
-        block_fn = lambda: SGSBBlockND(WIDTH_SGSB, kernel_size=kernel_size, ndim=1, num_channels=num_channels)
-        width = WIDTH_SGSB
+        def block_factory_fn(h):
+            return lambda w: SGSBBlockND(w, kernel_size=kernel_size, ndim=1, num_channels=h)
     elif model_type == 'conv':
-        block_fn = lambda: ConvBlock(WIDTH_CONV, kernel_size=kernel_size)
-        width = WIDTH_CONV
+        def block_factory_fn(h):
+            return lambda w: ConvBlock(w, kernel_size=kernel_size)
     elif model_type == 'gather':
-        block_fn = lambda: TelephoneAttentionBlock(WIDTH_GATHER, num_heads=num_channels)
-        width = WIDTH_GATHER
+        def block_factory_fn(h):
+            return lambda w: TelephoneAttentionBlock(w, num_heads=h)
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 
-    model = SequenceLM(block_fn(), width, layers, vocab_size, seq_len)
-    model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
-    return model.to(device)
+    def classifier_factory_fn(block_factory, w):
+        block_fn = lambda: block_factory(w)
+        model = SequenceLM(block_fn(), w, layers, vocab_size, seq_len)
+        model.layers = nn.ModuleList([block_fn() for _ in range(layers)])
+        return model
+
+    width, num_heads = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
+    block_factory = block_factory_fn(num_heads)
+    return classifier_factory_fn(block_factory, width).to(device)
 
 
 def build_model_audio(model_type, layers, n_classes, seq_len, device, num_channels=4, use_ssm=False, conv_position='both', attn_residual=True, merge_mode='lowrank', lowrank_hier=True, kernel_size=17, attn_order='tele,conv,lowrank', target_params=400_000, jacobi_iters=12, siren_conv=False):
