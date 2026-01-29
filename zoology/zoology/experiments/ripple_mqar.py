@@ -105,9 +105,8 @@ for input_seq_len, num_kv_pairs in [
                 else:
                     block_type = "TransformerBlock"
 
-                ripple_d = d_model // 2 if "ripple" in sequence_mixer else d_model
                 model = ModelConfig(
-                    d_model=ripple_d,
+                    d_model=d_model,
                     n_layers=2,
                     block_type=block_type,
                     max_position_embeddings=input_seq_len if sequence_mixer == "attention" else 0,
