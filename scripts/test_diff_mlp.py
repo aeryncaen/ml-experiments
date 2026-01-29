@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Compare SwiGLU vs DifferentialSwiGLU on nonlinear function approximation."""
+"""Compare SwiGLU vs DifferentialSwiGLU on tasks MLPs do well on."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import sys
 sys.path.insert(0, "src")
 
@@ -18,105 +19,107 @@ class SwiGLU(nn.Module):
         self.gate = nn.Linear(width, hidden, bias=False)
         self.up = nn.Linear(width, hidden, bias=False)
         self.down = nn.Linear(hidden, width, bias=False)
-
     def forward(self, x):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-class MLPModel(nn.Module):
-    def __init__(self, width, n_layers, mlp_cls):
+class MLPClassifier(nn.Module):
+    def __init__(self, in_dim, width, n_layers, n_classes, mlp_cls):
         super().__init__()
+        self.embed = nn.Linear(in_dim, width)
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(n_layers):
             self.norms.append(nn.LayerNorm(width))
             self.layers.append(mlp_cls(width))
         self.norm_out = nn.LayerNorm(width)
+        self.head = nn.Linear(width, n_classes)
 
     def forward(self, x):
+        x = self.embed(x)
         for norm, layer in zip(self.norms, self.layers):
             x = x + layer(norm(x))
-        return self.norm_out(x)
+        return self.head(self.norm_out(x))
 
 
-def make_target_fn():
-    """Random nonlinear target: a fixed 2-layer ReLU net."""
-    W1 = torch.randn(64, 128)
-    b1 = torch.randn(128)
-    W2 = torch.randn(128, 64)
-    b2 = torch.randn(64)
-    def fn(x):
-        h = F.relu(x @ W1 + b1)
-        return h @ W2 + b2
-    return fn
+def make_xor_data(n, dim=16, seed=42):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, dim)).astype(np.float32)
+    # label = XOR of signs of first 4 features
+    bits = (x[:, :4] > 0).astype(int)
+    y = bits.sum(axis=1) % 2
+    return torch.from_numpy(x), torch.from_numpy(y).long()
 
 
-def run_experiment(name, mlp_cls, width=64, n_layers=4, n_train=8192, n_test=2048,
-                   lr=3e-4, epochs=200, seed=42):
-    torch.manual_seed(seed)
+def make_sparse_parity_data(n, dim=32, k=6, seed=42):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, dim)).astype(np.float32)
+    bits = (x[:, :k] > 0).astype(int)
+    y = bits.sum(axis=1) % 2
+    return torch.from_numpy(x), torch.from_numpy(y).long()
+
+
+def make_nonlinear_boundary(n, dim=16, seed=42):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, dim)).astype(np.float32)
+    # quadratic boundary: sum of squares of first 4 > sum of squares of next 4
+    y = ((x[:, :4] ** 2).sum(1) > (x[:, 4:8] ** 2).sum(1)).astype(np.int64)
+    return torch.from_numpy(x), torch.from_numpy(y)
+
+
+def run(name, mlp_cls, task_fn, in_dim, width=64, n_layers=3, epochs=300, lr=1e-3, seed=42):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    target_fn = make_target_fn()
-    # move target params to device
-    for obj in target_fn.__code__.co_consts:
-        pass
-    # just regenerate on device
-    torch.manual_seed(0)
-    W1 = torch.randn(width, width * 2, device=device)
-    b1 = torch.randn(width * 2, device=device)
-    W2 = torch.randn(width * 2, width, device=device)
-    b2 = torch.randn(width, device=device)
-
-    def target(x):
-        h = F.relu(x @ W1 + b1)
-        return h @ W2 + b2
-
     torch.manual_seed(seed)
-    x_train = torch.randn(n_train, width, device=device)
-    y_train = target(x_train).detach()
-    x_test = torch.randn(n_test, width, device=device)
-    y_test = target(x_test).detach()
+
+    x_train, y_train = task_fn(8192, dim=in_dim, seed=seed)
+    x_test, y_test = task_fn(2048, dim=in_dim, seed=seed + 100)
+    x_train, y_train = x_train.to(device), y_train.to(device)
+    x_test, y_test = x_test.to(device), y_test.to(device)
 
     torch.manual_seed(seed + 1)
-    model = MLPModel(width, n_layers, mlp_cls).to(device)
+    model = MLPClassifier(in_dim, width, n_layers, 2, mlp_cls).to(device)
     params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
 
-    best_test = float("inf")
+    best_acc = 0.0
     for ep in range(epochs):
         model.train()
-        pred = model(x_train)
-        loss = F.mse_loss(pred, y_train)
+        logits = model(x_train)
+        loss = F.cross_entropy(logits, y_train)
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
 
-        if (ep + 1) % 20 == 0 or ep == epochs - 1:
+        if (ep + 1) % 50 == 0 or ep == epochs - 1:
             model.eval()
             with torch.no_grad():
-                test_loss = F.mse_loss(model(x_test), y_test).item()
-            best_test = min(best_test, test_loss)
-            print(f"  [{name}] ep {ep+1:3d}  train={loss.item():.4f}  test={test_loss:.4f}  best={best_test:.4f}")
+                acc = (model(x_test).argmax(-1) == y_test).float().mean().item()
+            best_acc = max(best_acc, acc)
+            print(f"  [{name:12s}] ep {ep+1:3d}  loss={loss.item():.4f}  test_acc={acc:.4f}  best={best_acc:.4f}")
 
-    return best_test, params
+    return best_acc, params
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Task: Learn a random 2-layer ReLU network (function approx)")
-    print("=" * 60)
+    tasks = [
+        ("XOR-4 (dim=16)", make_xor_data, 16),
+        ("sparse-parity-6 (dim=32)", make_sparse_parity_data, 32),
+        ("quadratic boundary (dim=16)", make_nonlinear_boundary, 16),
+    ]
 
-    for width in [64, 128]:
-        for n_layers in [2, 4]:
-            print(f"\n--- width={width}, layers={n_layers} ---")
-            best_plain, params_plain = run_experiment(
-                "SwiGLU", SwiGLU, width=width, n_layers=n_layers)
-            best_diff, params_diff = run_experiment(
-                "DiffSwiGLU", DifferentialSwiGLU, width=width, n_layers=n_layers)
-            print(f"  SwiGLU:     params={params_plain:>8,}  best_test={best_plain:.4f}")
-            print(f"  DiffSwiGLU: params={params_diff:>8,}  best_test={best_diff:.4f}")
-            ratio = best_plain / max(best_diff, 1e-8)
-            winner = "DiffSwiGLU" if best_diff < best_plain else "SwiGLU"
-            print(f"  Winner: {winner} ({ratio:.2f}x)")
+    for task_name, task_fn, in_dim in tasks:
+        print(f"\n{'='*60}")
+        print(f"Task: {task_name}")
+        print(f"{'='*60}")
+
+        for width in [64, 128]:
+            for n_layers in [2, 4]:
+                print(f"\n--- width={width}, layers={n_layers} ---")
+                acc_s, p_s = run("SwiGLU", SwiGLU, task_fn, in_dim, width=width, n_layers=n_layers)
+                acc_d, p_d = run("DiffSwiGLU", DifferentialSwiGLU, task_fn, in_dim, width=width, n_layers=n_layers)
+                print(f"  SwiGLU:     params={p_s:>7,}  acc={acc_s:.4f}")
+                print(f"  DiffSwiGLU: params={p_d:>7,}  acc={acc_d:.4f}")
+                winner = "DiffSwiGLU" if acc_d > acc_s else ("SwiGLU" if acc_s > acc_d else "TIE")
+                print(f"  Winner: {winner}")
