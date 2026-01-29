@@ -22,12 +22,12 @@ class ReLUSquared(nn.Module):
 
 class DifferentialSwiGLU(nn.Module):
 
-    def __init__(self, width: int, mult: float = 4.8, lambda_init: float = 0.5):
+    def __init__(self, width: int, mult: float = 4, lambda_init: float = 0.5):
         super().__init__()
         hidden = int(width * mult * 2 / 3)
         hidden = ((hidden + 7) // 8) * 8
         self.gate_up = nn.Linear(width, 2 * hidden, bias=False)
-        self.down = nn.Linear(hidden // 2, width, bias=False)
+        self.down = nn.Linear(hidden, 2 * width, bias=False)
         self.lambda_logit = nn.Parameter(torch.tensor(0.0))
         self.lambda_init = lambda_init
 
@@ -35,9 +35,10 @@ class DifferentialSwiGLU(nn.Module):
         gu = self.gate_up(x)
         g, u = gu.chunk(2, dim=-1)
         h = F.silu(g) * u
-        h1, h2 = h.chunk(2, dim=-1)
+        o = self.down(h)
+        o1, o2 = o.chunk(2, dim=-1)
         lam = torch.sigmoid(self.lambda_logit) + self.lambda_init
-        return self.down(h1 - lam * h2)
+        return o1 - lam * o2
 
 try:
     from .triton_adaptive_conv import TritonAdaptiveLocalConv, HAS_TRITON
