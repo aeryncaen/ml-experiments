@@ -1089,8 +1089,8 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         
         merge_acc = None
         if merged_model is not None and teacher is not None:
-            teacher_sd = prev_sd if prev_sd is not None else {k: v.clone() for k, v in model.state_dict().items()}
             student_sd = model.state_dict()
+            teacher_sd = {k: v.to(student_sd[k].device) for k, v in prev_sd.items()} if prev_sd is not None else {k: v.clone() for k, v in student_sd.items()}
             new_sd = merge_teacher_student(teacher_sd, student_sd, distill_merge_alpha, method=distill_merge)
             merged_model.load_state_dict(new_sd)
             _, merge_acc = evaluate(merged_model, test_loader, device, desc="Eval [M]", flatten=flatten, task_type=task_type)
