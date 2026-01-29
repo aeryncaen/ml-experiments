@@ -1312,12 +1312,14 @@ class MIMOJacobiSSM_ND(nn.Module):
         state_dim: int = 64,
         mimo_rank: int = 4,
         ndim: int = 2,
+        n_iters: int = 1,
     ):
         super().__init__()
         self.D = dim
         self.N = state_dim
         self.R = mimo_rank
         self.ndim = ndim
+        self.n_iters = n_iters
         
         self.to_B = nn.Linear(dim, state_dim * mimo_rank)
         self.to_C = nn.Linear(dim, state_dim * mimo_rank)
@@ -1325,12 +1327,13 @@ class MIMOJacobiSSM_ND(nn.Module):
         self.to_decay = nn.Linear(dim, state_dim)
         self.to_theta = nn.Linear(dim, state_dim // 2)
         
-        if ndim == 1 and HAS_TRITON_ADAPTIVE and TritonAdaptiveLocalConv is not None:
-            self.diffuse = TritonAdaptiveLocalConv(state_dim, num_heads=max(1, state_dim // 8), max_kernel_size=32)
-        elif ndim == 1 and AdaptiveLocalConv is not None:
-            self.diffuse = AdaptiveLocalConv(state_dim, num_heads=max(1, state_dim // 8), max_kernel_size=32)
+        if ndim == 1:
+            self.diffuse = nn.Conv1d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
+        elif ndim == 2:
+            self.diffuse = nn.Conv2d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
         else:
-            self.diffuse = AdaptiveConvND(state_dim, ndim=ndim)
+            self.diffuse = nn.Conv3d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
+        self._diffuse_ndim = ndim
         
         self.out_proj = nn.Linear(state_dim * mimo_rank, dim)
     
@@ -1378,7 +1381,12 @@ class MIMOJacobiSSM_ND(nn.Module):
         inject = B_rot * X_r_bcast
         
         H_flat = H.view(B * self.R, *spatial_shape, self.N)
-        H_flat, _ = self.diffuse(H_flat)
+        if self._diffuse_ndim == 1:
+            H_flat = self.diffuse(H_flat.transpose(1, 2)).transpose(1, 2)
+        elif self._diffuse_ndim == 2:
+            H_flat = self.diffuse(H_flat.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        else:
+            H_flat = self.diffuse(H_flat.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
         H = H_flat.view(B, self.R, *spatial_shape, self.N)
         
         # decay is (B, *spatial, N), need (B, 1, *spatial, N) for broadcast
@@ -1394,7 +1402,9 @@ class MIMOJacobiSSM_ND(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         H = self.init_state(x)
-        H, out = self.step(x, H, 0)
+        out = x
+        for i in range(self.n_iters):
+            H, out = self.step(x, H, i)
         return out
 
 
@@ -1405,8 +1415,9 @@ class MIMOJacobiSSM(MIMOJacobiSSM_ND):
         dim: int,
         state_dim: int = 64,
         mimo_rank: int = 4,
+        n_iters: int = 1,
     ):
-        super().__init__(dim, state_dim, mimo_rank, ndim=1)
+        super().__init__(dim, state_dim, mimo_rank, ndim=1, n_iters=n_iters)
 
 
 class MIMOJacobiBlock_ND(nn.Module):

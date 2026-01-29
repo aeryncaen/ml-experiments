@@ -844,8 +844,10 @@ def ensemble_teacher_logits(logit_history, loss_history, top_k=3):
     _, best_idx = stacked_losses.topk(k, dim=0, largest=False)
     selected_logits = torch.gather(stacked_logits, 0, best_idx.unsqueeze(-1).expand(-1, -1, stacked_logits.shape[-1]))
     selected_losses = torch.gather(stacked_losses, 0, best_idx)
-    weights = 1.0 / (selected_losses + 1e-8)
-    weights = weights / weights.sum(dim=0, keepdim=True)
+    valid = selected_losses < float('inf')
+    weights = torch.where(valid, 1.0 / (selected_losses + 1e-8), torch.zeros_like(selected_losses))
+    w_sum = weights.sum(dim=0, keepdim=True).clamp(min=1e-8)
+    weights = weights / w_sum
     return (selected_logits * weights.unsqueeze(-1)).sum(dim=0)
 
 
@@ -1146,7 +1148,10 @@ def train_model(model, train_loader, test_loader, device, epochs, lr, warmup_epo
         if self_distill and epoch > 0:
             if distill_ensemble:
                 epoch_logits = generate_teacher_logits_indexed(model, current_loader, device, flatten=flatten, task_type=task_type)
-                epoch_losses = F.cross_entropy(epoch_logits, current_loader.y[:len(epoch_logits)], reduction='none')
+                labels_all = current_loader.y[:len(epoch_logits)]
+                epoch_losses = F.cross_entropy(epoch_logits, labels_all, reduction='none')
+                wrong = epoch_logits.argmax(dim=-1) != labels_all
+                epoch_losses = epoch_losses.masked_fill(wrong, float('inf'))
                 ensemble_logits_history.append(epoch_logits)
                 ensemble_loss_history.append(epoch_losses)
                 combined = ensemble_teacher_logits(ensemble_logits_history, ensemble_loss_history, top_k=distill_ensemble_k)

@@ -221,6 +221,7 @@ class RippleAttention(nn.Module):
         telephone_power: float = 0.5625,
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
+        jacobi_iters: int = 1,
     ):
         super().__init__()
         self.channels = channels
@@ -268,7 +269,7 @@ class RippleAttention(nn.Module):
             )
         
         if 'jacobi' in unique_ops:
-            self.jacobi = MIMOJacobiSSM(channels)
+            self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters)
         
         self.norms = nn.ModuleDict({
             name: RMSNorm(channels, eps)
@@ -311,6 +312,7 @@ class RippleBlock(nn.Module):
         conv_power: float = 0.421875,
         max_seq_len: int = 8192,
         cross_layer: bool = False,
+        jacobi_iters: int = 1,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -325,6 +327,7 @@ class RippleBlock(nn.Module):
             telephone_power=telephone_power,
             conv_power=conv_power,
             max_seq_len=max_seq_len,
+            jacobi_iters=jacobi_iters,
         )
         
         hidden = int(channels * mlp_ratio)
@@ -385,6 +388,7 @@ class RippleClassifier(nn.Module):
         cross_layer: bool = False,
         embed_2d: tuple[int, int] | None = None,
         vocab_size: int | None = None,
+        jacobi_iters: int = 1,
     ):
         super().__init__()
         self.cross_layer = cross_layer
@@ -419,6 +423,7 @@ class RippleClassifier(nn.Module):
                 conv_power=conv_power,
                 max_seq_len=max_seq_len,
                 cross_layer=cross_layer,
+                jacobi_iters=jacobi_iters,
             )
             for _ in range(n_layers)
         ])
