@@ -35,7 +35,7 @@ class RippleMixer(nn.Module):
         order: str = "tele,conv,lowrank",
         max_kernel_size: int = 64,
         max_seq_len: int = 8192,
-        use_triton: bool = False,
+        use_triton: bool = True,
         jacobi_iters: int = 1,
         siren_conv: bool = False,
     ):
