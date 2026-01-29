@@ -436,7 +436,6 @@ class RippleBlock(nn.Module):
         channels: int,
         num_heads: int = 8,
         max_kernel_size: int = 64,
-        mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
         order: str = "jacobi,attn",
@@ -473,13 +472,6 @@ class RippleBlock(nn.Module):
             bc_norm=bc_norm,
         )
         
-        hidden = int(channels * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, channels),
-        )
-        
         if cross_layer:
             self.cross_layer_attn = CrossLayerAttention(channels, num_heads, eps)
             self.history_accum = LayerHistoryAccumulator(channels, lowrank_power, eps)
@@ -499,7 +491,6 @@ class RippleBlock(nn.Module):
         
         attn_out, info = self.attn(x)
         x = x + attn_out
-        x = x + self.mlp(x)
         
         if self.cross_layer:
             x_lowrank = self.history_accum(x)
@@ -520,7 +511,6 @@ class RippleClassifier(nn.Module):
         seq_len: int,
         num_heads: int = 8,
         max_kernel_size: int = 64,
-        mlp_ratio: float = 4.0,
         use_triton: bool = True,
         eps: float = 1e-6,
         order: str = "jacobi,attn",
@@ -562,7 +552,6 @@ class RippleClassifier(nn.Module):
                 channels=width,
                 num_heads=num_heads,
                 max_kernel_size=max_kernel_size,
-                mlp_ratio=mlp_ratio,
                 use_triton=use_triton,
                 eps=eps,
                 order=order,
@@ -616,6 +605,92 @@ class RippleClassifier(nn.Module):
         if self.vocab_size is not None:
             return self.head(x)
         return self.head(x.mean(dim=1))
+
+
+class RippleLM(nn.Module):
+
+    def __init__(
+        self,
+        width: int,
+        n_layers: int,
+        vocab_size: int,
+        seq_len: int,
+        num_heads: int = 8,
+        max_kernel_size: int = 64,
+        use_triton: bool = True,
+        eps: float = 1e-6,
+        order: str = "jacobi,attn",
+        lowrank_power: float = 0.75,
+        telephone_power: float = 0.5625,
+        conv_power: float = 0.421875,
+        max_seq_len: int = 8192,
+        jacobi_iters: int = 2,
+        siren_conv: bool = False,
+        diffuse_se: bool = True,
+        diff_inject: bool = True,
+        diff_readout: bool = True,
+        bc_norm: bool = True,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.width = width
+        self.n_layers = n_layers
+
+        self.token_embed = nn.Embedding(vocab_size, width)
+        self.pos_embed = nn.Embedding(seq_len, width)
+
+        self.layers = nn.ModuleList([
+            RippleBlock(
+                channels=width,
+                num_heads=num_heads,
+                max_kernel_size=max_kernel_size,
+                use_triton=use_triton,
+                eps=eps,
+                order=order,
+                lowrank_power=lowrank_power,
+                telephone_power=telephone_power,
+                conv_power=conv_power,
+                max_seq_len=max_seq_len,
+                jacobi_iters=jacobi_iters,
+                siren_conv=siren_conv,
+                diffuse_se=diffuse_se,
+                diff_inject=diff_inject,
+                diff_readout=diff_readout,
+                bc_norm=bc_norm,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.norm = RMSNorm(width, eps)
+        self.lm_head = nn.Linear(width, vocab_size, bias=False)
+
+        self.lm_head.weight = self.token_embed.weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.token_embed.weight, std=0.02)
+        nn.init.normal_(self.pos_embed.weight, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        for layer in self.layers:
+            for name, p in layer.named_parameters():
+                if "out_proj.weight" in name:
+                    with torch.no_grad():
+                        p.mul_(1.0 / (2 * self.n_layers) ** 0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L = x.shape
+        pos = torch.arange(L, device=x.device)
+        x = self.token_embed(x) + self.pos_embed(pos)
+
+        for layer in self.layers:
+            x, _ = layer(x)
+
+        return self.lm_head(self.norm(x))
 
 
 def _make_channel_op(

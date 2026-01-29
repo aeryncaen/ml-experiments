@@ -24,7 +24,7 @@ from heuristic_secrets.models.scatter_attention import (
     apply_rope,
     sinusoidal_pos_embed_nd,
 )
-from heuristic_secrets.models.ripple_attention import RippleAttention, RippleClassifier, RippleChannelClassifier
+from heuristic_secrets.models.ripple_attention import RippleAttention, RippleClassifier, RippleChannelClassifier, RippleLM
 from heuristic_secrets.models.backbone import SSMMixer3
 from heuristic_secrets.models.backbone2d import SSMBlock3_2d
 from heuristic_secrets.models.telephone_attention import TelephoneAttentionND
@@ -1466,15 +1466,15 @@ def build_model_lm(model_type, layers, vocab_size, seq_len, device, num_channels
         def block_factory_fn(h):
             return lambda w: None
         def classifier_factory_fn(block_factory, w):
-            return RippleClassifier(
-                width=w, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
-                num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=vocab_size,
+            return RippleLM(
+                width=w, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
+                num_heads=num_channels, order=attn_order,
                 jacobi_iters=jacobi_iters, siren_conv=siren_conv,
             )
         width, _ = find_config_for_params(block_factory_fn, classifier_factory_fn, target_params)
-        return RippleClassifier(
-            width=width, n_layers=layers, n_classes=vocab_size, seq_len=seq_len,
-            num_heads=num_channels, order=attn_order, cross_layer=cross_layer, vocab_size=vocab_size,
+        return RippleLM(
+            width=width, n_layers=layers, vocab_size=vocab_size, seq_len=seq_len,
+            num_heads=num_channels, order=attn_order,
             jacobi_iters=jacobi_iters, siren_conv=siren_conv,
         ).to(device)
 
