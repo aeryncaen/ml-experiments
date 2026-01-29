@@ -110,29 +110,68 @@ class LayerHistoryAccumulator(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """Standard causal multi-head self-attention, usable as a channel op."""
+    """Differential causal self-attention (Ye et al., ICLR 2025), usable as a channel op.
 
-    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1):
+    Computes attention as: (softmax(Q1K1^T) - λ·softmax(Q2K2^T)) · V
+    where Q,K are split into two halves and λ is a learnable scalar.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0):
         super().__init__()
+        import math as _math
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.half_dim = self.head_dim // 2
         self.dropout = dropout
+        self.lambda_init = 0.8 - 0.6 * _math.exp(-0.3 * layer_idx)
+
         self.qkv = nn.Linear(channels, 3 * channels, bias=True)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+        self.q_norm = RMSNorm(self.half_dim)
+        self.k_norm = RMSNorm(self.half_dim)
+        self.head_norm = RMSNorm(self.head_dim)
+
+        # λ reparameterization: exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+        self.lambda_q1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+
         self.out_proj = nn.Linear(channels, channels, bias=True)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
-        H, D = self.num_heads, self.head_dim
+        H, D, D2 = self.num_heads, self.head_dim, self.half_dim
+
         qkv = F.silu(self.qkv(x))
         q, k, v = qkv.reshape(B, L, 3, H, D).unbind(2)
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
+
+        # Split Q,K into two halves for differential attention
+        q1, q2 = q[..., :D2], q[..., D2:]  # (B, L, H, D2)
+        k1, k2 = k[..., :D2], k[..., D2:]
+
+        # QK norm on each half
+        q1 = self.q_norm(q1).transpose(1, 2)
+        q2 = self.q_norm(q2).transpose(1, 2)
+        k1 = self.k_norm(k1).transpose(1, 2)
+        k2 = self.k_norm(k2).transpose(1, 2)
+        v = v.transpose(1, 2)  # (B, H, L, D)
+
+        # Learnable λ
+        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+               + self.lambda_init)
+
         drop_p = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
-        out = out.transpose(1, 2).reshape(B, L, C)
+        out1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, dropout_p=drop_p)
+        out2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, dropout_p=drop_p)
+
+        # Differential: cancel attention noise
+        diff = out1 - lam * out2  # (B, H, L, D)
+
+        # Per-head RMSNorm + fixed scale to align gradient flow
+        diff = self.head_norm(diff) * (1 - self.lambda_init)
+
+        out = diff.transpose(1, 2).reshape(B, L, C)
         return F.silu(self.out_proj(out)), {}
 
 
