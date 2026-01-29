@@ -165,8 +165,8 @@ class CausalSelfAttention(nn.Module):
         drop_p = self.dropout if self.training else 0.0
 
         if self.differential:
-            q1, q2 = q[..., :D2], q[..., D2:]
-            k1, k2 = k[..., :D2], k[..., D2:]
+            q1, q2 = q[..., :D2], q[..., D2:2*D2]
+            k1, k2 = k[..., :D2], k[..., D2:2*D2]
 
             q1 = self.q_norm(q1)
             q2 = self.q_norm(q2)
