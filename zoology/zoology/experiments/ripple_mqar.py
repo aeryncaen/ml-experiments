@@ -24,6 +24,7 @@ configs = []
 for input_seq_len, num_kv_pairs in [
     (64, 4),
     (256, 16),
+    (512, 32),
     (1024, 64),
     (4096, 256),
 ]:
