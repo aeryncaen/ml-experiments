@@ -112,12 +112,13 @@ class LayerHistoryAccumulator(nn.Module):
 class CausalSelfAttention(nn.Module):
     """Standard causal multi-head self-attention, usable as a channel op."""
 
-    def __init__(self, channels: int, num_heads: int = 8):
+    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
-        self.qkv = nn.Linear(channels, 3 * channels, bias=False)
-        self.out_proj = nn.Linear(channels, channels, bias=False)
+        self.dropout = dropout
+        self.qkv = nn.Linear(channels, 3 * channels, bias=True)
+        self.out_proj = nn.Linear(channels, channels, bias=True)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, L, C = x.shape
@@ -126,7 +127,8 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        drop_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
         out = out.transpose(1, 2).reshape(B, L, C)
         return self.out_proj(out), {}
 
