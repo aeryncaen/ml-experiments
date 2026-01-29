@@ -293,7 +293,7 @@ class RippleAttention(nn.Module):
         super().__init__()
         import math
         if max_kernel_size is None:
-            max_kernel_size = int(math.isqrt(max_seq_len))
+            max_kernel_size = 16
         self.channels = channels
         self.num_heads = num_heads
         self.order = [s.strip() for s in order.split(",")]

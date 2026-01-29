@@ -698,8 +698,12 @@ class LowRankAttention(nn.Module):
         self.v_head_dim = 2 * self.head_dim
         self.scale = self.head_dim ** -0.5
         
-        self.downsample = SIRENDownsampleND(embed_dim, ndim=1)
-        self.upsample = SIRENUpsampleND(embed_dim, ndim=1)
+        self.downsample = lambda x, shape: F.interpolate(
+            x.transpose(1, 2), size=shape[0], mode='linear', align_corners=False
+        ).transpose(1, 2)
+        self.upsample = lambda x, shape: F.interpolate(
+            x.transpose(1, 2), size=shape[0], mode='linear', align_corners=False
+        ).transpose(1, 2)
         
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)

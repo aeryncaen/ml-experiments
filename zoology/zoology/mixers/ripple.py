@@ -37,13 +37,13 @@ class RippleMixer(nn.Module):
         max_seq_len: int = 8192,
         use_triton: bool = True,
         jacobi_iters: int = 12,
-        siren_conv: bool = False,
+        siren_conv: bool = True,
         dim_divisor: int = 1,
     ):
         super().__init__()
         import math
         if max_kernel_size is None:
-            max_kernel_size = int(math.isqrt(max_seq_len))
+            max_kernel_size = 16
         channels = d_model // dim_divisor
         self.d_model = d_model
         self.channels = channels
