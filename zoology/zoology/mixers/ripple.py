@@ -39,6 +39,8 @@ class RippleMixer(nn.Module):
         jacobi_iters: int = 12,
         siren_conv: bool = False,
         dim_divisor: int = 1,
+        differential: bool = True,
+        embed_residual: bool = True,
     ):
         super().__init__()
         import math
@@ -59,6 +61,8 @@ class RippleMixer(nn.Module):
             max_seq_len=max_seq_len,
             jacobi_iters=jacobi_iters,
             siren_conv=siren_conv,
+            differential=differential,
+            embed_residual=embed_residual,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

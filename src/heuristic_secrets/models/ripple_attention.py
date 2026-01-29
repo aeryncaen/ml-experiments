@@ -116,25 +116,30 @@ class CausalSelfAttention(nn.Module):
     where Q,K are split into two halves and λ is a learnable scalar.
     """
 
-    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0):
+    def __init__(self, channels: int, num_heads: int = 1, dropout: float = 0.1, layer_idx: int = 0, differential: bool = True):
         super().__init__()
         import math as _math
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.half_dim = self.head_dim // 2
         self.dropout = dropout
+        self.differential = differential
         self.lambda_init = 0.8 - 0.6 * _math.exp(-0.3 * layer_idx)
 
         self.qkv = nn.Linear(channels, 3 * channels, bias=True)
-        self.q_norm = RMSNorm(self.half_dim)
-        self.k_norm = RMSNorm(self.half_dim)
-        self.head_norm = RMSNorm(self.head_dim)
+        if differential:
+            self.q_norm = RMSNorm(self.half_dim)
+            self.k_norm = RMSNorm(self.half_dim)
+            self.head_norm = RMSNorm(self.head_dim)
 
-        # λ reparameterization: exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
-        self.lambda_q1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            # λ reparameterization: exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+            self.lambda_q1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_k1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_q2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_k2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+        else:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
         self.out_proj = nn.Linear(channels, channels, bias=True)
 
@@ -144,34 +149,35 @@ class CausalSelfAttention(nn.Module):
 
         qkv = F.silu(self.qkv(x))
         q, k, v = qkv.reshape(B, L, 3, H, D).unbind(2)
-
-        # Split Q,K into two halves for differential attention
-        q1, q2 = q[..., :D2], q[..., D2:]  # (B, L, H, D2)
-        k1, k2 = k[..., :D2], k[..., D2:]
-
-        # QK norm on each half
-        q1 = self.q_norm(q1).transpose(1, 2)
-        q2 = self.q_norm(q2).transpose(1, 2)
-        k1 = self.k_norm(k1).transpose(1, 2)
-        k2 = self.k_norm(k2).transpose(1, 2)
-        v = v.transpose(1, 2)  # (B, H, L, D)
-
-        # Learnable λ
-        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
-               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
-               + self.lambda_init)
-
         drop_p = self.dropout if self.training else 0.0
-        out1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, dropout_p=drop_p)
-        out2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, dropout_p=drop_p)
 
-        # Differential: cancel attention noise
-        diff = out1 - lam * out2  # (B, H, L, D)
+        if self.differential:
+            q1, q2 = q[..., :D2], q[..., D2:]
+            k1, k2 = k[..., :D2], k[..., D2:]
 
-        # Per-head RMSNorm + fixed scale to align gradient flow
-        diff = self.head_norm(diff) * (1 - self.lambda_init)
+            q1 = self.q_norm(q1).transpose(1, 2)
+            q2 = self.q_norm(q2).transpose(1, 2)
+            k1 = self.k_norm(k1).transpose(1, 2)
+            k2 = self.k_norm(k2).transpose(1, 2)
+            v = v.transpose(1, 2)
 
-        out = diff.transpose(1, 2).reshape(B, L, C)
+            lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+                   - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+                   + self.lambda_init)
+
+            out1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, dropout_p=drop_p)
+            out2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, dropout_p=drop_p)
+
+            diff = out1 - lam * out2
+            diff = self.head_norm(diff) * (1 - self.lambda_init)
+            out = diff.transpose(1, 2).reshape(B, L, C)
+        else:
+            q = self.q_norm(q).transpose(1, 2)
+            k = self.k_norm(k).transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_p)
+            out = out.transpose(1, 2).reshape(B, L, C)
+
         return F.silu(self.out_proj(out)), {}
 
 
@@ -289,6 +295,8 @@ class RippleAttention(nn.Module):
         max_seq_len: int = 8192,
         jacobi_iters: int = 12,
         siren_conv: bool = False,
+        differential: bool = True,
+        embed_residual: bool = True,
     ):
         super().__init__()
         import math
@@ -296,6 +304,7 @@ class RippleAttention(nn.Module):
             max_kernel_size = 16
         self.channels = channels
         self.num_heads = num_heads
+        self.embed_residual = embed_residual
         self.order = [s.strip() for s in order.split(",")]
         
         unique_ops = list(dict.fromkeys(self.order))
@@ -343,7 +352,7 @@ class RippleAttention(nn.Module):
             )
         
         if 'attn' in unique_ops:
-            self.attn_op = CausalSelfAttention(channels, num_heads=num_heads)
+            self.attn_op = CausalSelfAttention(channels, num_heads=num_heads, differential=differential)
 
         if 'jacobi' in unique_ops:
             self.jacobi = MIMOJacobiSSM(channels, n_iters=jacobi_iters)
@@ -372,7 +381,7 @@ class RippleAttention(nn.Module):
                 raise ValueError(f"Unknown layer: {name}")
             h = h + self.norms[name](out)
         
-        return x + h, info
+        return (x + h, info) if self.embed_residual else (h, info)
 
 
 class RippleBlock(nn.Module):
