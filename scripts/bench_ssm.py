@@ -328,11 +328,11 @@ def make_models(dim):
     mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
     return {
-        'DS1': ds1,
+        # 'DS1': ds1,
         'DS1++': ds1_pp,
-        'S4D': s4d,
-        'S5': s5,
-        'Mamba': mamba,
+        # 'S4D': s4d,
+        # 'S5': s5,
+        # 'Mamba': mamba,
     }
 
 

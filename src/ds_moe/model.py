@@ -23,6 +23,34 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
+def project_l1_ball(z: torch.Tensor, C: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Project z onto the L1 ball {p : ‖p‖₁ ≤ C}.
+    Signed sparse output: exact zeros for small entries, negative weights allowed.
+    C is broadcastable scalar (learnable radius).
+    """
+    abs_z = z.abs()
+    l1_norm = abs_z.sum(dim=dim, keepdim=True)
+    # if already inside ball, return z unchanged
+    needs_proj = (l1_norm > C).squeeze(dim)
+    if not needs_proj.any():
+        return z
+    # project |z| onto simplex of radius C, then restore signs
+    # same algorithm as sparsemax but target sum = C instead of 1
+    abs_sorted, _ = abs_z.sort(dim=dim, descending=True)
+    n = z.size(dim)
+    k = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
+    shape = [1] * z.ndim
+    shape[dim] = -1
+    k = k.view(shape)
+    cumsum = abs_sorted.cumsum(dim=dim)
+    # support: largest k such that abs_sorted[k] > (cumsum[k] - C) / k
+    support = (abs_sorted * k > cumsum - C).sum(dim=dim, keepdim=True).to(z.dtype)
+    tau = (cumsum.gather(dim, (support - 1).long().clamp(min=0)) - C) / support
+    projected = z.sign() * (abs_z - tau).clamp(min=0)
+    # only apply projection where needed
+    return torch.where(needs_proj.unsqueeze(dim).expand_as(z), projected, z)
+
+
 def apply_interleaved_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     """Interleaved RoPE: even/odd index rotation.
     x: (..., N)  where N is even
@@ -131,7 +159,7 @@ class DS1(nn.Module):
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
             self.attn_gate = nn.Parameter(torch.tensor(0.5))
-            self.poly_scale = nn.Parameter(torch.tensor(0.01))  # dynamic scale, init conservative
+            self.attn_C = nn.Parameter(torch.tensor(0.5))  # L1 ball radius for signed sparse attn
             # 80% shared with B/C, 20% dedicated
             self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
             self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
@@ -317,10 +345,10 @@ class DS1(nn.Module):
             V = V_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
             Q = self.q_norm(Q)
             K = self.k_norm(K)
-            # squared polynomial attention: full Q,K,V — no differential split
+            # signed sparse attention via L1 ball projection
             scale = N ** -0.5
             S = Q @ K.transpose(-2, -1) * scale  # (B, R, L, L)
-            A = S.pow(2) * self.poly_scale        # non-negative
+            A = project_l1_ball(S, self.attn_C.abs(), dim=-1)  # signed + sparse
             H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
