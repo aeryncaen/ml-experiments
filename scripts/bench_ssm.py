@@ -329,7 +329,7 @@ def make_models(dim):
 
     return {
         # 'DS1': ds1,      # already single layer, unchanged
-        'DS1++': ds1_pp,    # already single layer, per-head attn_C update
+        # 'DS1++': ds1_pp, # already single layer, have numbers
         'S4D': s4d,         # was 3 layers, now 1 layer d_state=384
         # 'S5': s5,         # already single layer, unchanged
         'Mamba': mamba,     # was 2 layers, now 1 layer expand=2
