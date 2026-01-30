@@ -131,6 +131,9 @@ class DS1(nn.Module):
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
             self.attn_gate = nn.Parameter(torch.tensor(0.5))
+            # 80% shared with B/C, 20% dedicated
+            self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
+            self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
@@ -161,7 +164,8 @@ class DS1(nn.Module):
         if out_gate:
             size += D * D      # to_Z
         if diff_attn:
-            size += 3 * D * N * R  # to_Q, to_K, to_V
+            ded = N * R - int(0.8 * N * R)  # 20% dedicated dims
+            size += 3 * D * ded  # to_Q_ded, to_K_ded, to_V_ded
         return size
 
     def _unpack_weights(self, ssm_w: torch.Tensor) -> tuple:
@@ -187,12 +191,16 @@ class DS1(nn.Module):
         w_lambda = take(D, 1)         # (D, 1)
         w_out = take(N * R, D)        # (N*R, D)
         w_Z = take(D, D) if self.out_gate else None  # (D, D)
-        w_Q = take(D, N * R) if self.diff_attn else None  # (D, N*R)
-        w_K = take(D, N * R) if self.diff_attn else None  # (D, N*R)
-        w_V = take(D, N * R) if self.diff_attn else None  # (D, N*R)
+        if self.diff_attn:
+            ded = self.attn_ded_dims
+            w_Q_ded = take(D, ded)  # (D, ded)
+            w_K_ded = take(D, ded)
+            w_V_ded = take(D, ded)
+        else:
+            w_Q_ded = w_K_ded = w_V_ded = None
 
         assert idx == ssm_w.numel(), f"Bank unpack mismatch: used {idx}, have {ssm_w.numel()}"
-        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q, w_K, w_V
+        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q_ded, w_K_ded, w_V_ded
 
     def forward(self, x: torch.Tensor, ssm_w: torch.Tensor) -> torch.Tensor:
         """
@@ -204,7 +212,7 @@ class DS1(nn.Module):
         N, R = self.N, self.R
         act = self.act
 
-        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q, w_K, w_V = self._unpack_weights(ssm_w)
+        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q_ded, w_K_ded, w_V_ded = self._unpack_weights(ssm_w)
 
         B_proj = act(x @ w_B + self.B_bias)         # (B, L, N*R)
         C_proj = act(x @ w_C + self.C_bias)         # (B, L, N*R)
@@ -288,10 +296,20 @@ class DS1(nn.Module):
 
         if self.diff_attn:
             half_N = N // 2
-            # dedicated Q, K, V projections
-            Q = (x @ w_Q).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()  # (B, R, L, N)
-            K = (x @ w_K).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
-            V = (x @ w_V).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
+            sd = self.attn_shared_dims
+            # 80% shared with B/C, 20% dedicated
+            Q_shared = (x @ w_B)[:, :, :sd]   # reuse B proj
+            Q_ded = x @ w_Q_ded               # dedicated
+            Q_full = torch.cat([Q_shared, Q_ded], dim=-1)  # (B, L, N*R)
+            K_shared = (x @ w_C)[:, :, :sd]   # reuse C proj
+            K_ded = x @ w_K_ded
+            K_full = torch.cat([K_shared, K_ded], dim=-1)
+            V_shared = (x @ w_B)[:, :, :sd]   # reuse B proj (content)
+            V_ded = x @ w_V_ded
+            V_full = torch.cat([V_shared, V_ded], dim=-1)
+            Q = Q_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()  # (B, R, L, N)
+            K = K_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
+            V = V_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
             Q1, Q2 = Q[..., :half_N], Q[..., half_N:]
             K1, K2 = K[..., :half_N], K[..., half_N:]
             V1, V2 = V[..., :half_N], V[..., half_N:]
