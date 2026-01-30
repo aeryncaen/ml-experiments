@@ -130,7 +130,7 @@ class DS1(nn.Module):
 
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
-            self.attn_gate = nn.Parameter(torch.zeros(1))
+            self.attn_gate = nn.Parameter(torch.ones(1))
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
@@ -226,6 +226,25 @@ class DS1(nn.Module):
         C_rot = C_base
         prev_inject = None
 
+        if self.diff_attn:
+            # global mixing before local iterations — seed H with attended content
+            angles_0 = theta.unsqueeze(1) * pos[None, None, :, None]
+            if self.rope_dims < N:
+                angles_0 = angles_0.clone()
+                angles_0[..., self.rope_dims // 2:] = 0
+            B_rot_0 = apply_interleaved_rope(B_base, angles_0)
+            inject_0 = B_rot_0 * X_r
+            C_rot_0 = apply_interleaved_rope(C_base, angles_0)
+            half_N = N // 2
+            Q1, Q2 = C_rot_0[..., :half_N], C_rot_0[..., half_N:]
+            K1, K2 = B_rot_0[..., :half_N], B_rot_0[..., half_N:]
+            V1, V2 = inject_0[..., :half_N], inject_0[..., half_N:]
+            O1 = F.scaled_dot_product_attention(Q1, K1, V1)
+            O2 = F.scaled_dot_product_attention(Q2, K2, V2)
+            H_attn = torch.cat([O1 - self.attn_lambda * O2,
+                                O1 + self.attn_lambda * O2], dim=-1)
+            H = self.attn_gate * H_attn
+
         for i in range(self.n_iters):
             angles = theta.unsqueeze(1) * pos[None, None, :, None] * (i + 1)
             if self.rope_dims < N:
@@ -263,19 +282,6 @@ class DS1(nn.Module):
             H_flat = F.conv1d(H_flat, w_i, b_i,
                               padding=self.kernel_size // 2, groups=N)
             H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
-
-        if self.diff_attn:
-            half_N = N // 2
-            Q1, Q2 = C_rot[..., :half_N], C_rot[..., half_N:]
-            K1, K2 = B_rot[..., :half_N], B_rot[..., half_N:]
-            # SDPA expects (B, heads, L, head_dim) — R=heads, half_N=head_dim
-            # V=inject: (B, R, L, N) — split to match Q/K halves
-            V1, V2 = inject[..., :half_N], inject[..., half_N:]
-            O1 = F.scaled_dot_product_attention(Q1, K1, V1)
-            O2 = F.scaled_dot_product_attention(Q2, K2, V2)
-            H_attn = torch.cat([O1 - self.attn_lambda * O2,
-                                O1 + self.attn_lambda * O2], dim=-1)
-            H = H + self.attn_gate * H_attn
 
         if self.diff_readout:
             half_N = N // 2
