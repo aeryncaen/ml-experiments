@@ -84,13 +84,17 @@ class DSAttention(nn.Module):
 
 
 
+        # Learnable temperature for entmax sparsity control
+        # init ~0.01 gives ~50% sparsity
+        self.log_scale = nn.Parameter(torch.tensor(-4.6))  # exp(-4.6) ~ 0.01
+
         if diff_readout:
             self.readout_lambda = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
         N, R = self.N, self.R
-        scale = N ** -0.5
+        scale = self.log_scale.exp()
 
         # Project Q, K, V
         Q = F.silu(self.to_Q(x)).view(B, L, N, R).permute(0, 3, 1, 2)  # (B, R, L, N)
