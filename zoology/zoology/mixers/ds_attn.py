@@ -22,29 +22,24 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
-def entmax15(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """1.5-entmax: sparse attention mapping (Correia et al., 2019).
-    Like softmax but produces exact zeros. Smooth gradients everywhere.
-    Maps R^n -> simplex with sparsity.
+def entmax15(z: torch.Tensor, dim: int = -1, n_iter: int = 25) -> torch.Tensor:
+    """1.5-entmax via bisection (Correia et al., 2019).
+    Sparse attention: exact zeros, smooth gradients, sums to 1.
+    For alpha=1.5: p_i = [max(0, z_i - tau)]^2, find tau s.t. sum(p) = 1.
     """
     z = z - z.max(dim=dim, keepdim=True).values  # numerical stability
-    z = z / 2  # alpha=1.5 scaling
 
-    sorted_z, _ = z.sort(dim=dim, descending=True)
-    n = z.size(dim)
-    k = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
-    shape = [1] * z.ndim
-    shape[dim] = -1
-    k = k.view(shape)
+    # Bisection to find tau such that sum(max(0, z - tau)^2) = 1
+    lo = z.min(dim=dim, keepdim=True).values - 1.0
+    hi = z.max(dim=dim, keepdim=True).values
+    for _ in range(n_iter):
+        mid = (lo + hi) / 2
+        p = F.relu(z - mid).square()
+        s = p.sum(dim=dim, keepdim=True)
+        lo = torch.where(s > 1.0, mid, lo)
+        hi = torch.where(s > 1.0, hi, mid)
 
-    # Find tau via cumulative sum
-    cumsum = sorted_z.cumsum(dim=dim)
-    # For alpha=1.5: threshold is (cumsum - 1) / k, support where sorted > tau
-    tau_candidate = (cumsum - 1.0) / k
-    support = (sorted_z > tau_candidate).sum(dim=dim, keepdim=True).to(z.dtype)
-    tau = (cumsum.gather(dim, (support - 1).long().clamp(min=0)) - 1.0) / support
-
-    # ReLU gives exact zeros, square gives alpha=1.5 mapping
+    tau = (lo + hi) / 2
     return F.relu(z - tau).square()
 
 
