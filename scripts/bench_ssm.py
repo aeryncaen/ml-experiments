@@ -283,17 +283,28 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
+class StackedSSM(nn.Module):
+    """Stack N identical SSM layers with residual connections."""
+    def __init__(self, make_layer, n_layers):
+        super().__init__()
+        self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + layer(x)
+        return x
+
+
 def make_models(dim):
-    """Build models with roughly matched param counts."""
-    # DS1: ~55K at dim=64, state_dim=64, mimo_rank=4
+    """Build models with roughly matched param counts (~51-57K)."""
+    # DS1: 1 layer, ~56.6K params
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
 
-    # S4D: d_model=dim, d_state tuned to match params
-    # S4D params ≈ d_model*d_state (kernel) + 2*d_model (D + output_linear)
-    s4d = S4D(d_model=dim, d_state=64)
+    # S4D: 3 layers × d_state=64 = ~49.9K params
+    s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
 
-    # Mamba: d_model=dim, expand/d_state tuned
-    mamba = MambaPure(d_model=dim, d_state=16, d_conv=4, expand=2)
+    # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
+    mamba = StackedSSM(lambda: MambaPure(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
     return {
         'DS1': ds1,
