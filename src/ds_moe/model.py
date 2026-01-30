@@ -130,7 +130,7 @@ class DS1(nn.Module):
 
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
-            self.attn_gate = nn.Parameter(torch.ones(1))
+            self.attn_gate = nn.Parameter(torch.tensor(0.5))
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
