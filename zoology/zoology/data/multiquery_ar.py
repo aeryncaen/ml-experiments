@@ -105,15 +105,15 @@ def multiquery_ar(
     key_choices = np.arange(1, key_vocab_size)
     value_choices = np.arange(key_vocab_size, vocab_size)
 
+    # Vectorized sampling: shuffle each row, take first num_kv_pairs
     keys_unshuffled = np.tile(key_choices, (num_examples, 1))
-    print(f"[TRACE] multiquery_ar: apply_along_axis keys...", flush=True)
-    keys = np.apply_along_axis(np.random.choice, 1, keys_unshuffled, replace=False, size=num_kv_pairs)
-    print(f"[TRACE] multiquery_ar: keys done", flush=True)
+    rng = np.random.default_rng(seed)
+    idx = np.argsort(rng.random(keys_unshuffled.shape), axis=1)
+    keys = np.take_along_axis(keys_unshuffled, idx[:, :num_kv_pairs], axis=1)
 
     values_unshuffled = np.tile(value_choices, (num_examples, 1))
-    print(f"[TRACE] multiquery_ar: apply_along_axis values...", flush=True)
-    values = np.apply_along_axis(np.random.choice, 1, values_unshuffled, replace=False, size=num_kv_pairs)
-    print(f"[TRACE] multiquery_ar: values done", flush=True)
+    idx = np.argsort(rng.random(values_unshuffled.shape), axis=1)
+    values = np.take_along_axis(values_unshuffled, idx[:, :num_kv_pairs], axis=1)
 
     # create sequences
     kvs = np.zeros((num_examples, context_size), dtype=np.int64)
@@ -126,10 +126,12 @@ def multiquery_ar(
     p = power_a * np.arange(1, space + 1) ** (power_a-1)
     p = p / p.sum()
 
-    x = np.stack([np.arange(space, dtype=int)] * num_examples)
-    print(f"[TRACE] multiquery_ar: apply_along_axis gaps...", flush=True)
-    gaps = np.apply_along_axis(np.random.choice, axis=1, arr=x, replace=False, p=p, size=num_kv_pairs)
-    print(f"[TRACE] multiquery_ar: gaps done", flush=True)
+    # Weighted sampling without replacement via Gumbel-max trick
+    log_p = np.log(p)
+    gumbel_noise = rng.gumbel(size=(num_examples, space))
+    perturbed = log_p + gumbel_noise
+    gap_idx = np.argpartition(-perturbed, num_kv_pairs, axis=1)[:, :num_kv_pairs]
+    gaps = gap_idx
 
     # queries and answers
     queries = np.zeros((num_examples, input_seq_len - context_size + 1), dtype=np.int64)
