@@ -53,7 +53,7 @@ for input_seq_len, num_kv_pairs in [
     )
 
     for d_model in [32, 64, 128, 256, 512]:
-        for lr in np.logspace(-4, -2, 4)[1:]:
+        for lr in np.logspace(-4, -2, 4)[2:]:
 
             # Determine num_heads: keep head_dim ~16-32 range
             if d_model <= 32:
