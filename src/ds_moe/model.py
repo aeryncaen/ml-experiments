@@ -128,6 +128,10 @@ class DS1(nn.Module):
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
 
+        # HiPPO-inspired frequency + decay priors
+        self.theta_bias = nn.Parameter(math.pi * torch.arange(state_dim // 2, dtype=torch.float32))
+        self.decay_bias = nn.Parameter(torch.full((state_dim,), 3.0))  # sigmoid(3)≈0.953
+
         if d_skip:
             # TODO: move to Block (C9) — stopgap residual inside DS1
             self.out_norm = RMSNorm(dim)
@@ -252,8 +256,8 @@ class DS1(nn.Module):
         B_proj = act(x @ w_B + self.B_bias)         # (B, L, N*R)
         C_proj = act(x @ w_C + self.C_bias)         # (B, L, N*R)
         X_r = act(x @ w_X)                          # (B, L, R)
-        decay = torch.sigmoid(x @ w_decay)           # (B, L, N)
-        theta = x @ w_theta                          # (B, L, N//2)
+        decay = torch.sigmoid(x @ w_decay + self.decay_bias)  # (B, L, N)
+        theta = x @ w_theta + self.theta_bias                # (B, L, N//2)
         lam = torch.sigmoid(x @ w_lambda)            # (B, L, 1)
 
         B_base = B_proj.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
