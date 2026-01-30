@@ -30,7 +30,8 @@ def entmax15(z: torch.Tensor, dim: int = -1, n_iter: int = 25) -> torch.Tensor:
     z = z - z.max(dim=dim, keepdim=True).values  # numerical stability
 
     # Bisection to find tau such that sum(max(0, z - tau)^2) = 1
-    lo = z.min(dim=dim, keepdim=True).values - 1.0
+    # Clamp lo to ignore -inf masked positions
+    lo = z.clamp(min=-100).min(dim=dim, keepdim=True).values - 1.0
     hi = z.max(dim=dim, keepdim=True).values
     for _ in range(n_iter):
         mid = (lo + hi) / 2
