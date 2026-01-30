@@ -91,17 +91,17 @@ class S5Wrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Mamba (real implementation from mamba checkout)
 # ---------------------------------------------------------------------------
-from mamba_ssm.modules.mamba_simple import Mamba
-
-
-class MambaWrapper(nn.Module):
-    """Wraps Mamba to accept (B, L, D) and return (B, L, D)."""
-    def __init__(self, d_model, **kwargs):
-        super().__init__()
-        self.mamba = Mamba(d_model=d_model, use_fast_path=True, **kwargs)
-
-    def forward(self, x):
-        return self.mamba(x)
+# from mamba_ssm.modules.mamba_simple import Mamba
+#
+#
+# class MambaWrapper(nn.Module):
+#     """Wraps Mamba to accept (B, L, D) and return (B, L, D)."""
+#     def __init__(self, d_model, **kwargs):
+#         super().__init__()
+#         self.mamba = Mamba(d_model=d_model, use_fast_path=True, **kwargs)
+#
+#     def forward(self, x):
+#         return self.mamba(x)
 
 
 # ---------------------------------------------------------------------------
@@ -269,15 +269,15 @@ def make_models(dim):
     # S5: state_width=256 = ~49.7K params
     s5 = S5Wrapper(width=dim, state_width=256)
 
-    # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
-    mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
+    # # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
+    # mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
     return {
         'DS1': ds1,
         'DS1+': ds1_plus,
         'S4D': s4d,
         'S5': s5,
-        'Mamba': mamba,
+        # 'Mamba': mamba,
     }
 
 
