@@ -145,6 +145,20 @@ def gen_selective_copy(B, L, D, n_markers=4, device='cpu'):
     return x, target
 
 
+def gen_parity(B, L, device='cpu'):
+    """Binary input {0,1}, target is running XOR (cumulative parity)."""
+    x = torch.randint(0, 2, (B, L), device=device)
+    target = x.cumsum(dim=1) % 2  # running parity
+    return x, target
+
+
+def gen_mod_arith(B, L, mod_base=5, device='cpu'):
+    """Digit input 0..mod_base-1, target is running sum mod base."""
+    x = torch.randint(0, mod_base, (B, L), device=device)
+    target = x.cumsum(dim=1) % mod_base
+    return x, target
+
+
 def gen_induction(B, L, vocab_size=32, device='cpu'):
     half = L // 2
     pattern = torch.randint(0, vocab_size, (B, half), device=device)
@@ -161,7 +175,17 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
 
-    if task_name == 'induction':
+    if task_name == 'parity':
+        vocab_size = 2
+        embed = nn.Embedding(vocab_size, dim).to(device)
+        head = nn.Linear(dim, vocab_size).to(device)
+        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+    elif task_name == 'mod_arith':
+        vocab_size = 5
+        embed = nn.Embedding(vocab_size, dim).to(device)
+        head = nn.Linear(dim, vocab_size).to(device)
+        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+    elif task_name == 'induction':
         vocab_size = 32
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
@@ -174,20 +198,31 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         readout = nn.Linear(dim, dim).to(device)
         opt = optim.Adam(list(model.parameters()) + list(readout.parameters()), lr=lr)
 
-    # warmup
-    for _ in range(3):
+    def _step(task_name):
         if task_name == 'delay':
             x, t = gen_delay(B, L, dim, device=device)
             y = readout(model(x))
-            F.mse_loss(y, t).backward()
+            return F.mse_loss(y, t)
         elif task_name == 'selective_copy':
             x, t = gen_selective_copy(B, L, dim, device=device)
             y = readout(model(proj_in(x)))
-            F.mse_loss(y[:, -4:, :], t).backward()
+            return F.mse_loss(y[:, -4:, :], t)
+        elif task_name == 'parity':
+            inp, tgt = gen_parity(B, L, device=device)
+            y = head(model(embed(inp)))
+            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+        elif task_name == 'mod_arith':
+            inp, tgt = gen_mod_arith(B, L, device=device)
+            y = head(model(embed(inp)))
+            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
         else:
             inp, tgt = gen_induction(B, L, vocab_size, device=device)
             y = head(model(embed(inp)))
-            F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1)).backward()
+            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+
+    # warmup
+    for _ in range(3):
+        _step(task_name).backward()
         opt.zero_grad(set_to_none=True)
 
     if device == 'cuda':
@@ -198,18 +233,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     t0 = time.perf_counter()
 
     for step in range(n_steps):
-        if task_name == 'delay':
-            x, target = gen_delay(B, L, dim, device=device)
-            y = readout(model(x))
-            loss = F.mse_loss(y, target)
-        elif task_name == 'selective_copy':
-            x, target = gen_selective_copy(B, L, dim, device=device)
-            y = readout(model(proj_in(x)))
-            loss = F.mse_loss(y[:, -4:, :], target)
-        else:
-            inp, tgt = gen_induction(B, L, vocab_size, device=device)
-            y = head(model(embed(inp)))
-            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+        loss = _step(task_name)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -259,9 +283,9 @@ def make_models(dim):
     # DS1 base: 1 layer, ~56.6K params
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
 
-    # DS1+: with output gate, D skip (~56.6K + 4096 gate + 64 skip = ~60.8K)
+    # DS1+: d_skip only (RMSNorm + residual, no gate)
     ds1_plus = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
-                           out_gate=True, d_skip=True)
+                           d_skip=True)
 
     # S4D: 3 layers × d_state=64 = ~49.9K params
     s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
@@ -284,7 +308,7 @@ def make_models(dim):
 if __name__ == '__main__':
     print(f"Device: {DEVICE}")
     dim = 64
-    tasks = ['delay', 'selective_copy', 'induction']
+    tasks = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
     n_steps = 2000
     B, L = 32, 32
 
