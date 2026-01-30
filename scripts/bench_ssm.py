@@ -6,12 +6,20 @@ Metrics: final loss, param count, peak memory, wall time
 Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box)
 """
 
-import sys, os, time, math
+import sys, os, time, math, random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from einops import rearrange, repeat
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mamba'))
@@ -287,6 +295,10 @@ def make_models(dim):
     ds1_plus = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
                            d_skip=True)
 
+    # DS1++: DS1 + differential attention (reuses B,C projections)
+    ds1_pp = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
+                         diff_attn=True)
+
     # S4D: 3 layers × d_state=64 = ~49.9K params
     s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
 
@@ -299,9 +311,10 @@ def make_models(dim):
     return {
         'DS1': ds1,
         'DS1+': ds1_plus,
-        'S4D': s4d,
-        'S5': s5,
-        'Mamba': mamba,
+        'DS1++': ds1_pp,
+        # 'S4D': s4d,
+        # 'S5': s5,
+        # 'Mamba': mamba,
     }
 
 
@@ -328,7 +341,11 @@ if __name__ == '__main__':
     all_names = list(models_info.keys())
     for task in tasks:
         for name in all_names:
-            torch.manual_seed(42)
+            random.seed(SEED)
+            np.random.seed(SEED)
+            torch.manual_seed(SEED)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(SEED)
             model = make_models(dim)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE)
             print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['reduction']*100:>7.1f}% {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")

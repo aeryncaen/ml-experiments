@@ -81,6 +81,7 @@ class DS1(nn.Module):
         rope_dims: int | None = None,
         out_gate: bool = False,
         d_skip: bool = False,
+        diff_attn: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -93,13 +94,16 @@ class DS1(nn.Module):
         self.diff_readout = diff_readout
         self.out_gate = out_gate
         self.d_skip = d_skip
+        self.diff_attn = diff_attn
         self.act = F.silu
 
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
 
         if d_skip:
+            # TODO: move to Block (C9) — stopgap residual inside DS1
             self.out_norm = RMSNorm(dim)
+            self.skip_gate = nn.Parameter(torch.ones(1))
 
         if diff_inject:
             self.inject_lambda = nn.Parameter(torch.tensor(0.5))
@@ -123,6 +127,10 @@ class DS1(nn.Module):
         self.has_se = diffuse_se
         if diffuse_se:
             self.diffuse_se = SqueezeExcite(state_dim)
+
+        if diff_attn:
+            self.attn_lambda = nn.Parameter(torch.tensor(0.5))
+            self.attn_gate = nn.Parameter(torch.zeros(1))
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
@@ -256,6 +264,17 @@ class DS1(nn.Module):
                               padding=self.kernel_size // 2, groups=N)
             H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
 
+        if self.diff_attn:
+            half_N = N // 2
+            Q1, Q2 = C_rot[..., :half_N], C_rot[..., half_N:]
+            K1, K2 = B_rot[..., :half_N], B_rot[..., half_N:]
+            scale = half_N ** -0.5
+            # (B, R, L, L)
+            A1 = torch.softmax(torch.einsum('brid,brjd->brij', Q1, K1) * scale, dim=-1)
+            A2 = torch.softmax(torch.einsum('brid,brjd->brij', Q2, K2) * scale, dim=-1)
+            H_attn = torch.einsum('brij,brjn->brin', A1 - self.attn_lambda * A2, inject)
+            H = H + self.attn_gate * H_attn
+
         if self.diff_readout:
             half_N = N // 2
             C1, C2 = C_rot[..., :half_N], C_rot[..., half_N:]
@@ -275,6 +294,6 @@ class DS1(nn.Module):
             y = y * z
 
         if self.d_skip:
-            y = self.out_norm(y) + x
+            y = self.out_norm(y) + self.skip_gate * x
 
         return y
