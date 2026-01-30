@@ -22,24 +22,30 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
-def project_l1_ball(z: torch.Tensor, C: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Project z onto the L1 ball {p : ||p||_1 <= C}.
-    Signed sparse output: exact zeros for small entries, negative weights allowed.
+def entmax15(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """1.5-entmax: sparse attention mapping (Correia et al., 2019).
+    Like softmax but produces exact zeros. Smooth gradients everywhere.
+    Maps R^n -> simplex with sparsity.
     """
-    abs_z = z.abs()
-    l1_norm = abs_z.sum(dim=dim, keepdim=True)
-    needs_proj = (l1_norm > C)                          # (... , 1) bool
-    abs_sorted, _ = abs_z.sort(dim=dim, descending=True)
+    z = z - z.max(dim=dim, keepdim=True).values  # numerical stability
+    z = z / 2  # alpha=1.5 scaling
+
+    sorted_z, _ = z.sort(dim=dim, descending=True)
     n = z.size(dim)
     k = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
     shape = [1] * z.ndim
     shape[dim] = -1
     k = k.view(shape)
-    cumsum = abs_sorted.cumsum(dim=dim)
-    support = (abs_sorted * k > cumsum - C).sum(dim=dim, keepdim=True).to(z.dtype)
-    tau = (cumsum.gather(dim, (support - 1).long().clamp(min=0)) - C) / support
-    projected = z.sign() * (abs_z - tau).clamp(min=0)
-    return torch.where(needs_proj.expand_as(z), projected, z)
+
+    # Find tau via cumulative sum
+    cumsum = sorted_z.cumsum(dim=dim)
+    # For alpha=1.5: threshold is (cumsum - 1) / k, support where sorted > tau
+    tau_candidate = (cumsum - 1.0) / k
+    support = (sorted_z > tau_candidate).sum(dim=dim, keepdim=True).to(z.dtype)
+    tau = (cumsum.gather(dim, (support - 1).long().clamp(min=0)) - 1.0) / support
+
+    # ReLU gives exact zeros, square gives alpha=1.5 mapping
+    return F.relu(z - tau).square()
 
 
 def apply_interleaved_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
@@ -80,9 +86,7 @@ class DSAttention(nn.Module):
         self.q_norm = RMSNorm(state_dim)
         self.k_norm = RMSNorm(state_dim)
 
-        # L1 ball radius per head (learnable, log-scale)
-        # init 2.5 -> exp(2.5)*sqrt(L) ~ 50% sparsity at typical L
-        self.log_attn_C = nn.Parameter(torch.full((mimo_rank,), 2.5))
+
 
         if diff_readout:
             self.readout_lambda = nn.Parameter(torch.tensor(0.5))
@@ -108,16 +112,13 @@ class DSAttention(nn.Module):
         Q = self.q_norm(Q)
         K = self.k_norm(K)
 
-        # Signed sparse attention via L1 ball projection
+        # Sparse attention via 1.5-entmax
         S = Q @ K.transpose(-2, -1) * scale            # (B, R, L, L)
 
-        # L1 ball projection — radius scales with sqrt(L)
-        C_per_head = (self.log_attn_C.exp() * (L ** 0.5)).view(1, R, 1, 1)
-        A = project_l1_ball(S, C_per_head, dim=-1)
-
-        # Causal mask: zero out future positions after projection
-        causal_mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), 1)
-        A = A.masked_fill(causal_mask, 0.0)
+        # Causal mask before entmax so masked positions get exact zero
+        causal_mask = torch.triu(torch.full((L, L), -1e9, device=x.device, dtype=x.dtype), 1)
+        S = S + causal_mask
+        A = entmax15(S, dim=-1)                         # (B, R, L, L) sparse
 
         # Apply attention
         out = A @ V                                     # (B, R, L, N)
