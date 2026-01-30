@@ -211,27 +211,45 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         if task_name == 'delay':
             x, t = gen_delay(B, L, dim, device=device)
             y = readout(model(x))
-            return F.mse_loss(y, t)
+            loss = F.mse_loss(y, t)
+            # R² accuracy: 1 - MSE/Var(target)
+            with torch.no_grad():
+                var = t.var()
+                acc = (1.0 - loss.detach() / var).item() if var > 0 else 0.0
+            return loss, acc
         elif task_name == 'selective_copy':
             x, t = gen_selective_copy(B, L, dim, device=device)
             y = readout(model(proj_in(x)))
-            return F.mse_loss(y[:, -4:, :], t)
+            loss = F.mse_loss(y[:, -4:, :], t)
+            with torch.no_grad():
+                var = t.var()
+                acc = (1.0 - loss.detach() / var).item() if var > 0 else 0.0
+            return loss, acc
         elif task_name == 'parity':
             inp, tgt = gen_parity(B, L, device=device)
             y = head(model(embed(inp)))
-            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            with torch.no_grad():
+                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
+            return loss, acc
         elif task_name == 'mod_arith':
             inp, tgt = gen_mod_arith(B, L, device=device)
             y = head(model(embed(inp)))
-            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            with torch.no_grad():
+                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
+            return loss, acc
         else:
             inp, tgt = gen_induction(B, L, vocab_size, device=device)
             y = head(model(embed(inp)))
-            return F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
+            with torch.no_grad():
+                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
+            return loss, acc
 
     # warmup
     for _ in range(3):
-        _step(task_name).backward()
+        _step(task_name)[0].backward()
         opt.zero_grad(set_to_none=True)
 
     if device == 'cuda':
@@ -241,13 +259,15 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     losses = []
     t0 = time.perf_counter()
 
+    accs = []
     for step in range(n_steps):
-        loss = _step(task_name)
+        loss, acc = _step(task_name)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         losses.append(loss.item())
+        accs.append(acc)
 
     if device == 'cuda':
         torch.cuda.synchronize()
@@ -259,10 +279,12 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
 
     initial = sum(losses[:10]) / 10
     final = sum(losses[-10:]) / 10
+    final_acc = sum(accs[-10:]) / 10
     return {
         'initial': initial,
         'final': final,
         'reduction': 1.0 - final / initial if initial > 0 else 0,
+        'acc': final_acc,
         'wall_s': wall,
         'peak_mem_mb': peak_mem,
     }
@@ -306,7 +328,7 @@ def make_models(dim):
     mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
     return {
-        # 'DS1': ds1,
+        'DS1': ds1,
         'DS1++': ds1_pp,
         # 'S4D': s4d,
         # 'S5': s5,
@@ -330,7 +352,7 @@ if __name__ == '__main__':
     print(f"\nRunning {n_steps} steps, B={B}, L={L}, dim={dim}")
     print('=' * 90)
 
-    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Reduc%':>8} {'Wall(s)':>8} {'Mem(MB)':>9}"
+    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Acc':>8} {'Wall(s)':>8} {'Mem(MB)':>9}"
     print(header)
     print('-' * 90)
 
@@ -344,5 +366,5 @@ if __name__ == '__main__':
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE)
-            print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['reduction']*100:>7.1f}% {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
+            print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
         print()

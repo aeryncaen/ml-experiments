@@ -131,7 +131,7 @@ class DS1(nn.Module):
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
             self.attn_gate = nn.Parameter(torch.tensor(0.5))
-            self.poly_scale = nn.Parameter(torch.tensor(0.1))  # dynamic scale, init conservative
+            self.poly_scale = nn.Parameter(torch.tensor(0.01))  # dynamic scale, init conservative
             # 80% shared with B/C, 20% dedicated
             self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
             self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
