@@ -134,7 +134,7 @@ class DS1(nn.Module):
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
-                  out_gate: bool = False) -> int:
+                  out_gate: bool = False, diff_attn: bool = False) -> int:
         """Total number of elements per layer in the SSM bank.
         Bank layout (transposed storage, each is (in_features, out_features)):
           to_B:      D x (N*R)
@@ -145,6 +145,9 @@ class DS1(nn.Module):
           to_lambda: D x 1
           out_proj:  (N*R) x D
           to_Z:      D x D  (only if out_gate=True)
+          to_Q:      D x (N*R)  (only if diff_attn=True)
+          to_K:      D x (N*R)  (only if diff_attn=True)
+          to_V:      D x (N*R)  (only if diff_attn=True)
         All stored as a single flat vector per layer.
         """
         N, R, D = state_dim, mimo_rank, dim
@@ -157,6 +160,8 @@ class DS1(nn.Module):
                 + N * R * D)   # out_proj
         if out_gate:
             size += D * D      # to_Z
+        if diff_attn:
+            size += 3 * D * N * R  # to_Q, to_K, to_V
         return size
 
     def _unpack_weights(self, ssm_w: torch.Tensor) -> tuple:
@@ -182,9 +187,12 @@ class DS1(nn.Module):
         w_lambda = take(D, 1)         # (D, 1)
         w_out = take(N * R, D)        # (N*R, D)
         w_Z = take(D, D) if self.out_gate else None  # (D, D)
+        w_Q = take(D, N * R) if self.diff_attn else None  # (D, N*R)
+        w_K = take(D, N * R) if self.diff_attn else None  # (D, N*R)
+        w_V = take(D, N * R) if self.diff_attn else None  # (D, N*R)
 
         assert idx == ssm_w.numel(), f"Bank unpack mismatch: used {idx}, have {ssm_w.numel()}"
-        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z
+        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q, w_K, w_V
 
     def forward(self, x: torch.Tensor, ssm_w: torch.Tensor) -> torch.Tensor:
         """
@@ -196,7 +204,7 @@ class DS1(nn.Module):
         N, R = self.N, self.R
         act = self.act
 
-        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z = self._unpack_weights(ssm_w)
+        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z, w_Q, w_K, w_V = self._unpack_weights(ssm_w)
 
         B_proj = act(x @ w_B + self.B_bias)         # (B, L, N*R)
         C_proj = act(x @ w_C + self.C_bias)         # (B, L, N*R)
@@ -280,14 +288,17 @@ class DS1(nn.Module):
 
         if self.diff_attn:
             half_N = N // 2
-            Q1, Q2 = C_rot[..., :half_N], C_rot[..., half_N:]
-            K1, K2 = B_rot[..., :half_N], B_rot[..., half_N:]
-            V1, V2 = inject[..., :half_N], inject[..., half_N:]
+            # dedicated Q, K, V projections
+            Q = (x @ w_Q).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()  # (B, R, L, N)
+            K = (x @ w_K).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
+            V = (x @ w_V).view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
+            Q1, Q2 = Q[..., :half_N], Q[..., half_N:]
+            K1, K2 = K[..., :half_N], K[..., half_N:]
+            V1, V2 = V[..., :half_N], V[..., half_N:]
             O1 = F.scaled_dot_product_attention(Q1, K1, V1)
             O2 = F.scaled_dot_product_attention(Q2, K2, V2)
             H_attn = torch.cat([O1 - self.attn_lambda * O2,
                                 O1 + self.attn_lambda * O2], dim=-1)
-            # project attended state same as SSM path: (B, R, L, N) -> (B, L, N*R) -> (B, L, D)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
 

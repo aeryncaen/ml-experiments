@@ -124,7 +124,8 @@ class DS1Wrapper(nn.Module):
         self.ds1 = DS1(dim=dim, state_dim=state_dim, mimo_rank=mimo_rank,
                         n_iters=n_iters, **kwargs)
         bank_size = DS1.bank_size(dim, state_dim, mimo_rank,
-                                   out_gate=kwargs.get('out_gate', False))
+                                   out_gate=kwargs.get('out_gate', False),
+                                   diff_attn=kwargs.get('diff_attn', False))
         self.bank = nn.Parameter(torch.randn(bank_size) * 0.02)
 
     def forward(self, x):
