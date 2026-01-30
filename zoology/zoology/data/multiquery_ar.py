@@ -13,7 +13,12 @@ class MQARConfig(DataSegmentConfig):
     include_slices: bool=True
 
     def build(self, seed: int) -> DataSegment:
-        return multiquery_ar(**self.model_dump(), seed=seed)
+        print(f"[TRACE] MQARConfig.build: model_dump starting", flush=True)
+        d = self.model_dump()
+        print(f"[TRACE] MQARConfig.build: model_dump done, calling multiquery_ar", flush=True)
+        result = multiquery_ar(**d, seed=seed)
+        print(f"[TRACE] MQARConfig.build: multiquery_ar done", flush=True)
+        return result
 
 def multiquery_ar(
     vocab_size: int,
@@ -85,6 +90,7 @@ def multiquery_ar(
     Raises:
         Warning: If potential data leakage is detected between the train and test sets.
     """
+    print(f"[TRACE] multiquery_ar: entered, seq_len={input_seq_len}, n={num_examples}, kv={num_kv_pairs}", flush=True)
     assert input_seq_len % 2 == 0, "input_seq_len must be even"
     assert vocab_size > input_seq_len
     assert num_kv_pairs * 2 * num_passes + num_kv_pairs * 2 <= input_seq_len  
@@ -100,10 +106,14 @@ def multiquery_ar(
     value_choices = np.arange(key_vocab_size, vocab_size)
 
     keys_unshuffled = np.tile(key_choices, (num_examples, 1))
+    print(f"[TRACE] multiquery_ar: apply_along_axis keys...", flush=True)
     keys = np.apply_along_axis(np.random.choice, 1, keys_unshuffled, replace=False, size=num_kv_pairs)
+    print(f"[TRACE] multiquery_ar: keys done", flush=True)
 
     values_unshuffled = np.tile(value_choices, (num_examples, 1))
+    print(f"[TRACE] multiquery_ar: apply_along_axis values...", flush=True)
     values = np.apply_along_axis(np.random.choice, 1, values_unshuffled, replace=False, size=num_kv_pairs)
+    print(f"[TRACE] multiquery_ar: values done", flush=True)
 
     # create sequences
     kvs = np.zeros((num_examples, context_size), dtype=np.int64)
@@ -117,7 +127,9 @@ def multiquery_ar(
     p = p / p.sum()
 
     x = np.stack([np.arange(space, dtype=int)] * num_examples)
+    print(f"[TRACE] multiquery_ar: apply_along_axis gaps...", flush=True)
     gaps = np.apply_along_axis(np.random.choice, axis=1, arr=x, replace=False, p=p, size=num_kv_pairs)
+    print(f"[TRACE] multiquery_ar: gaps done", flush=True)
 
     # queries and answers
     queries = np.zeros((num_examples, input_seq_len - context_size + 1), dtype=np.int64)
