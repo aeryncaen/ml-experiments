@@ -67,7 +67,7 @@ class DS1(nn.Module):
     to_theta, to_lambda, out_proj) are NOT stored here. They live in the
     model shell's ssm_bank and are passed as `ssm_w` to forward().
 
-    This module stores only small per-op params: B/C biases, conv weights,
+    This module stores only small per-op params: B/C biases, depthwise conv,
     optional SE, optional BC-norm, optional diff lambdas.
     """
 
@@ -77,17 +77,21 @@ class DS1(nn.Module):
         state_dim: int = 64,
         mimo_rank: int = 4,
         n_iters: int = 2,
+        kernel_size: int = 7,
         diffuse_se: bool = False,
         diff_inject: bool = False,
         diff_readout: bool = False,
         bc_norm: bool = False,
         relu2: bool = False,
+        rope_dims: int | None = None,
     ):
         super().__init__()
         self.D = dim
         self.N = state_dim
         self.R = mimo_rank
         self.n_iters = n_iters
+        self.kernel_size = kernel_size
+        self.rope_dims = rope_dims if rope_dims is not None else 12
         self.diff_inject = diff_inject
         self.diff_readout = diff_readout
         self.act = relu_squared if relu2 else F.silu
@@ -105,7 +109,8 @@ class DS1(nn.Module):
             self.b_norm = RMSNorm(state_dim)
             self.c_norm = RMSNorm(state_dim)
 
-        self.diffuse = nn.Conv1d(state_dim, state_dim, kernel_size=3, padding=1, groups=state_dim)
+        self.conv_weight = nn.Parameter(torch.randn(state_dim, 1, kernel_size) * 0.02)
+        self.conv_bias = nn.Parameter(torch.zeros(state_dim))
 
         self.has_se = diffuse_se
         if diffuse_se:
@@ -200,8 +205,10 @@ class DS1(nn.Module):
         prev_inject = None
 
         for i in range(self.n_iters):
-            # angles: (B, 1, L, N//2) = content_theta * position * iteration
             angles = theta.unsqueeze(1) * pos[None, None, :, None] * (i + 1)
+            if self.rope_dims < N:
+                angles = angles.clone()
+                angles[..., self.rope_dims // 2:] = 0
             B_rot = apply_interleaved_rope(B_base, angles)
             C_rot = apply_interleaved_rope(C_base, angles)
 
@@ -215,23 +222,24 @@ class DS1(nn.Module):
             else:
                 inject = B_rot * X_r
 
-            H = H.permute(0, 1, 3, 2).reshape(B_batch * R, N, L)
-            H = self.diffuse(H)
-            H = H.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
-
-            if self.has_se:
-                H_flat = H.reshape(B_batch * R, L, N)
-                H_flat = self.diffuse_se(H_flat)
-                H = H_flat.reshape(B_batch, R, L, N)
-
-            alpha = decay    # (B, 1, L, N)
-            gamma = lam     # (B, 1, L, 1)
+            alpha = decay
+            gamma = lam
             if prev_inject is not None:
                 beta = (1.0 - gamma) * alpha
                 H = alpha * H + beta * prev_inject + gamma * inject
             else:
                 H = alpha * H + inject
             prev_inject = inject
+
+            H_flat = H.permute(0, 1, 3, 2).reshape(B_batch * R, N, L)
+            H_flat = F.conv1d(H_flat, self.conv_weight, self.conv_bias,
+                              padding=self.kernel_size // 2, groups=N)
+            H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
+
+            if self.has_se:
+                H_flat = H.reshape(B_batch * R, L, N)
+                H_flat = self.diffuse_se(H_flat)
+                H = H_flat.reshape(B_batch, R, L, N)
 
         if self.diff_readout:
             half_N = N // 2

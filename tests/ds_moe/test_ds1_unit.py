@@ -3,6 +3,7 @@
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 import os
 
@@ -360,7 +361,8 @@ class TestDS1OldCodeParity:
                     inject = B_rot * X_r
 
                 H = H.permute(0, 1, 3, 2).reshape(B_batch * R, N, L)
-                H = ds1.diffuse(H)
+                H = F.conv1d(H, ds1.conv_weight, ds1.conv_bias,
+                             padding=ds1.conv_weight.shape[-1] // 2, groups=N)
                 H = H.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
 
                 if ds1.has_se:
@@ -405,12 +407,12 @@ class TestDS1OldCodeParity:
         old = MIMOJacobiSSM(dim=D, state_dim=N, mimo_rank=R, n_iters=2)
         self._zero_linear_biases(old)
 
-        new = self._make_ds1_no_pos_rope(D, N, R, n_iters=2)
+        new = self._make_ds1_no_pos_rope(D, N, R, n_iters=2, kernel_size=3)
         with torch.no_grad():
             new.B_bias.copy_(old.B_bias)
             new.C_bias.copy_(old.C_bias)
-            new.diffuse.weight.copy_(old.diffuse.weight)
-            new.diffuse.bias.copy_(old.diffuse.bias)
+            new.conv_weight.copy_(old.diffuse.weight)
+            new.conv_bias.copy_(old.diffuse.bias)
 
         bank = self._pack_old_weights(old)
         torch.manual_seed(99)
@@ -429,13 +431,13 @@ class TestDS1OldCodeParity:
                             diff_inject=True, diff_readout=True, bc_norm=True)
         self._zero_linear_biases(old)
 
-        new = self._make_ds1_no_pos_rope(D, N, R, n_iters=2,
+        new = self._make_ds1_no_pos_rope(D, N, R, n_iters=2, kernel_size=3,
                                          diff_inject=True, diff_readout=True, bc_norm=True)
         with torch.no_grad():
             new.B_bias.copy_(old.B_bias)
             new.C_bias.copy_(old.C_bias)
-            new.diffuse.weight.copy_(old.diffuse.weight)
-            new.diffuse.bias.copy_(old.diffuse.bias)
+            new.conv_weight.copy_(old.diffuse.weight)
+            new.conv_bias.copy_(old.diffuse.bias)
             new.inject_lambda.copy_(old.inject_lambda)
             new.readout_lambda.copy_(old.readout_lambda)
             new.b_norm.weight.copy_(old.b_norm.weight)
