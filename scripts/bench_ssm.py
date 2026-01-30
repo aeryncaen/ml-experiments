@@ -328,11 +328,11 @@ def make_models(dim):
     mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
     return {
-        'DS1': ds1,
-        'DS1++': ds1_pp,
-        'S4D': s4d,
-        'S5': s5,
-        'Mamba': mamba,
+        # 'DS1': ds1,      # already single layer, unchanged
+        'DS1++': ds1_pp,    # already single layer, per-head attn_C update
+        'S4D': s4d,         # was 3 layers, now 1 layer d_state=384
+        # 'S5': s5,         # already single layer, unchanged
+        'Mamba': mamba,     # was 2 layers, now 1 layer expand=2
     }
 
 
