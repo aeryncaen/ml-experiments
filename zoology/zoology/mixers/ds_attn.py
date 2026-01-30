@@ -28,9 +28,7 @@ def project_l1_ball(z: torch.Tensor, C: torch.Tensor, dim: int = -1) -> torch.Te
     """
     abs_z = z.abs()
     l1_norm = abs_z.sum(dim=dim, keepdim=True)
-    needs_proj = (l1_norm > C).squeeze(dim)
-    if not needs_proj.any():
-        return z
+    needs_proj = (l1_norm > C)                          # (... , 1) bool
     abs_sorted, _ = abs_z.sort(dim=dim, descending=True)
     n = z.size(dim)
     k = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
@@ -41,7 +39,7 @@ def project_l1_ball(z: torch.Tensor, C: torch.Tensor, dim: int = -1) -> torch.Te
     support = (abs_sorted * k > cumsum - C).sum(dim=dim, keepdim=True).to(z.dtype)
     tau = (cumsum.gather(dim, (support - 1).long().clamp(min=0)) - C) / support
     projected = z.sign() * (abs_z - tau).clamp(min=0)
-    return torch.where(needs_proj.unsqueeze(dim).expand_as(z), projected, z)
+    return torch.where(needs_proj.expand_as(z), projected, z)
 
 
 def apply_interleaved_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
