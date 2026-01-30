@@ -80,8 +80,8 @@ class DSAttention(nn.Module):
         self.q_norm = RMSNorm(state_dim)
         self.k_norm = RMSNorm(state_dim)
 
-        # L1 ball radius per head (learnable)
-        self.attn_C = nn.Parameter(torch.ones(mimo_rank))
+        # L1 ball radius per head (learnable, log-scale)
+        self.log_attn_C = nn.Parameter(torch.zeros(mimo_rank))
 
         if diff_readout:
             self.readout_lambda = nn.Parameter(torch.tensor(0.5))
@@ -110,8 +110,8 @@ class DSAttention(nn.Module):
         # Signed sparse attention via L1 ball projection
         S = Q @ K.transpose(-2, -1) * scale            # (B, R, L, L)
 
-        # L1 ball projection (signed sparse weights)
-        C_per_head = self.attn_C.abs().view(1, R, 1, 1)
+        # L1 ball projection — radius scales with sqrt(L)
+        C_per_head = (self.log_attn_C.exp() * (L ** 0.5)).view(1, R, 1, 1)
         A = project_l1_ball(S, C_per_head, dim=-1)
 
         # Causal mask: zero out future positions after projection
