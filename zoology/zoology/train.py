@@ -256,24 +256,38 @@ def _append_csv(config: TrainConfig, best_metrics: dict, n_params: int):
 
 
 def train(config: TrainConfig):
+    import time as _time
+    _t0 = _time.time()
+    def _mark(label):
+        print(f"[TRACE] {label}: {_time.time()-_t0:.2f}s", flush=True)
+
     set_determinism(config.seed)
+    _mark("set_determinism")
     
     logger = WandbLogger(config)
+    _mark("WandbLogger")
     logger.log_config(config)
+    _mark("log_config")
     config.print()
+    _mark("config.print")
 
     if config.input_type == "continuous":
         model = ContinuousInputModel(config.model)
+        _mark("ContinuousInputModel")
         train_dataloader, test_dataloader = prepare_continuous_data(
             config.data,
             embeddings=model.backbone.embeddings.word_embeddings.weight.detach(),
         )
+        _mark("prepare_continuous_data")
     else:
         model = LanguageModel(config.model)
+        _mark("LanguageModel")
         train_dataloader, test_dataloader = prepare_data(config.data)
+        _mark("prepare_data")
 
     n_params = sum(p.numel() for p in model.parameters())
     logger.log_model(model, config=config)
+    _mark("log_model")
 
     task = Trainer(
         model=model,
@@ -290,9 +304,12 @@ def train(config: TrainConfig):
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger=logger,
     )
+    _mark("Trainer init")
     task.fit()
+    _mark("fit")
     _append_csv(config, task.best_metrics, n_params)
     logger.finish()
+    _mark("done")
 
 
 if __name__ == "__main__":
