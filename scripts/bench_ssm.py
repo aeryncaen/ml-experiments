@@ -15,6 +15,7 @@ from einops import rearrange, repeat
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mamba'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 's5-pytorch'))
 
 DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 
@@ -69,6 +70,22 @@ class S4D(nn.Module):
         y = self.activation(y)
         y = self.output_linear(y)
         return y.transpose(-1, -2)
+
+
+# ---------------------------------------------------------------------------
+# S5 (PyTorch port from s5-pytorch checkout)
+# ---------------------------------------------------------------------------
+from s5.s5_model import S5 as S5Module
+
+
+class S5Wrapper(nn.Module):
+    """Wraps S5 to accept (B, L, H) and return (B, L, H)."""
+    def __init__(self, width, state_width=256):
+        super().__init__()
+        self.s5 = S5Module(width=width, state_width=state_width)
+
+    def forward(self, x):
+        return self.s5(x)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +266,9 @@ def make_models(dim):
     # S4D: 3 layers × d_state=64 = ~49.9K params
     s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
 
+    # S5: state_width=256 = ~49.7K params
+    s5 = S5Wrapper(width=dim, state_width=256)
+
     # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
     mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
@@ -256,6 +276,7 @@ def make_models(dim):
         'DS1': ds1,
         'DS1+': ds1_plus,
         'S4D': s4d,
+        'S5': s5,
         'Mamba': mamba,
     }
 
