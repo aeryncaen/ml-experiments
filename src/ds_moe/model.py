@@ -79,8 +79,8 @@ class DS1(nn.Module):
         n_iters: int = 2,
         kernel_size: int = 7,
         diffuse_se: bool = False,
-        diff_inject: bool = False,
-        diff_readout: bool = False,
+        diff_inject: bool = True,
+        diff_readout: bool = True,
         bc_norm: bool = False,
         relu2: bool = False,
         rope_dims: int | None = None,
@@ -116,8 +116,14 @@ class DS1(nn.Module):
             self.b_norm = RMSNorm(state_dim)
             self.c_norm = RMSNorm(state_dim)
 
-        self.conv_weight = nn.Parameter(torch.randn(state_dim, 1, kernel_size) * 0.02)
-        self.conv_bias = nn.Parameter(torch.zeros(state_dim))
+        self.conv_weight = nn.ParameterList([
+            nn.Parameter(torch.randn(state_dim, 1, kernel_size) * 0.02)
+            for _ in range(n_iters)
+        ])
+        self.conv_bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(state_dim))
+            for _ in range(n_iters)
+        ])
 
         self.has_se = diffuse_se
         if diffuse_se:
@@ -244,15 +250,16 @@ class DS1(nn.Module):
                 H = alpha * H + inject
             prev_inject = inject
 
-            H_flat = H.permute(0, 1, 3, 2).reshape(B_batch * R, N, L)
-            H_flat = F.conv1d(H_flat, self.conv_weight, self.conv_bias,
-                              padding=self.kernel_size // 2, groups=N)
-            H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
-
             if self.has_se:
                 H_flat = H.reshape(B_batch * R, L, N)
                 H_flat = self.diffuse_se(H_flat)
                 H = H_flat.reshape(B_batch, R, L, N)
+
+            H_flat = H.permute(0, 1, 3, 2).reshape(B_batch * R, N, L)
+            w_i, b_i = self.conv_weight[i], self.conv_bias[i]
+            H_flat = F.conv1d(H_flat, w_i, b_i,
+                              padding=self.kernel_size // 2, groups=N)
+            H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
 
         if self.diff_readout:
             half_N = N // 2
