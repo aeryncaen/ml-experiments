@@ -81,7 +81,8 @@ class DSAttention(nn.Module):
         self.k_norm = RMSNorm(state_dim)
 
         # L1 ball radius per head (learnable, log-scale)
-        self.log_attn_C = nn.Parameter(torch.zeros(mimo_rank))
+        # init 2.5 -> exp(2.5)*sqrt(L) ~ 50% sparsity at typical L
+        self.log_attn_C = nn.Parameter(torch.full((mimo_rank,), 2.5))
 
         if diff_readout:
             self.readout_lambda = nn.Parameter(torch.tensor(0.5))
