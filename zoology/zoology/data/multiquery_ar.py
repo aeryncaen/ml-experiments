@@ -110,10 +110,12 @@ def multiquery_ar(
     rng = np.random.default_rng(seed)
     idx = np.argsort(rng.random(keys_unshuffled.shape), axis=1)
     keys = np.take_along_axis(keys_unshuffled, idx[:, :num_kv_pairs], axis=1)
+    print(f"[TRACE] multiquery_ar: keys done", flush=True)
 
     values_unshuffled = np.tile(value_choices, (num_examples, 1))
     idx = np.argsort(rng.random(values_unshuffled.shape), axis=1)
     values = np.take_along_axis(values_unshuffled, idx[:, :num_kv_pairs], axis=1)
+    print(f"[TRACE] multiquery_ar: values done", flush=True)
 
     # create sequences
     kvs = np.zeros((num_examples, context_size), dtype=np.int64)
@@ -132,6 +134,7 @@ def multiquery_ar(
     perturbed = log_p + gumbel_noise
     gap_idx = np.argpartition(-perturbed, num_kv_pairs, axis=1)[:, :num_kv_pairs]
     gaps = gap_idx
+    print(f"[TRACE] multiquery_ar: gaps done", flush=True)
 
     # queries and answers
     queries = np.zeros((num_examples, input_seq_len - context_size + 1), dtype=np.int64)
