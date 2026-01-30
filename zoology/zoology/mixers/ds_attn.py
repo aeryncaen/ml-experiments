@@ -37,7 +37,7 @@ def entmax15(z: torch.Tensor, dim: int = -1, n_iter: int = 25) -> torch.Tensor:
         p = F.relu(z - mid).square()
         s = p.sum(dim=dim, keepdim=True)
         lo = torch.where(s > 1.0, mid, lo)
-        hi = torch.where(s > 1.0, hi, mid)
+        hi = torch.where(s <= 1.0, mid, hi)
 
     tau = (lo + hi) / 2
     return F.relu(z - tau).square()
