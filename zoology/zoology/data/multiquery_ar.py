@@ -137,21 +137,26 @@ def multiquery_ar(
     print(f"[TRACE] multiquery_ar: gaps done", flush=True)
 
     # queries and answers
+    print(f"[TRACE] multiquery_ar: building queries...", flush=True)
     queries = np.zeros((num_examples, input_seq_len - context_size + 1), dtype=np.int64)
     np.put_along_axis(queries, (gaps * 2), values=keys, axis=1)
     examples = np.concatenate([
         kvs, 
         queries
     ], axis=1)
+    print(f"[TRACE] multiquery_ar: queries done", flush=True)
 
     labels = np.full((num_examples, input_seq_len + 1), -100, dtype=np.int64)
     np.put_along_axis(labels, (gaps * 2) + context_size + 1, values=values, axis=1)
+    print(f"[TRACE] multiquery_ar: labels done", flush=True)
 
     inputs, labels = torch.tensor(examples[:, :-1]), torch.tensor(labels[:, 1:])
+    print(f"[TRACE] multiquery_ar: tensors done", flush=True)
     
     # replace all the 0 with random values
     if random_non_queries:
         inputs[inputs == 0] = torch.randint(vocab_size, size=inputs.shape)[inputs == 0]
+    print(f"[TRACE] multiquery_ar: returning", flush=True)
     return DataSegment(
         inputs, 
         labels, 
