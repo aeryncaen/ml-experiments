@@ -303,19 +303,19 @@ class DS1(nn.Module):
         if self.diff_attn:
             half_N = N // 2
             sd = self.attn_shared_dims
-            # 80% shared with B/C, 20% dedicated
-            Q_shared = (x @ w_B)[:, :, :sd]   # reuse B proj
-            Q_ded = x @ w_Q_ded               # dedicated
-            Q_full = torch.cat([Q_shared, Q_ded], dim=-1)  # (B, L, N*R)
-            K_shared = (x @ w_C)[:, :, :sd]   # reuse C proj
-            K_ded = x @ w_K_ded
-            K_full = torch.cat([K_shared, K_ded], dim=-1)
-            V_shared = (x @ w_B)[:, :, :sd]   # reuse B proj (content)
-            V_ded = x @ w_V_ded
-            V_full = torch.cat([V_shared, V_ded], dim=-1)
-            Q = Q_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()  # (B, R, L, N)
+            # 80% shared with B/C, 20% dedicated; bias + activation
+            Q_shared = (x @ w_B)[:, :, :sd]
+            Q_full = act(torch.cat([Q_shared, x @ w_Q_ded], dim=-1) + self.Q_bias)
+            K_shared = (x @ w_C)[:, :, :sd]
+            K_full = act(torch.cat([K_shared, x @ w_K_ded], dim=-1) + self.K_bias)
+            V_shared = (x @ w_B)[:, :, :sd]
+            V_full = act(torch.cat([V_shared, x @ w_V_ded], dim=-1) + self.V_bias)
+            # reshape to (B, R, L, N) then QK norm
+            Q = Q_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
             K = K_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
             V = V_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
+            Q = self.q_norm(Q)
+            K = self.k_norm(K)
             Q1, Q2 = Q[..., :half_N], Q[..., half_N:]
             K1, K2 = K[..., :half_N], K[..., half_N:]
             V1, V2 = V[..., :half_N], V[..., half_N:]

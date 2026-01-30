@@ -293,7 +293,7 @@ def make_models(dim):
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
 
     # DS1++: DS1 + differential attention (reuses B,C projections)
-    ds1_pp = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
+    ds1_pp = DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2,
                          diff_attn=True)
 
     # S4D: 3 layers × d_state=64 = ~49.9K params
