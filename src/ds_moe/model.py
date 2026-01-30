@@ -169,9 +169,9 @@ class DS1(nn.Module):
             self.V_bias = nn.Parameter(torch.ones(NR))
             self.q_norm = RMSNorm(state_dim)
             self.k_norm = RMSNorm(state_dim)
-            # attention-guided selective scan
-            self.scan_scale = nn.Parameter(torch.tensor(1.0))
-            self.scan_bias = nn.Parameter(torch.tensor(0.0))
+            # selective scan with independent gate from x
+            self.scan_gate_proj = nn.Linear(dim, mimo_rank, bias=True)
+            self.scan_gate_norm = RMSNorm(mimo_rank)
             self.scan_mix = nn.Parameter(torch.tensor(0.5))
 
     @staticmethod
@@ -357,13 +357,14 @@ class DS1(nn.Module):
             H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
-            # attention-guided selective scan over V
-            relevance = A.abs().sum(dim=-2)   # (B, R, L) — column L1 norm
-            gate = torch.sigmoid(self.scan_scale * relevance + self.scan_bias)  # (B, R, L)
+            # selective scan with independent content gate
+            scan_g = torch.sigmoid(act(self.scan_gate_norm(
+                self.scan_gate_proj(x))))             # (B, L, R)
+            scan_g = scan_g.permute(0, 2, 1).unsqueeze(-1)  # (B, R, L, 1)
             s = torch.zeros(B_batch, R, N, device=x.device, dtype=x.dtype)
-            scan_out = torch.zeros_like(V)    # (B, R, L, N)
+            scan_out = torch.zeros_like(V)            # (B, R, L, N)
             for t in range(L):
-                g = gate[:, :, t].unsqueeze(-1)   # (B, R, 1)
+                g = scan_g[:, :, t, :]                # (B, R, 1)
                 s = (1.0 - g) * s + g * V[:, :, t, :]  # (B, R, N)
                 scan_out[:, :, t, :] = s
             scan_flat = scan_out.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
