@@ -84,6 +84,8 @@ class DS1(nn.Module):
         bc_norm: bool = False,
         relu2: bool = False,
         rope_dims: int | None = None,
+        out_gate: bool = False,
+        d_skip: bool = False,
     ):
         super().__init__()
         self.D = dim
@@ -94,10 +96,15 @@ class DS1(nn.Module):
         self.rope_dims = rope_dims if rope_dims is not None else 12
         self.diff_inject = diff_inject
         self.diff_readout = diff_readout
+        self.out_gate = out_gate
+        self.d_skip = d_skip
         self.act = relu_squared if relu2 else F.silu
 
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
+
+        if d_skip:
+            self.D_skip = nn.Parameter(torch.ones(dim))
 
         if diff_inject:
             self.inject_lambda = nn.Parameter(torch.tensor(0.5))
@@ -117,7 +124,8 @@ class DS1(nn.Module):
             self.diffuse_se = SqueezeExcite(state_dim, relu2=relu2)
 
     @staticmethod
-    def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4) -> int:
+    def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
+                  out_gate: bool = False) -> int:
         """Total number of elements per layer in the SSM bank.
         Bank layout (transposed storage, each is (in_features, out_features)):
           to_B:      D x (N*R)
@@ -127,16 +135,20 @@ class DS1(nn.Module):
           to_theta:  D x (N//2)
           to_lambda: D x 1
           out_proj:  (N*R) x D
+          to_Z:      D x D  (only if out_gate=True)
         All stored as a single flat vector per layer.
         """
         N, R, D = state_dim, mimo_rank, dim
-        return (D * N * R      # to_B
+        size = (D * N * R      # to_B
                 + D * N * R    # to_C
                 + D * R        # to_X
                 + D * N        # to_decay
                 + D * (N // 2) # to_theta
                 + D * 1        # to_lambda
                 + N * R * D)   # out_proj
+        if out_gate:
+            size += D * D      # to_Z
+        return size
 
     def _unpack_weights(self, ssm_w: torch.Tensor) -> tuple:
         """Unpack flat weight vector into individual projection matrices.
@@ -160,9 +172,10 @@ class DS1(nn.Module):
         w_theta = take(D, N // 2)     # (D, N//2)
         w_lambda = take(D, 1)         # (D, 1)
         w_out = take(N * R, D)        # (N*R, D)
+        w_Z = take(D, D) if self.out_gate else None  # (D, D)
 
         assert idx == ssm_w.numel(), f"Bank unpack mismatch: used {idx}, have {ssm_w.numel()}"
-        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out
+        return w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z
 
     def forward(self, x: torch.Tensor, ssm_w: torch.Tensor) -> torch.Tensor:
         """
@@ -174,7 +187,7 @@ class DS1(nn.Module):
         N, R = self.N, self.R
         act = self.act
 
-        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out = self._unpack_weights(ssm_w)
+        w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, w_Z = self._unpack_weights(ssm_w)
 
         B_proj = act(x @ w_B + self.B_bias)         # (B, L, N*R)
         C_proj = act(x @ w_C + self.C_bias)         # (B, L, N*R)
@@ -254,4 +267,12 @@ class DS1(nn.Module):
 
         out = gated.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
         y = act(out @ w_out)
+
+        if self.out_gate:
+            z = F.silu(x @ w_Z)
+            y = y * z
+
+        if self.d_skip:
+            y = y + x * self.D_skip
+
         return y

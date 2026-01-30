@@ -319,7 +319,7 @@ class TestDS1OldCodeParity:
             B_batch, L, D = x.shape
             N, R = ds1.N, ds1.R
             act = ds1.act
-            w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out = ds1._unpack_weights(ssm_w)
+            w_B, w_C, w_X, w_decay, w_theta, w_lambda, w_out, _w_Z = ds1._unpack_weights(ssm_w)
 
             from ds_moe.model import apply_interleaved_rope
 

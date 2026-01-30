@@ -2,6 +2,8 @@
 
 Tasks: delay-1, selective copy, induction head
 Metrics: final loss, param count, peak memory, wall time
+
+Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box)
 """
 
 import sys, os, time, math
@@ -12,7 +14,6 @@ import torch.optim as optim
 from einops import rearrange, repeat
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 's4', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mamba'))
 
 DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -71,79 +72,19 @@ class S4D(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Mamba (pure-PyTorch slow path, no CUDA ops needed)
+# Mamba (real implementation from mamba checkout)
 # ---------------------------------------------------------------------------
-class MambaPure(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
-                 dt_min=0.001, dt_max=0.1, dt_scale=1.0):
+from mamba_ssm.modules.mamba_simple import Mamba
+
+
+class MambaWrapper(nn.Module):
+    """Wraps Mamba to accept (B, L, D) and return (B, L, D)."""
+    def __init__(self, d_model, **kwargs):
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.d_inner = int(expand * d_model)
-        self.dt_rank = math.ceil(d_model / 16)
-
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=d_conv,
-                                padding=d_conv - 1, groups=self.d_inner, bias=True)
-        self.act = nn.SiLU()
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-
-        # dt bias init
-        dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-
-        # A init (S4D real)
-        A = repeat(torch.arange(1, d_state + 1, dtype=torch.float32), 'n -> d n', d=self.d_inner).contiguous()
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D_skip = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        self.mamba = Mamba(d_model=d_model, use_fast_path=True, **kwargs)
 
     def forward(self, x):
-        # x: (B, L, D)
-        B_batch, L, _ = x.shape
-        xz = self.in_proj(x)  # (B, L, 2*d_inner)
-        xz = rearrange(xz, 'b l d -> b d l')
-        x_inner, z = xz.chunk(2, dim=1)  # each (B, d_inner, L)
-
-        # causal conv
-        x_inner = self.act(self.conv1d(x_inner)[..., :L])
-
-        # SSM projections
-        x_dbl = rearrange(x_inner, 'b d l -> (b l) d')
-        x_dbl = self.x_proj(x_dbl)
-        dt, B_ssm, C_ssm = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = self.dt_proj.weight @ dt.t()  # (d_inner, bl)
-        dt = rearrange(dt, 'd (b l) -> b d l', l=L)
-        dt = F.softplus(dt + self.dt_proj.bias.unsqueeze(-1))  # (B, d_inner, L)
-
-        B_ssm = rearrange(B_ssm, '(b l) n -> b l n', l=L)
-        C_ssm = rearrange(C_ssm, '(b l) n -> b l n', l=L)
-
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-
-        # selective scan (sequential, pure PyTorch)
-        y = torch.zeros_like(x_inner)  # (B, d_inner, L)
-        h = torch.zeros(B_batch, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
-        for t in range(L):
-            dt_t = dt[:, :, t]  # (B, d_inner)
-            B_t = B_ssm[:, t, :]  # (B, d_state)
-            C_t = C_ssm[:, t, :]  # (B, d_state)
-            x_t = x_inner[:, :, t]  # (B, d_inner)
-
-            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # (B, d_inner, d_state)
-            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # (B, d_inner, d_state)
-            h = h * dA + x_t.unsqueeze(-1) * dB
-            y_t = (h * C_t.unsqueeze(1)).sum(-1)  # (B, d_inner)
-            y[:, :, t] = y_t
-
-        y = y + x_inner * self.D_skip.unsqueeze(-1)
-        y = y * self.act(z)
-        y = rearrange(y, 'b d l -> b l d')
-        return self.out_proj(y)
+        return self.mamba(x)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +98,8 @@ class DS1Wrapper(nn.Module):
         super().__init__()
         self.ds1 = DS1(dim=dim, state_dim=state_dim, mimo_rank=mimo_rank,
                         n_iters=n_iters, **kwargs)
-        bank_size = DS1.bank_size(dim, state_dim, mimo_rank)
+        bank_size = DS1.bank_size(dim, state_dim, mimo_rank,
+                                   out_gate=kwargs.get('out_gate', False))
         self.bank = nn.Parameter(torch.randn(bank_size) * 0.02)
 
     def forward(self, x):
@@ -296,18 +238,23 @@ class StackedSSM(nn.Module):
 
 
 def make_models(dim):
-    """Build models with roughly matched param counts (~51-57K)."""
-    # DS1: 1 layer, ~56.6K params
+    """Build models with roughly matched param counts (~51-61K)."""
+    # DS1 base: 1 layer, ~56.6K params
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
+
+    # DS1+: with output gate, D skip (~56.6K + 4096 gate + 64 skip = ~60.8K)
+    ds1_plus = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
+                           out_gate=True, d_skip=True)
 
     # S4D: 3 layers × d_state=64 = ~49.9K params
     s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
 
     # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
-    mamba = StackedSSM(lambda: MambaPure(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
+    mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
 
     return {
         'DS1': ds1,
+        'DS1+': ds1_plus,
         'S4D': s4d,
         'Mamba': mamba,
     }
@@ -333,8 +280,9 @@ if __name__ == '__main__':
     print(header)
     print('-' * 90)
 
+    all_names = list(models_info.keys())
     for task in tasks:
-        for name in ['DS1', 'S4D', 'Mamba']:
+        for name in all_names:
             torch.manual_seed(42)
             model = make_models(dim)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE)
