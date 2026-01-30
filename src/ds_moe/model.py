@@ -104,7 +104,7 @@ class DS1(nn.Module):
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
 
         if d_skip:
-            self.D_skip = nn.Parameter(torch.ones(dim))
+            self.out_norm = RMSNorm(dim)
 
         if diff_inject:
             self.inject_lambda = nn.Parameter(torch.tensor(0.5))
@@ -273,6 +273,6 @@ class DS1(nn.Module):
             y = y * z
 
         if self.d_skip:
-            y = y + x * self.D_skip
+            y = self.out_norm(y) + x
 
         return y
