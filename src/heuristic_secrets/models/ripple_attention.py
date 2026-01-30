@@ -520,6 +520,7 @@ class RippleBlock(nn.Module):
     ):
         super().__init__()
         self.cross_layer = cross_layer
+        self.pre_norm = nn.LayerNorm(channels, eps=eps)
         self.resid_dropout = nn.Dropout(resid_dropout) if resid_dropout > 0 else nn.Identity()
         self.attn = RippleAttention(
             channels=channels,
