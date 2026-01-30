@@ -131,6 +131,7 @@ class DS1(nn.Module):
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
             self.attn_gate = nn.Parameter(torch.tensor(0.5))
+            self.poly_scale = nn.Parameter(torch.tensor(0.1))  # dynamic scale, init conservative
             # 80% shared with B/C, 20% dedicated
             self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
             self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
@@ -319,13 +320,12 @@ class DS1(nn.Module):
             Q1, Q2 = Q[..., :half_N], Q[..., half_N:]
             K1, K2 = K[..., :half_N], K[..., half_N:]
             V1, V2 = V[..., :half_N], V[..., half_N:]
-            # polynomial attention: x³/√L (signed weights, Frobenius-stable)
+            # polynomial attention: x³ * learned_scale (signed weights, Frobenius-stable)
             scale = half_N ** -0.5
-            poly_scale = L ** -0.5
             S1 = (Q1 @ K1.transpose(-2, -1) * scale)
             S2 = (Q2 @ K2.transpose(-2, -1) * scale)
-            A1 = S1.pow(3) * poly_scale  # (B, R, L, L) — signed weights
-            A2 = S2.pow(3) * poly_scale
+            A1 = S1.pow(3) * self.poly_scale  # (B, R, L, L) — signed weights
+            A2 = S2.pow(3) * self.poly_scale
             O1 = A1 @ V1
             O2 = A2 @ V2
             H_attn = torch.cat([O1 - self.attn_lambda * O2,
