@@ -291,10 +291,6 @@ def make_models(dim):
     # DS1 base: 1 layer, ~56.6K params
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
 
-    # DS1+: d_skip only (RMSNorm + residual, no gate)
-    ds1_plus = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
-                           d_skip=True)
-
     # DS1++: DS1 + differential attention (reuses B,C projections)
     ds1_pp = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2,
                          diff_attn=True)
@@ -310,7 +306,6 @@ def make_models(dim):
 
     return {
         'DS1': ds1,
-        'DS1+': ds1_plus,
         'DS1++': ds1_pp,
         # 'S4D': s4d,
         # 'S5': s5,

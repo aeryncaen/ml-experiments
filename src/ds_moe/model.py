@@ -268,11 +268,13 @@ class DS1(nn.Module):
             half_N = N // 2
             Q1, Q2 = C_rot[..., :half_N], C_rot[..., half_N:]
             K1, K2 = B_rot[..., :half_N], B_rot[..., half_N:]
-            scale = half_N ** -0.5
-            # (B, R, L, L)
-            A1 = torch.softmax(torch.einsum('brid,brjd->brij', Q1, K1) * scale, dim=-1)
-            A2 = torch.softmax(torch.einsum('brid,brjd->brij', Q2, K2) * scale, dim=-1)
-            H_attn = torch.einsum('brij,brjn->brin', A1 - self.attn_lambda * A2, inject)
+            # SDPA expects (B, heads, L, head_dim) — R=heads, half_N=head_dim
+            # V=inject: (B, R, L, N) — split to match Q/K halves
+            V1, V2 = inject[..., :half_N], inject[..., half_N:]
+            O1 = F.scaled_dot_product_attention(Q1, K1, V1)
+            O2 = F.scaled_dot_product_attention(Q2, K2, V2)
+            H_attn = torch.cat([O1 - self.attn_lambda * O2,
+                                O1 + self.attn_lambda * O2], dim=-1)
             H = H + self.attn_gate * H_attn
 
         if self.diff_readout:
