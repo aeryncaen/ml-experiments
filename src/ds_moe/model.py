@@ -317,19 +317,11 @@ class DS1(nn.Module):
             V = V_full.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
             Q = self.q_norm(Q)
             K = self.k_norm(K)
-            Q1, Q2 = Q[..., :half_N], Q[..., half_N:]
-            K1, K2 = K[..., :half_N], K[..., half_N:]
-            V1, V2 = V[..., :half_N], V[..., half_N:]
-            # squared attention: non-negative maps, differential provides sign
-            scale = half_N ** -0.5
-            S1 = Q1 @ K1.transpose(-2, -1) * scale
-            S2 = Q2 @ K2.transpose(-2, -1) * scale
-            A1 = S1.pow(2) * self.poly_scale  # (B, R, L, L) — non-negative
-            A2 = S2.pow(2) * self.poly_scale  # differential subtraction provides sign
-            O1 = A1 @ V1
-            O2 = A2 @ V2
-            H_attn = torch.cat([O1 - self.attn_lambda * O2,
-                                O1 + self.attn_lambda * O2], dim=-1)
+            # squared polynomial attention: full Q,K,V — no differential split
+            scale = N ** -0.5
+            S = Q @ K.transpose(-2, -1) * scale  # (B, R, L, L)
+            A = S.pow(2) * self.poly_scale        # non-negative
+            H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
 

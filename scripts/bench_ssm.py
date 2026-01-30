@@ -330,9 +330,9 @@ def make_models(dim):
     return {
         'DS1': ds1,
         'DS1++': ds1_pp,
-        # 'S4D': s4d,
-        # 'S5': s5,
-        # 'Mamba': mamba,
+        'S4D': s4d,
+        'S5': s5,
+        'Mamba': mamba,
     }
 
 
