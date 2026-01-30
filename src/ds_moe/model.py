@@ -134,6 +134,12 @@ class DS1(nn.Module):
             # 80% shared with B/C, 20% dedicated
             self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
             self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
+            NR = state_dim * mimo_rank
+            self.Q_bias = nn.Parameter(torch.ones(NR))
+            self.K_bias = nn.Parameter(torch.ones(NR))
+            self.V_bias = nn.Parameter(torch.ones(NR))
+            self.q_norm = RMSNorm(state_dim)
+            self.k_norm = RMSNorm(state_dim)
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
