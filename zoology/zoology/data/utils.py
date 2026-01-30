@@ -80,9 +80,11 @@ class DataSegment:
                 except RuntimeError as e:
                     print(e)
         else:
-            print(f"Generating dataset...") 
+            print(f"Generating dataset...", flush=True) 
             # generate data
+            print(f"[TRACE] calling config.build(seed={seed})...", flush=True)
             data: DataSegment = config.build(seed=seed)
+            print(f"[TRACE] config.build returned", flush=True)
 
             if cache_dir is not None:
                 print(f"Saving dataset to on-disk cache at {cache_path}...") 
