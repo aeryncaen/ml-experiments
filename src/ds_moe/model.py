@@ -172,7 +172,6 @@ class DS1(nn.Module):
             # selective scan with independent gate from x
             self.scan_gate_proj = nn.Linear(dim, mimo_rank, bias=True)
             self.scan_gate_norm = RMSNorm(mimo_rank)
-            self.scan_mix = nn.Parameter(torch.tensor(0.5))
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
@@ -319,6 +318,19 @@ class DS1(nn.Module):
                               padding=self.kernel_size // 2, groups=N)
             H = H_flat.reshape(B_batch, R, N, L).permute(0, 1, 3, 2)
 
+        if self.diff_attn:
+            # selective scan over H before readout
+            scan_g = torch.sigmoid(act(self.scan_gate_norm(
+                self.scan_gate_proj(x))))             # (B, L, R)
+            scan_g = scan_g.permute(0, 2, 1).unsqueeze(-1)  # (B, R, L, 1)
+            s = torch.zeros(B_batch, R, N, device=x.device, dtype=x.dtype)
+            scan_out = torch.zeros_like(H)            # (B, R, L, N)
+            for t in range(L):
+                g = scan_g[:, :, t, :]                # (B, R, 1)
+                s = (1.0 - g) * s + g * H[:, :, t, :]  # (B, R, N)
+                scan_out[:, :, t, :] = s
+            H = H + scan_out
+
         if self.diff_readout:
             half_N = N // 2
             C1, C2 = C_rot[..., :half_N], C_rot[..., half_N:]
@@ -357,18 +369,6 @@ class DS1(nn.Module):
             H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
-            # selective scan with independent content gate
-            scan_g = torch.sigmoid(act(self.scan_gate_norm(
-                self.scan_gate_proj(x))))             # (B, L, R)
-            scan_g = scan_g.permute(0, 2, 1).unsqueeze(-1)  # (B, R, L, 1)
-            s = torch.zeros(B_batch, R, N, device=x.device, dtype=x.dtype)
-            scan_out = torch.zeros_like(V)            # (B, R, L, N)
-            for t in range(L):
-                g = scan_g[:, :, t, :]                # (B, R, 1)
-                s = (1.0 - g) * s + g * V[:, :, t, :]  # (B, R, N)
-                scan_out[:, :, t, :] = s
-            scan_flat = scan_out.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
-            y = y + self.scan_mix * act(scan_flat @ w_out)
 
         if self.out_gate:
             z = F.silu(x @ w_Z)
