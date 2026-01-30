@@ -159,7 +159,7 @@ class DS1(nn.Module):
         if diff_attn:
             self.attn_lambda = nn.Parameter(torch.tensor(0.5))
             self.attn_gate = nn.Parameter(torch.tensor(0.5))
-            self.attn_C = nn.Parameter(torch.tensor(0.5))  # L1 ball radius for signed sparse attn
+            self.attn_C = nn.Parameter(torch.full((mimo_rank,), 0.5))  # per-head L1 ball radius
             # 80% shared with B/C, 20% dedicated
             self.attn_shared_dims = int(0.8 * state_dim * mimo_rank)
             self.attn_ded_dims = state_dim * mimo_rank - self.attn_shared_dims
@@ -348,7 +348,8 @@ class DS1(nn.Module):
             # signed sparse attention via L1 ball projection
             scale = N ** -0.5
             S = Q @ K.transpose(-2, -1) * scale  # (B, R, L, L)
-            A = project_l1_ball(S, self.attn_C.abs(), dim=-1)  # signed + sparse
+            C_per_head = self.attn_C.abs().view(1, -1, 1, 1)    # (1, R, 1, 1)
+            A = project_l1_ball(S, C_per_head, dim=-1)            # signed + sparse
             H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
