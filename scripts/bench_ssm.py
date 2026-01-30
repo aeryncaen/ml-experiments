@@ -310,29 +310,29 @@ class StackedSSM(nn.Module):
 
 
 def make_models(dim):
-    """Build models with roughly matched param counts (~51-61K)."""
-    # DS1 base: 1 layer, ~56.6K params
+    """Build models — ALL single layer, matched param counts (~50-57K)."""
+    # DS1 base: 1 layer, ~57K params
     ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
 
-    # DS1++: DS1 + differential attention (reuses B,C projections)
+    # DS1++: DS1 + signed sparse attention, 1 layer, ~51K params
     ds1_pp = DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2,
                          diff_attn=True)
 
-    # S4D: 3 layers × d_state=64 = ~49.9K params
-    s4d = StackedSSM(lambda: S4D(d_model=dim, d_state=64), n_layers=3)
+    # S4D: 1 layer, d_state=384 = ~57.6K params
+    s4d = S4D(d_model=dim, d_state=384)
 
-    # S5: state_width=256 = ~49.7K params
+    # S5: 1 layer, state_width=256 = ~49.7K params
     s5 = S5Wrapper(width=dim, state_width=256)
 
-    # Mamba: 2 layers × expand=1, d_state=64 = ~51.1K params
-    mamba = StackedSSM(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=1), n_layers=2)
+    # Mamba: 1 layer, expand=2, d_state=64 = ~51K params
+    mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
     return {
-        # 'DS1': ds1,
+        'DS1': ds1,
         'DS1++': ds1_pp,
-        # 'S4D': s4d,
-        # 'S5': s5,
-        # 'Mamba': mamba,
+        'S4D': s4d,
+        'S5': s5,
+        'Mamba': mamba,
     }
 
 
