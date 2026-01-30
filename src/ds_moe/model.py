@@ -128,10 +128,6 @@ class DS1(nn.Module):
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
 
-        # HiPPO-inspired frequency + decay priors
-        self.theta_bias = nn.Parameter(math.pi * torch.arange(state_dim // 2, dtype=torch.float32))
-        self.decay_bias = nn.Parameter(torch.full((state_dim,), 3.0))  # sigmoid(3)≈0.953
-
         if d_skip:
             # TODO: move to Block (C9) — stopgap residual inside DS1
             self.out_norm = RMSNorm(dim)
@@ -173,6 +169,10 @@ class DS1(nn.Module):
             self.V_bias = nn.Parameter(torch.ones(NR))
             self.q_norm = RMSNorm(state_dim)
             self.k_norm = RMSNorm(state_dim)
+            # attention-guided selective scan
+            self.scan_scale = nn.Parameter(torch.tensor(1.0))
+            self.scan_bias = nn.Parameter(torch.tensor(0.0))
+            self.scan_mix = nn.Parameter(torch.tensor(0.5))
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
@@ -256,8 +256,8 @@ class DS1(nn.Module):
         B_proj = act(x @ w_B + self.B_bias)         # (B, L, N*R)
         C_proj = act(x @ w_C + self.C_bias)         # (B, L, N*R)
         X_r = act(x @ w_X)                          # (B, L, R)
-        decay = torch.sigmoid(x @ w_decay + self.decay_bias)  # (B, L, N)
-        theta = x @ w_theta + self.theta_bias                # (B, L, N//2)
+        decay = torch.sigmoid(x @ w_decay)           # (B, L, N)
+        theta = x @ w_theta                          # (B, L, N//2)
         lam = torch.sigmoid(x @ w_lambda)            # (B, L, 1)
 
         B_base = B_proj.view(B_batch, L, N, R).permute(0, 3, 1, 2).contiguous()
@@ -357,6 +357,17 @@ class DS1(nn.Module):
             H_attn = A @ V                        # (B, R, L, N)
             attn_out = H_attn.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
             y = y + self.attn_gate * act(attn_out @ w_out)
+            # attention-guided selective scan over V
+            relevance = A.abs().sum(dim=-2)   # (B, R, L) — column L1 norm
+            gate = torch.sigmoid(self.scan_scale * relevance + self.scan_bias)  # (B, R, L)
+            s = torch.zeros(B_batch, R, N, device=x.device, dtype=x.dtype)
+            scan_out = torch.zeros_like(V)    # (B, R, L, N)
+            for t in range(L):
+                g = gate[:, :, t].unsqueeze(-1)   # (B, R, 1)
+                s = (1.0 - g) * s + g * V[:, :, t, :]  # (B, R, N)
+                scan_out[:, :, t, :] = s
+            scan_flat = scan_out.permute(0, 2, 1, 3).reshape(B_batch, L, N * R)
+            y = y + self.scan_mix * act(scan_flat @ w_out)
 
         if self.out_gate:
             z = F.silu(x @ w_Z)

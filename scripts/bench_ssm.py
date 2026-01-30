@@ -328,8 +328,8 @@ def make_models(dim):
     mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
     return {
-        'DS1': ds1,
-        # 'DS1++': ds1_pp,
+        # 'DS1': ds1,
+        'DS1++': ds1_pp,
         # 'S4D': s4d,
         # 'S5': s5,
         # 'Mamba': mamba,
