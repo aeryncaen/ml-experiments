@@ -112,22 +112,24 @@ def multiquery_ar(
     value_choices = np.arange(key_vocab_size, vocab_size)
     _t("choices built")
 
-    # Vectorized sampling: shuffle each row, take first num_kv_pairs
-    keys_unshuffled = np.tile(key_choices, (num_examples, 1))
-    _t(f"keys_unshuffled: {keys_unshuffled.shape}")
+    # Sample num_kv_pairs keys/values per example without replacement
     rng = np.random.default_rng(seed)
-    _t("rng created")
-    r = rng.random(keys_unshuffled.shape)
-    _t("random matrix done")
-    idx = np.argsort(r, axis=1)
-    _t("argsort done")
-    keys = np.take_along_axis(keys_unshuffled, idx[:, :num_kv_pairs], axis=1)
-    _t("keys done")
-
-    values_unshuffled = np.tile(value_choices, (num_examples, 1))
-    idx = np.argsort(rng.random(values_unshuffled.shape), axis=1)
-    values = np.take_along_axis(values_unshuffled, idx[:, :num_kv_pairs], axis=1)
-    print(f"[TRACE] multiquery_ar: values done", flush=True)
+    n_keys = len(key_choices)
+    n_vals = len(value_choices)
+    keys = np.empty((num_examples, num_kv_pairs), dtype=np.int64)
+    values = np.empty((num_examples, num_kv_pairs), dtype=np.int64)
+    _t("sampling keys+values in chunks")
+    CHUNK = 10000
+    for i in range(0, num_examples, CHUNK):
+        end = min(i + CHUNK, num_examples)
+        sz = end - i
+        # keys: random indices into key_choices
+        ki = np.argsort(rng.random((sz, n_keys)), axis=1)[:, :num_kv_pairs]
+        keys[i:end] = key_choices[ki]
+        # values: random indices into value_choices
+        vi = np.argsort(rng.random((sz, n_vals)), axis=1)[:, :num_kv_pairs]
+        values[i:end] = value_choices[vi]
+    _t("keys+values done")
 
     # create sequences
     kvs = np.zeros((num_examples, context_size), dtype=np.int64)
