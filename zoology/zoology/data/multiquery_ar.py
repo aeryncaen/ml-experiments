@@ -90,12 +90,18 @@ def multiquery_ar(
     Raises:
         Warning: If potential data leakage is detected between the train and test sets.
     """
-    print(f"[TRACE] multiquery_ar: entered, seq_len={input_seq_len}, n={num_examples}, kv={num_kv_pairs}", flush=True)
+    import sys
+    def _t(msg):
+        sys.stderr.write(f"[TRACE] {msg}\n")
+        sys.stderr.flush()
+    _t(f"entered, seq_len={input_seq_len}, n={num_examples}, kv={num_kv_pairs}")
     assert input_seq_len % 2 == 0, "input_seq_len must be even"
     assert vocab_size > input_seq_len
     assert num_kv_pairs * 2 * num_passes + num_kv_pairs * 2 <= input_seq_len  
+    _t("asserts passed")
 
     np.random.seed(seed)
+    _t("np.random.seed done")
 
     # two tokens for key and value
     context_size = num_kv_pairs * 2 * num_passes
@@ -104,13 +110,19 @@ def multiquery_ar(
     key_vocab_size = vocab_size // 2
     key_choices = np.arange(1, key_vocab_size)
     value_choices = np.arange(key_vocab_size, vocab_size)
+    _t("choices built")
 
     # Vectorized sampling: shuffle each row, take first num_kv_pairs
     keys_unshuffled = np.tile(key_choices, (num_examples, 1))
+    _t(f"keys_unshuffled: {keys_unshuffled.shape}")
     rng = np.random.default_rng(seed)
-    idx = np.argsort(rng.random(keys_unshuffled.shape), axis=1)
+    _t("rng created")
+    r = rng.random(keys_unshuffled.shape)
+    _t("random matrix done")
+    idx = np.argsort(r, axis=1)
+    _t("argsort done")
     keys = np.take_along_axis(keys_unshuffled, idx[:, :num_kv_pairs], axis=1)
-    print(f"[TRACE] multiquery_ar: keys done", flush=True)
+    _t("keys done")
 
     values_unshuffled = np.tile(value_choices, (num_examples, 1))
     idx = np.argsort(rng.random(values_unshuffled.shape), axis=1)
