@@ -23,10 +23,6 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
-def relu_squared(x: torch.Tensor) -> torch.Tensor:
-    return F.relu(x).square()
-
-
 def apply_interleaved_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     """Interleaved RoPE: even/odd index rotation.
     x: (..., N)  where N is even
@@ -43,12 +39,12 @@ def apply_interleaved_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tenso
 
 
 class SqueezeExcite(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4, relu2: bool = False):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
         hidden = max(channels // reduction, 8)
         self.fc1 = nn.Linear(channels, hidden, bias=False)
         self.fc2 = nn.Linear(hidden, channels, bias=False)
-        self.act = relu_squared if relu2 else F.silu
+        self.act = F.silu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., spatial..., C) — pool over all dims except batch and last
@@ -81,8 +77,7 @@ class DS1(nn.Module):
         diffuse_se: bool = False,
         diff_inject: bool = True,
         diff_readout: bool = True,
-        bc_norm: bool = False,
-        relu2: bool = False,
+        bc_norm: bool = True,
         rope_dims: int | None = None,
         out_gate: bool = False,
         d_skip: bool = False,
@@ -98,7 +93,7 @@ class DS1(nn.Module):
         self.diff_readout = diff_readout
         self.out_gate = out_gate
         self.d_skip = d_skip
-        self.act = relu_squared if relu2 else F.silu
+        self.act = F.silu
 
         self.B_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
         self.C_bias = nn.Parameter(torch.ones(state_dim * mimo_rank))
@@ -127,7 +122,7 @@ class DS1(nn.Module):
 
         self.has_se = diffuse_se
         if diffuse_se:
-            self.diffuse_se = SqueezeExcite(state_dim, relu2=relu2)
+            self.diffuse_se = SqueezeExcite(state_dim)
 
     @staticmethod
     def bank_size(dim: int, state_dim: int = 64, mimo_rank: int = 4,
