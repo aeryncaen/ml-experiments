@@ -271,10 +271,28 @@ for input_seq_len, num_kv_pairs in [
                         "max_seq_len": input_seq_len,
                     },
                 ),
+                # DS-Attention: signed sparse via L1 ball projection
+                "ds-attn": dict(
+                    name="zoology.mixers.ds_attn.DSAttention",
+                    kwargs={
+                        "state_dim": 64,
+                        "mimo_rank": num_heads,
+                    },
+                ),
+                "ds-attn-nodiff": dict(
+                    name="zoology.mixers.ds_attn.DSAttention",
+                    kwargs={
+                        "state_dim": 64,
+                        "mimo_rank": num_heads,
+                        "diff_readout": False,
+                    },
+                ),
             }
 
             for sequence_mixer in [
                 "attention",
+                "ds-attn",
+                "ds-attn-nodiff",
                 "ripple-tcl",
                 "ripple-ca",
                 "ripple-ca-plain",
