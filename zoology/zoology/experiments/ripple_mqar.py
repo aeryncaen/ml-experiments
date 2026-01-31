@@ -171,6 +171,14 @@ for input_seq_len, num_kv_pairs in [
                         "plain_conv_size": 3,
                     },
                 ),
+                "ripple-msca": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "msconv,attn",
+                        "max_seq_len": input_seq_len,
+                    },
+                ),
                 "ripple-jluna": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
@@ -371,6 +379,8 @@ for input_seq_len, num_kv_pairs in [
                 "luna-attn",
                 "ripple-ja",
                 "ripple-conv3a",
+                "ripple-ca",
+                "ripple-msca",
                 "ripple-jluna",
             ]:
                 if "mamba" in sequence_mixer:
@@ -382,7 +392,7 @@ for input_seq_len, num_kv_pairs in [
                     d_model=d_model,
                     n_layers=2,
                     block_type=block_type,
-                    max_position_embeddings=input_seq_len if sequence_mixer in ("attention", "luna-attn", "ripple-ja", "ripple-conv3a", "ripple-jluna") else 0,
+                    max_position_embeddings=input_seq_len if sequence_mixer in ("attention", "luna-attn", "ripple-ja", "ripple-conv3a", "ripple-ca", "ripple-msca", "ripple-jluna") else 0,
                     vocab_size=VOCAB_SIZE,
                     sequence_mixer=MIXERS[sequence_mixer],
                     state_mixer=dict(name="torch.nn.Identity", kwargs={}),

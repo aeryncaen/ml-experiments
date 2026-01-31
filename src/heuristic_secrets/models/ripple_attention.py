@@ -20,6 +20,35 @@ class ReLUSquared(nn.Module):
         return F.relu(x).square()
 
 
+class MultiScaleDepthwiseConv(nn.Module):
+    """Split channels into groups, each with a different kernel size depthwise conv, then SE."""
+    def __init__(self, channels: int, kernel_sizes: tuple = (3, 6, 12, 24)):
+        super().__init__()
+        self.kernel_sizes = kernel_sizes
+        n_groups = len(kernel_sizes)
+        assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups} scales"
+        self.group_size = channels // n_groups
+        self.convs = nn.ModuleList([
+            nn.Conv1d(self.group_size, self.group_size, k, padding=k // 2, groups=self.group_size)
+            for k in kernel_sizes
+        ])
+        from .adaptive_local_conv import SqueezeExcite1D
+        self.se = SqueezeExcite1D(channels)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        # x: (B, L, C)
+        B, L, C = x.shape
+        gs = self.group_size
+        chunks = [x[..., i * gs:(i + 1) * gs] for i in range(len(self.kernel_sizes))]
+        out = []
+        for chunk, conv in zip(chunks, self.convs):
+            # (B, L, gs) -> (B, gs, L) -> conv -> (B, gs, L') -> trim -> (B, L, gs)
+            y = conv(chunk.transpose(1, 2))[..., :L].transpose(1, 2)
+            out.append(y)
+        out = torch.cat(out, dim=-1)  # (B, L, C)
+        return self.se(out), {}
+
+
 class DifferentialSwiGLU(nn.Module):
 
     def __init__(self, width: int, mult: float = 4, lambda_init: float = 0.5):
@@ -423,6 +452,9 @@ class RippleAttention(nn.Module):
         if 'mlp' in unique_ops:
             self.mlp = DifferentialSwiGLU(channels)
 
+        if 'msconv' in unique_ops:
+            self.msconv_op = MultiScaleDepthwiseConv(channels)
+
         if 'luna' in unique_ops:
             from zoology.mixers.luna import LUNA
             head_dim = channels // num_heads
@@ -450,6 +482,8 @@ class RippleAttention(nn.Module):
                     self._dup_ops[key] = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
                 elif name == 'mlp':
                     self._dup_ops[key] = DifferentialSwiGLU(channels)
+                elif name == 'msconv':
+                    self._dup_ops[key] = MultiScaleDepthwiseConv(channels)
                 elif name == 'luna':
                     from zoology.mixers.luna import LUNA
                     self._dup_ops[key] = LUNA(d_model=channels, num_heads=num_heads, M=8, L=4, hidden=64, nonneg=True, act="relu")
@@ -490,6 +524,9 @@ class RippleAttention(nn.Module):
         elif name == 'luna':
             op = self._dup_ops[key] if is_dup else self.luna_op
             out = op(h)
+        elif name == 'msconv':
+            op = self._dup_ops[key] if is_dup else self.msconv_op
+            out, _ = op(h)
         else:
             raise ValueError(f"Unknown layer: {name}")
         norm = self._dup_norms[key] if is_dup else self.norms[name]
