@@ -201,7 +201,7 @@ for input_seq_len in CUM_PARITY_SEQS:
                     model=model,
                     data=data,
                     learning_rate=lr,
-                    loss_scale=5.0,
+                    loss_scale=1.0,
                     max_epochs=64,
                     run_id=f"cum_parity-{mixer_name}-seqlen{input_seq_len}-dmodel{d_model}-lr{lr:.6f}",
                     logger=LoggerConfig(
