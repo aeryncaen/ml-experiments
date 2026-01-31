@@ -1,3 +1,4 @@
+import torch
 from torch import nn 
 import torch.nn.functional as F
 
@@ -43,6 +44,40 @@ class GLU(nn.Module):
         self.fc3 = nn.Linear(hidden_features, out_features)
         self.activation = activation
 
+
+    def forward(self, x):
+        x = self.fc1(x) * self.activation(self.fc2(x))
+        y = self.fc3(x)
+        return y if not self.return_residual else (y, x)
+
+
+class _LearnedAct(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(3) / 3.0)
+
+    def forward(self, x):
+        r = F.relu(x)
+        s = F.silu(x)
+        t = torch.tanh(x)
+        return self.w[0] * r * r + self.w[1] * s * s + self.w[2] * t * t
+
+
+class LearnedGLU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 4,
+        return_residual: bool = False,
+        **kwargs
+    ):
+        super().__init__()
+        hidden = d_model * hidden_mult
+        self.return_residual = return_residual
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.fc2 = nn.Linear(d_model, hidden)
+        self.fc3 = nn.Linear(hidden, d_model)
+        self.activation = _LearnedAct()
 
     def forward(self, x):
         x = self.fc1(x) * self.activation(self.fc2(x))

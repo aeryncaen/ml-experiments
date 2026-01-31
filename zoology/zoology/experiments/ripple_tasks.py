@@ -116,11 +116,12 @@ for input_seq_len, num_kv_pairs in [
                 data = data_fn(input_seq_len, kv, batch_size)
 
                 for mixer_name in ["attention", "ripple-msca", "ripple-conv3a"]:
-                    state_mixer = (
-                        dict(name="zoology.mixers.mlp.GLU", kwargs={"hidden_mult": 4})
-                        if task_name == "cum_parity"
-                        else dict(name="torch.nn.Identity", kwargs={})
-                    )
+                    if task_name == "cum_parity" and mixer_name.startswith("ripple"):
+                        state_mixer = dict(name="zoology.mixers.mlp.LearnedGLU", kwargs={"hidden_mult": 4})
+                    elif task_name == "cum_parity":
+                        state_mixer = dict(name="zoology.mixers.mlp.GLU", kwargs={"hidden_mult": 4})
+                    else:
+                        state_mixer = dict(name="torch.nn.Identity", kwargs={})
                     model = ModelConfig(
                         d_model=d_model,
                         n_layers=2,
