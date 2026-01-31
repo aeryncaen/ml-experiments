@@ -48,10 +48,10 @@ TASKS = {
     ),
     "cum_parity": lambda sl, kv, bs: DataConfig(
         train_configs=[CumulativeParityConfig(
-            num_examples=100_000, vocab_size=VOCAB_SIZE, input_seq_len=sl,
+            num_examples=100_000, vocab_size=3, input_seq_len=sl,
         )],
         test_configs=[CumulativeParityConfig(
-            num_examples=3_000, vocab_size=VOCAB_SIZE, input_seq_len=sl,
+            num_examples=3_000, vocab_size=3, input_seq_len=sl,
         )],
         batch_size=bs,
     ),
@@ -116,14 +116,19 @@ for input_seq_len, num_kv_pairs in [
                 data = data_fn(input_seq_len, kv, batch_size)
 
                 for mixer_name in ["attention", "ripple-msca", "ripple-conv3a"]:
+                    state_mixer = (
+                        dict(name="zoology.mixers.mlp.GLU", kwargs={"hidden_mult": 4})
+                        if task_name == "cum_parity"
+                        else dict(name="torch.nn.Identity", kwargs={})
+                    )
                     model = ModelConfig(
                         d_model=d_model,
                         n_layers=2,
                         block_type="TransformerBlock",
                         max_position_embeddings=input_seq_len,
-                        vocab_size=VOCAB_SIZE,
+                        vocab_size=3 if task_name == "cum_parity" else VOCAB_SIZE,
                         sequence_mixer=MIXERS[mixer_name],
-                        state_mixer=dict(name="torch.nn.Identity", kwargs={}),
+                        state_mixer=state_mixer,
                     )
                     config = TrainConfig(
                         model=model,
