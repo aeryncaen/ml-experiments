@@ -224,6 +224,7 @@ class LUNAAttn(nn.Module):
             d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=nonneg, act=act, ch_rms=ch_rms,
         )
         self.luna_norm = RMSNorm(d_model)
+        self.luna_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         # Attention stage
         self.attn_Wq = nn.Linear(d_model, d_model)
@@ -256,8 +257,9 @@ class LUNAAttn(nn.Module):
 
         luna_out = luna_out.permute(0, 2, 1, 3).reshape(B, N, self.d_model)
         luna_out = self.luna_out(luna_out)
-        # norm + residual back to input
-        h = x + self.luna_norm(luna_out)
+        # norm + gated residual back to input
+        g = self.luna_gate.clamp(0.1, 5.0)
+        h = x + g * self.luna_norm(luna_out)
 
         # --- Full causal softmax attention on h ---
         Q2 = self.attn_Wq(h).view(B, N, H, d).permute(0, 2, 1, 3)
