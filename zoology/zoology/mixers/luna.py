@@ -44,7 +44,7 @@ class ScalarMLP(nn.Module):
 class LearnableFeatureMap(nn.Module):
     def __init__(self, d: int, M: int, L: int, hidden: int = 64,
                  nonneg: bool = True, act: str = "relu", chunk: int = 1_000_000,
-                 ch_rms: bool = False, ch_rms_target: float = 0.1):
+                 ch_rms: bool = True, ch_rms_target: float = 0.1):
         super().__init__()
         self.M = M
         self.L = L
@@ -100,7 +100,7 @@ class LUNA(nn.Module):
         hidden: int = 64,
         nonneg: bool = True,
         act: str = "relu",
-        ch_rms: bool = False,
+        ch_rms: bool = True,
         layer_idx: int = None,
         **kwargs,
     ):
