@@ -181,11 +181,19 @@ class LUNA(nn.Module):
         return self.out_proj(out)
 
 
-class LUNAAttn(nn.Module):
-    """LUNA linear attention followed by full causal softmax attention.
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
 
-    Shared QKV projections. LUNA output is added as residual before attention.
-    """
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+class LUNAAttn(nn.Module):
+    """LUNA linear attention → norm → residual → full causal softmax attention."""
     def __init__(
         self,
         d_model: int,
@@ -207,17 +215,21 @@ class LUNAAttn(nn.Module):
         self.D = M * L
         assert d_model % num_heads == 0
 
-        # Shared QKV
-        self.Wq = nn.Linear(d_model, d_model)
-        self.Wk = nn.Linear(d_model, d_model)
-        self.Wv = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        # LUNA feature map
+        # LUNA stage
+        self.luna_Wq = nn.Linear(d_model, d_model)
+        self.luna_Wk = nn.Linear(d_model, d_model)
+        self.luna_Wv = nn.Linear(d_model, d_model)
+        self.luna_out = nn.Linear(d_model, d_model)
         self.phi = LearnableFeatureMap(
             d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=nonneg, act=act, ch_rms=ch_rms,
         )
+        self.luna_norm = RMSNorm(d_model)
 
+        # Attention stage
+        self.attn_Wq = nn.Linear(d_model, d_model)
+        self.attn_Wk = nn.Linear(d_model, d_model)
+        self.attn_Wv = nn.Linear(d_model, d_model)
+        self.attn_out = nn.Linear(d_model, d_model)
         self.dropout_p = dropout
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
 
@@ -226,12 +238,11 @@ class LUNAAttn(nn.Module):
         H = self.num_heads
         d = self.head_dim
 
-        # Shared QKV -> (B, H, N, d)
-        Q = self.Wq(x).view(B, N, H, d).permute(0, 2, 1, 3)
-        K = self.Wk(x).view(B, N, H, d).permute(0, 2, 1, 3)
-        V = self.Wv(x).view(B, N, H, d).permute(0, 2, 1, 3)
+        # --- LUNA stage ---
+        Q = self.luna_Wq(x).view(B, N, H, d).permute(0, 2, 1, 3)
+        K = self.luna_Wk(x).view(B, N, H, d).permute(0, 2, 1, 3)
+        V = self.luna_Wv(x).view(B, N, H, d).permute(0, 2, 1, 3)
 
-        # --- LUNA: causal linear attention via cumsum ---
         phi_Q = self.phi(Q)  # (B, H, N, D)
         phi_K = self.phi(K)  # (B, H, N, D)
 
@@ -243,11 +254,17 @@ class LUNAAttn(nn.Module):
         luna_denom = torch.einsum("bhnd,bhnd->bhn", phi_Q, K_cum).unsqueeze(-1).clamp(min=1e-6)
         luna_out = luna_numer / luna_denom  # (B, H, N, d)
 
-        # Add LUNA output as residual to V for attention
-        V2 = V + luna_out
+        luna_out = luna_out.permute(0, 2, 1, 3).reshape(B, N, self.d_model)
+        luna_out = self.luna_out(luna_out)
+        # norm + residual back to input
+        h = x + self.luna_norm(luna_out)
 
-        # --- Full causal softmax attention ---
-        scores = torch.einsum("bhnd,bhmd->bhnm", Q, K) * self.softmax_scale
+        # --- Full causal softmax attention on h ---
+        Q2 = self.attn_Wq(h).view(B, N, H, d).permute(0, 2, 1, 3)
+        K2 = self.attn_Wk(h).view(B, N, H, d).permute(0, 2, 1, 3)
+        V2 = self.attn_Wv(h).view(B, N, H, d).permute(0, 2, 1, 3)
+
+        scores = torch.einsum("bhnd,bhmd->bhnm", Q2, K2) * self.softmax_scale
         causal_mask = torch.triu(torch.full((N, N), -10000.0, device=x.device), 1)
         scores = scores + causal_mask.to(dtype=scores.dtype)
         attn = torch.softmax(scores, dim=-1, dtype=V2.dtype)
@@ -255,4 +272,4 @@ class LUNAAttn(nn.Module):
 
         out = torch.einsum("bhnm,bhmd->bhnd", attn, V2)  # (B, H, N, d)
         out = out.permute(0, 2, 1, 3).reshape(B, N, self.d_model)
-        return self.out_proj(out)
+        return self.attn_out(out)
