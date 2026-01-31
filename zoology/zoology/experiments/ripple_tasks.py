@@ -129,6 +129,7 @@ for input_seq_len, num_kv_pairs in [
                         model=model,
                         data=data,
                         learning_rate=lr,
+                        loss_scale=5.0 if task_name == "cum_parity" else 1.0,
                         max_epochs=64,
                         run_id=f"{task_name}-{mixer_name}-seqlen{input_seq_len}-dmodel{d_model}-lr{lr:.6f}-kv{kv}",
                         logger=LoggerConfig(

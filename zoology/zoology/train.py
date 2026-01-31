@@ -34,6 +34,7 @@ class Trainer:
         early_stopping_metric: str = None,
         early_stopping_threshold: float = None,
         loss_type: str = "ce",
+        loss_scale: float = 1.0,
         slice_keys: List[str] = [],
         device: Union[str, int] = "cuda",
         logger: WandbLogger = None,
@@ -52,6 +53,7 @@ class Trainer:
         self.weight_decay = weight_decay
         self.slice_keys = slice_keys
         self.loss_type = loss_type
+        self.loss_scale = loss_scale
 
     def compute_loss(self, inputs, targets):
         if self.input_type == "continuous":
@@ -139,6 +141,8 @@ class Trainer:
                 if auxiliary_loss:
                     loss = loss + sum(auxiliary_loss)
 
+            if self.loss_scale != 1.0:
+                loss = loss * self.loss_scale
             loss.backward()
             self.optimizer.step()
             iterator.set_postfix({"loss": loss.item()})
@@ -301,6 +305,7 @@ def train(config: TrainConfig):
         early_stopping_threshold=config.early_stopping_threshold,
         slice_keys=config.slice_keys,
         loss_type=config.loss_type,
+        loss_scale=config.loss_scale,
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger=logger,
     )

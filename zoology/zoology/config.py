@@ -133,6 +133,7 @@ class TrainConfig(BaseConfig):
     early_stopping_threshold: float = 0.99
     slice_keys: List[str] = []
 
+    loss_scale: float = 1.0
     learning_rate: float = 1e-3
     weight_decay: float = 0.1
     seed: int = 123
