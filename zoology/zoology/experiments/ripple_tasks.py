@@ -142,11 +142,11 @@ for input_seq_len, num_kv_pairs in SEQ_KV:
                     configs.append(config)
 
 # Cumulative parity: separate sweep with short seqlens + MLP
+# Aligned with zoology paper: batch=256 train / 32 test, their LR range, 16 epochs
 for input_seq_len in CUM_PARITY_SEQS:
-    batch_size = 512
 
     for d_model in [16, 32, 64, 128, 256]:
-        for lr in np.logspace(-4, -2, 4)[2:]:
+        for lr in np.logspace(-3.5, -2, 4):
 
             if d_model <= 32:
                 num_heads = 2
@@ -157,10 +157,26 @@ for input_seq_len in CUM_PARITY_SEQS:
             else:
                 num_heads = 8
 
+            conv_mixer = dict(
+                name="zoology.mixers.base_conv.BaseConv",
+                kwargs={
+                    "l_max": input_seq_len,
+                    "kernel_size": 3,
+                    "implicit_long_conv": True,
+                },
+            )
+
             MIXERS_CP = {
                 "attention": dict(
                     name="zoology.mixers.attention.MHA",
                     kwargs={"dropout": 0.1, "num_heads": 1},
+                ),
+                "zoo-conv-attn": dict(
+                    name="zoology.mixers.hybrid.Hybrid",
+                    kwargs={"configs": [conv_mixer, dict(
+                        name="zoology.mixers.attention.MHA",
+                        kwargs={"dropout": 0.1, "num_heads": 1},
+                    )]},
                 ),
                 "ripple-msca": dict(
                     name="zoology.mixers.ripple.RippleMixer",
@@ -181,9 +197,17 @@ for input_seq_len in CUM_PARITY_SEQS:
                 ),
             }
 
-            data = TASKS["cum_parity"](input_seq_len, 0, batch_size)
+            data = DataConfig(
+                train_configs=[CumulativeParityConfig(
+                    num_examples=100_000, vocab_size=3, input_seq_len=input_seq_len,
+                )],
+                test_configs=[CumulativeParityConfig(
+                    num_examples=1_000, vocab_size=3, input_seq_len=input_seq_len,
+                )],
+                batch_size=(256, 32),
+            )
 
-            for mixer_name in ["attention", "ripple-msca", "ripple-conv3a"]:
+            for mixer_name in ["attention", "zoo-conv-attn", "ripple-msca", "ripple-conv3a"]:
                 if mixer_name.startswith("ripple"):
                     state_mixer = dict(name="zoology.mixers.mlp.LearnedGLU", kwargs={"hidden_mult": 4})
                 else:
@@ -192,7 +216,7 @@ for input_seq_len in CUM_PARITY_SEQS:
                     d_model=d_model,
                     n_layers=2,
                     block_type="TransformerBlock",
-                    max_position_embeddings=input_seq_len,
+                    max_position_embeddings=0,
                     vocab_size=3,
                     sequence_mixer=MIXERS_CP[mixer_name],
                     state_mixer=state_mixer,
@@ -201,8 +225,7 @@ for input_seq_len in CUM_PARITY_SEQS:
                     model=model,
                     data=data,
                     learning_rate=lr,
-                    loss_scale=1.0,
-                    max_epochs=64,
+                    max_epochs=16,
                     run_id=f"cum_parity-{mixer_name}-seqlen{input_seq_len}-dmodel{d_model}-lr{lr:.6f}",
                     logger=LoggerConfig(
                         project_name="ripple-tasks",

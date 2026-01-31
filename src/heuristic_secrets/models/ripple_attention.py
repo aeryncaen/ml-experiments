@@ -44,7 +44,7 @@ class MultiScaleDepthwiseConv(nn.Module):
         passthrough = x[..., n_conv * gs:]
         out = []
         for chunk, conv in zip(conv_chunks, self.convs):
-            y = conv(chunk.transpose(1, 2))[..., :L].transpose(1, 2)
+            y = F.silu(conv(chunk.transpose(1, 2))[..., :L]).transpose(1, 2)
             out.append(y)
         out.append(passthrough)
         out = torch.cat(out, dim=-1)  # (B, L, C)
