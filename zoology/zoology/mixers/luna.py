@@ -19,7 +19,11 @@ def _chunked(fn, x, chunk_size):
     return torch.cat([fn(x[i:i+chunk_size]) for i in range(0, x.shape[0], chunk_size)], dim=0)
 
 
-_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu}
+def _silu2(x):
+    s = F.silu(x)
+    return s * s
+
+_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu, "silu2": _silu2}
 
 
 class ScalarMLP(nn.Module):
