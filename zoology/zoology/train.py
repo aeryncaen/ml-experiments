@@ -188,8 +188,22 @@ class Trainer:
         self.model.to(self.device)
         self.loss_fn = nn.CrossEntropyLoss()
         self.best_metrics = {}
+        gate_params = []
+        other_params = []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.endswith('.activation.w') or name.endswith('.act.w'):
+                gate_params.append(p)
+            else:
+                other_params.append(p)
+        param_groups = [
+            {"params": other_params, "lr": self.learning_rate},
+        ]
+        if gate_params:
+            param_groups.append({"params": gate_params, "lr": self.learning_rate * 0.1})
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
+            param_groups,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
