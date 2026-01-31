@@ -319,6 +319,17 @@ for input_seq_len, num_kv_pairs in [
                         "act": "silu2",
                     },
                 ),
+                "luna-learned": dict(
+                    name="zoology.mixers.luna.LUNA",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "M": 8,
+                        "L": 4,
+                        "hidden": 64,
+                        "nonneg": False,
+                        "act": "learned",
+                    },
+                ),
             }
 
             for sequence_mixer in [
@@ -328,6 +339,7 @@ for input_seq_len, num_kv_pairs in [
                 "luna",
                 "luna-silu",
                 "luna-silu2",
+                "luna-learned",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"

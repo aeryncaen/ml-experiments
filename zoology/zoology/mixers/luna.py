@@ -23,7 +23,21 @@ def _silu2(x):
     s = F.silu(x)
     return s * s
 
-_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu, "silu2": _silu2}
+
+class LearnedAct(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # init equal weights: 1/3 each
+        self.w = nn.Parameter(torch.ones(3) / 3.0)
+
+    def forward(self, x):
+        r = F.relu(x)
+        s = F.silu(x)
+        t = torch.tanh(x)
+        return self.w[0] * r * r + self.w[1] * s * s + self.w[2] * t * t
+
+
+_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu, "silu2": _silu2, "learned": None}
 
 
 class ScalarMLP(nn.Module):
@@ -32,7 +46,10 @@ class ScalarMLP(nn.Module):
         self.fc1 = nn.Linear(1, hidden)
         self.fc2 = nn.Linear(hidden, L)
         self.nonneg = nonneg
-        self.act = _ACTS[act]
+        if act == "learned":
+            self.act = LearnedAct()
+        else:
+            self.act = _ACTS[act]
 
     def forward(self, u):  # (T, 1) -> (T, L)
         y = self.fc2(self.act(self.fc1(u)))
