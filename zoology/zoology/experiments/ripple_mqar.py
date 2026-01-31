@@ -52,7 +52,7 @@ for input_seq_len, num_kv_pairs in [
         batch_size=batch_size,
     )
 
-    for d_model in [32, 64, 128, 256, 512]:
+    for d_model in [16, 32, 64, 128, 256, 512]:
         for lr in np.logspace(-4, -2, 4)[2:]:
 
             # Determine num_heads: keep head_dim ~16-32 range
@@ -382,7 +382,7 @@ for input_seq_len, num_kv_pairs in [
                     d_model=d_model,
                     n_layers=2,
                     block_type=block_type,
-                    max_position_embeddings=input_seq_len if sequence_mixer in ("attention", "luna-attn") else 0,
+                    max_position_embeddings=input_seq_len if sequence_mixer in ("attention", "luna-attn", "ripple-ja", "ripple-conv3a", "ripple-jluna") else 0,
                     vocab_size=VOCAB_SIZE,
                     sequence_mixer=MIXERS[sequence_mixer],
                     state_mixer=dict(name="torch.nn.Identity", kwargs={}),
