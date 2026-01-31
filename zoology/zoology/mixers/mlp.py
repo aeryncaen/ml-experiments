@@ -58,10 +58,7 @@ class _LearnedAct(nn.Module):
 
     def forward(self, x):
         w = self.w.clamp(0.05, 1.0)
-        r = F.relu(x)
-        s = F.silu(x)
-        t = torch.tanh(x)
-        return w[0] * r * r + w[1] * s * s + w[2] * t * t
+        return w[0] * F.relu(x) + w[1] * F.silu(x) + w[2] * torch.tanh(x)
 
 
 class LearnedGLU(nn.Module):
