@@ -292,7 +292,7 @@ for input_seq_len, num_kv_pairs in [
                     name="zoology.mixers.luna.LUNA",
                     kwargs={
                         "num_heads": num_heads,
-                        "M": 16,
+                        "M": 8,
                         "L": 4,
                         "hidden": 64,
                     },
@@ -301,7 +301,7 @@ for input_seq_len, num_kv_pairs in [
                     name="zoology.mixers.luna.LUNA",
                     kwargs={
                         "num_heads": num_heads,
-                        "M": 16,
+                        "M": 8,
                         "L": 4,
                         "hidden": 64,
                         "nonneg": False,
@@ -312,7 +312,7 @@ for input_seq_len, num_kv_pairs in [
                     name="zoology.mixers.luna.LUNA",
                     kwargs={
                         "num_heads": num_heads,
-                        "M": 16,
+                        "M": 8,
                         "L": 4,
                         "hidden": 64,
                         "nonneg": False,

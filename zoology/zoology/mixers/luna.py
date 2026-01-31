@@ -43,12 +43,15 @@ class ScalarMLP(nn.Module):
 
 class LearnableFeatureMap(nn.Module):
     def __init__(self, d: int, M: int, L: int, hidden: int = 64,
-                 nonneg: bool = True, act: str = "relu", chunk: int = 1_000_000):
+                 nonneg: bool = True, act: str = "relu", chunk: int = 1_000_000,
+                 ch_rms: bool = False, ch_rms_target: float = 0.1):
         super().__init__()
         self.M = M
         self.L = L
         self.scale = 1.0 / math.sqrt(M)
         self.chunk = chunk
+        self.ch_rms = ch_rms
+        self.ch_rms_target = ch_rms_target
 
         # Task-specific projections: W_i^T x + b_i
         self.W = nn.Parameter(torch.randn(M, d) / math.sqrt(d))
@@ -64,9 +67,15 @@ class LearnableFeatureMap(nn.Module):
         proj = torch.einsum("md,bhnd->bhnm", self.W, x) + self.b
 
         # Apply channel MLP to each scalar
-        u = proj.reshape(-1, 1)  # (B*H*N*M, 1)
+        u = proj.reshape(-1, 1).float()  # (B*H*N*M, 1)
         y = _chunked(self.channel_mlp, u, self.chunk)  # (B*H*N*M, L)
+        y = y.to(x.dtype)
         y = y.view(B, H, N, self.M, self.L)
+
+        if self.ch_rms:
+            rms = torch.sqrt(y.pow(2).mean((0, 1, 2, 3)) + 1e-6)  # (L,)
+            s = (self.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            y = y * s.view(1, 1, 1, 1, self.L)
 
         return (y * self.scale).reshape(B, H, N, self.M * self.L)
 
@@ -91,6 +100,7 @@ class LUNA(nn.Module):
         hidden: int = 64,
         nonneg: bool = True,
         act: str = "relu",
+        ch_rms: bool = False,
         layer_idx: int = None,
         **kwargs,
     ):
@@ -109,7 +119,7 @@ class LUNA(nn.Module):
 
         # Learned feature map (shared across heads)
         self.phi = LearnableFeatureMap(
-            d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=nonneg, act=act,
+            d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=nonneg, act=act, ch_rms=ch_rms,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
