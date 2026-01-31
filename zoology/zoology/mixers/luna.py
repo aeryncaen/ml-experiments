@@ -19,15 +19,19 @@ def _chunked(fn, x, chunk_size):
     return torch.cat([fn(x[i:i+chunk_size]) for i in range(0, x.shape[0], chunk_size)], dim=0)
 
 
+_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu}
+
+
 class ScalarMLP(nn.Module):
-    def __init__(self, L: int = 1, hidden: int = 64, nonneg: bool = True):
+    def __init__(self, L: int = 1, hidden: int = 64, nonneg: bool = True, act: str = "relu"):
         super().__init__()
         self.fc1 = nn.Linear(1, hidden)
         self.fc2 = nn.Linear(hidden, L)
         self.nonneg = nonneg
+        self.act = _ACTS[act]
 
     def forward(self, u):  # (T, 1) -> (T, L)
-        y = self.fc2(F.relu(self.fc1(u)))
+        y = self.fc2(self.act(self.fc1(u)))
         if self.nonneg:
             y = F.relu(y)
         return y
@@ -35,7 +39,7 @@ class ScalarMLP(nn.Module):
 
 class LearnableFeatureMap(nn.Module):
     def __init__(self, d: int, M: int, L: int, hidden: int = 64,
-                 nonneg: bool = True, chunk: int = 1_000_000):
+                 nonneg: bool = True, act: str = "relu", chunk: int = 1_000_000):
         super().__init__()
         self.M = M
         self.L = L
@@ -47,7 +51,7 @@ class LearnableFeatureMap(nn.Module):
         self.b = nn.Parameter(torch.zeros(M))
 
         # Shared channel MLP: scalar -> L channels
-        self.channel_mlp = ScalarMLP(L, hidden, nonneg)
+        self.channel_mlp = ScalarMLP(L, hidden, nonneg, act)
 
     def forward(self, x):  # (B, H, N, d) -> (B, H, N, M*L)
         B, H, N, d = x.shape
@@ -81,6 +85,8 @@ class LUNA(nn.Module):
         M: int = 16,
         L: int = 4,
         hidden: int = 64,
+        nonneg: bool = True,
+        act: str = "relu",
         layer_idx: int = None,
         **kwargs,
     ):
@@ -99,7 +105,7 @@ class LUNA(nn.Module):
 
         # Learned feature map (shared across heads)
         self.phi = LearnableFeatureMap(
-            d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=True,
+            d=self.head_dim, M=M, L=L, hidden=hidden, nonneg=nonneg, act=act,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
