@@ -54,11 +54,11 @@ class GLU(nn.Module):
 class _LearnedAct(nn.Module):
     def __init__(self):
         super().__init__()
-        self.w = nn.Parameter(torch.ones(3) / 3.0)
+        self.w = nn.Parameter(torch.ones(2) * 0.1)
 
     def forward(self, x):
         w = self.w.clamp(0.05, 1.0)
-        return w[0] * F.relu(x) + w[1] * F.silu(x) + w[2] * torch.tanh(x)
+        return F.silu(x) + w[0] * F.relu(x) + w[1] * torch.tanh(x)
 
 
 class LearnedGLU(nn.Module):
