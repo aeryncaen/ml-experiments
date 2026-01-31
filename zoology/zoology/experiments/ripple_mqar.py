@@ -287,12 +287,23 @@ for input_seq_len, num_kv_pairs in [
                         "diff_readout": False,
                     },
                 ),
+                # LUNA: learned kernel linear attention
+                "luna": dict(
+                    name="zoology.mixers.luna.LUNA",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "M": 16,
+                        "L": 4,
+                        "hidden": 64,
+                    },
+                ),
             }
 
             for sequence_mixer in [
                 "attention",
                 "ds-attn",
                 "ds-attn-nodiff",
+                "luna",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"
