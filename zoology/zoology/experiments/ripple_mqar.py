@@ -330,6 +330,17 @@ for input_seq_len, num_kv_pairs in [
                         "act": "learned",
                     },
                 ),
+                "luna-attn": dict(
+                    name="zoology.mixers.luna.LUNAAttn",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "M": 8,
+                        "L": 4,
+                        "hidden": 64,
+                        "act": "relu",
+                        "dropout": 0.1,
+                    },
+                ),
             }
 
             for sequence_mixer in [
@@ -340,6 +351,7 @@ for input_seq_len, num_kv_pairs in [
                 "luna-silu",
                 "luna-silu2",
                 "luna-learned",
+                "luna-attn",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"
@@ -350,7 +362,7 @@ for input_seq_len, num_kv_pairs in [
                     d_model=d_model,
                     n_layers=2,
                     block_type=block_type,
-                    max_position_embeddings=input_seq_len if sequence_mixer == "attention" else 0,
+                    max_position_embeddings=input_seq_len if sequence_mixer in ("attention", "luna-attn") else 0,
                     vocab_size=VOCAB_SIZE,
                     sequence_mixer=MIXERS[sequence_mixer],
                     state_mixer=dict(name="torch.nn.Identity", kwargs={}),
