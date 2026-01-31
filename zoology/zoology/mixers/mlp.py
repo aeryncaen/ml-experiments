@@ -52,12 +52,22 @@ class GLU(nn.Module):
 
 
 class _LearnedAct(nn.Module):
-    def __init__(self):
+    def __init__(self, ema_decay: float = 0.99):
         super().__init__()
         self.w = nn.Parameter(torch.ones(2) * 0.1)
+        self.register_buffer('w_ema', torch.ones(2) * 0.1)
+        self.ema_decay = ema_decay
+
+    @torch.no_grad()
+    def _update_ema(self):
+        self.w_ema.mul_(self.ema_decay).add_(self.w.data.clamp(0.05, 1.0), alpha=1 - self.ema_decay)
 
     def forward(self, x):
-        w = self.w.clamp(0.05, 1.0)
+        if self.training:
+            self._update_ema()
+            w = self.w.clamp(0.05, 1.0)
+        else:
+            w = self.w_ema
         return F.silu(x) + w[0] * F.relu(x) + w[1] * torch.tanh(x)
 
 
