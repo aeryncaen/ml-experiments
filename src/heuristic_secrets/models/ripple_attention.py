@@ -22,7 +22,7 @@ class ReLUSquared(nn.Module):
 
 class MultiScaleDepthwiseConv(nn.Module):
     """Split channels into 4 groups: 3 with different kernel sizes, 1 passthrough. Then SE."""
-    def __init__(self, channels: int, kernel_sizes: tuple = (3, 6, 12)):
+    def __init__(self, channels: int, kernel_sizes: tuple = (2, 4, 8)):
         super().__init__()
         self.kernel_sizes = kernel_sizes
         n_groups = len(kernel_sizes) + 1  # +1 for passthrough
