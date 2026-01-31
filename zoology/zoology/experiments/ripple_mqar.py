@@ -352,6 +352,7 @@ for input_seq_len, num_kv_pairs in [
                 "luna-silu2",
                 "luna-learned",
                 "luna-attn",
+                "ripple-ja",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"
