@@ -162,6 +162,14 @@ for input_seq_len, num_kv_pairs in [
                         "max_seq_len": input_seq_len,
                     },
                 ),
+                "ripple-jluna": dict(
+                    name="zoology.mixers.ripple.RippleMixer",
+                    kwargs={
+                        "num_heads": num_heads,
+                        "order": "jacobi,luna",
+                        "max_seq_len": input_seq_len,
+                    },
+                ),
                 "ripple-cja": dict(
                     name="zoology.mixers.ripple.RippleMixer",
                     kwargs={
@@ -353,6 +361,7 @@ for input_seq_len, num_kv_pairs in [
                 "luna-learned",
                 "luna-attn",
                 "ripple-ja",
+                "ripple-jluna",
             ]:
                 if "mamba" in sequence_mixer:
                     block_type = "MambaBlock"

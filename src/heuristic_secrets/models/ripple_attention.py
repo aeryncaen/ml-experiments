@@ -422,6 +422,14 @@ class RippleAttention(nn.Module):
 
         if 'mlp' in unique_ops:
             self.mlp = DifferentialSwiGLU(channels)
+
+        if 'luna' in unique_ops:
+            from zoology.mixers.luna import LUNA
+            head_dim = channels // num_heads
+            self.luna_op = LUNA(
+                d_model=channels, num_heads=num_heads,
+                M=8, L=4, hidden=64, nonneg=True, act="relu",
+            )
         
         self._dup_ops = nn.ModuleDict()
         self._dup_norms = nn.ModuleDict()
@@ -442,6 +450,9 @@ class RippleAttention(nn.Module):
                     self._dup_ops[key] = MIMOJacobiSSM(channels, n_iters=jacobi_iters, diffuse_se=diffuse_se, diff_inject=diff_inject, diff_readout=diff_readout, bc_norm=bc_norm, relu2=relu2)
                 elif name == 'mlp':
                     self._dup_ops[key] = DifferentialSwiGLU(channels)
+                elif name == 'luna':
+                    from zoology.mixers.luna import LUNA
+                    self._dup_ops[key] = LUNA(d_model=channels, num_heads=num_heads, M=8, L=4, hidden=64, nonneg=True, act="relu")
                 elif name == 'tele':
                     self._dup_ops[key] = TelephoneAttentionND(channels=channels, ndim=1, num_heads=num_heads, max_freq=max_freq, min_freq=min_freq, max_kernel_size=max_kernel_size, chunk_size=chunk_size, use_triton=use_triton, scale_power=telephone_power, max_seq_len=max_seq_len)
                 elif name == 'lowrank':
@@ -475,6 +486,9 @@ class RippleAttention(nn.Module):
             out = op(h)
         elif name == 'mlp':
             op = self._dup_ops[key] if is_dup else self.mlp
+            out = op(h)
+        elif name == 'luna':
+            op = self._dup_ops[key] if is_dup else self.luna_op
             out = op(h)
         else:
             raise ValueError(f"Unknown layer: {name}")
