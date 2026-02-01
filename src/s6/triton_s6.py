@@ -1252,7 +1252,6 @@ class _TritonS6(torch.autograd.Function):
             d_C_re, d_C_im, d_D,
             torch.empty(P, device=u.device, dtype=u.dtype),
             torch.empty(P, device=u.device, dtype=u.dtype),
-            torch.empty(P, device=u.device, dtype=u.dtype),
             M, H, P,
             BLOCK_H, BLOCK_P,
         )
