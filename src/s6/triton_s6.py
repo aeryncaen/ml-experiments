@@ -1226,68 +1226,67 @@ class _TritonS6(torch.autograd.Function):
         u_flat = u.reshape(M, H)
         A_real_neg = -torch.exp(log_A_real)
 
-        # ---- Steps 7+6: Fused readout + c_gate backward ----
-        BLOCK_H = min(64, triton.next_power_of_2(H))
-        d_h_re = torch.zeros(M, P, device=u.device, dtype=u.dtype)
-        d_h_im = torch.zeros(M, P, device=u.device, dtype=u.dtype)
-        d_c_gate_buf = torch.zeros(M, P, device=u.device, dtype=u.dtype)  # accumulator
-        d_u_skip = torch.empty(M, H, device=u.device, dtype=u.dtype)
-        d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
-        d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
-        d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
+        # ---- Steps 7+6: PyTorch readout + c_gate backward (DEBUG) ----
+        h_re_flat = h_re.view(M, P)
+        h_im_flat = h_im.view(M, P)
+        c_gate_flat = c_gate
 
-        fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
-            h_re.view(M, P), h_im.view(M, P),
-            c_gate, c_proj_out,
-            cum_theta.view(M, P // 2),
-            C_re, C_im, u_flat, D,
-            c_norm_gamma, c_bias,
-            d_out.view(M, H),
-            d_h_re, d_h_im,
-            d_c_gate_buf,
-            torch.empty(M, P // 2, device=u.device, dtype=u.dtype),  # placeholder, cgate chain does this
-            d_u_skip,
-            d_C_re, d_C_im, d_D,
-            torch.empty(P, device=u.device, dtype=u.dtype),  # d_c_bias placeholder
-            torch.empty(P, device=u.device, dtype=u.dtype),  # d_c_norm_gamma placeholder
-            M, H, P,
-            BLOCK_H, BLOCK_P,
-        )
+        hg_re = h_re_flat * c_gate_flat
+        hg_im = h_im_flat * c_gate_flat
 
-        # DEBUG: check for NaN after readout kernel
-        for _nm, _t in [("d_h_re", d_h_re), ("d_h_im", d_h_im), ("d_c_gate_buf", d_c_gate_buf),
-                         ("d_u_skip", d_u_skip), ("d_C_re", d_C_re), ("d_C_im", d_C_im), ("d_D", d_D)]:
-            if _t.isnan().any():
-                _nan_idx = _t.isnan().nonzero(as_tuple=False)
-                print(f"NaN in {_nm}: count={_t.isnan().sum()}, first indices={_nan_idx[:5]}, shape={_t.shape}")
-                print(f"  h_re nan={h_re.view(M,P).isnan().any()}, h_im nan={h_im.view(M,P).isnan().any()}")
-                print(f"  c_gate nan={c_gate.isnan().any()}, c_proj_out nan={c_proj_out.isnan().any()}")
-                print(f"  C_re nan={C_re.isnan().any()}, C_im nan={C_im.isnan().any()}")
-                print(f"  u nan={u_flat.isnan().any()}, D nan={D.isnan().any()}")
-                print(f"  d_out nan={d_out.isnan().any()}")
-                raise AssertionError(f"NaN in {_nm}")
+        y_re = hg_re @ C_re.t()
+        y_im = hg_im @ C_im.t()
+        y = y_re - y_im
 
-        # c_gate chain rule (RoPE, rmsnorm, silu backward)
-        d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
-        d_cum_theta_c = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
-        d_c_bias = torch.zeros(P, device=u.device, dtype=u.dtype)
-        d_c_norm_gamma = torch.zeros(P, device=u.device, dtype=u.dtype)
+        x_skip = y + u_flat * D
+        sig_skip = torch.sigmoid(x_skip)
+        d_x_skip = d_out.view(M, H) * (sig_skip + x_skip * sig_skip * (1 - sig_skip))
 
-        fused_bwd_cgate_chain_kernel[(M,)](
-            d_c_gate_buf,
-            c_proj_out, cum_theta.view(M, P // 2),
-            c_norm_gamma, c_bias,
-            d_c_proj_out, d_cum_theta_c,
-            d_c_bias, d_c_norm_gamma,
-            M, P, 1e-6,
-            BLOCK_P,
-        )
+        d_y = d_x_skip
+        d_u_skip = d_x_skip * D
+        d_D = (d_x_skip * u_flat).sum(0)
 
-        # DEBUG: check for NaN after cgate chain kernel
-        assert not d_c_proj_out.isnan().any(), "NaN in d_c_proj_out after cgate chain"
-        assert not d_cum_theta_c.isnan().any(), "NaN in d_cum_theta_c after cgate chain"
-        assert not d_c_bias.isnan().any(), "NaN in d_c_bias after cgate chain"
-        assert not d_c_norm_gamma.isnan().any(), "NaN in d_c_norm_gamma after cgate chain"
+        d_hg_re = d_y @ C_re
+        d_hg_im = -(d_y @ C_im)
+        d_C_re = d_y.t() @ hg_re
+        d_C_im = -(d_y.t() @ hg_im)
+
+        d_h_re = d_hg_re * c_gate_flat
+        d_h_im = d_hg_im * c_gate_flat
+        d_c_gate = d_hg_re * h_re_flat + d_hg_im * h_im_flat
+
+        # c_gate backward (PyTorch)
+        cum_theta_flat = cum_theta.view(M, P // 2)
+        c_silu = F.silu(c_proj_out)
+        c_var = c_silu.pow(2).mean(-1, keepdim=True)
+        c_normed = c_silu / torch.sqrt(c_var + 1e-6) * c_norm_gamma
+        c_gate_pre_rope = c_normed + c_bias
+
+        cos_ct = torch.cos(cum_theta_flat)
+        sin_ct = torch.sin(cum_theta_flat)
+
+        d_cg = d_c_gate.view(M, P)
+        d_cg1, d_cg2 = d_cg[..., 0::2], d_cg[..., 1::2]
+        cg1, cg2 = c_gate_pre_rope[..., 0::2], c_gate_pre_rope[..., 1::2]
+
+        d_cgpre = torch.empty_like(c_gate_pre_rope)
+        d_cgpre[..., 0::2] = d_cg1 * cos_ct + d_cg2 * sin_ct
+        d_cgpre[..., 1::2] = -d_cg1 * sin_ct + d_cg2 * cos_ct
+
+        d_cum_theta_c = (d_cg1 * (-cg1 * sin_ct - cg2 * cos_ct) +
+                         d_cg2 * (cg1 * cos_ct - cg2 * sin_ct))
+
+        d_c_bias = d_cgpre.sum(0)
+
+        rrms_c = torch.rsqrt(c_var + 1e-6)
+        c_hat = c_silu * rrms_c
+        d_c_norm_gamma = (d_cgpre * c_hat).sum(0)
+        d_c_hat = d_cgpre * c_norm_gamma
+        inner_c = (d_c_hat * c_hat).sum(-1, keepdim=True) / P
+        d_c_silu = rrms_c * (d_c_hat - c_hat * inner_c)
+
+        sig_c = torch.sigmoid(c_proj_out)
+        d_c_proj_out = d_c_silu * (sig_c + c_proj_out * sig_c * (1 - sig_c))
 
         # c_proj linear backward
         d_c_proj_w = d_c_proj_out.t() @ u_flat
