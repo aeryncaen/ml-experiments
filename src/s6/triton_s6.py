@@ -1627,8 +1627,10 @@ if HAS_TRITON:
         d_inj_re_ptr, d_inj_im_ptr,  # (B, L, P)
         d_dt_inj_ptr,  # (B, L, P)
         d_lam_ptr,  # (B, L, P)
-        d_Bu_rot_ptr,  # (B, L, P) atomic add
-        d_alpha_re_ptr, d_alpha_im_ptr,  # (B, L, P) atomic add
+        d_Bu_self_ptr, d_Bu_prev1_ptr, d_Bu_prev2_ptr, d_Bu_next1_ptr, d_Bu_next2_ptr,
+        d_alpha_self_re_ptr, d_alpha_self_im_ptr,
+        d_alpha_prev1_re_ptr, d_alpha_prev1_im_ptr,
+        d_alpha_next1_re_ptr, d_alpha_next1_im_ptr,
         B_batch, L, P,
         BLOCK_P: tl.constexpr,
     ):
@@ -1707,13 +1709,10 @@ if HAS_TRITON:
 
         # d_Bu_rot for current position
         d_Bu_curr = lam_t * dt_t * d_inj_re
-        tl.atomic_add(d_Bu_rot_ptr + off, d_Bu_curr, mask=p_mask)
 
         # d_alpha (current) from Z = alpha * U
         d_a_re_add = dZ_re * U_re + dZ_im * U_im
         d_a_im_add = dZ_im * U_re - dZ_re * U_im
-        tl.atomic_add(d_alpha_re_ptr + off, d_a_re_add, mask=p_mask)
-        tl.atomic_add(d_alpha_im_ptr + off, d_a_im_add, mask=p_mask)
 
         # dU from Z = alpha * U
         dU_re = dZ_re * a_re + dZ_im * a_im
@@ -1725,21 +1724,35 @@ if HAS_TRITON:
         d_next1 = dU_re * (m2 + m3)
         d_next2 = dU_re * a_next_re + dU_im * a_next_im
 
-        tl.atomic_add(d_Bu_rot_ptr + off_prev1, d_prev1, mask=p_mask & has_prev1)
-        tl.atomic_add(d_Bu_rot_ptr + off_prev2, d_prev2 * m1, mask=p_mask & has_prev2)
-        tl.atomic_add(d_Bu_rot_ptr + off_next1, d_next1, mask=p_mask & has_next1)
-        tl.atomic_add(d_Bu_rot_ptr + off_next2, d_next2 * m2, mask=p_mask & has_next2)
-
         # alpha_prev/alpha_next contributions
         d_a_prev_re = dU_re * Bu_prev2
         d_a_prev_im = dU_im * Bu_prev2
         d_a_next_re = dU_re * Bu_next2
         d_a_next_im = dU_im * Bu_next2
 
-        tl.atomic_add(d_alpha_re_ptr + off_prev1, d_a_prev_re * m1, mask=p_mask & has_prev1)
-        tl.atomic_add(d_alpha_im_ptr + off_prev1, d_a_prev_im * m1, mask=p_mask & has_prev1)
-        tl.atomic_add(d_alpha_re_ptr + off_next1, d_a_next_re * m2, mask=p_mask & has_next1)
-        tl.atomic_add(d_alpha_im_ptr + off_next1, d_a_next_im * m2, mask=p_mask & has_next1)
+        # store contributions (no atomics)
+        d_prev1 = tl.where(has_prev1, d_prev1, 0.0)
+        d_prev2 = tl.where(has_prev2, d_prev2 * m1, 0.0)
+        d_next1 = tl.where(has_next1, d_next1, 0.0)
+        d_next2 = tl.where(has_next2, d_next2 * m2, 0.0)
+
+        d_a_prev_re = tl.where(has_prev1, d_a_prev_re * m1, 0.0)
+        d_a_prev_im = tl.where(has_prev1, d_a_prev_im * m1, 0.0)
+        d_a_next_re = tl.where(has_next1, d_a_next_re * m2, 0.0)
+        d_a_next_im = tl.where(has_next1, d_a_next_im * m2, 0.0)
+
+        tl.store(d_Bu_self_ptr + off, d_Bu_curr, mask=p_mask)
+        tl.store(d_Bu_prev1_ptr + off, d_prev1, mask=p_mask)
+        tl.store(d_Bu_prev2_ptr + off, d_prev2, mask=p_mask)
+        tl.store(d_Bu_next1_ptr + off, d_next1, mask=p_mask)
+        tl.store(d_Bu_next2_ptr + off, d_next2, mask=p_mask)
+
+        tl.store(d_alpha_self_re_ptr + off, d_a_re_add, mask=p_mask)
+        tl.store(d_alpha_self_im_ptr + off, d_a_im_add, mask=p_mask)
+        tl.store(d_alpha_prev1_re_ptr + off, d_a_prev_re, mask=p_mask)
+        tl.store(d_alpha_prev1_im_ptr + off, d_a_prev_im, mask=p_mask)
+        tl.store(d_alpha_next1_re_ptr + off, d_a_next_re, mask=p_mask)
+        tl.store(d_alpha_next1_im_ptr + off, d_a_next_im, mask=p_mask)
 
     # ========== Alpha -> dt/A backward ==========
 
@@ -1750,7 +1763,7 @@ if HAS_TRITON:
         d_alpha_re_ptr, d_alpha_im_ptr,
         A_real_ptr, A_imag_ptr,
         d_dt_ptr,
-        d_log_A_real_ptr, d_A_imag_ptr,
+        d_log_A_real_buf_ptr, d_A_imag_buf_ptr,
         B_batch, L, P,
         BLOCK_P: tl.constexpr,
     ):
@@ -1781,8 +1794,9 @@ if HAS_TRITON:
             d_A_real_acc += d_a_re * dt_t * alpha_re + d_a_im * dt_t * alpha_im
             d_A_imag_acc += -d_a_re * dt_t * alpha_im + d_a_im * dt_t * alpha_re
 
-        tl.atomic_add(d_log_A_real_ptr + offs_p, d_A_real_acc * a_re, mask=p_mask)
-        tl.atomic_add(d_A_imag_ptr + offs_p, d_A_imag_acc, mask=p_mask)
+        off_out = pid_b * P + offs_p
+        tl.store(d_log_A_real_buf_ptr + off_out, d_A_real_acc * a_re, mask=p_mask)
+        tl.store(d_A_imag_buf_ptr + off_out, d_A_imag_acc, mask=p_mask)
 
     # ========== RoPE backward for Bu ==========
 
@@ -2897,7 +2911,19 @@ class _TritonS6(torch.autograd.Function):
 
         d_dt_inj = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_lam_disc = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_Bu_rot = torch.zeros(B, L, P, device=u.device, dtype=u.dtype)
+
+        d_Bu_self = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_prev1 = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_prev2 = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_next1 = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_next2 = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+
+        d_alpha_self_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_self_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_prev1_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_prev1_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_next1_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_next1_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
 
         fused_inject_bwd_kernel[(B, L, triton.cdiv(P, BLOCK_P_SCAN))](
             dt.view(B, L, P), lam.view(B, L, P),
@@ -2905,15 +2931,35 @@ class _TritonS6(torch.autograd.Function):
             alpha_re.view(B, L, P), alpha_im.view(B, L, P),
             d_inject_re, d_inject_im,
             d_dt_inj, d_lam_disc,
-            d_Bu_rot,
-            d_alpha_re, d_alpha_im,
+            d_Bu_self, d_Bu_prev1, d_Bu_prev2, d_Bu_next1, d_Bu_next2,
+            d_alpha_self_re, d_alpha_self_im,
+            d_alpha_prev1_re, d_alpha_prev1_im,
+            d_alpha_next1_re, d_alpha_next1_im,
             B, L, P,
             BLOCK_P_SCAN,
         )
 
+        # Deterministic aggregation for d_Bu_rot
+        d_Bu_rot = d_Bu_self.clone()
+        if L > 1:
+            d_Bu_rot[:, :-1] += d_Bu_prev1[:, 1:]
+            d_Bu_rot[:, 1:] += d_Bu_next1[:, :-1]
+        if L > 2:
+            d_Bu_rot[:, :-2] += d_Bu_prev2[:, 2:]
+            d_Bu_rot[:, 2:] += d_Bu_next2[:, :-2]
+
+        # Deterministic aggregation for d_alpha
+        d_alpha_re = d_alpha_re + d_alpha_self_re
+        d_alpha_im = d_alpha_im + d_alpha_self_im
+        if L > 1:
+            d_alpha_re[:, :-1] += d_alpha_prev1_re[:, 1:]
+            d_alpha_im[:, :-1] += d_alpha_prev1_im[:, 1:]
+            d_alpha_re[:, 1:] += d_alpha_next1_re[:, :-1]
+            d_alpha_im[:, 1:] += d_alpha_next1_im[:, :-1]
+
         d_dt_alpha = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_log_A_real = torch.zeros(P, device=u.device, dtype=u.dtype)
-        d_A_imag = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_log_A_real_buf = torch.empty(B, P, device=u.device, dtype=u.dtype)
+        d_A_imag_buf = torch.empty(B, P, device=u.device, dtype=u.dtype)
 
         fused_alpha_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
             dt.view(B, L, P),
@@ -2921,10 +2967,13 @@ class _TritonS6(torch.autograd.Function):
             d_alpha_re, d_alpha_im,
             A_real_neg, A_imag,
             d_dt_alpha,
-            d_log_A_real, d_A_imag,
+            d_log_A_real_buf, d_A_imag_buf,
             B, L, P,
             BLOCK_P_SCAN,
         )
+
+        d_log_A_real = d_log_A_real_buf.sum(dim=0)
+        d_A_imag = d_A_imag_buf.sum(dim=0)
 
         d_dt_total = d_dt_inj + d_dt_alpha
 
