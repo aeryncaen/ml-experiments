@@ -199,8 +199,7 @@ def debug_forward_stepwise():
     from .s6 import S6, apply_rotary_emb
     from .triton_s6 import (TritonS6, triton_linear,
                              fused_prescan_kernel, fused_scan_kernel,
-                             fused_cgate_kernel, fused_readout_kernel,
-                             LOG2E)
+                             fused_cgate_kernel, fused_readout_kernel)
     import triton
 
     torch.manual_seed(SEED)
