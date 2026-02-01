@@ -33,16 +33,22 @@ class SqueezeExcite1D(nn.Module):
 
 
 class MultiScaleDepthwiseConv(nn.Module):
-    """Split channels into 4 groups: 3 with different kernel sizes, 1 passthrough. Then SE."""
-    def __init__(self, channels, kernel_sizes=(3, 6, 12)):
+    """Split channels into 4 groups: 3 causal, 3 acausal, 9 causal, 9 acausal. Then SE."""
+    def __init__(self, channels):
         super().__init__()
-        self.kernel_sizes = kernel_sizes
-        n_groups = len(kernel_sizes) + 1  # +1 for passthrough
+        n_groups = 4
         assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups}"
         self.group_size = channels // n_groups
+        self.kernel_specs = [(3, True), (3, False), (9, True), (9, False)]
         self.convs = nn.ModuleList([
-            nn.Conv1d(self.group_size, self.group_size, k, padding=k // 2, groups=self.group_size)
-            for k in kernel_sizes
+            nn.Conv1d(
+                self.group_size,
+                self.group_size,
+                k,
+                padding=(k - 1 if causal else k // 2),
+                groups=self.group_size,
+            )
+            for k, causal in self.kernel_specs
         ])
         self.se = SqueezeExcite1D(channels)
 
@@ -50,14 +56,15 @@ class MultiScaleDepthwiseConv(nn.Module):
         # x: (B, L, C)
         B, L, C = x.shape
         gs = self.group_size
-        n_conv = len(self.kernel_sizes)
+        n_conv = len(self.kernel_specs)
         conv_chunks = [x[..., i * gs:(i + 1) * gs] for i in range(n_conv)]
-        passthrough = x[..., n_conv * gs:]
         out = []
-        for chunk, conv in zip(conv_chunks, self.convs):
-            y = F.silu(conv(chunk.transpose(1, 2)))[..., :L].transpose(1, 2)
+        for (chunk, conv, (k, causal)) in zip(conv_chunks, self.convs, self.kernel_specs):
+            y = conv(chunk.transpose(1, 2))
+            if causal:
+                y = y[..., :L]
+            y = F.silu(y).transpose(1, 2)
             out.append(y)
-        out.append(passthrough)
         out = torch.cat(out, dim=-1)  # (B, L, C)
         return self.se(out)
 
@@ -301,7 +308,7 @@ class S6(nn.Module):
 
         # Multi-scale depthwise conv (before projections)
         assert d_model % 4 == 0, f"d_model ({d_model}) must be divisible by 4 for msconv"
-        self.msconv = MultiScaleDepthwiseConv(d_model, kernel_sizes=(3, 6, 12))
+        self.msconv = MultiScaleDepthwiseConv(d_model)
 
         # D skip connection
         self.D = nn.Parameter(torch.randn(self.h))

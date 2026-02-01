@@ -303,6 +303,7 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
             msconv.convs[0].weight, msconv.convs[0].bias,
             msconv.convs[1].weight, msconv.convs[1].bias,
             msconv.convs[2].weight, msconv.convs[2].bias,
+            msconv.convs[3].weight, msconv.convs[3].bias,
             msconv.se.fc1.weight, msconv.se.fc2.weight,
             msconv.group_size,
         )
@@ -318,7 +319,7 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
     # attention
     def f_attn():
-        return s6.attn(y_conv, y_conv, Bu_raw, c_proj_out)
+        return s6.attn(y_conv, y_conv)
     timed(f_attn, "attention")
 
     # --- Backward profiling ---
