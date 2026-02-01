@@ -1255,13 +1255,17 @@ class _TritonS6(torch.autograd.Function):
         )
 
         # DEBUG: check for NaN after readout kernel
-        assert not d_h_re.isnan().any(), "NaN in d_h_re after readout kernel"
-        assert not d_h_im.isnan().any(), "NaN in d_h_im after readout kernel"
-        assert not d_c_gate_buf.isnan().any(), "NaN in d_c_gate_buf after readout kernel"
-        assert not d_u_skip.isnan().any(), "NaN in d_u_skip after readout kernel"
-        assert not d_C_re.isnan().any(), "NaN in d_C_re after readout kernel"
-        assert not d_C_im.isnan().any(), "NaN in d_C_im after readout kernel"
-        assert not d_D.isnan().any(), "NaN in d_D after readout kernel"
+        for _nm, _t in [("d_h_re", d_h_re), ("d_h_im", d_h_im), ("d_c_gate_buf", d_c_gate_buf),
+                         ("d_u_skip", d_u_skip), ("d_C_re", d_C_re), ("d_C_im", d_C_im), ("d_D", d_D)]:
+            if _t.isnan().any():
+                _nan_idx = _t.isnan().nonzero(as_tuple=False)
+                print(f"NaN in {_nm}: count={_t.isnan().sum()}, first indices={_nan_idx[:5]}, shape={_t.shape}")
+                print(f"  h_re nan={h_re.view(M,P).isnan().any()}, h_im nan={h_im.view(M,P).isnan().any()}")
+                print(f"  c_gate nan={c_gate.isnan().any()}, c_proj_out nan={c_proj_out.isnan().any()}")
+                print(f"  C_re nan={C_re.isnan().any()}, C_im nan={C_im.isnan().any()}")
+                print(f"  u nan={u_flat.isnan().any()}, D nan={D.isnan().any()}")
+                print(f"  d_out nan={d_out.isnan().any()}")
+                raise AssertionError(f"NaN in {_nm}")
 
         # c_gate chain rule (RoPE, rmsnorm, silu backward)
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
