@@ -205,18 +205,41 @@ class S6Kernel(nn.Module):
 
 
 class S6Attention(nn.Module):
-    """Causal attention. K uses pre-mixed B projection from S6.forward."""
-    def __init__(self, d_model, d_state, num_heads=1):
+    """Causal attention with 80/20 weight sharing.
+
+    Q: 80% of rows shared with c_proj, 20% dedicated.
+    K: 80% of rows shared with phi_B.W, 20% dedicated.
+    V: standalone.
+    Separate forward ops — just shared Parameter storage.
+    """
+    def __init__(self, d_model, d_state, M=4, num_heads=1,
+                 phi_B=None, c_proj=None):
         super().__init__()
         H = d_model
         P = d_state
         self.H = H
         self.P = P
+        self.M = M
         self.num_heads = num_heads
         self.head_dim = P // num_heads
         assert P % num_heads == 0
 
-        self.q_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
+        # Q: 80% rows from c_proj, 20% dedicated
+        self.shared_q_rows = int(0.8 * P)
+        self.ded_q_rows = P - self.shared_q_rows
+        assert c_proj is not None
+        self._c_proj = c_proj
+        self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
+        self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
+
+        # K: 80% W rows from phi_B, 20% dedicated
+        self.shared_k_dirs = int(0.8 * M)
+        self.ded_k_dirs = M - self.shared_k_dirs
+        assert phi_B is not None
+        self._phi_B = phi_B
+        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
+        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
+
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
         self.q_norm = RMSNorm(self.head_dim)
@@ -227,18 +250,35 @@ class S6Attention(nn.Module):
         self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, u, y_ssm, K_mixed):
+    def forward(self, u, y_ssm):
         """
-        u: (B, L, H) — input for Q/V projections
+        u: (B, L, H) — input for Q/K/V projections
         y_ssm: (B, L, H) — SSM output (residual target)
-        K_mixed: (B, L, P) — pre-mixed B projection for K (from dual gate)
         """
-        B_batch, L, _ = u.shape
+        B_batch, L, H = u.shape
+        P = self.P
+        M = self.M
         nh = self.num_heads
         hd = self.head_dim
 
-        Q = self.q_proj(u.bfloat16())  # (B, L, P)
-        K = K_mixed.bfloat16()  # (B, L, P)
+        # Q: assemble shared c_proj rows + dedicated rows
+        q_w = torch.cat([self._c_proj.weight[:self.shared_q_rows],
+                         self.q_ded_weight], dim=0)
+        q_b = torch.cat([self._c_proj.bias[:self.shared_q_rows],
+                         self.q_ded_bias], dim=0)
+        Q = F.linear(u, q_w, q_b).bfloat16()  # (B, L, P)
+
+        # K: assemble shared phi_B rows + dedicated rows, run feature map
+        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
+                         self.k_ded_W], dim=0)  # (M, H)
+        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
+                         self.k_ded_b], dim=0)  # (M,)
+        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
+        k_flat = k_proj.reshape(-1, 1).float()
+        k_feat = self._phi_B.channel_mlp(k_flat)
+        k_feat = k_feat.view(B_batch, L, M, self._phi_B.L)
+        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()
+
         V = self.v_proj(u.bfloat16())  # (B, L, P)
 
         Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
@@ -246,7 +286,7 @@ class S6Attention(nn.Module):
         V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, self.P)
+        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
         return y_ssm + self.gate * self.out_proj(attn_out).float()
 
@@ -269,15 +309,6 @@ class S6(nn.Module):
         # SSM Kernel (parallel scan, not FFT conv)
         self.kernel = S6Kernel(self.h, N=self.n, M=M, **kernel_args)
 
-        # Dual B/K projection: phi_B (nonlinear) + linear_B, with learned gates
-        # phi_B lives inside self.kernel, linear_B is new
-        self.linear_B = nn.Linear(self.h, self.n)
-        # Per-dim gates, init 0.0 → sigmoid(0)=0.5 → equal mix
-        # gate_b_ssm: how much phi_B vs linear_B for SSM's B input
-        # gate_b_attn: how much phi_B vs linear_B for attention's K input
-        self.gate_b_ssm = nn.Parameter(torch.zeros(self.n))
-        self.gate_b_attn = nn.Parameter(torch.zeros(self.n))
-
         # C: static MIMO readout (H, P) complex — maps state back to output channels
         C = torch.randn(self.h, self.n, dtype=torch.cfloat) / math.sqrt(self.n)
         self.C = nn.Parameter(torch.view_as_real(C))  # (H, P, 2) stored as real
@@ -288,13 +319,9 @@ class S6(nn.Module):
         # Post-readout norm (before attention residual)
         self.readout_norm = RMSNorm(self.h)
 
-        # Attention (standalone Q, K from dual gate mix, V standalone)
-        self.attn = S6Attention(d_model, d_state, num_heads=num_heads)
-
-    def _mix_b(self, phi_out, lin_out, gate_logit):
-        """Mix phi_B and linear_B outputs with bounded gate."""
-        g = torch.sigmoid(gate_logit).clamp(0.1, 0.9)  # (P,)
-        return g * phi_out + (1.0 - g) * lin_out
+        # Attention (80/20 weight sharing with phi_B and c_proj)
+        self.attn = S6Attention(d_model, d_state, M=M, num_heads=num_heads,
+                                phi_B=self.kernel.phi_B, c_proj=self.c_proj)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
@@ -303,18 +330,8 @@ class S6(nn.Module):
         # msconv first
         x = self.msconv(u)
 
-        # Compute both B projections once
-        phi_B_out = self.kernel.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
-        lin_B_out = self.linear_B(x)  # (B, L, P)
-
-        # Mix for SSM (gate_b_ssm controls phi_B vs linear_B balance)
-        Bu_ssm = self._mix_b(phi_B_out, lin_B_out, self.gate_b_ssm)
-
-        # Mix for attention K (different gate, same two projections)
-        K_attn = self._mix_b(phi_B_out, lin_B_out, self.gate_b_attn)
-
-        # Run SSM scan with pre-mixed B
-        h, cum_theta = self.kernel(x, Bu_raw=Bu_ssm)
+        # Run SSM scan (phi_B computed internally by kernel)
+        h, cum_theta = self.kernel(x)
 
         # Input-dependent C gating + static C readout
         c_proj_out = self.c_proj(x)  # (B, L, P)
@@ -332,6 +349,6 @@ class S6(nn.Module):
 
         # Post-readout norm + residual + attention
         y_normed = self.readout_norm(y) + x
-        y = self.attn(x, y_normed, K_attn)
+        y = self.attn(x, y_normed)
 
         return y

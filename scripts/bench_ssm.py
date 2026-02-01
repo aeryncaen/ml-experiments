@@ -159,23 +159,26 @@ class DS1Wrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Task generators
 # ---------------------------------------------------------------------------
-def gen_delay(B, L, D, delay=1, device='cpu'):
-    x = torch.randn(B, L, D, device=device)
+def gen_delay(B, L, vocab_size=32, delay=1, device='cpu'):
+    """Token input, target is same sequence shifted by `delay` positions."""
+    x = torch.randint(0, vocab_size, (B, L), device=device)
     target = torch.zeros_like(x)
-    target[:, delay:, :] = x[:, :L - delay, :]
+    target[:, delay:] = x[:, :L - delay]
     return x, target
 
 
-def gen_selective_copy(B, L, D, n_markers=4, device='cpu'):
-    x = torch.randn(B, L, D, device=device)
-    target = torch.zeros(B, n_markers, D, device=device)
-    markers = torch.zeros(B, L, 1, device=device)
+def gen_selective_copy(B, L, vocab_size=32, n_markers=4, device='cpu'):
+    """Token input with marker channel. Target is the n_markers marked tokens.
+    Input: (B, L) tokens + (B, L) marker flags → fed as 2-token tuples via embedding.
+    Output: (B, n_markers) token predictions at end of sequence."""
+    tokens = torch.randint(0, vocab_size, (B, L), device=device)
+    markers = torch.zeros(B, L, dtype=torch.long, device=device)
+    target = torch.zeros(B, n_markers, dtype=torch.long, device=device)
     for b in range(B):
         idxs = torch.randperm(L, device=device)[:n_markers].sort().values
-        markers[b, idxs, 0] = 1.0
-        target[b] = x[b, idxs]
-    x = torch.cat([x, markers], dim=-1)  # (B, L, D+1)
-    return x, target
+        markers[b, idxs] = 1
+        target[b] = tokens[b, idxs]
+    return tokens, markers, target
 
 
 def gen_parity(B, L, device='cpu'):
@@ -208,7 +211,19 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
 
-    if task_name == 'parity':
+    if task_name == 'delay':
+        vocab_size = 32
+        embed = nn.Embedding(vocab_size, dim).to(device)
+        head = nn.Linear(dim, vocab_size).to(device)
+        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+    elif task_name == 'selective_copy':
+        vocab_size = 32
+        embed = nn.Embedding(vocab_size, dim).to(device)
+        marker_embed = nn.Embedding(2, dim).to(device)
+        head = nn.Linear(dim, vocab_size).to(device)
+        opt = optim.Adam(list(model.parameters()) + list(embed.parameters())
+                         + list(marker_embed.parameters()) + list(head.parameters()), lr=lr)
+    elif task_name == 'parity':
         vocab_size = 2
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
@@ -223,31 +238,25 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-    elif task_name == 'selective_copy':
-        proj_in = nn.Linear(dim + 1, dim).to(device)
-        readout = nn.Linear(dim, dim).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(proj_in.parameters()) + list(readout.parameters()), lr=lr)
-    else:
-        readout = nn.Linear(dim, dim).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(readout.parameters()), lr=lr)
 
     def _step(task_name):
         if task_name == 'delay':
-            x, t = gen_delay(B, L, dim, device=device)
-            y = readout(model(x))
-            loss = F.mse_loss(y, t)
-            # R² accuracy: 1 - MSE/Var(target)
+            inp, tgt = gen_delay(B, L, vocab_size, device=device)
+            y = head(model(embed(inp)))
+            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
-                var = t.var()
-                acc = (1.0 - loss.detach() / var).item() if var > 0 else 0.0
+                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'selective_copy':
-            x, t = gen_selective_copy(B, L, dim, device=device)
-            y = readout(model(proj_in(x)))
-            loss = F.mse_loss(y[:, -4:, :], t)
+            tokens, markers, tgt = gen_selective_copy(B, L, vocab_size, device=device)
+            x = embed(tokens) + marker_embed(markers)  # (B, L, dim)
+            y = head(model(x))  # (B, L, vocab_size)
+            # Only score the last n_markers positions
+            n_markers = tgt.shape[1]
+            y_last = y[:, -n_markers:]  # (B, n_markers, vocab_size)
+            loss = F.cross_entropy(y_last.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
-                var = t.var()
-                acc = (1.0 - loss.detach() / var).item() if var > 0 else 0.0
+                acc = (y_last.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'parity':
             inp, tgt = gen_parity(B, L, device=device)

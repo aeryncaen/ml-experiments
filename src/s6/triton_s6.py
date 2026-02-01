@@ -2068,7 +2068,7 @@ class TritonS6(nn.Module):
             msconv.group_size,
         )  # (B, L, H)
 
-        # 2. Dual B projection: phi_B (Triton) + linear_B, then gate-mix
+        # 2. phi_B projection (Triton)
         phi = kern.phi_B
         mlp = phi.channel_mlp
         N_rows = B_size * L_size
@@ -2085,12 +2085,7 @@ class TritonS6(nn.Module):
             rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
             sc = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
             raw = (raw_3d * sc.view(1, 1, phi.L)).view(N_rows, -1)
-        phi_B_out = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
-        lin_B_out = s6.linear_B(x)  # (B, L, P)
-
-        # Gate-mix for SSM and attention K (bounded [0.1, 0.9])
-        Bu_ssm = s6._mix_b(phi_B_out, lin_B_out, s6.gate_b_ssm)
-        K_attn = s6._mix_b(phi_B_out, lin_B_out, s6.gate_b_attn)
+        Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
         # 3. SSM core (Triton) — operates on x (post-msconv)
         C = torch.view_as_complex(s6.C)
@@ -2099,7 +2094,7 @@ class TritonS6(nn.Module):
 
         y_ssm = _TritonS6.apply(
             x,
-            Bu_ssm,
+            Bu_raw,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
             kern.log_A_real, kern.A_imag,
@@ -2113,8 +2108,8 @@ class TritonS6(nn.Module):
         # 4. Post-readout norm + residual from x (post-msconv)
         y_normed = s6.readout_norm(y_ssm) + x
 
-        # 5. Attention (PyTorch) — standalone Q, gate-mixed K
-        y = s6.attn(x, y_normed, K_attn)
+        # 5. Attention (PyTorch)
+        y = s6.attn(x, y_normed)
 
         return y
 
