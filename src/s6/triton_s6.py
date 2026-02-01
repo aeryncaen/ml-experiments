@@ -3052,6 +3052,7 @@ class _TritonS6(torch.autograd.Function):
 
         return (d_u,
                 d_Bu_raw_out,
+                None, None,
                 d_x_proj_w, d_x_proj_b,
                 d_b_norm_gamma, d_b_bias, d_log_dt_bias,
                 d_log_A_real, d_A_imag,
