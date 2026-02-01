@@ -1097,7 +1097,6 @@ if HAS_TRITON:
         base = pid_b * L * P
 
         start = pid_c * chunk_size
-        end = tl.minimum(start + chunk_size, L)
 
         a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
         a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
@@ -1106,13 +1105,16 @@ if HAS_TRITON:
 
         for t in range(0, chunk_size):
             t_idx = start + t
-            if t_idx >= L:
-                break
+            active = t_idx < L
             off = base + t_idx * P + offs_p
-            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
-            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
-            b_re = tl.load(inject_re_ptr + off, mask=p_mask, other=0.0)
-            b_im = tl.load(inject_im_ptr + off, mask=p_mask, other=0.0)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask & active, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask & active, other=0.0)
+            b_re = tl.load(inject_re_ptr + off, mask=p_mask & active, other=0.0)
+            b_im = tl.load(inject_im_ptr + off, mask=p_mask & active, other=0.0)
+            a_re = tl.where(active, a_re, 1.0)
+            a_im = tl.where(active, a_im, 0.0)
+            b_re = tl.where(active, b_re, 0.0)
+            b_im = tl.where(active, b_im, 0.0)
 
             # b_acc = a * b_acc + b
             b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
@@ -1198,25 +1200,27 @@ if HAS_TRITON:
         h_im = tl.load(chunk_h0_im_ptr + off_chunk, mask=p_mask, other=0.0)
 
         start = pid_c * chunk_size
-        end = tl.minimum(start + chunk_size, L)
 
         for t in range(0, chunk_size):
             t_idx = start + t
-            if t_idx >= L:
-                break
+            active = t_idx < L
             off = base + t_idx * P + offs_p
-            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
-            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
-            b_re = tl.load(inject_re_ptr + off, mask=p_mask, other=0.0)
-            b_im = tl.load(inject_im_ptr + off, mask=p_mask, other=0.0)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask & active, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask & active, other=0.0)
+            b_re = tl.load(inject_re_ptr + off, mask=p_mask & active, other=0.0)
+            b_im = tl.load(inject_im_ptr + off, mask=p_mask & active, other=0.0)
+            a_re = tl.where(active, a_re, 1.0)
+            a_im = tl.where(active, a_im, 0.0)
+            b_re = tl.where(active, b_re, 0.0)
+            b_im = tl.where(active, b_im, 0.0)
 
             h_re_new = a_re * h_re - a_im * h_im + b_re
             h_im_new = a_re * h_im + a_im * h_re + b_im
-            h_re = h_re_new
-            h_im = h_im_new
+            h_re = tl.where(active, h_re_new, h_re)
+            h_im = tl.where(active, h_im_new, h_im)
 
-            tl.store(h_re_ptr + off, h_re, mask=p_mask)
-            tl.store(h_im_ptr + off, h_im, mask=p_mask)
+            tl.store(h_re_ptr + off, h_re, mask=p_mask & active)
+            tl.store(h_im_ptr + off, h_im, mask=p_mask & active)
 
     # ========== Chunked scan backward (adjoint) ==========
     # Uses alpha and d_h to produce d_inject and d_alpha.
@@ -1242,7 +1246,6 @@ if HAS_TRITON:
         base = pid_b * L * P
 
         start = pid_c * chunk_size
-        end = tl.minimum(start + chunk_size, L)
 
         a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
         a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
@@ -1250,16 +1253,19 @@ if HAS_TRITON:
         b_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         for t in range(0, chunk_size):
-            t_idx = end - 1 - t
-            if t_idx < start:
-                break
+            t_idx = start + chunk_size - 1 - t
+            active = (t_idx >= start) & (t_idx < L)
             off = base + t_idx * P + offs_p
-            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
-            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask & active, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask & active, other=0.0)
             # conj(alpha)
             a_im = -a_im
-            b_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
-            b_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
+            b_re = tl.load(d_h_re_ptr + off, mask=p_mask & active, other=0.0)
+            b_im = tl.load(d_h_im_ptr + off, mask=p_mask & active, other=0.0)
+            a_re = tl.where(active, a_re, 1.0)
+            a_im = tl.where(active, a_im, 0.0)
+            b_re = tl.where(active, b_re, 0.0)
+            b_im = tl.where(active, b_im, 0.0)
 
             b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
             b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
@@ -1346,43 +1352,43 @@ if HAS_TRITON:
         adj_im = tl.load(chunk_adj0_im_ptr + off_chunk, mask=p_mask, other=0.0)
 
         start = pid_c * chunk_size
-        end = tl.minimum(start + chunk_size, L)
 
         for t in range(0, chunk_size):
-            t_idx = end - 1 - t
-            if t_idx < start:
-                break
+            t_idx = start + chunk_size - 1 - t
+            active = (t_idx >= start) & (t_idx < L)
             off = base + t_idx * P + offs_p
 
-            d_out_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
-            d_out_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
+            d_out_re = tl.load(d_h_re_ptr + off, mask=p_mask & active, other=0.0)
+            d_out_im = tl.load(d_h_im_ptr + off, mask=p_mask & active, other=0.0)
             d_h_re = d_out_re + adj_re
             d_h_im = d_out_im + adj_im
 
-            tl.store(d_inj_re_ptr + off, d_h_re, mask=p_mask)
-            tl.store(d_inj_im_ptr + off, d_h_im, mask=p_mask)
+            tl.store(d_inj_re_ptr + off, d_h_re, mask=p_mask & active)
+            tl.store(d_inj_im_ptr + off, d_h_im, mask=p_mask & active)
 
             # Load alpha[t]
-            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
-            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask & active, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask & active, other=0.0)
+            a_re = tl.where(active, a_re, 1.0)
+            a_im = tl.where(active, a_im, 0.0)
 
             # Load h[t-1]
             if t_idx > 0:
                 prev_off = base + (t_idx - 1) * P + offs_p
-                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask, other=0.0)
-                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask, other=0.0)
+                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask & active, other=0.0)
+                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask & active, other=0.0)
             else:
                 h_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
                 h_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
             d_a_re = d_h_re * h_prev_re + d_h_im * h_prev_im
             d_a_im = d_h_im * h_prev_re - d_h_re * h_prev_im
-            tl.store(d_alpha_re_ptr + off, d_a_re, mask=p_mask)
-            tl.store(d_alpha_im_ptr + off, d_a_im, mask=p_mask)
+            tl.store(d_alpha_re_ptr + off, d_a_re, mask=p_mask & active)
+            tl.store(d_alpha_im_ptr + off, d_a_im, mask=p_mask & active)
 
             # adj = conj(alpha) * d_h
-            adj_re = a_re * d_h_re + a_im * d_h_im
-            adj_im = a_re * d_h_im - a_im * d_h_re
+            adj_re = tl.where(active, a_re * d_h_re + a_im * d_h_im, adj_re)
+            adj_im = tl.where(active, a_re * d_h_im - a_im * d_h_re, adj_im)
 
     # ========== Fused kernel 3: postscan ==========
     # Computes c_gate (silu + rmsnorm + bias + RoPE) and stores it.
