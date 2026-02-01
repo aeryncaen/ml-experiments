@@ -116,7 +116,7 @@ class MambaWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # DS1 wrapper
 # ---------------------------------------------------------------------------
-from ds_moe.model import DS1
+from ds_moe.model import DS1, RMSNorm
 
 # ---------------------------------------------------------------------------
 # S6
@@ -140,6 +140,34 @@ class S6Wrapper(nn.Module):
 
     def forward(self, x):
         return self.s6(x)
+
+
+class SwiGLUMLP(nn.Module):
+    def __init__(self, d_model, d_hidden, bias=True):
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, d_hidden, bias=bias)
+        self.w_up = nn.Linear(d_model, d_hidden, bias=bias)
+        self.w_down = nn.Linear(d_hidden, d_model, bias=bias)
+
+    def forward(self, x):
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+
+class MHABlock(nn.Module):
+    """Single block of multi-head attention (SDPA) + SwiGLU MLP."""
+    def __init__(self, d_model, n_heads=4, mlp_hidden=208):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = SwiGLUMLP(d_model, mlp_hidden)
+
+    def forward(self, x):
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class DS1Wrapper(nn.Module):
@@ -363,6 +391,9 @@ def make_models(dim):
     # S6: 1 layer, d_state=104 to match ~57K param budget
     s6 = S6Wrapper(d_model=dim, d_state=104, M=4, num_heads=4)
 
+    # MHA+SwiGLU: 1 block, ~57K params (MHA 4-head ~16.6K + SwiGLU mlp_hidden=208 ~40.4K)
+    mha = MHABlock(d_model=dim, n_heads=4, mlp_hidden=208)
+
     return {
         # 'DS1': ds1,
         'DS1++': ds1_pp,
@@ -370,6 +401,7 @@ def make_models(dim):
         # 'S5': s5,
         # 'Mamba': mamba,
         'S6': s6,
+        'MHA': mha,
     }
 
 

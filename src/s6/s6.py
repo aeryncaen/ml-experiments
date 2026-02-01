@@ -179,6 +179,7 @@ class S6Kernel(nn.Module):
         """
         B, L, H = u.shape
         P = self.P
+        assert P % 4 == 0, "d_state must be divisible by 4 for scan grouping"
 
         # Materialize complex A
         A = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (P,) complex
@@ -201,14 +202,55 @@ class S6Kernel(nn.Module):
         cum_theta = torch.cumsum(dt_half * theta, dim=1)  # (B, L, P//2)
         Bu = apply_rotary_emb(Bu, cum_theta)
         # Bu_prev: shift AFTER rotation so position t-1 keeps its own rotation angle
-        Bu_prev = F.pad(Bu[:, :-1], (0, 0, 1, 0))
+        Bu_prev1 = F.pad(Bu[:, :-1], (0, 0, 1, 0))
+        Bu_prev2 = F.pad(Bu[:, :-2], (0, 0, 2, 0))
+        Bu_next1 = F.pad(Bu[:, 1:], (0, 0, 0, 1))
+        Bu_next2 = F.pad(Bu[:, 2:], (0, 0, 0, 2))
 
         # Trapezoidal discretization (complex)
         alpha = torch.exp(dt.to(torch.cfloat) * A)  # (B, L, P) complex decay
+        alpha_prev1 = F.pad(alpha[:, :-1], (0, 0, 1, 0))
+        alpha_next1 = F.pad(alpha[:, 1:], (0, 0, 0, 1))
+
         Bu_c = Bu.to(torch.cfloat)
-        Bu_prev_c = Bu_prev.to(torch.cfloat)
+        Bu_prev1_c = Bu_prev1.to(torch.cfloat)
+        Bu_prev2_c = Bu_prev2.to(torch.cfloat)
+        Bu_next1_c = Bu_next1.to(torch.cfloat)
+        Bu_next2_c = Bu_next2.to(torch.cfloat)
         dt_c = dt.to(torch.cfloat)
-        inject = lam * dt_c * Bu_c + (1 - lam) * dt_c * alpha * Bu_prev_c  # (B, L, P) complex
+
+        g = P // 4
+        g0 = slice(0, g)
+        g1 = slice(g, 2 * g)
+        g2 = slice(2 * g, 3 * g)
+        g3 = slice(3 * g, 4 * g)
+
+        inject = torch.zeros_like(Bu_c)
+        # pass-through: current only
+        inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * Bu_c[:, :, g0]
+        # causal AB2: look behind 2 with stacked decay
+        inject[:, :, g1] = (
+            lam[:, :, g1] * dt_c[:, :, g1] * Bu_c[:, :, g1]
+            + (1 - lam[:, :, g1]) * dt_c[:, :, g1] * (
+                alpha[:, :, g1] * Bu_prev1_c[:, :, g1]
+                + (alpha[:, :, g1] * alpha_prev1[:, :, g1]) * Bu_prev2_c[:, :, g1]
+            )
+        )
+        # retro AB2: look ahead 2 with stacked decay
+        inject[:, :, g2] = (
+            lam[:, :, g2] * dt_c[:, :, g2] * Bu_c[:, :, g2]
+            + (1 - lam[:, :, g2]) * dt_c[:, :, g2] * (
+                alpha[:, :, g2] * Bu_next1_c[:, :, g2]
+                + (alpha[:, :, g2] * alpha_next1[:, :, g2]) * Bu_next2_c[:, :, g2]
+            )
+        )
+        # center: one behind + one ahead, single decay both directions
+        inject[:, :, g3] = (
+            lam[:, :, g3] * dt_c[:, :, g3] * Bu_c[:, :, g3]
+            + (1 - lam[:, :, g3]) * dt_c[:, :, g3] * (
+                alpha[:, :, g3] * (Bu_prev1_c[:, :, g3] + Bu_next1_c[:, :, g3])
+            )
+        )
 
         # Parallel scan: h[t] = alpha[t] * h[t-1] + inject[t]
         h = parallel_scan(alpha, inject)  # (B, L, P) complex

@@ -699,9 +699,13 @@ if HAS_TRITON:
         s_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
         s_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-        # Previous Bu_rotated for trapezoidal (initialized to zero)
-        Bu_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
-        Bu_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        # Previous Bu_rotated (initialized to zero)
+        Bu_prev1_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        Bu_prev2_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        # Previous alpha (for stacked decay)
+        alpha_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        alpha_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         # Base offsets
         base = pid_b * L * P
@@ -769,19 +773,95 @@ if HAS_TRITON:
             tl.store(alpha_re_ptr + off, alpha_re_t, mask=p_mask)
             tl.store(alpha_im_ptr + off, alpha_im_t, mask=p_mask)
 
-            # Trapezoidal inject (Bu_rot is real, alpha is complex)
-            # inject = lam*dt*Bu_rot + (1-lam)*dt*alpha*Bu_prev_rot
-            # Bu_prev_rot is complex (from previous position's RoPE)
-            # Actually — Bu_rot is REAL (RoPE applied to real Bu gives real result)
-            # Bu_prev is the PREVIOUS position's Bu_rot, also real
-            # So inject_re = lam*dt*Bu_rot + (1-lam)*dt*(alpha_re*Bu_prev_re - alpha_im*Bu_prev_im)
-            # inject_im = (1-lam)*dt*(alpha_re*Bu_prev_im + alpha_im*Bu_prev_re)
-            # But Bu_prev_im = 0 since Bu_prev is real! So:
-            # inject_re = lam*dt*Bu_rot + (1-lam)*dt*alpha_re*Bu_prev_re
-            # inject_im = (1-lam)*dt*alpha_im*Bu_prev_re
+            # --- Grouped Adams-Bashforth inject ---
             one_minus_lam = 1.0 - lam
-            inj_re = lam * dt * Bu_rot + one_minus_lam * dt * alpha_re_t * Bu_prev_re
-            inj_im = one_minus_lam * dt * alpha_im_t * Bu_prev_re
+
+            # Load Bu_next1 / Bu_next2 (RoPE) and alpha_next1 for retro groups
+            Bu_next1_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            Bu_next2_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            alpha_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            alpha_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            if t + 1 < L:
+                off_n1 = base + (t + 1) * P + offs_p
+                off_theta_n1 = base_theta + (t + 1) * half_P + pair_idx
+                Bu_n1 = tl.load(Bu_ptr + off_n1, mask=p_mask, other=0.0)
+                angle_n1 = tl.load(cum_theta_ptr + off_theta_n1, mask=p_mask, other=0.0)
+                cos_n1 = tl.cos(angle_n1)
+                sin_n1 = tl.sin(angle_n1)
+                partner_off_n1 = base + (t + 1) * P + partner_offs
+                Bu_partner_n1 = tl.load(Bu_ptr + partner_off_n1, mask=p_mask & partner_mask, other=0.0)
+                Bu_next1_re = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_n1 * sin_n1 + Bu_n1 * cos_n1,
+                    Bu_n1 * cos_n1 - Bu_partner_n1 * sin_n1,
+                )
+
+                # alpha_next1
+                dt_n1 = tl.load(dt_ptr + off_n1, mask=p_mask, other=0.0)
+                dt_a_re_n1 = dt_n1 * a_re
+                dt_a_im_n1 = dt_n1 * a_im
+                exp_re_n1 = tl.exp(dt_a_re_n1)
+                alpha_next_re = exp_re_n1 * tl.cos(dt_a_im_n1)
+                alpha_next_im = exp_re_n1 * tl.sin(dt_a_im_n1)
+
+            if t + 2 < L:
+                off_n2 = base + (t + 2) * P + offs_p
+                off_theta_n2 = base_theta + (t + 2) * half_P + pair_idx
+                Bu_n2 = tl.load(Bu_ptr + off_n2, mask=p_mask, other=0.0)
+                angle_n2 = tl.load(cum_theta_ptr + off_theta_n2, mask=p_mask, other=0.0)
+                cos_n2 = tl.cos(angle_n2)
+                sin_n2 = tl.sin(angle_n2)
+                partner_off_n2 = base + (t + 2) * P + partner_offs
+                Bu_partner_n2 = tl.load(Bu_ptr + partner_off_n2, mask=p_mask & partner_mask, other=0.0)
+                Bu_next2_re = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_n2 * sin_n2 + Bu_n2 * cos_n2,
+                    Bu_n2 * cos_n2 - Bu_partner_n2 * sin_n2,
+                )
+
+            # group masks
+            gsize = P // 4
+            g0 = offs_p < gsize
+            g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
+            g2 = (offs_p >= 2 * gsize) & (offs_p < 3 * gsize)
+            g3 = offs_p >= 3 * gsize
+            m1 = g1.to(tl.float32)
+            m2 = g2.to(tl.float32)
+            m3 = g3.to(tl.float32)
+
+            # stacked alpha products
+            alpha_prod_prev_re = alpha_re_t * alpha_prev_re - alpha_im_t * alpha_prev_im
+            alpha_prod_prev_im = alpha_re_t * alpha_prev_im + alpha_im_t * alpha_prev_re
+            alpha_prod_next_re = alpha_re_t * alpha_next_re - alpha_im_t * alpha_next_im
+            alpha_prod_next_im = alpha_re_t * alpha_next_im + alpha_im_t * alpha_next_re
+
+            # neighbor terms
+            term_prev1_re = alpha_re_t * Bu_prev1_re
+            term_prev1_im = alpha_im_t * Bu_prev1_re
+            term_prev2_re = alpha_prod_prev_re * Bu_prev2_re
+            term_prev2_im = alpha_prod_prev_im * Bu_prev2_re
+
+            term_next1_re = alpha_re_t * Bu_next1_re
+            term_next1_im = alpha_im_t * Bu_next1_re
+            term_next2_re = alpha_prod_next_re * Bu_next2_re
+            term_next2_im = alpha_prod_next_im * Bu_next2_re
+
+            # current term
+            inj_re = lam * dt * Bu_rot
+            inj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            # causal AB2
+            inj_re += m1 * one_minus_lam * dt * (term_prev1_re + term_prev2_re)
+            inj_im += m1 * one_minus_lam * dt * (term_prev1_im + term_prev2_im)
+
+            # retro AB2
+            inj_re += m2 * one_minus_lam * dt * (term_next1_re + term_next2_re)
+            inj_im += m2 * one_minus_lam * dt * (term_next1_im + term_next2_im)
+
+            # center (one behind + one ahead)
+            inj_re += m3 * one_minus_lam * dt * (term_prev1_re + term_next1_re)
+            inj_im += m3 * one_minus_lam * dt * (term_prev1_im + term_next1_im)
 
             # Store inject for backward
             tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
@@ -797,8 +877,11 @@ if HAS_TRITON:
             tl.store(h_re_ptr + off, s_re, mask=p_mask)
             tl.store(h_im_ptr + off, s_im, mask=p_mask)
 
-            # Bu_prev for next iteration (real, from current Bu_rot)
-            Bu_prev_re = Bu_rot
+            # Update prev buffers and alpha_prev
+            Bu_prev2_re = Bu_prev1_re
+            Bu_prev1_re = Bu_rot
+            alpha_prev_re = alpha_re_t
+            alpha_prev_im = alpha_im_t
 
     # ========== Fused kernel 3: postscan ==========
     # Computes c_gate (silu + rmsnorm + bias + RoPE) and stores it.
@@ -1322,14 +1405,12 @@ if HAS_TRITON:
         theta_ptr,  # (B*L, P//2) — for d_dt_half_theta -> d_dt from rope
         # Gradient input
         d_h_re_ptr, d_h_im_ptr,  # (B, L, P)
-        d_cum_theta_c_ptr,  # (B*L, P//2) — from c_gate RoPE backward
         # Gradient outputs
-        d_dt_ptr,  # (B, L, P) — total d_dt (from inject + alpha + rope)
+        d_dt_ptr,  # (B, L, P) — d_dt from inject + alpha (rope added later)
         d_lam_ptr,  # (B, L, P)
-        d_Bu_ptr,  # (B, L, P) — gradient on Bu (to feed into prescan_bwd)
+        d_Bu_rot_ptr,  # (B, L, P) — grad on Bu_rot (RoPE backward done later)
         d_log_A_real_ptr,  # (P,) — atomic
         d_A_imag_ptr,  # (P,) — atomic
-        d_dt_half_theta_ptr,  # (B, L, P//2) — for prescan bwd to handle
         # Dims
         B_batch, L, P,
         BLOCK_P: tl.constexpr,
