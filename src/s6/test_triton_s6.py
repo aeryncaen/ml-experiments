@@ -188,10 +188,31 @@ def bench(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
     pt_ms = time_fwd_bwd(model_pt, x)
     tr_ms = time_fwd_bwd(model_tr, x)
 
+    # CUDA graph path
+    model_cg = TritonS6(d_model=H, d_state=P, M=M, chunk_size=32).cuda()
+    with torch.no_grad():
+        for (n1, p1), (n2, p2) in zip(model_pt.named_parameters(), model_cg._pytorch_s6.named_parameters()):
+            p2.copy_(p1)
+    sample = torch.randn(B, L, H, device='cuda')
+    model_cg.enable_cuda_graph(sample)
+    # Warmup graph replay
+    for _ in range(warmup):
+        model_cg(sample)
+        model_cg.zero_grad()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        model_cg(sample)
+        model_cg.zero_grad()
+        torch.cuda.synchronize()
+    cg_ms = (time.perf_counter() - start) / iters * 1000
+
     print(f"\nBenchmark (H={H}, P={P}, L={L}, B={B}, M={M}):")
-    print(f"  PyTorch: {pt_ms:.1f} ms")
-    print(f"  Triton:  {tr_ms:.1f} ms")
-    print(f"  Speedup: {pt_ms / tr_ms:.2f}x")
+    print(f"  PyTorch:    {pt_ms:.1f} ms")
+    print(f"  Triton:     {tr_ms:.1f} ms")
+    print(f"  Triton+CG:  {cg_ms:.1f} ms")
+    print(f"  Speedup (Triton):    {pt_ms / tr_ms:.2f}x")
+    print(f"  Speedup (Triton+CG): {pt_ms / cg_ms:.2f}x")
 
 
 def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):

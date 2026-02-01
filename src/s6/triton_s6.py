@@ -1629,10 +1629,13 @@ class TritonS6(nn.Module):
 
         self._pytorch_s6 = S6(d_model, d_state, M=M, layer_idx=layer_idx, **kwargs)
 
-    def forward(self, u, **kwargs):
-        if not u.is_cuda or not HAS_TRITON:
-            return self._pytorch_s6(u, **kwargs)
+        # CUDA graph state
+        self._graph = None
+        self._graph_input = None
+        self._graph_output = None
+        self._graph_shape = None
 
+    def _forward_impl(self, u):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
@@ -1683,3 +1686,45 @@ class TritonS6(nn.Module):
         y = s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
 
         return y
+
+    def enable_cuda_graph(self, sample_input):
+        """Capture fwd+bwd into a CUDA graph. Call once after warmup.
+        sample_input: (B, L, H) tensor with the fixed shape you'll use.
+        """
+        assert sample_input.is_cuda
+        self._graph_shape = sample_input.shape
+
+        # Static buffers — graph replays operate on these exact addresses
+        self._graph_input = sample_input.clone().requires_grad_(True)
+        self._graph_grad = torch.ones_like(sample_input)  # sum() backward
+
+        # Warmup (fills autograd caches, cudnn workspace, etc.)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                out = self._forward_impl(self._graph_input)
+                out.backward(self._graph_grad)
+                self.zero_grad()
+                self._graph_input.grad = None
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            self._graph_output = self._forward_impl(self._graph_input)
+            self._graph_output.backward(self._graph_grad)
+
+    def forward(self, u, **kwargs):
+        if not u.is_cuda or not HAS_TRITON:
+            return self._pytorch_s6(u, **kwargs)
+
+        # CUDA graph replay path
+        if self._graph is not None and u.shape == self._graph_shape:
+            self._graph_input.copy_(u)
+            self._graph.replay()
+            # Grads are already on params from replay.
+            # Return a clone so caller gets a live tensor (not the static buffer).
+            return self._graph_output.clone()
+
+        return self._forward_impl(u)
