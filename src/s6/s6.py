@@ -205,7 +205,7 @@ class S6Kernel(nn.Module):
 
 
 class SharedAttention(nn.Module):
-    """Causal attention sharing 80% of Q/K dims with SSM B/C projections."""
+    """Causal attention sharing 80% of Q/K dims with SSM B/C projections. bf16 internally."""
     def __init__(self, d_model, d_state, M=4, num_heads=1, layer_idx=0):
         super().__init__()
         H = d_model
@@ -220,19 +220,20 @@ class SharedAttention(nn.Module):
         self.shared_dims = int(0.8 * P)
         self.ded_dims = P - self.shared_dims
 
-        # Dedicated projections for the 20% unique dims
-        self.q_ded = nn.Linear(H, self.ded_dims, bias=False)
-        self.k_ded = nn.Linear(H, self.ded_dims, bias=False)
-        # V is fully standalone
-        self.v_proj = nn.Linear(H, P, bias=False)
+        # All attention params in bf16
+        self.q_ded = nn.Linear(H, self.ded_dims, bias=False, dtype=torch.bfloat16)
+        self.k_ded = nn.Linear(H, self.ded_dims, bias=False, dtype=torch.bfloat16)
+        self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
-        self.q_bias = nn.Parameter(torch.ones(P))
-        self.k_bias = nn.Parameter(torch.ones(P))
+        self.q_bias = nn.Parameter(torch.ones(P, dtype=torch.bfloat16))
+        self.k_bias = nn.Parameter(torch.ones(P, dtype=torch.bfloat16))
 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
+        self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
 
-        self.out_proj = nn.Linear(P, H, bias=False)
+        self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, u, y_ssm, B_shared, C_shared):
@@ -247,10 +248,15 @@ class SharedAttention(nn.Module):
         nh = self.num_heads
         hd = self.head_dim
 
+        # Cast shared inputs to bf16 at boundary
+        u_bf = u.bfloat16()
+        B_sh = B_shared[..., :sd].bfloat16()
+        C_sh = C_shared[..., :sd].bfloat16()
+
         # Q = [B_shared[:sd] | q_ded] + bias, K = [C_shared[:sd] | k_ded] + bias
-        Q = F.silu(torch.cat([B_shared[..., :sd], self.q_ded(u)], dim=-1) + self.q_bias)
-        K = F.silu(torch.cat([C_shared[..., :sd], self.k_ded(u)], dim=-1) + self.k_bias)
-        V = self.v_proj(u)  # (B, L, P)
+        Q = F.silu(torch.cat([B_sh, self.q_ded(u_bf)], dim=-1) + self.q_bias)
+        K = F.silu(torch.cat([C_sh, self.k_ded(u_bf)], dim=-1) + self.k_bias)
+        V = self.v_proj(u_bf)  # (B, L, P)
 
         # Reshape to (B, nh, L, hd) and normalize
         Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
@@ -260,7 +266,8 @@ class SharedAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, self.P)
 
-        return y_ssm + self.gate * self.out_proj(attn_out)
+        # Cast back to f32 at boundary
+        return y_ssm + self.gate * self.out_proj(attn_out).float()
 
 
 class S6(nn.Module):
