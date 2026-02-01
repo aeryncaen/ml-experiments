@@ -1721,7 +1721,8 @@ class TritonS6(nn.Module):
 
         # CUDA graph replay path
         if self._graph is not None and u.shape == self._graph_shape:
-            self._graph_input.copy_(u)
+            with torch.no_grad():
+                self._graph_input.copy_(u)
             self._graph.replay()
             # Grads are already on params from replay.
             # Return a clone so caller gets a live tensor (not the static buffer).
