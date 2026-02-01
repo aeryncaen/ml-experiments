@@ -21,6 +21,11 @@ except Exception:
     HAS_PROFILER = False
 from einops import rearrange, repeat
 
+DETERMINISTIC = os.getenv("BENCH_DETERMINISTIC", "0") == "1"
+if DETERMINISTIC:
+    # Must be set before any CUDA context is created
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -28,9 +33,7 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-DETERMINISTIC = os.getenv("BENCH_DETERMINISTIC", "0") == "1"
 if DETERMINISTIC:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
