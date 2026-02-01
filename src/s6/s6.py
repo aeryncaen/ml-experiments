@@ -33,22 +33,22 @@ class SqueezeExcite1D(nn.Module):
 
 
 class MultiScaleDepthwiseConv(nn.Module):
-    """Split channels into 4 groups: 3 causal, 3 acausal, 9 causal, 9 acausal. Then SE."""
+    """Split channels into 4 groups: 3 causal, 3 retrocausal, 9 causal, 9 retrocausal. Then SE."""
     def __init__(self, channels):
         super().__init__()
         n_groups = 4
         assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups}"
         self.group_size = channels // n_groups
-        self.kernel_specs = [(3, True), (3, False), (9, True), (9, False)]
+        self.kernel_specs = [(3, "causal"), (3, "retro"), (9, "causal"), (9, "retro")]
         self.convs = nn.ModuleList([
             nn.Conv1d(
                 self.group_size,
                 self.group_size,
                 k,
-                padding=(k - 1 if causal else k // 2),
+                padding=(k - 1),
                 groups=self.group_size,
             )
-            for k, causal in self.kernel_specs
+            for k, _mode in self.kernel_specs
         ])
         self.se = SqueezeExcite1D(channels)
 
@@ -59,10 +59,13 @@ class MultiScaleDepthwiseConv(nn.Module):
         n_conv = len(self.kernel_specs)
         conv_chunks = [x[..., i * gs:(i + 1) * gs] for i in range(n_conv)]
         out = []
-        for (chunk, conv, (k, causal)) in zip(conv_chunks, self.convs, self.kernel_specs):
-            y = conv(chunk.transpose(1, 2))
-            if causal:
-                y = y[..., :L]
+        for (chunk, conv, (k, mode)) in zip(conv_chunks, self.convs, self.kernel_specs):
+            x_in = chunk.transpose(1, 2)
+            if mode == "retro":
+                x_in = torch.flip(x_in, dims=(-1,))
+            y = conv(x_in)[..., :L]
+            if mode == "retro":
+                y = torch.flip(y, dims=(-1,))
             y = F.silu(y).transpose(1, 2)
             out.append(y)
         out = torch.cat(out, dim=-1)  # (B, L, C)
