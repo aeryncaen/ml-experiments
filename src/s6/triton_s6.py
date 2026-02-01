@@ -1525,34 +1525,42 @@ if HAS_TRITON:
             adj_re = alpha_re_t * d_h_re_t + alpha_im_t * d_h_im_t
             adj_im = alpha_re_t * d_h_im_t - alpha_im_t * d_h_re_t
 
-            # --- Discretization backward ---
+            # --- Discretization backward (grouped) ---
             one_minus_lam = 1.0 - lam_t
 
-            # d_lam from inject
-            d_lam_t = (d_inj_re * dt_t * (Bu_rot_t - alpha_re_t * Bu_prev_re)
-                       + d_inj_im * (-dt_t * alpha_im_t * Bu_prev_re))
+            gsize = P // 4
+            g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
+            g2 = (offs_p >= 2 * gsize) & (offs_p < 3 * gsize)
+            g3 = offs_p >= 3 * gsize
+            m1 = g1.to(tl.float32)
+            m2 = g2.to(tl.float32)
+            m3 = g3.to(tl.float32)
+
+            alpha_prod_prev_re = alpha_re_t * alpha_prev_re - alpha_im_t * alpha_prev_im
+            alpha_prod_prev_im = alpha_re_t * alpha_prev_im + alpha_im_t * alpha_prev_re
+            alpha_prod_next_re = alpha_re_t * alpha_next_re - alpha_im_t * alpha_next_im
+            alpha_prod_next_im = alpha_re_t * alpha_next_im + alpha_im_t * alpha_next_re
+
+            Z_re = (m1 * (Bu_prev1_re + alpha_prod_prev_re * Bu_prev2_re)
+                    + m2 * (Bu_next1_re + alpha_prod_next_re * Bu_next2_re)
+                    + m3 * (Bu_prev1_re + Bu_next1_re))
+            Z_im = (m1 * (alpha_prod_prev_im * Bu_prev2_re)
+                    + m2 * (alpha_prod_next_im * Bu_next2_re))
+
+            d_lam_t = (d_inj_re * dt_t * (Bu_rot_t - Z_re)
+                       + d_inj_im * (-dt_t * Z_im))
             tl.store(d_lam_ptr + off, d_lam_t, mask=p_mask)
 
-            # d_Bu_rot from inject (current position)
-            d_Bu_rot_t = d_inj_re * lam_t * dt_t
+            d_dt_from_inject = (d_inj_re * (lam_t * Bu_rot_t + one_minus_lam * Z_re)
+                                + d_inj_im * one_minus_lam * Z_im)
 
-            # d_Bu_prev from inject
-            d_Bu_prev_t = ((d_inj_re * alpha_re_t + d_inj_im * alpha_im_t)
-                           * one_minus_lam * dt_t)
+            d_a_re_total = d_a_re + one_minus_lam * dt_t * (d_inj_re * Z_re + d_inj_im * Z_im)
+            d_a_im_total = d_a_im + one_minus_lam * dt_t * (d_inj_im * Z_re - d_inj_re * Z_im)
 
-            # d_dt from inject
-            d_dt_from_inject = (d_inj_re * (lam_t * Bu_rot_t + one_minus_lam * alpha_re_t * Bu_prev_re)
-                                + d_inj_im * one_minus_lam * alpha_im_t * Bu_prev_re)
-
-            # d_alpha from inject (add to scan's d_alpha)
-            d_a_re_total = d_a_re + d_inj_re * one_minus_lam * dt_t * Bu_prev_re
-            d_a_im_total = d_a_im + d_inj_im * one_minus_lam * dt_t * Bu_prev_re
-
-            # d_dt from alpha: alpha = exp(dt*A), d_dt = d_alpha * alpha * A
             d_dt_from_alpha = (d_a_re_total * (a_re * alpha_re_t - a_im * alpha_im_t)
                                + d_a_im_total * (a_re * alpha_im_t + a_im * alpha_re_t))
-
             d_dt_disc = d_dt_from_inject + d_dt_from_alpha
+            tl.store(d_dt_ptr + off, d_dt_disc, mask=p_mask)
 
             # Accumulate A grads
             d_A_real_acc += d_a_re_total * dt_t * alpha_re_t + d_a_im_total * dt_t * alpha_im_t

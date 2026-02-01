@@ -117,6 +117,7 @@ class MambaWrapper(nn.Module):
 # DS1 wrapper
 # ---------------------------------------------------------------------------
 from ds_moe.model import DS1, RMSNorm
+from heuristic_secrets.models.backbone import SEBlock
 
 # ---------------------------------------------------------------------------
 # S6
@@ -153,19 +154,59 @@ class SwiGLUMLP(nn.Module):
         return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
+class QuadConvMix(nn.Module):
+    """Split channels into 4 paths: passthrough, causal conv, acausal conv, retrocausal conv.
+    Recombine via SE gating."""
+    def __init__(self, d_model, k=3, reduction=4):
+        super().__init__()
+        assert d_model % 4 == 0
+        self.d_path = d_model // 4
+        # causal: left-padded conv
+        self.conv_causal = nn.Conv1d(self.d_path, self.d_path, k, padding=0, groups=self.d_path)
+        # acausal: symmetric-padded conv
+        self.conv_acausal = nn.Conv1d(self.d_path, self.d_path, k, padding=k // 2, groups=self.d_path)
+        # retrocausal: right-padded conv
+        self.conv_retro = nn.Conv1d(self.d_path, self.d_path, k, padding=0, groups=self.d_path)
+        self.se = SEBlock(d_model, reduction=reduction)
+        self.k = k
+
+    def forward(self, x):
+        # x: (B, L, D)
+        B, L, D = x.shape
+        chunks = x.chunk(4, dim=-1)  # 4 x (B, L, d_path)
+
+        p0 = chunks[0]  # passthrough
+
+        # causal: pad left
+        c1 = chunks[1].transpose(1, 2)  # (B, d_path, L)
+        c1 = F.pad(c1, (self.k - 1, 0))
+        c1 = self.conv_causal(c1).transpose(1, 2)
+
+        # acausal: symmetric padding already in conv
+        c2 = self.conv_acausal(chunks[2].transpose(1, 2)).transpose(1, 2)
+
+        # retrocausal: pad right
+        c3 = chunks[3].transpose(1, 2)
+        c3 = F.pad(c3, (0, self.k - 1))
+        c3 = self.conv_retro(c3).transpose(1, 2)
+
+        out = torch.cat([p0, c1, c2, c3], dim=-1)  # (B, L, D)
+        return self.se(out)
+
+
 class MHABlock(nn.Module):
     """Single block of multi-head attention (SDPA) + SwiGLU MLP."""
-    def __init__(self, d_model, n_heads=4, mlp_hidden=208):
+    def __init__(self, d_model, n_heads=4, mlp_hidden=208, se_reduction=4):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.quad_conv = QuadConvMix(d_model, k=3, reduction=se_reduction)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, mlp_hidden)
 
     def forward(self, x):
         h = self.norm1(x)
-        h = self.conv(h.transpose(1, 2)).transpose(1, 2)
+        h = self.quad_conv(h)
         h, _ = self.attn(h, h, h)
         x = x + h
         x = x + self.mlp(self.norm2(x))
