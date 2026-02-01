@@ -230,6 +230,7 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
     def f_ssm():
         return _TritonS6.apply(
             x, Bu_raw,
+            kern.rope_group_pairs, kern.rope_freqs,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
             kern.log_A_real, kern.A_imag,
