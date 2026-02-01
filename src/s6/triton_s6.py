@@ -3033,36 +3033,12 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # 1. Multi-scale conv (Triton fused) — before SSM
+        # 1. Multi-scale conv (PyTorch/cuDNN) — before SSM
         B_size, L_size, H = u.shape
-        msconv = s6.msconv
-        x = _TritonMSConv.apply(
-            u,
-            msconv.convs[0].weight, msconv.convs[0].bias,
-            msconv.convs[1].weight, msconv.convs[1].bias,
-            msconv.convs[2].weight, msconv.convs[2].bias,
-            msconv.se.fc1.weight, msconv.se.fc2.weight,
-            msconv.group_size,
-        )  # (B, L, H)
+        x = s6.msconv(u)  # (B, L, H)
 
-        # 2. phi_B projection (Triton)
-        phi = kern.phi_B
-        mlp = phi.channel_mlp
-        N_rows = B_size * L_size
-        raw = _TritonPhiB.apply(
-            x.reshape(N_rows, H),
-            phi.W, phi.b,
-            mlp.fc1.weight, mlp.fc1.bias,
-            mlp.fc2.weight, mlp.fc2.bias,
-            phi.M, phi.L, mlp.fc1.out_features,
-        )  # (N_rows, P)
-        # ch_rms + scale in PyTorch so autograd handles their gradients
-        if phi.ch_rms:
-            raw_3d = raw.view(N_rows, phi.M, phi.L)
-            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
-            sc = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
-            raw = (raw_3d * sc.view(1, 1, phi.L)).view(N_rows, -1)
-        Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
+        # 2. phi_B projection (PyTorch)
+        Bu_raw = kern.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
         # 3. SSM core (Triton) — operates on x (post-msconv)
         C = torch.view_as_complex(s6.C)

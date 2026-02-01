@@ -6,7 +6,8 @@ Metrics: final loss, param count, peak memory, wall time
 Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box)
 """
 
-import sys, os, time, math, random
+import sys, os, time, math, random, hashlib
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -284,9 +285,53 @@ def gen_induction(B, L, vocab_size=32, device='cpu'):
 
 
 # ---------------------------------------------------------------------------
+# Data pregeneration, disk caching, and GPU preloading
+# ---------------------------------------------------------------------------
+CACHE_DIR = Path(__file__).parent / '.bench_cache'
+
+
+def _cache_key(task_name, n_steps, B, L, seed):
+    raw = f"{task_name}_{n_steps}_{B}_{L}_{seed}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def pregen_task_data(task_name, n_steps, B, L, seed, device='cpu'):
+    """Generate all batches for a task, cache to disk, return list of GPU tensors."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    key = _cache_key(task_name, n_steps, B, L, seed)
+    cache_path = CACHE_DIR / f"{task_name}_{key}.pt"
+
+    if cache_path.exists():
+        batches = torch.load(cache_path, weights_only=True)
+    else:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        batches = []
+        for _ in range(n_steps + 3):  # +3 for warmup
+            if task_name == 'delay':
+                batches.append(gen_delay(B, L, vocab_size=32, device='cpu'))
+            elif task_name == 'selective_copy':
+                batches.append(gen_selective_copy(B, L, vocab_size=32, device='cpu'))
+            elif task_name == 'parity':
+                batches.append(gen_parity(B, L, device='cpu'))
+            elif task_name == 'mod_arith':
+                batches.append(gen_mod_arith(B, L, device='cpu'))
+            elif task_name == 'induction':
+                batches.append(gen_induction(B, L, vocab_size=32, device='cpu'))
+        torch.save(batches, cache_path)
+
+    # Preload everything to target device
+    def _to(t):
+        return t.to(device, non_blocking=True) if isinstance(t, torch.Tensor) else t
+    return [tuple(_to(t) for t in batch) for batch in batches]
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device='cpu'):
+def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device='cpu',
+               preloaded_data=None):
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
 
@@ -318,56 +363,59 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
 
-    def _step(task_name):
+    data = preloaded_data
+    assert data is not None, "preloaded_data required — use pregen_task_data()"
+
+    def _step(idx):
+        batch = data[idx]
         if task_name == 'delay':
-            inp, tgt = gen_delay(B, L, vocab_size, device=device)
+            inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'selective_copy':
-            tokens, markers, tgt = gen_selective_copy(B, L, vocab_size, device=device)
-            x = embed(tokens) + marker_embed(markers)  # (B, L, dim)
-            y = head(model(x))  # (B, L, vocab_size)
-            # Only score the last n_markers positions
+            tokens, markers, tgt = batch
+            x = embed(tokens) + marker_embed(markers)
+            y = head(model(x))
             n_markers = tgt.shape[1]
-            y_last = y[:, -n_markers:]  # (B, n_markers, vocab_size)
+            y_last = y[:, -n_markers:]
             loss = F.cross_entropy(y_last.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y_last.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'parity':
-            inp, tgt = gen_parity(B, L, device=device)
+            inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'mod_arith':
-            inp, tgt = gen_mod_arith(B, L, device=device)
+            inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         else:
-            inp, tgt = gen_induction(B, L, vocab_size, device=device)
+            inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
 
-    # warmup
-    for _ in range(3):
-        _step(task_name)[0].backward()
+    # warmup (first 3 batches)
+    for i in range(3):
+        _step(i)[0].backward()
         opt.zero_grad(set_to_none=True)
 
     # Optional profiling for S6 on CUDA (forward + backward on one batch)
     if device == 'cuda' and isinstance(model, S6Wrapper) and HAS_PROFILER:
-        for _ in range(50):
-            loss, _ = _step(task_name)
+        for i in range(50):
+            loss, _ = _step(i % 3)
             opt.zero_grad(set_to_none=True)
             loss.backward()
         torch.cuda.synchronize()
@@ -375,7 +423,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                      record_shapes=True,
                      profile_memory=True) as prof:
-            loss, _ = _step(task_name)
+            loss, _ = _step(0)
             opt.zero_grad(set_to_none=True)
             loss.backward()
         torch.cuda.synchronize()
@@ -391,7 +439,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
 
     accs = []
     for step in range(n_steps):
-        loss, acc = _step(task_name)
+        loss, acc = _step(3 + step)  # offset past warmup batches
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -494,6 +542,13 @@ if __name__ == '__main__':
     print(header)
     print('-' * 90)
 
+    # Pregen all task data (cached to disk, preloaded to GPU)
+    print("Pregenerating task data...")
+    task_data = {}
+    for task in tasks:
+        task_data[task] = pregen_task_data(task, n_steps, B, L, SEED, device=DEVICE)
+        print(f"  {task}: {len(task_data[task])} batches ready on {DEVICE}")
+
     all_names = list(models_info.keys())
     for task in tasks:
         for name in all_names:
@@ -503,6 +558,7 @@ if __name__ == '__main__':
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim)[name]
-            r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE)
+            r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
+                           preloaded_data=task_data[task])
             print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
         print()
