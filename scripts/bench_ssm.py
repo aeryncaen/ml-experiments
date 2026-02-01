@@ -441,10 +441,10 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         for h in hooks:
             h.remove()
 
-        print("\n[Module Memory Peaks] (approx, per leaf module, delta)")
-        top = sorted(mem_stats.items(), key=lambda kv: kv[1], reverse=True)[:20]
-        for name, peak in top:
-            print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
+        # print("\n[Module Memory Peaks] (approx, per leaf module, delta)")
+        # top = sorted(mem_stats.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        # for name, peak in top:
+        #     print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
 
     # Optional profiling for S6 on CUDA (forward + backward on one batch)
     if device == 'cuda' and isinstance(model, S6Wrapper) and HAS_PROFILER:
@@ -461,8 +461,8 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
             opt.zero_grad(set_to_none=True)
             loss.backward()
         torch.cuda.synchronize()
-        print("\n[S6 profile] Forward+Backward (1 batch)")
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
+        # print("\n[S6 profile] Forward+Backward (1 batch)")
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
 
     mem_baseline = 0
     if device == 'cuda':
