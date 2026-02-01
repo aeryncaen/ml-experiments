@@ -399,6 +399,7 @@ class S6(nn.Module):
         # Attention (80/20 weight sharing with phi_B and c_proj)
         self.attn = S6Attention(d_model, d_state, M=M, num_heads=num_heads,
                                 phi_B=self.kernel.phi_B, c_proj=self.c_proj)
+        self.post_attn_norm = RMSNorm(self.h)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
@@ -426,6 +427,7 @@ class S6(nn.Module):
 
         # Post-readout norm + residual + attention
         y_normed = self.readout_norm(y) + x
-        y = self.attn(x, y_normed)
+        y_attn = self.attn(x, y_normed)
 
-        return y
+        # Post-attention norm + residual back to SSM output
+        return self.post_attn_norm(y_attn) + y_normed
