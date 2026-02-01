@@ -2668,12 +2668,12 @@ class _TritonS6(torch.autograd.Function):
 
         # 3. Cumulative theta (PyTorch — one launch)
         cum_theta = torch.cumsum(dt_half_theta.view(B, L, P // 2), dim=1).contiguous()
-        g_pairs = kern.rope_group_pairs
+        g_pairs = self._pytorch_s6.kernel.rope_group_pairs
         if g_pairs > 0:
             cum_theta_data = cum_theta
             cum_theta = torch.zeros_like(cum_theta_data)
             pos = torch.arange(L, device=u.device, dtype=cum_theta.dtype)
-            rope = pos[:, None] * kern.rope_freqs.to(cum_theta.dtype)
+            rope = pos[:, None] * self._pytorch_s6.kernel.rope_freqs.to(cum_theta.dtype)
             cum_theta[:, :, g_pairs:2 * g_pairs] = rope.unsqueeze(0)
             cum_theta[:, :, 2 * g_pairs:3 * g_pairs] = cum_theta_data[:, :, 2 * g_pairs:3 * g_pairs]
 
