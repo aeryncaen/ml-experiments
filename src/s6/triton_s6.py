@@ -1254,6 +1254,15 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_H, BLOCK_P,
         )
 
+        # DEBUG: check for NaN after readout kernel
+        assert not d_h_re.isnan().any(), "NaN in d_h_re after readout kernel"
+        assert not d_h_im.isnan().any(), "NaN in d_h_im after readout kernel"
+        assert not d_c_gate_buf.isnan().any(), "NaN in d_c_gate_buf after readout kernel"
+        assert not d_u_skip.isnan().any(), "NaN in d_u_skip after readout kernel"
+        assert not d_C_re.isnan().any(), "NaN in d_C_re after readout kernel"
+        assert not d_C_im.isnan().any(), "NaN in d_C_im after readout kernel"
+        assert not d_D.isnan().any(), "NaN in d_D after readout kernel"
+
         # c_gate chain rule (RoPE, rmsnorm, silu backward)
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
         d_cum_theta_c = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
@@ -1269,6 +1278,12 @@ class _TritonS6(torch.autograd.Function):
             M, P, 1e-6,
             BLOCK_P,
         )
+
+        # DEBUG: check for NaN after cgate chain kernel
+        assert not d_c_proj_out.isnan().any(), "NaN in d_c_proj_out after cgate chain"
+        assert not d_cum_theta_c.isnan().any(), "NaN in d_cum_theta_c after cgate chain"
+        assert not d_c_bias.isnan().any(), "NaN in d_c_bias after cgate chain"
+        assert not d_c_norm_gamma.isnan().any(), "NaN in d_c_norm_gamma after cgate chain"
 
         # c_proj linear backward
         d_c_proj_w = d_c_proj_out.t() @ u_flat
@@ -1298,6 +1313,14 @@ class _TritonS6(torch.autograd.Function):
             B, L, P,
             BLOCK_P_SCAN,
         )
+
+        # DEBUG: check for NaN after scan_disc kernel
+        assert not d_dt_total.isnan().any(), "NaN in d_dt_total after scan_disc"
+        assert not d_lam_disc.isnan().any(), "NaN in d_lam_disc after scan_disc"
+        assert not d_Bu_3d.isnan().any(), "NaN in d_Bu_3d after scan_disc"
+        assert not d_log_A_real.isnan().any(), "NaN in d_log_A_real after scan_disc"
+        assert not d_A_imag.isnan().any(), "NaN in d_A_imag after scan_disc"
+        assert not d_dt_half_theta.isnan().any(), "NaN in d_dt_half_theta after scan_disc"
 
         # d_theta from d_dt_half_theta: d_theta[t] = d_dt_half_theta[t] * dt_half[t]
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)
