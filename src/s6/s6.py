@@ -305,14 +305,11 @@ class S6(nn.Module):
         """ Input and output shape (B, L, H) """
         B, L, H = u.shape
 
-        # Multi-scale conv (before any projections)
-        u_conv = self.msconv(u)  # (B, L, H)
-
         # Run SSM scan
-        h, cum_theta, Bu_raw = self.kernel(u_conv)  # h: (B,L,P), cum_theta: (B,L,P//2), Bu_raw: (B,L,P)
+        h, cum_theta, Bu_raw = self.kernel(u)  # h: (B,L,P), cum_theta: (B,L,P//2), Bu_raw: (B,L,P)
 
         # Input-dependent C gating + static C readout
-        c_proj_out = self.c_proj(u_conv)  # (B, L, P) — save for attention K sharing
+        c_proj_out = self.c_proj(u)  # (B, L, P) — save for attention K sharing
         c_gate = self.c_norm(F.silu(c_proj_out)) + self.c_bias  # (B, L, P)
         c_gate = apply_rotary_emb(c_gate, cum_theta)  # rotate to match state
         h_gated = h * c_gate  # (B, L, P) — input-dependent selection of state dims
@@ -322,11 +319,12 @@ class S6(nn.Module):
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
         # Skip connection + activation
-        y = y + u_conv * self.D
+        y = y + u * self.D
         y = F.silu(y)
 
-        # Post-readout norm + residual back to pre-SSM states + attention
-        y_normed = self.readout_norm(y)
-        y = self.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+        # Post-readout norm + residual from x + msconv + attention
+        y_normed = self.readout_norm(y) + u
+        y_conv = self.msconv(y_normed)  # (B, L, H)
+        y = self.attn(y_conv, y_conv, Bu_raw, c_proj_out)
 
         return y

@@ -250,17 +250,10 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
     N_rows = B * L
 
-    # msconv
-    def f_msconv():
-        return s6.msconv(x)
-    timed(f_msconv, "msconv")
-
-    u_conv = s6.msconv(x)
-
     # phi_B (Triton)
     def f_phi_b():
         raw = _TritonPhiB.apply(
-            u_conv.reshape(N_rows, H), phi.W, phi.b,
+            x.reshape(N_rows, H), phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
             phi.M, phi.L, mlp.fc1.out_features,
         )
@@ -281,7 +274,7 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
     def f_ssm():
         return _TritonS6.apply(
-            u_conv, Bu_raw,
+            x, Bu_raw,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
             kern.log_A_real, kern.A_imag,
@@ -294,22 +287,38 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
     y_ssm = f_ssm()
 
-    # readout norm
+    # readout norm + residual
     def f_norm():
-        return s6.readout_norm(y_ssm)
-    timed(f_norm, "readout_norm")
+        return s6.readout_norm(y_ssm) + x
+    timed(f_norm, "readout_norm + residual")
 
     y_normed = f_norm()
-    c_proj_out = s6.c_proj(u_conv)
+
+    # msconv (after SSM)
+    from .triton_s6 import _TritonMSConv
+    msconv = s6.msconv
+    def f_msconv():
+        return _TritonMSConv.apply(
+            y_normed,
+            msconv.convs[0].weight, msconv.convs[0].bias,
+            msconv.convs[1].weight, msconv.convs[1].bias,
+            msconv.convs[2].weight, msconv.convs[2].bias,
+            msconv.se.fc1.weight, msconv.se.fc2.weight,
+            msconv.group_size,
+        )
+    timed(f_msconv, "msconv (Triton)")
+
+    y_conv = f_msconv()
+    c_proj_out = s6.c_proj(x)
 
     # c_proj recompute
     def f_cproj():
-        return s6.c_proj(u_conv)
+        return s6.c_proj(x)
     timed(f_cproj, "c_proj recompute")
 
     # attention
     def f_attn():
-        return s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+        return s6.attn(y_conv, y_conv, Bu_raw, c_proj_out)
     timed(f_attn, "attention")
 
     # --- Backward profiling ---

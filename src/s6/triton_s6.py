@@ -2056,24 +2056,13 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # 1. Multi-scale conv (Triton fused)
-        msconv = s6.msconv
-        u_conv = _TritonMSConv.apply(
-            u,
-            msconv.convs[0].weight, msconv.convs[0].bias,
-            msconv.convs[1].weight, msconv.convs[1].bias,
-            msconv.convs[2].weight, msconv.convs[2].bias,
-            msconv.se.fc1.weight, msconv.se.fc2.weight,
-            msconv.group_size,
-        )  # (B, L, H)
-
-        # 2. Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
+        # 1. Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
         phi = kern.phi_B
         mlp = phi.channel_mlp
-        B_size, L_size, H = u_conv.shape
+        B_size, L_size, H = u.shape
         N_rows = B_size * L_size
         raw = _TritonPhiB.apply(
-            u_conv.reshape(N_rows, H),
+            u.reshape(N_rows, H),
             phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias,
             mlp.fc2.weight, mlp.fc2.bias,
@@ -2087,13 +2076,13 @@ class TritonS6(nn.Module):
             raw = (raw_3d * s.view(1, 1, phi.L)).view(N_rows, -1)
         Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
-        # 3. SSM core (Triton)
+        # 2. SSM core (Triton) — operates on u directly
         C = torch.view_as_complex(s6.C)
         C_re = C.real.contiguous()
         C_im = C.imag.contiguous()
 
         y_ssm = _TritonS6.apply(
-            u_conv,
+            u,
             Bu_raw,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
@@ -2105,10 +2094,23 @@ class TritonS6(nn.Module):
             self.P, self.chunk_size,
         )
 
-        # 4. Post-readout norm + attention (PyTorch)
-        y_normed = s6.readout_norm(y_ssm)
-        c_proj_out = s6.c_proj(u_conv)  # cheap recompute for K sharing
-        y = s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+        # 3. Post-readout norm + residual from u
+        y_normed = s6.readout_norm(y_ssm) + u
+
+        # 4. Multi-scale conv (Triton fused)
+        msconv = s6.msconv
+        y_conv = _TritonMSConv.apply(
+            y_normed,
+            msconv.convs[0].weight, msconv.convs[0].bias,
+            msconv.convs[1].weight, msconv.convs[1].bias,
+            msconv.convs[2].weight, msconv.convs[2].bias,
+            msconv.se.fc1.weight, msconv.se.fc2.weight,
+            msconv.group_size,
+        )  # (B, L, H)
+
+        # 5. Attention (PyTorch)
+        c_proj_out = s6.c_proj(u)  # cheap recompute for K sharing
+        y = s6.attn(y_conv, y_conv, Bu_raw, c_proj_out)
 
         return y
 
