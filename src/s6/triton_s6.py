@@ -655,11 +655,9 @@ if HAS_TRITON:
         dt = tl.where(pre > 20.0, pre, tl.log(1.0 + tl.exp(pre)))
         tl.store(dt_ptr + row * P + offs_p, dt, mask=p_mask)
 
-        # --- lam activation: sigmoid(silu(lam_raw)) ---
+        # --- lam activation: sigmoid(lam_raw) ---
         lam_raw = tl.load(lam_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
-        sig_lam = 1.0 / (1.0 + tl.exp(-lam_raw))
-        lam_silu = lam_raw * sig_lam
-        lam = 1.0 / (1.0 + tl.exp(-lam_silu))
+        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
         tl.store(lam_ptr + row * P + offs_p, lam, mask=p_mask)
 
         # --- Bu: RMSNorm(Bu_raw) + b_bias ---
@@ -680,9 +678,7 @@ if HAS_TRITON:
         dt_odd = tl.load(dt_ptr + row * P + offs_h * 2 + 1, mask=h_mask, other=0.0)
         dt_half = (dt_even + dt_odd) * 0.5
         theta = tl.load(theta_ptr + row * half_P + offs_h, mask=h_mask, other=0.0)
-        sig_theta = 1.0 / (1.0 + tl.exp(-theta))
-        theta_silu = theta * sig_theta
-        tl.store(dt_half_theta_ptr + row * half_P + offs_h, dt_half * theta_silu, mask=h_mask)
+        tl.store(dt_half_theta_ptr + row * half_P + offs_h, dt_half * theta, mask=h_mask)
 
     # ========== Fused kernel 2: scan ==========
     # Grid: (B, cdiv(P, BLOCK_P_SCAN))
@@ -1873,9 +1869,7 @@ if HAS_TRITON:
             tl.store(d_dt_half_ptr + off_h, acc, mask=h_mask)
 
             theta_t = tl.load(theta_ptr + off_h, mask=h_mask, other=0.0)
-            sig_theta = 1.0 / (1.0 + tl.exp(-theta_t))
-            theta_silu = theta_t * sig_theta
-            d_dt_val = acc * theta_silu * 0.5
+            d_dt_val = acc * theta_t * 0.5
 
             off_even = base + t * P + offs_h * 2
             off_odd = off_even + 1
@@ -1929,14 +1923,11 @@ if HAS_TRITON:
         d_dt_raw = d_pre * (sig_dt + dt_raw * sig_dt * (1.0 - sig_dt))
         tl.store(d_dt_raw_ptr + row * P + offs_p, d_dt_raw, mask=p_mask)
 
-        # --- lam backward: sigmoid(silu(lam_raw)) ---
+        # --- lam backward ---
         d_lam = tl.load(d_lam_ptr + row * P + offs_p, mask=p_mask, other=0.0)
         lam_raw = tl.load(lam_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
-        sig_lam = 1.0 / (1.0 + tl.exp(-lam_raw))
-        lam_silu = lam_raw * sig_lam
-        lam = 1.0 / (1.0 + tl.exp(-lam_silu))
-        d_lam_silu = d_lam * lam * (1.0 - lam)
-        d_lam_raw = d_lam_silu * (sig_lam + lam_raw * sig_lam * (1.0 - sig_lam))
+        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
+        d_lam_raw = d_lam * lam * (1.0 - lam)
         tl.store(d_lam_raw_ptr + row * P + offs_p, d_lam_raw, mask=p_mask)
 
         # --- Bu backward: through bias -> rmsnorm ---
@@ -2968,10 +2959,6 @@ class _TritonS6(torch.autograd.Function):
         # d_theta from d_dt_half_theta: d_theta[t] = d_dt_half_theta[t] * dt_half[t]
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)
         d_theta = (d_dt_half_theta * dt_half).view(M, P // 2)
-        theta_raw = theta.view(M, P // 2)
-        theta_sig = torch.sigmoid(theta_raw)
-        theta_silu_grad = theta_sig + theta_raw * theta_sig * (1.0 - theta_sig)
-        d_theta = d_theta * theta_silu_grad
 
         # ---- 2. Prescan backward (dt/lam activations, Bu rmsnorm) ----
         d_dt_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)

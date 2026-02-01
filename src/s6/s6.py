@@ -178,10 +178,10 @@ class S6Kernel(nn.Module):
             Bu_raw = F.silu(self.phi_B(u))  # (B, L, P)
 
         # dt, lam, theta from fused linear projection
-        x_proj = F.silu(self.x_proj(u))  # (B, L, P+P+P//2)
+        x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
         dt_raw, lam_raw, theta = x_proj.split(self._split_sizes, dim=-1)
 
-        dt = F.softplus(dt_raw + self.log_dt_bias)  # (B, L, P)
+        dt = F.softplus(F.silu(dt_raw) + self.log_dt_bias)  # (B, L, P)
         lam = torch.sigmoid(lam_raw)  # (B, L, P)
 
         Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
