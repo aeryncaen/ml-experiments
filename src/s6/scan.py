@@ -86,7 +86,11 @@ def chunked_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32
 
 
 def parallel_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
-    """Chunked parallel scan — cuBLAS matmul within chunks, sequential across chunks."""
+    """Chunked parallel scan — cuBLAS matmul within chunks, sequential across chunks.
+    Falls back to sequential scan on MPS (no complex cumsum support).
+    """
+    if alpha.device.type == 'mps':
+        return sequential_scan(alpha, inject)
     if alpha.shape[1] <= chunk_size:
         return chunked_scan(alpha, inject, chunk_size=alpha.shape[1])
     return chunked_scan(alpha, inject, chunk_size=chunk_size)

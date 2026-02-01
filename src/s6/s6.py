@@ -1,13 +1,22 @@
 """S6: S4D base + S5 MIMO + Mamba selectivity + trapezoidal discretization + data-dependent RoPE."""
 
 import math
+import importlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from pathlib import Path
 
 from .scan import parallel_scan
+
+# Import LearnableFeatureMap from zoology (sibling repo)
+_zoology_path = str(Path(__file__).resolve().parents[2] / 'zoology')
+import sys as _sys
+if _zoology_path not in _sys.path:
+    _sys.path.insert(0, _zoology_path)
+from zoology.mixers.luna import LearnableFeatureMap
 
 
 def make_HiPPO(N):
@@ -47,11 +56,12 @@ def apply_rotary_emb(x, angles):
 class S6Kernel(nn.Module):
     """S6 SSM: input-dependent discretization + parallel scan, MIMO via shared diagonal state."""
 
-    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1, lr=None):
+    def __init__(self, d_model, N=64, M=4, dt_min=0.001, dt_max=0.1, lr=None):
         super().__init__()
         H = d_model
         P = N
         assert P % 2 == 0, "d_state must be even for RoPE"
+        assert P % M == 0, f"d_state ({P}) must be divisible by M ({M})"
         self.H = H
         self.P = P
 
@@ -62,10 +72,17 @@ class S6Kernel(nn.Module):
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
-        # Fused input projection: one cuBLAS call for all input-dependent params
-        # Layout: [B(P), dt(P), lam(P), theta(P//2)]
-        self.x_proj = nn.Linear(H, P + P + P + P // 2)
-        self._split_sizes = [P, P, P, P // 2]
+        # B: LUNA feature bank (H → P) — learned nonlinear input selectivity
+        L_fb = P // M
+        self.phi_B = LearnableFeatureMap(
+            d=H, M=M, L=L_fb, hidden=64,
+            nonneg=False, act="silu", ch_rms=True,
+        )
+
+        # Fused input projection for dt, lam, theta (B is now separate via feature bank)
+        # Layout: [dt(P), lam(P), theta(P//2)]
+        self.x_proj = nn.Linear(H, P + P + P // 2)
+        self._split_sizes = [P, P, P // 2]
 
         # B norm + bias (Mamba-3 pattern)
         self.b_norm = RMSNorm(P)
@@ -76,17 +93,13 @@ class S6Kernel(nn.Module):
         self.log_dt_bias = nn.Parameter(log_dt_bias)
 
         # lambda_proj bias init: sigmoid(2) ≈ 0.88 biased toward current input
-        # We init the lambda slice of x_proj.bias to 2.0, rest to 0
         with torch.no_grad():
             bias = self.x_proj.bias
-            # zero out lambda and theta bias regions, set lambda to 2.0
-            b_end = P
-            dt_end = 2 * P
-            lam_end = 3 * P
-            bias[lam_end - P:lam_end] = 2.0
-            # zero out theta region weights for init (starts from zero rotation)
-            self.x_proj.weight[lam_end:] = 0.0
-            bias[lam_end:] = 0.0
+            # lam region starts at P, ends at 2P
+            bias[P:2*P] = 2.0
+            # theta region: zero weights and bias for init (starts from zero rotation)
+            self.x_proj.weight[2*P:] = 0.0
+            bias[2*P:] = 0.0
 
     def forward(self, u):
         """
@@ -102,23 +115,25 @@ class S6Kernel(nn.Module):
         # Materialize complex A
         A = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (P,) complex
 
-        # Single fused projection, then split
-        x_proj = self.x_proj(u)  # (B, L, P+P+P+P//2) — one cuBLAS call
-        Bu_raw, dt_raw, lam_raw, theta = x_proj.split(self._split_sizes, dim=-1)
+        # B: feature bank projection (nonlinear, learned selectivity)
+        # phi_B expects (B, H, N, d) → unsqueeze dummy head dim
+        Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+
+        # dt, lam, theta from fused linear projection
+        x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
+        dt_raw, lam_raw, theta = x_proj.split(self._split_sizes, dim=-1)
 
         dt = F.softplus(F.silu(dt_raw) + self.log_dt_bias)  # (B, L, P)
         lam = torch.sigmoid(lam_raw)  # (B, L, P)
-        # theta is already (B, L, P//2)
 
-        Bu = self.b_norm(F.silu(Bu_raw)) + self.b_bias  # (B, L, P)
-        Bu_prev = F.pad(Bu[:, :-1], (0, 0, 1, 0))  # shifted right by 1
+        Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
 
         # Data-dependent RoPE on B
-        # dt is (B,L,P), theta is (B,L,P//2). Average paired dt dims to get P//2 scale.
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)  # (B, L, P//2)
         cum_theta = torch.cumsum(dt_half * theta, dim=1)  # (B, L, P//2)
         Bu = apply_rotary_emb(Bu, cum_theta)
-        Bu_prev = apply_rotary_emb(Bu_prev, cum_theta)
+        # Bu_prev: shift AFTER rotation so position t-1 keeps its own rotation angle
+        Bu_prev = F.pad(Bu[:, :-1], (0, 0, 1, 0))
 
         # Trapezoidal discretization (complex)
         alpha = torch.exp(dt.to(torch.cfloat) * A)  # (B, L, P) complex decay
@@ -146,7 +161,7 @@ class S6Kernel(nn.Module):
 
 
 class S6(nn.Module):
-    def __init__(self, d_model, d_state=64, layer_idx=None, **kernel_args):
+    def __init__(self, d_model, d_state=64, M=4, layer_idx=None, **kernel_args):
         super().__init__()
 
         self.h = d_model
@@ -157,7 +172,7 @@ class S6(nn.Module):
         self.D = nn.Parameter(torch.randn(self.h))
 
         # SSM Kernel (parallel scan, not FFT conv)
-        self.kernel = S6Kernel(self.h, N=self.n, **kernel_args)
+        self.kernel = S6Kernel(self.h, N=self.n, M=M, **kernel_args)
 
         # C: static MIMO readout (H, P) complex — maps state back to output channels
         C = torch.randn(self.h, self.n, dtype=torch.cfloat) / math.sqrt(self.n)

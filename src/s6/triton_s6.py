@@ -782,8 +782,9 @@ class _TritonS6(torch.autograd.Function):
     @staticmethod
     def forward(ctx,
                 u,  # (B, L, H)
-                # Kernel params (x_proj fused)
-                x_proj_w, x_proj_b,  # Linear(H, P+P+P+P//2)
+                Bu_raw,  # (B, L, P) — from feature bank (computed in PyTorch)
+                # Kernel params (x_proj fused for dt, lam, theta only)
+                x_proj_w, x_proj_b,  # Linear(H, P+P+P//2)
                 b_norm_gamma, b_bias, log_dt_bias,
                 log_A_real, A_imag,
                 # C-side params
@@ -795,36 +796,33 @@ class _TritonS6(torch.autograd.Function):
                 P, chunk_size):
         B, L, H = u.shape
         M = B * L
-        split_sizes = [P, P, P, P // 2]
+        split_sizes = [P, P, P // 2]
 
         u_flat = u.reshape(M, H)
 
-        # 1. Fused input projection
-        x_proj_out = triton_linear(u_flat, x_proj_w, x_proj_b)  # (M, 3.5P)
-        Bu_raw, dt_raw, lam_raw, theta = x_proj_out.split(split_sizes, dim=-1)
+        # 1. Fused input projection (dt, lam, theta only — B is from feature bank)
+        x_proj_out = triton_linear(u_flat, x_proj_w, x_proj_b)  # (M, P+P+P//2)
+        dt_raw, lam_raw, theta = x_proj_out.split(split_sizes, dim=-1)
 
         # 2. dt and lam activations
         dt, lam = triton_fused_dt_lam(dt_raw, lam_raw, log_dt_bias.expand(M, P).contiguous())
 
-        # 3. B: silu → rmsnorm → + bias
-        Bu_silu = triton_silu(Bu_raw)  # (M, P)
-        Bu_normed = triton_rmsnorm(Bu_silu, b_norm_gamma)  # (M, P)
-        # Add bias (fused would be better, but keep simple)
+        # 3. B: rmsnorm → + bias (feature bank already applied activation)
+        Bu_raw_flat = Bu_raw.reshape(M, P)
+        Bu_normed = triton_rmsnorm(Bu_raw_flat, b_norm_gamma)  # (M, P)
         Bu = Bu_normed + b_bias.unsqueeze(0)  # (M, P)
 
-        # Reshape for sequence ops
-        Bu_3d = Bu.view(B, L, P)
-        Bu_prev = torch.zeros_like(Bu_3d)
-        Bu_prev[:, 1:] = Bu_3d[:, :-1]
-
-        # 4. RoPE
+        # 4. RoPE on Bu, then shift to get Bu_prev
         dt_3d = dt.view(B, L, P)
         theta_3d = theta.view(B, L, P // 2)
         dt_half = dt_3d.view(B, L, P // 2, 2).mean(-1)  # (B, L, P//2)
         cum_theta = torch.cumsum(dt_half * theta_3d, dim=1)  # (B, L, P//2)
 
+        Bu_3d = Bu.view(B, L, P)
         Bu_rotated = triton_rope(Bu_3d, cum_theta)
-        Bu_prev_rotated = triton_rope(Bu_prev, cum_theta)
+        # Shift AFTER rotation so position t-1 keeps its own rotation angle
+        Bu_prev_rotated = torch.zeros_like(Bu_rotated)
+        Bu_prev_rotated[:, 1:] = Bu_rotated[:, :-1]
 
         # 5. Complex discretization
         A_real_neg = -torch.exp(log_A_real)  # (P,)
@@ -867,7 +865,7 @@ class _TritonS6(torch.autograd.Function):
 
         # Save for backward
         ctx.save_for_backward(
-            u, Bu_raw, Bu_silu, Bu_normed, Bu_3d, Bu_prev,
+            u, Bu_raw_flat, Bu_normed, Bu_3d,
             dt_raw, dt, lam_raw, lam, theta, dt_half, cum_theta,
             Bu_rotated, Bu_prev_rotated,
             alpha_re, alpha_im, inject_re, inject_im,
@@ -885,7 +883,7 @@ class _TritonS6(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_out):
-        (u, Bu_raw, Bu_silu, Bu_normed, Bu_3d, Bu_prev,
+        (u, Bu_raw_flat, Bu_normed, Bu_3d,
          dt_raw, dt, lam_raw, lam, theta, dt_half, cum_theta,
          Bu_rotated, Bu_prev_rotated,
          alpha_re, alpha_im, inject_re, inject_im,
@@ -1106,28 +1104,22 @@ class _TritonS6(torch.autograd.Function):
             d_Bu_rot.view(-1), d_Bu_prev_rot.view(-1),
             N_elem, P, BLOCK)
 
-        # ---- 4. Backward through RoPE on Bu and Bu_prev ----
+        # ---- 4. Backward through Bu_prev shift + RoPE ----
+        # Forward was: Bu_rotated = rope(Bu_3d), Bu_prev_rotated = pad(Bu_rotated[:, :-1])
+        # So d_Bu_rotated = d_Bu_rot + shift_back(d_Bu_prev_rot)
+        d_Bu_rotated = d_Bu_rot.clone()
+        d_Bu_rotated[:, :-1] += d_Bu_prev_rot[:, 1:]
+
         d_Bu_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_cum_theta_b1 = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
+        d_cum_theta_b = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
         rope_bwd_kernel[(N_rows,)](
-            d_Bu_rot.contiguous().view(-1), cum_theta.contiguous().view(-1),
-            d_Bu_3d.view(-1), d_cum_theta_b1.view(-1),
+            d_Bu_rotated.contiguous().view(-1), cum_theta.contiguous().view(-1),
+            d_Bu_3d.view(-1), d_cum_theta_b.view(-1),
             Bu_3d.contiguous().view(-1),
             N_rows, P, BLOCK_ROPE)
 
-        d_Bu_prev_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_cum_theta_b2 = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
-        rope_bwd_kernel[(N_rows,)](
-            d_Bu_prev_rot.contiguous().view(-1), cum_theta.contiguous().view(-1),
-            d_Bu_prev_3d.view(-1), d_cum_theta_b2.view(-1),
-            Bu_prev.contiguous().view(-1),
-            N_rows, P, BLOCK_ROPE)
-
-        # Shift d_Bu_prev back: d_Bu[:, :-1] += d_Bu_prev[:, 1:]
-        d_Bu_3d[:, :-1] += d_Bu_prev_3d[:, 1:]
-
         # ---- cum_theta grad: reverse cumsum ----
-        d_cum_theta = d_cum_theta_c + d_cum_theta_b1 + d_cum_theta_b2
+        d_cum_theta = d_cum_theta_c + d_cum_theta_b
         d_dt_half_theta = d_cum_theta.flip(1).cumsum(1).flip(1)  # reverse cumsum
         d_dt_half = d_dt_half_theta * theta.view(B, L, P // 2)
         d_theta = d_dt_half_theta * dt_half
@@ -1136,14 +1128,10 @@ class _TritonS6(torch.autograd.Function):
 
         # ---- 3. Backward through B norm + bias ----
         d_Bu_flat = d_Bu_3d.reshape(M, P)
-        # d_b_bias = sum(d_Bu)
         d_b_bias = d_Bu_flat.sum(0)
-        # d_Bu_normed = d_Bu (additive bias)
-        d_Bu_normed = d_Bu_flat
-        # rmsnorm backward (Triton)
-        d_Bu_silu, d_b_norm_gamma = triton_rmsnorm_bwd(d_Bu_normed, Bu_silu, b_norm_gamma)
-        # silu backward (Triton)
-        d_Bu_raw = triton_silu_bwd(d_Bu_silu, Bu_raw)
+        d_Bu_normed = d_Bu_flat  # additive bias
+        # rmsnorm backward (Triton) — no silu step, feature bank already activated
+        d_Bu_raw_flat, d_b_norm_gamma = triton_rmsnorm_bwd(d_Bu_normed, Bu_raw_flat, b_norm_gamma)
 
         # ---- 2. Backward through dt/lam activations ----
         d_dt_total = d_dt_disc.reshape(M, P) + d_dt_from_rope.reshape(M, P)
@@ -1161,9 +1149,8 @@ class _TritonS6(torch.autograd.Function):
 
         d_log_dt_bias = d_log_dt_bias_flat.sum(0)
 
-        # ---- 1. Backward through x_proj linear ----
-        # Reassemble d_x_proj from splits
-        d_x_proj = torch.cat([d_Bu_raw, d_dt_raw, d_lam_raw, d_theta.reshape(M, P // 2)], dim=-1)
+        # ---- 1. Backward through x_proj linear (dt, lam, theta only) ----
+        d_x_proj = torch.cat([d_dt_raw, d_lam_raw, d_theta.reshape(M, P // 2)], dim=-1)
 
         d_x_proj_w = torch.zeros_like(x_proj_w)
         out_dim = x_proj_w.shape[0]
@@ -1187,26 +1174,20 @@ class _TritonS6(torch.autograd.Function):
             d_u_proj.stride(0), d_u_proj.stride(1),
             BLOCK_M, BLOCK_K, BLOCK_N)
 
-        # Total d_u
+        # Total d_u (from x_proj + c_proj + skip)
         d_u = (d_u_proj + d_u_c + d_u_skip.view(M, H)).view(B, L, H)
 
-        # d_log_A_real: from d_alpha through A_real_neg = -exp(log_A_real)
-        # d_A_real_neg comes from discretize backward (accumulated over B,L)
-        # We need to sum d_alpha contributions... this was handled inside complex_discretize_bwd
-        # which gives d_dt. For d_A we need: d_alpha * d(exp(dt*A))/dA = d_alpha * dt * alpha
-        # This requires another pass or we fold it into the discretize kernel.
-        # For now: compute from chain rule
-        # alpha = exp(dt * A), A = A_real_neg + j*A_imag
-        # d_A_real_neg = sum over B,L of: d_alpha_re * dt * alpha_re_from_real - ...
-        # Actually this is complex: d_A = sum(d_alpha * dt * alpha) (conjugate)
-        # Let's just do it in PyTorch for now since it's a (P,) reduction
+        # d_Bu_raw: reshape to (B, L, P) to match input
+        d_Bu_raw = d_Bu_raw_flat.view(B, L, P)
+
+        # d_log_A_real: chain rule through A_real_neg = -exp(log_A_real)
         dt_3d_cont = dt.view(B, L, P)
         d_A_real = (d_alpha_re * dt_3d_cont * alpha_re + d_alpha_im * dt_3d_cont * alpha_im).sum(dim=(0, 1))
         d_A_imag = (-d_alpha_re * dt_3d_cont * alpha_im + d_alpha_im * dt_3d_cont * alpha_re).sum(dim=(0, 1))
-        # Chain through -exp(log_A_real): d_log_A_real = d_A_real * A_real_neg
         d_log_A_real = d_A_real * A_real_neg
 
         return (d_u,
+                d_Bu_raw,  # grad for Bu_raw input
                 d_x_proj_w, d_x_proj_b,
                 d_b_norm_gamma, d_b_bias, d_log_dt_bias,
                 d_log_A_real, d_A_imag,
@@ -1222,10 +1203,9 @@ class _TritonS6(torch.autograd.Function):
 class TritonS6(nn.Module):
     """S6 using Triton kernels. Falls back to PyTorch S6 on non-CUDA devices."""
 
-    def __init__(self, d_model, d_state=64, chunk_size=32, layer_idx=None, **kwargs):
+    def __init__(self, d_model, d_state=64, M=4, chunk_size=32, layer_idx=None, **kwargs):
         super().__init__()
-        from .s6 import S6, S6Kernel, make_DPLR_HiPPO, RMSNorm
-        import numpy as np
+        from .s6 import S6
 
         H = d_model
         P = d_state
@@ -1234,7 +1214,7 @@ class TritonS6(nn.Module):
         self.chunk_size = chunk_size
 
         # Build a PyTorch S6 for init and fallback
-        self._pytorch_s6 = S6(d_model, d_state, layer_idx=layer_idx, **kwargs)
+        self._pytorch_s6 = S6(d_model, d_state, M=M, layer_idx=layer_idx, **kwargs)
 
         # Extract references to the actual parameters (shared with _pytorch_s6)
         # This way the Module's parameters() includes everything
@@ -1246,16 +1226,18 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
+        # Run feature bank in PyTorch (small MLP, not worth Tritonizing)
+        # phi_B expects (B, H, N, d) → unsqueeze dummy head dim
+        Bu_raw = kern.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+
         # Split complex C into real/imag for Triton
         C = torch.view_as_complex(s6.C)
         C_re = C.real.contiguous()
         C_im = C.imag.contiguous()
 
-        # Materialize A
-        A_real_neg = -torch.exp(kern.log_A_real)
-
         return _TritonS6.apply(
             u,
+            Bu_raw,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
             kern.log_A_real, kern.A_imag,
