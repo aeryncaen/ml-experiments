@@ -416,18 +416,22 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     # Module-level memory profiling (CUDA only, S6 only)
     if device == 'cuda' and isinstance(model, S6Wrapper):
         mem_stats = defaultdict(int)
+        mem_baseline = {}
         hooks = []
         module_names = {m: n for n, m in model.named_modules()}
 
-        def _pre_hook(_module, _inputs):
+        def _pre_hook(module, _inputs):
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
+            mem_baseline[id(module)] = torch.cuda.memory_allocated()
 
         def _post_hook(module, _inputs, _outputs):
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated()
+            base = mem_baseline.get(id(module), 0)
+            delta = max(0, peak - base)
             name = module_names.get(module, module.__class__.__name__)
-            mem_stats[name] = max(mem_stats[name], peak)
+            mem_stats[name] = max(mem_stats[name], delta)
 
         for m in model.modules():
             if len(list(m.children())) == 0:
@@ -440,7 +444,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         for h in hooks:
             h.remove()
 
-        print("\n[Module Memory Peaks] (approx, per leaf module)")
+        print("\n[Module Memory Peaks] (approx, per leaf module, delta)")
         top = sorted(mem_stats.items(), key=lambda kv: kv[1], reverse=True)[:20]
         for name, peak in top:
             print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
