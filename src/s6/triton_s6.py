@@ -1636,13 +1636,16 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
+        # 1. Multi-scale conv (PyTorch)
+        u_conv = s6.msconv(u)  # (B, L, H)
+
+        # 2. Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
         phi = kern.phi_B
         mlp = phi.channel_mlp
-        B_size, L_size, H = u.shape
+        B_size, L_size, H = u_conv.shape
         N_rows = B_size * L_size
         raw = _TritonPhiB.apply(
-            u.reshape(N_rows, H),
+            u_conv.reshape(N_rows, H),
             phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias,
             mlp.fc2.weight, mlp.fc2.bias,
@@ -1656,13 +1659,13 @@ class TritonS6(nn.Module):
             raw = (raw_3d * s.view(1, 1, phi.L)).view(N_rows, -1)
         Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
-        # Split complex C
+        # 3. SSM core (Triton)
         C = torch.view_as_complex(s6.C)
         C_re = C.real.contiguous()
         C_im = C.imag.contiguous()
 
-        return _TritonS6.apply(
-            u,
+        y_ssm = _TritonS6.apply(
+            u_conv,
             Bu_raw,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
@@ -1673,3 +1676,10 @@ class TritonS6(nn.Module):
             s6.D,
             self.P, self.chunk_size,
         )
+
+        # 4. Post-readout norm + attention (PyTorch)
+        y_normed = s6.readout_norm(y_ssm)
+        c_proj_out = s6.c_proj(u_conv)  # cheap recompute for K sharing
+        y = s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+
+        return y

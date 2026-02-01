@@ -19,6 +19,49 @@ if _zoology_path not in _sys.path:
 from zoology.mixers.luna import LearnableFeatureMap
 
 
+class SqueezeExcite1D(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.fc1 = nn.Linear(channels, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, channels, bias=False)
+
+    def forward(self, x):
+        # x: (B, L, C)
+        scale = torch.sigmoid(self.fc2(F.silu(self.fc1(x.mean(dim=1)))))
+        return x * scale.unsqueeze(1)
+
+
+class MultiScaleDepthwiseConv(nn.Module):
+    """Split channels into 4 groups: 3 with different kernel sizes, 1 passthrough. Then SE."""
+    def __init__(self, channels, kernel_sizes=(3, 6, 12)):
+        super().__init__()
+        self.kernel_sizes = kernel_sizes
+        n_groups = len(kernel_sizes) + 1  # +1 for passthrough
+        assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups}"
+        self.group_size = channels // n_groups
+        self.convs = nn.ModuleList([
+            nn.Conv1d(self.group_size, self.group_size, k, padding=k - 1, groups=self.group_size)
+            for k in kernel_sizes
+        ])
+        self.se = SqueezeExcite1D(channels)
+
+    def forward(self, x):
+        # x: (B, L, C)
+        B, L, C = x.shape
+        gs = self.group_size
+        n_conv = len(self.kernel_sizes)
+        conv_chunks = [x[..., i * gs:(i + 1) * gs] for i in range(n_conv)]
+        passthrough = x[..., n_conv * gs:]
+        out = []
+        for chunk, conv in zip(conv_chunks, self.convs):
+            y = F.silu(conv(chunk.transpose(1, 2))[..., :L].transpose(1, 2))
+            out.append(y)
+        out.append(passthrough)
+        out = torch.cat(out, dim=-1)  # (B, L, C)
+        return self.se(out)
+
+
 def make_HiPPO(N):
     P = np.sqrt(1 + 2 * np.arange(N))
     A = P[:, np.newaxis] * P[np.newaxis, :]
@@ -108,6 +151,7 @@ class S6Kernel(nn.Module):
         Returns:
             h: (B, L, P) all hidden states after scan
             cum_theta: (B, L, P//2) cumulative rotation angles for C readout
+            Bu_raw: (B, L, P) raw feature bank output (for attention Q sharing)
         """
         B, L, H = u.shape
         P = self.P
@@ -145,7 +189,7 @@ class S6Kernel(nn.Module):
         # Parallel scan: h[t] = alpha[t] * h[t-1] + inject[t]
         h = parallel_scan(alpha, inject)  # (B, L, P) complex
 
-        return h, cum_theta
+        return h, cum_theta, Bu_raw
 
     def register(self, name, tensor, lr=None):
         """Register a tensor with a configurable learning rate and 0 weight decay"""
@@ -160,13 +204,76 @@ class S6Kernel(nn.Module):
             setattr(getattr(self, name), "_optim", optim)
 
 
+class SharedAttention(nn.Module):
+    """Causal attention sharing 80% of Q/K dims with SSM B/C projections."""
+    def __init__(self, d_model, d_state, M=4, num_heads=1, layer_idx=0):
+        super().__init__()
+        H = d_model
+        P = d_state
+        self.H = H
+        self.P = P
+        self.num_heads = num_heads
+        self.head_dim = P // num_heads
+        assert P % num_heads == 0
+
+        # 80/20 split
+        self.shared_dims = int(0.8 * P)
+        self.ded_dims = P - self.shared_dims
+
+        # Dedicated projections for the 20% unique dims
+        self.q_ded = nn.Linear(H, self.ded_dims, bias=False)
+        self.k_ded = nn.Linear(H, self.ded_dims, bias=False)
+        # V is fully standalone
+        self.v_proj = nn.Linear(H, P, bias=False)
+
+        self.q_bias = nn.Parameter(torch.ones(P))
+        self.k_bias = nn.Parameter(torch.ones(P))
+
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+        self.out_proj = nn.Linear(P, H, bias=False)
+        self.gate = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, u, y_ssm, B_shared, C_shared):
+        """
+        u: (B, L, H) — pre-SSM hidden states
+        y_ssm: (B, L, H) — SSM readout (after norm)
+        B_shared: (B, L, P) — Bu_raw from phi_B (first 80% reused for Q)
+        C_shared: (B, L, P) — c_proj output (first 80% reused for K)
+        """
+        B_batch, L, _ = u.shape
+        sd = self.shared_dims
+        nh = self.num_heads
+        hd = self.head_dim
+
+        # Q = [B_shared[:sd] | q_ded] + bias, K = [C_shared[:sd] | k_ded] + bias
+        Q = F.silu(torch.cat([B_shared[..., :sd], self.q_ded(u)], dim=-1) + self.q_bias)
+        K = F.silu(torch.cat([C_shared[..., :sd], self.k_ded(u)], dim=-1) + self.k_bias)
+        V = self.v_proj(u)  # (B, L, P)
+
+        # Reshape to (B, nh, L, hd) and normalize
+        Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
+        K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
+        V = V.view(B_batch, L, nh, hd).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, self.P)
+
+        return y_ssm + self.gate * self.out_proj(attn_out)
+
+
 class S6(nn.Module):
-    def __init__(self, d_model, d_state=64, M=4, layer_idx=None, **kernel_args):
+    def __init__(self, d_model, d_state=64, M=4, layer_idx=None, num_heads=1, **kernel_args):
         super().__init__()
 
         self.h = d_model
         self.n = d_state
         self.d_output = self.h
+
+        # Multi-scale depthwise conv (before projections)
+        assert d_model % 4 == 0, f"d_model ({d_model}) must be divisible by 4 for msconv"
+        self.msconv = MultiScaleDepthwiseConv(d_model, kernel_sizes=(3, 6, 12))
 
         # D skip connection
         self.D = nn.Parameter(torch.randn(self.h))
@@ -181,15 +288,25 @@ class S6(nn.Module):
         self.c_norm = RMSNorm(self.n)
         self.c_bias = nn.Parameter(torch.ones(self.n))
 
+        # Post-readout norm (before attention residual)
+        self.readout_norm = RMSNorm(self.h)
+
+        # Shared attention (after readout)
+        self.attn = SharedAttention(d_model, d_state, M=M, num_heads=num_heads, layer_idx=layer_idx or 0)
+
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
         B, L, H = u.shape
 
+        # Multi-scale conv (before any projections)
+        u_conv = self.msconv(u)  # (B, L, H)
+
         # Run SSM scan
-        h, cum_theta = self.kernel(u)  # h: (B, L, P), cum_theta: (B, L, P//2)
+        h, cum_theta, Bu_raw = self.kernel(u_conv)  # h: (B,L,P), cum_theta: (B,L,P//2), Bu_raw: (B,L,P)
 
         # Input-dependent C gating + static C readout
-        c_gate = self.c_norm(F.silu(self.c_proj(u))) + self.c_bias  # (B, L, P)
+        c_proj_out = self.c_proj(u_conv)  # (B, L, P) — save for attention K sharing
+        c_gate = self.c_norm(F.silu(c_proj_out)) + self.c_bias  # (B, L, P)
         c_gate = apply_rotary_emb(c_gate, cum_theta)  # rotate to match state
         h_gated = h * c_gate  # (B, L, P) — input-dependent selection of state dims
 
@@ -198,6 +315,11 @@ class S6(nn.Module):
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
         # Skip connection + activation
-        y = y + u * self.D
+        y = y + u_conv * self.D
         y = F.silu(y)
+
+        # Post-readout norm + residual back to pre-SSM states + attention
+        y_normed = self.readout_norm(y)
+        y = self.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+
         return y
