@@ -565,6 +565,24 @@ if HAS_TRITON:
         if pid_g == 0:
             tl.atomic_add(d_x_ptr + row_off + group_off + offs_gs, d_out, mask=gs_mask)
         elif pid_g == 1:
+            acc = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
+            for j in range(K0):
+                src_l = pid_l - (K0 - 1) + j
+                valid = (src_l >= 0) & (src_l < L)
+                x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
+                w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
+                acc += x_val * w_val
+            sig = 1.0 / (1.0 + tl.exp(-acc))
+            d_pre = d_out * (sig + acc * sig * (1.0 - sig))
+            tl.atomic_add(d_cb0_ptr + offs_gs, d_pre, mask=gs_mask)
+            for j in range(K0):
+                src_l = pid_l - (K0 - 1) + j
+                valid = (src_l >= 0) & (src_l < L)
+                x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
+                w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
+                tl.atomic_add(d_cw0_ptr + offs_gs * K0 + j, d_pre * x_val, mask=gs_mask)
+                tl.atomic_add(d_x_ptr + base + src_l * H + group_off + offs_gs, d_pre * w_val, mask=gs_mask & valid)
+        elif pid_g == 2:
             acc = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
             for j in range(K1):
                 src_l = pid_l + (K1 - 1) - j
