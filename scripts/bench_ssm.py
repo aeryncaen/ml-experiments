@@ -352,7 +352,7 @@ def make_models(dim):
     mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
     # S6: 1 layer, d_state=128 to match ~50K param budget
-    s6 = S6Wrapper(d_model=dim, d_state=128, M=4)
+    s6 = S6Wrapper(d_model=dim, d_state=128, M=4, num_heads=4)
 
     return {
         # 'DS1': ds1,
