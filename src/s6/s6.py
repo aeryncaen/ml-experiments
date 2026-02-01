@@ -7,16 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from pathlib import Path
-
 from .scan import parallel_scan
-
-# Import LearnableFeatureMap from zoology (sibling repo)
-_zoology_path = str(Path(__file__).resolve().parents[2] / 'zoology')
-import sys as _sys
-if _zoology_path not in _sys.path:
-    _sys.path.insert(0, _zoology_path)
-from zoology.mixers.luna import LearnableFeatureMap
 
 
 class SqueezeExcite1D(nn.Module):
@@ -139,12 +130,10 @@ class S6Kernel(nn.Module):
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
-        # B: LUNA feature bank (H → P) — learned nonlinear input selectivity
-        L_fb = P // M
-        self.phi_B = LearnableFeatureMap(
-            d=H, M=M, L=L_fb, hidden=64,
-            nonneg=False, act="silu", ch_rms=True,
-        )
+        # B: simple linear projection (H → P)
+        self.phi_B = nn.Linear(H, P)
+        nn.init.normal_(self.phi_B.weight, mean=0.0, std=1.0 / math.sqrt(H))
+        nn.init.zeros_(self.phi_B.bias)
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
         # Layout: [dt(P), lam(P), theta(P//2)]
@@ -186,13 +175,13 @@ class S6Kernel(nn.Module):
 
         # B: use provided Bu_raw or compute from phi_B
         if Bu_raw is None:
-            Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+            Bu_raw = F.silu(self.phi_B(u))  # (B, L, P)
 
         # dt, lam, theta from fused linear projection
-        x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
+        x_proj = F.silu(self.x_proj(u))  # (B, L, P+P+P//2)
         dt_raw, lam_raw, theta = x_proj.split(self._split_sizes, dim=-1)
 
-        dt = F.softplus(F.silu(dt_raw) + self.log_dt_bias)  # (B, L, P)
+        dt = F.softplus(dt_raw + self.log_dt_bias)  # (B, L, P)
         lam = torch.sigmoid(lam_raw)  # (B, L, P)
 
         Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
@@ -274,7 +263,7 @@ class S6Attention(nn.Module):
     """Causal attention with 80/20 weight sharing.
 
     Q: 80% of rows shared with c_proj, 20% dedicated.
-    K: 80% of rows shared with phi_B.W, 20% dedicated.
+    K: 80% of rows shared with phi_B, 20% dedicated.
     V: standalone.
     Separate forward ops — just shared Parameter storage.
     """
@@ -298,13 +287,13 @@ class S6Attention(nn.Module):
         self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
         self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
 
-        # K: 80% W rows from phi_B, 20% dedicated
-        self.shared_k_dirs = int(0.8 * M)
-        self.ded_k_dirs = M - self.shared_k_dirs
+        # K: 80% rows from phi_B, 20% dedicated
+        self.shared_k_rows = int(0.8 * P)
+        self.ded_k_rows = P - self.shared_k_rows
         assert phi_B is not None
         self._phi_B = phi_B
-        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
-        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
+        self.k_ded_weight = nn.Parameter(torch.randn(self.ded_k_rows, H) / math.sqrt(H))
+        self.k_ded_bias = nn.Parameter(torch.zeros(self.ded_k_rows))
 
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
@@ -326,7 +315,6 @@ class S6Attention(nn.Module):
         """
         B_batch, L, H = u.shape
         P = self.P
-        M = self.M
         nh = self.num_heads
         hd = self.head_dim
 
@@ -335,20 +323,16 @@ class S6Attention(nn.Module):
                          self.q_ded_weight], dim=0)
         q_b = torch.cat([self._c_proj.bias[:self.shared_q_rows],
                          self.q_ded_bias], dim=0)
-        Q = F.linear(u, q_w, q_b).bfloat16()  # (B, L, P)
+        Q = F.silu(F.linear(u, q_w, q_b)).bfloat16()  # (B, L, P)
 
         # K: assemble shared phi_B rows + dedicated rows, run feature map
-        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
-                         self.k_ded_W], dim=0)  # (M, H)
-        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
-                         self.k_ded_b], dim=0)  # (M,)
-        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
-        k_flat = k_proj.reshape(-1, 1).float()
-        k_feat = self._phi_B.channel_mlp(k_flat)
-        k_feat = k_feat.view(B_batch, L, M, self._phi_B.L)
-        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()
+        k_W = torch.cat([self._phi_B.weight[:self.shared_k_rows],
+                         self.k_ded_weight], dim=0)  # (P, H)
+        k_b = torch.cat([self._phi_B.bias[:self.shared_k_rows],
+                         self.k_ded_bias], dim=0)  # (P,)
+        K = F.silu(F.linear(u, k_W, k_b)).bfloat16()  # (B, L, P)
 
-        V = self.v_proj(u.bfloat16())  # (B, L, P)
+        V = F.silu(self.v_proj(u.bfloat16()))  # (B, L, P)
 
         Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
         K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
@@ -365,7 +349,7 @@ class S6Attention(nn.Module):
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
-        return y_ssm + self.gate * self.out_proj(attn_out).float()
+        return y_ssm + self.gate * F.silu(self.out_proj(attn_out)).float()
 
 
 class S6(nn.Module):

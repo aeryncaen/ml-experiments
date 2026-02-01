@@ -206,7 +206,6 @@ class MHABlock(nn.Module):
     """Single block of multi-head attention (SDPA) + SwiGLU MLP."""
     def __init__(self, d_model, n_heads=4, mlp_hidden=208, se_reduction=4, mamba_state=16):
         super().__init__()
-        self.norm1 = RMSNorm(d_model)
         self.quad_conv = QuadConvMix(d_model, k=3, reduction=se_reduction)
         self.mamba = Mamba(d_model=d_model, d_state=mamba_state, d_conv=4, expand=1, use_fast_path=True)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
@@ -214,13 +213,11 @@ class MHABlock(nn.Module):
         self.mlp = SwiGLUMLP(d_model, mlp_hidden)
 
     def forward(self, x):
-        h = self.norm1(x)
-        h = self.quad_conv(h)
+        h = self.quad_conv(x)
         h = self.mamba(h)
         h, _ = self.attn(h, h, h)
-        x = x + h
-        x = x + self.mlp(self.norm2(x))
-        return x
+        h = h + self.mlp(self.norm2(h))
+        return h
 
 
 class DS1Wrapper(nn.Module):
@@ -514,67 +511,76 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-class StackedSSM(nn.Module):
-    """Stack N identical SSM layers with residual connections."""
-    def __init__(self, make_layer, n_layers):
+class StackedModel(nn.Module):
+    """Stack N identical layers with pre-norm residual connections."""
+    def __init__(self, make_layer, n_layers, dim):
         super().__init__()
         self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
+        self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
+        self.final_norm = RMSNorm(dim)
 
     def forward(self, x):
-        for layer in self.layers:
-            x = x + layer(x)
-        return x
+        for norm, layer in zip(self.norms, self.layers):
+            x = x + layer(norm(x))
+        return self.final_norm(x)
 
 
-def make_models(dim):
-    """Build models — ALL single layer, matched param counts (~50-57K)."""
-    # DS1 base: 1 layer, ~57K params
-    ds1 = DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2)
+def _stack(make_layer, n_layers, dim):
+    """Always wrap with pre-norm residual stacking."""
+    return StackedModel(make_layer, n_layers, dim)
 
-    # DS1++: DS1 + signed sparse attention, 1 layer, ~51K params
-    ds1_pp = DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2,
-                         diff_attn=True)
 
-    # S4D: 1 layer, d_state=384 = ~57.6K params
-    s4d = S4D(d_model=dim, d_state=384)
+def make_models(dim, n_layers=1):
+    """Build models with configurable depth. Param counts are per-layer (~50-57K)."""
+    models = {}
 
-    # S5: 1 layer, state_width=256 = ~49.7K params
-    s5 = S5Wrapper(width=dim, state_width=256)
+    # DS1 base
+    # models['DS1'] = _stack(
+    #     lambda: DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2),
+    #     n_layers, dim)
 
-    # Mamba: 1 layer, expand=2, d_state=64 = ~51K params
-    mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
+    # DS1++: DS1 + signed sparse attention
+    models['DS1++'] = _stack(
+        lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True),
+        n_layers, dim)
 
-    # S6: 1 layer, d_state=104 to match ~57K param budget
-    s6 = S6Wrapper(d_model=dim, d_state=104, M=4, num_heads=4)
+    # S4D: d_state=384 = ~57.6K params/layer
+    # models['S4D'] = _stack(lambda: S4D(d_model=dim, d_state=384), n_layers, dim)
 
-    # MHA+SwiGLU: 1 block, ~57K params (MHA 4-head ~16.6K + SwiGLU mlp_hidden=208 ~40.4K)
-    mha = MHABlock(d_model=dim, n_heads=4, mlp_hidden=208)
+    # S5: state_width=256 = ~49.7K params/layer
+    # models['S5'] = _stack(lambda: S5Wrapper(width=dim, state_width=256), n_layers, dim)
 
-    return {
-        # 'DS1': ds1,
-        'DS1++': ds1_pp,
-        # 'S4D': s4d,
-        # 'S5': s5,
-        # 'Mamba': mamba,
-        'S6': s6,
-        'MHA': mha,
-    }
+    # Mamba: expand=2, d_state=64 = ~51K params/layer
+    # models['Mamba'] = _stack(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2), n_layers, dim)
+
+    # S6: d_state=104 = ~57K params/layer
+    models['S6'] = _stack(
+        lambda: S6Wrapper(d_model=dim, d_state=104, M=4, num_heads=4),
+        n_layers, dim)
+
+    # MHA+SwiGLU: ~57K params/layer
+    models['MHA'] = _stack(
+        lambda: MHABlock(d_model=dim, n_heads=4, mlp_hidden=208),
+        n_layers, dim)
+
+    return models
 
 
 if __name__ == '__main__':
     print(f"Device: {DEVICE}")
     dim = 64
+    n_layers = 1
     tasks = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
     n_steps = 2000
     B, L = 32, 32
 
-    models_info = make_models(dim)
-    print(f"\n{'Model':<10} {'Params':>10}")
-    print('-' * 22)
+    models_info = make_models(dim, n_layers=n_layers)
+    print(f"\n{'Model':<10} {'Params':>10} {'Layers':>8}")
+    print('-' * 30)
     for name, m in models_info.items():
-        print(f"{name:<10} {count_params(m):>10,}")
+        print(f"{name:<10} {count_params(m):>10,} {n_layers:>8}")
 
-    print(f"\nRunning {n_steps} steps, B={B}, L={L}, dim={dim}")
+    print(f"\nRunning {n_steps} steps, B={B}, L={L}, dim={dim}, layers={n_layers}")
     print('=' * 90)
 
     header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Acc':>8} {'Wall(s)':>8} {'Mem(MB)':>9}"
@@ -592,7 +598,7 @@ if __name__ == '__main__':
             torch.manual_seed(SEED)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
-            model = make_models(dim)[name]
+            model = make_models(dim, n_layers=n_layers)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data)
             print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
