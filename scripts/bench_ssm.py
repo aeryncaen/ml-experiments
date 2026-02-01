@@ -168,6 +168,7 @@ class QuadConvMix(nn.Module):
         # retrocausal: right-padded conv
         self.conv_retro = nn.Conv1d(self.d_path, self.d_path, k, padding=0, groups=self.d_path)
         self.se = SEBlock(d_model, reduction=reduction)
+        self.norm = RMSNorm(d_model)
         self.k = k
 
     def forward(self, x):
@@ -191,7 +192,7 @@ class QuadConvMix(nn.Module):
         c3 = self.conv_retro(c3).transpose(1, 2)
 
         out = torch.cat([p0, c1, c2, c3], dim=-1)  # (B, L, D)
-        return self.se(out)
+        return self.norm(self.se(out) + x)
 
 
 class MHABlock(nn.Module):
