@@ -324,12 +324,11 @@ class S6Attention(nn.Module):
         self.lambda_q2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
         self.lambda_k2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
 
-        # Post-diff sublayer norm (per-head RMSNorm), scaled by (1 - λ_init)
-        self.diff_norm = RMSNorm(self.half_head_dim)
-        self.diff_norm.weight.data = self.diff_norm.weight.data.bfloat16()
+        # Post-diff head norm on full head_dim, scaled by (1 - λ_init)
+        self.head_norm = RMSNorm(self.head_dim)
+        self.head_norm.weight.data = self.head_norm.weight.data.bfloat16()
 
-        # Diff attn output is half the original dim (P//2)
-        self.out_proj = nn.Linear(P // 2, H, bias=False, dtype=torch.bfloat16)
+        self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, u, y_ssm):
@@ -373,33 +372,27 @@ class S6Attention(nn.Module):
         ghw = gw // 2  # group half-width
         q_halves_1, q_halves_2 = [], []
         k_halves_1, k_halves_2 = [], []
-        v_halves_1, v_halves_2 = [], []
         for i in range(4):
             s = i * gw
             q_halves_1.append(Q[..., s:s+ghw])
             q_halves_2.append(Q[..., s+ghw:s+gw])
             k_halves_1.append(K[..., s:s+ghw])
             k_halves_2.append(K[..., s+ghw:s+gw])
-            v_halves_1.append(V[..., s:s+ghw])
-            v_halves_2.append(V[..., s+ghw:s+gw])
 
         Q1 = torch.cat(q_halves_1, dim=-1)  # (B, L, nh, hhd)
         Q2 = torch.cat(q_halves_2, dim=-1)
         K1 = torch.cat(k_halves_1, dim=-1)
         K2 = torch.cat(k_halves_2, dim=-1)
-        V1 = torch.cat(v_halves_1, dim=-1)
-        V2 = torch.cat(v_halves_2, dim=-1)
 
         # QK-norm on each half
         Q1 = self.q_norm(Q1).transpose(1, 2)  # (B, nh, L, hhd)
         Q2 = self.q_norm(Q2).transpose(1, 2)
         K1 = self.k_norm(K1).transpose(1, 2)
         K2 = self.k_norm(K2).transpose(1, 2)
-        V1 = V1.transpose(1, 2)
-        V2 = V2.transpose(1, 2)
+        V = V.transpose(1, 2)  # (B, nh, L, hd) — full V, shared by both maps
 
-        # Positional RoPE only on group 0 (passthrough) dims — now ghw wide per sub-half
-        rd = self.rope_dim  # = ghw = head_dim // 8
+        # Positional RoPE only on group 0 (passthrough) dims
+        rd = self.rope_dim
         pos = torch.arange(L, device=u.device, dtype=Q1.dtype)
         freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q1.dtype)
         freqs = freqs.unsqueeze(0).unsqueeze(0)
@@ -409,22 +402,22 @@ class S6Attention(nn.Module):
         K2 = torch.cat([apply_rotary_emb(K2[..., :rd], freqs), K2[..., rd:]], dim=-1)
 
         # Differential attention: (softmax(Q1K1^T) - λ·softmax(Q2K2^T)) · V
-        # Both sub-halves attend over their respective V half
-        attn1 = F.scaled_dot_product_attention(Q1, K1, V1, is_causal=True)  # (B, nh, L, hhd)
-        attn2 = F.scaled_dot_product_attention(Q2, K2, V2, is_causal=True)
+        # Same V for both — only Q/K split for noise cancellation
+        attn1 = F.scaled_dot_product_attention(Q1, K1, V, is_causal=True)  # (B, nh, L, hd)
+        attn2 = F.scaled_dot_product_attention(Q2, K2, V, is_causal=True)
 
         # λ = exp(λq1·λk1) - exp(λq2·λk2) + λ_init
         lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
                + self.lambda_init)
 
-        diff_out = attn1 - lam * attn2  # (B, nh, L, hhd)
+        diff_out = attn1 - lam * attn2  # (B, nh, L, hd)
 
-        # Per-head sublayer norm scaled by (1 - λ_init)
-        diff_out = self.diff_norm(diff_out.transpose(1, 2))  # (B, L, nh, hhd)
+        # Per-head norm scaled by (1 - λ_init)
+        diff_out = self.head_norm(diff_out.transpose(1, 2))  # (B, L, nh, hd)
         diff_out = diff_out * (1.0 - self.lambda_init)
 
-        attn_out = diff_out.reshape(B_batch, L, nh * hhd)  # (B, L, P//2)
+        attn_out = diff_out.reshape(B_batch, L, P)  # (B, L, P)
 
         return y_ssm + self.gate * F.silu(self.out_proj(attn_out)).float()
 
