@@ -1275,10 +1275,9 @@ class _TritonS6(torch.autograd.Function):
             nan_rows = d_h_re.isnan().any(dim=1).nonzero(as_tuple=False).squeeze()
             for r in nan_rows[:3]:
                 r = r.item()
-                print(f"Row {r}: max_y={_dbg[r,0]:.4f} max_dxskip={_dbg[r,1]:.4f} max_dhgre={_dbg[r,2]:.4f} max_dhre={_dbg[r,3]:.4f}")
-                print(f"  d_h_re[{r}]={d_h_re[r]}")
-                print(f"  h_re[{r}] range=[{h_re.view(M,P)[r].min():.4f}, {h_re.view(M,P)[r].max():.4f}]")
-                print(f"  gate[{r}] range=[{c_gate[r].min():.4f}, {c_gate[r].max():.4f}]")
+                print(f"Row {r}: max_y={_dbg[r,0]:.6g} max_dxskip={_dbg[r,1]:.6g} max_dhgre={_dbg[r,2]:.6g} max_dhre={_dbg[r,3]:.6g}")
+                print(f"  max_dout={_dbg[r,4]:.6g} max_silu_deriv={_dbg[r,5]:.6g} max_xskip={_dbg[r,6]:.6g} max_sigskip={_dbg[r,7]:.6g}")
+            raise AssertionError("NaN in d_h_re")
 
         # c_gate chain rule
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
