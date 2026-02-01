@@ -6,6 +6,7 @@ Run on CUDA box:
 
 import torch
 import torch.nn as nn
+import pytest
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -13,9 +14,9 @@ torch.backends.cudnn.allow_tf32 = False
 SEED = 42
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_forward_match():
     """Check that Triton forward matches PyTorch forward."""
-    from .s6 import S6
     from .triton_s6 import TritonS6
 
     torch.manual_seed(SEED)
@@ -32,26 +33,14 @@ def test_forward_match():
         y_tr = model(x)
 
     max_diff = (y_pt - y_tr).abs().max().item()
-    mean_diff = (y_pt - y_tr).abs().mean().item()
-    rel_diff = ((y_pt - y_tr).abs() / (y_pt.abs() + 1e-8)).mean().item()
-
-    print(f"Forward match:")
-    print(f"  max abs diff:  {max_diff:.2e}")
-    print(f"  mean abs diff: {mean_diff:.2e}")
-    print(f"  mean rel diff: {rel_diff:.2e}")
-    print(f"  PASS: {max_diff < 1e-2}")
-    return max_diff < 1e-2
+    assert max_diff < 1e-2, f"forward max diff {max_diff:.2e}"
 
 
-def test_backward_match():
-    """Check that Triton backward matches PyTorch backward on all params and dx."""
-    from .s6 import S6
+def _backward_match(H, P, L, B, M, chunk_size, atol=1e-1, rtol=1e-1):
     from .triton_s6 import TritonS6
 
     torch.manual_seed(SEED)
-    H, P, L, B, M = 32, 16, 64, 2, 4
-
-    model_tr = TritonS6(d_model=H, d_state=P, M=M, chunk_size=32).cuda()
+    model_tr = TritonS6(d_model=H, d_state=P, M=M, chunk_size=chunk_size).cuda()
     model_pt = model_tr._pytorch_s6
 
     torch.manual_seed(SEED + 1)
@@ -60,7 +49,8 @@ def test_backward_match():
     # PyTorch backward
     x_pt = x.clone().requires_grad_(True)
     y_pt = model_pt(x_pt)
-    y_pt.sum().backward()
+    loss_pt = (y_pt ** 2).mean()
+    loss_pt.backward()
 
     grads_pt = {}
     for name, p in model_pt.named_parameters():
@@ -68,12 +58,13 @@ def test_backward_match():
             grads_pt[name] = p.grad.clone()
     dx_pt = x_pt.grad.clone()
 
-    model_pt.zero_grad()
+    model_pt.zero_grad(set_to_none=True)
 
     # Triton backward
     x_tr = x.clone().requires_grad_(True)
     y_tr = model_tr(x_tr)
-    y_tr.sum().backward()
+    loss_tr = (y_tr ** 2).mean()
+    loss_tr.backward()
 
     grads_tr = {}
     for name, p in model_pt.named_parameters():
@@ -81,46 +72,27 @@ def test_backward_match():
             grads_tr[name] = p.grad.clone()
     dx_tr = x_tr.grad.clone()
 
-    print(f"\nBackward match:")
-    all_pass = True
+    assert torch.isfinite(dx_tr).all(), "dx has NaN/Inf"
+    torch.testing.assert_close(dx_tr, dx_pt, rtol=rtol, atol=atol)
 
-    # dx
-    dx_diff = (dx_pt - dx_tr).abs().max().item()
-    dx_rel = ((dx_pt - dx_tr).abs() / (dx_pt.abs() + 1e-8)).mean().item()
-    ok = dx_diff < 1e-1
-    all_pass &= ok
-    print(f"  {'d_x':35s}: max={dx_diff:.2e}  rel={dx_rel:.2e}  {'PASS' if ok else 'FAIL'}")
-
-    # All named params
     all_names = sorted(set(list(grads_pt.keys()) + list(grads_tr.keys())))
     for name in all_names:
-        if name not in grads_pt:
-            print(f"  {name:35s}: MISSING in PyTorch")
-            all_pass = False
-            continue
-        if name not in grads_tr:
-            print(f"  {name:35s}: MISSING in Triton")
-            all_pass = False
-            continue
+        assert name in grads_pt, f"missing grad in PyTorch: {name}"
+        assert name in grads_tr, f"missing grad in Triton: {name}"
         g_pt = grads_pt[name]
         g_tr = grads_tr[name]
-        max_d = (g_pt - g_tr).abs().max().item()
-        rel_d = ((g_pt - g_tr).abs() / (g_pt.abs() + 1e-8)).mean().item()
-        tol = 1e-1 if g_pt.numel() > 100 else 5e-1
-        ok = max_d < tol
-        all_pass &= ok
-        print(f"  {name:35s}: max={max_d:.2e}  rel={rel_d:.2e}  {'PASS' if ok else 'FAIL'}")
-
-    # Check no params were missed
-    pt_names = set(n for n, p in model_pt.named_parameters())
-    for name in pt_names:
-        if name not in grads_pt and name not in grads_tr:
-            print(f"  {name:35s}: NO GRAD in either (possible bug)")
-
-    print(f"\n  Overall: {'PASS' if all_pass else 'FAIL'}")
-    return all_pass
+        assert torch.isfinite(g_tr).all(), f"grad has NaN/Inf: {name}"
+        torch.testing.assert_close(g_tr, g_pt, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("L,chunk_size", [(64, 32), (37, 16)])
+def test_backward_match(L, chunk_size):
+    """Check that Triton backward matches PyTorch backward on all params and dx."""
+    _backward_match(H=32, P=16, L=L, B=2, M=4, chunk_size=chunk_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gradient_flow():
     """Verify all params get nonzero gradients through Triton path."""
     from .triton_s6 import TritonS6
@@ -133,18 +105,11 @@ def test_gradient_flow():
     y = model(x)
     y.sum().backward()
 
-    print(f"\nGradient flow:")
-    all_have_grad = True
     for name, p in model.named_parameters():
-        has = p.grad is not None and p.grad.abs().max().item() > 0
-        if not has:
-            print(f"  {name:35s}: NO GRAD")
-            all_have_grad = False
-        else:
-            print(f"  {name:35s}: grad norm {p.grad.norm().item():.4f}")
-    print(f"  {'x.grad':35s}: norm {x.grad.norm().item():.4f}")
-    print(f"  Overall: {'PASS' if all_have_grad else 'FAIL'}")
-    return all_have_grad
+        assert p.grad is not None, f"missing grad: {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad: {name}"
+        assert p.grad.abs().max().item() > 0, f"zero grad: {name}"
+    assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
 def bench(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
