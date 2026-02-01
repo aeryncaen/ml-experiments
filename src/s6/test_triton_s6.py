@@ -223,10 +223,18 @@ def debug_forward_stepwise():
 
     print("\nStep-by-step forward comparison:")
 
-    # Step 0: phi_B (same code path)
+    # Step 0: phi_B (Triton vs PyTorch)
+    from .triton_s6 import _TritonPhiB
     with torch.no_grad():
         Bu_raw_pt = kern.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
-        Bu_raw_tr = kern.phi_B(x.unsqueeze(1)).squeeze(1)
+        phi = kern.phi_B
+        mlp = phi.channel_mlp
+        Bu_raw_tr = _TritonPhiB.apply(
+            x.reshape(ML, H), phi.W, phi.b,
+            mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
+            phi.M, phi.L, mlp.fc1.out_features,
+            phi.scale, phi.ch_rms_target if phi.ch_rms else 0.0,
+        ).view(B, L, -1)
     cmp("phi_B output", Bu_raw_pt, Bu_raw_tr)
 
     # Step 1: x_proj linear

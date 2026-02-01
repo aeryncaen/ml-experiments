@@ -112,6 +112,195 @@ if HAS_TRITON:
         dw_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
         tl.store(dw_ptrs, acc, mask=dw_mask)
 
+    # ========== Fused phi_B kernel ==========
+    # Fuses: W projection + ScalarMLP (fc1 broadcast*silu + fc2 matmul)
+    # Grid: (cdiv(N_rows, BLOCK_ROW),) where N_rows = B*L
+    # Per row: load x(H), compute proj=W@x+b -> (M,) scalars,
+    #          for each scalar: broadcast * fc1_w + fc1_b -> silu -> @ fc2_w.T + fc2_b -> (L_fb,)
+    #          concatenate M outputs -> (P,) = M*L_fb
+    # ch_rms normalization done in PyTorch after.
+
+    @triton.jit
+    def fused_phi_b_kernel(
+        # Input
+        x_ptr,  # (N_rows, H)
+        # Params
+        W_ptr,  # (M_proj, H) — projection directions
+        b_ptr,  # (M_proj,) — projection bias
+        fc1_w_ptr,  # (hidden,) — fc1 weights (hidden, 1) stored as vector
+        fc1_b_ptr,  # (hidden,)
+        fc2_w_ptr,  # (L_fb, hidden)
+        fc2_b_ptr,  # (L_fb,)
+        # Output
+        out_ptr,  # (N_rows, P) where P = M_proj * L_fb
+        # Dims
+        N_rows, H, M_proj, L_fb, hidden,
+        BLOCK_H: tl.constexpr,
+        BLOCK_HIDDEN: tl.constexpr,
+        BLOCK_LFB: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        row = pid
+        if row >= N_rows:
+            return
+
+        offs_h = tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+
+        # Load x for this row
+        x = tl.load(x_ptr + row * H + offs_h, mask=h_mask, other=0.0)
+
+        offs_hidden = tl.arange(0, BLOCK_HIDDEN)
+        hidden_mask = offs_hidden < hidden
+        offs_lfb = tl.arange(0, BLOCK_LFB)
+        lfb_mask = offs_lfb < L_fb
+
+        # Load fc1 weights and bias (shared across all M projections)
+        fc1_w = tl.load(fc1_w_ptr + offs_hidden, mask=hidden_mask, other=0.0)  # (hidden,)
+        fc1_b = tl.load(fc1_b_ptr + offs_hidden, mask=hidden_mask, other=0.0)  # (hidden,)
+
+        # Load fc2 weights and bias
+        fc2_w = tl.load(
+            fc2_w_ptr + offs_lfb[:, None] * hidden + offs_hidden[None, :],
+            mask=lfb_mask[:, None] & hidden_mask[None, :], other=0.0
+        )  # (BLOCK_LFB, BLOCK_HIDDEN)
+        fc2_b = tl.load(fc2_b_ptr + offs_lfb, mask=lfb_mask, other=0.0)  # (L_fb,)
+
+        for m in range(M_proj):
+            # W[m] @ x + b[m] -> scalar projection
+            W_m = tl.load(W_ptr + m * H + offs_h, mask=h_mask, other=0.0)
+            b_m = tl.load(b_ptr + m)
+            proj_scalar = tl.sum(W_m * x) + b_m
+
+            # fc1: broadcast scalar * weights + bias -> (hidden,)
+            h_vals = proj_scalar * fc1_w + fc1_b
+
+            # silu activation
+            sig_h = 1.0 / (1.0 + tl.exp(-h_vals))
+            h_vals = h_vals * sig_h
+
+            # fc2: (L_fb, hidden) @ (hidden,) -> (L_fb,)
+            out_vals = tl.sum(fc2_w * h_vals[None, :], axis=1) + fc2_b
+
+            # Store output at position m*L_fb
+            out_offset = row * (M_proj * L_fb) + m * L_fb
+            tl.store(out_ptr + out_offset + offs_lfb, out_vals, mask=lfb_mask)
+
+    # ========== Fused phi_B backward kernel ==========
+    # Recomputes forward, then chains backward through fc2 -> silu -> fc1 -> proj -> W/x
+    # Grid: (N_rows,), one program per row
+    # Param grads use atomic_add (accumulated across rows)
+
+    @triton.jit
+    def fused_phi_b_bwd_kernel(
+        # Forward inputs (for recomputation)
+        x_ptr,      # (N_rows, H)
+        W_ptr,      # (M_proj, H)
+        b_ptr,      # (M_proj,)
+        fc1_w_ptr,  # (hidden,)
+        fc1_b_ptr,  # (hidden,)
+        fc2_w_ptr,  # (L_fb, hidden)
+        # Grad input
+        d_out_ptr,  # (N_rows, P)  P = M_proj * L_fb
+        # Grad outputs
+        d_x_ptr,    # (N_rows, H)
+        d_W_ptr,    # (M_proj, H)
+        d_b_ptr,    # (M_proj,)
+        d_fc1_w_ptr,  # (hidden,)
+        d_fc1_b_ptr,  # (hidden,)
+        d_fc2_w_ptr,  # (L_fb, hidden)
+        d_fc2_b_ptr,  # (L_fb,)
+        # Dims
+        N_rows, H, M_proj, L_fb, hidden,
+        BLOCK_H: tl.constexpr,
+        BLOCK_HIDDEN: tl.constexpr,
+        BLOCK_LFB: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        if row >= N_rows:
+            return
+
+        offs_h = tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        offs_hidden = tl.arange(0, BLOCK_HIDDEN)
+        hidden_mask = offs_hidden < hidden
+        offs_lfb = tl.arange(0, BLOCK_LFB)
+        lfb_mask = offs_lfb < L_fb
+
+        # Load x for this row
+        x = tl.load(x_ptr + row * H + offs_h, mask=h_mask, other=0.0)
+
+        # Load shared params
+        fc1_w = tl.load(fc1_w_ptr + offs_hidden, mask=hidden_mask, other=0.0)
+        fc1_b = tl.load(fc1_b_ptr + offs_hidden, mask=hidden_mask, other=0.0)
+        fc2_w = tl.load(
+            fc2_w_ptr + offs_lfb[:, None] * hidden + offs_hidden[None, :],
+            mask=lfb_mask[:, None] & hidden_mask[None, :], other=0.0
+        )  # (BLOCK_LFB, BLOCK_HIDDEN)
+
+        # Accumulate d_x across M projections
+        d_x_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+        P = M_proj * L_fb
+
+        for m in range(M_proj):
+            # === Recompute forward for this projection ===
+            W_m = tl.load(W_ptr + m * H + offs_h, mask=h_mask, other=0.0)
+            b_m = tl.load(b_ptr + m)
+            proj_scalar = tl.sum(W_m * x) + b_m
+
+            # fc1: scalar * w + b
+            pre_act = proj_scalar * fc1_w + fc1_b  # (hidden,)
+
+            # silu
+            sig_pre = 1.0 / (1.0 + tl.exp(-pre_act))
+            h_act = pre_act * sig_pre  # (hidden,)
+
+            # === Backward ===
+            # Load d_out for this projection's slice: (L_fb,)
+            d_out_m = tl.load(
+                d_out_ptr + row * P + m * L_fb + offs_lfb,
+                mask=lfb_mask, other=0.0
+            )
+
+            # d_fc2_b += d_out_m  (atomic across rows)
+            tl.atomic_add(d_fc2_b_ptr + offs_lfb, d_out_m, mask=lfb_mask)
+
+            # d_fc2_w += d_out_m[:, None] * h_act[None, :]  (atomic)
+            d_fc2_w_update = d_out_m[:, None] * h_act[None, :]  # (BLOCK_LFB, BLOCK_HIDDEN)
+            tl.atomic_add(
+                d_fc2_w_ptr + offs_lfb[:, None] * hidden + offs_hidden[None, :],
+                d_fc2_w_update,
+                mask=lfb_mask[:, None] & hidden_mask[None, :],
+            )
+
+            # d_h = fc2_w.T @ d_out_m = sum over L_fb: fc2_w[l, :] * d_out_m[l]
+            d_h = tl.sum(fc2_w * d_out_m[:, None], axis=0)  # (BLOCK_HIDDEN,)
+
+            # silu backward: d_pre = d_h * (sig + pre * sig * (1 - sig))
+            d_pre = d_h * (sig_pre + pre_act * sig_pre * (1.0 - sig_pre))  # (hidden,)
+
+            # d_fc1_b += d_pre
+            tl.atomic_add(d_fc1_b_ptr + offs_hidden, d_pre, mask=hidden_mask)
+
+            # d_fc1_w += d_pre * proj_scalar
+            tl.atomic_add(d_fc1_w_ptr + offs_hidden, d_pre * proj_scalar, mask=hidden_mask)
+
+            # d_proj_scalar = sum(d_pre * fc1_w)
+            d_proj_scalar = tl.sum(d_pre * fc1_w)
+
+            # d_W[m] += d_proj_scalar * x
+            tl.atomic_add(d_W_ptr + m * H + offs_h, d_proj_scalar * x, mask=h_mask)
+
+            # d_b[m] += d_proj_scalar
+            tl.atomic_add(d_b_ptr + m, d_proj_scalar)
+
+            # d_x += d_proj_scalar * W_m
+            d_x_acc += d_proj_scalar * W_m
+
+        # Store d_x (no atomic needed — one row per program)
+        tl.store(d_x_ptr + row * H + offs_h, d_x_acc, mask=h_mask)
+
     # ========== Fused kernel 1: prescan ==========
     # Per row (B*L rows, P cols): dt/lam activations, Bu RMSNorm+bias, dt_half*theta
     # Grid: (M,) where M = B*L, one program per row
@@ -1077,6 +1266,104 @@ if HAS_TRITON:
 
 # ========== Python wrappers ==========
 
+class _TritonPhiB(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W, b, fc1_w, fc1_b, fc2_w, fc2_b, M_proj, L_fb, hidden, scale, ch_rms_target):
+        """x: (N, H) -> (N, P) where P = M_proj * L_fb."""
+        N_rows, H = x.shape
+        P = M_proj * L_fb
+        out = torch.empty(N_rows, P, device=x.device, dtype=x.dtype)
+
+        BLOCK_H = triton.next_power_of_2(H)
+        BLOCK_HIDDEN = triton.next_power_of_2(hidden)
+        BLOCK_LFB = triton.next_power_of_2(L_fb)
+
+        fc1_w_vec = fc1_w.view(-1).contiguous()
+
+        fused_phi_b_kernel[(N_rows,)](
+            x, W, b,
+            fc1_w_vec, fc1_b,
+            fc2_w, fc2_b,
+            out,
+            N_rows, H, M_proj, L_fb, hidden,
+            BLOCK_H, BLOCK_HIDDEN, BLOCK_LFB,
+        )
+
+        # ch_rms (small PyTorch ops for global reduction, but fused into the scale)
+        ch_rms_scale = None
+        if ch_rms_target > 0:
+            out_3d = out.view(N_rows, M_proj, L_fb)
+            rms = torch.sqrt(out_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
+            s = (ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            ch_rms_scale = s
+            out = (out_3d * s.view(1, 1, L_fb)).view(N_rows, P)
+
+        out = out * scale
+
+        if ch_rms_scale is not None:
+            ctx.save_for_backward(x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b, ch_rms_scale)
+        else:
+            ctx.save_for_backward(x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b)
+        ctx.M_proj = M_proj
+        ctx.L_fb = L_fb
+        ctx.hidden = hidden
+        ctx.scale = scale
+        ctx.ch_rms_target = ch_rms_target
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        if ctx.ch_rms_target > 0:
+            x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b, ch_rms_scale = ctx.saved_tensors
+        else:
+            x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b = ctx.saved_tensors
+            ch_rms_scale = None
+        M_proj = ctx.M_proj
+        L_fb = ctx.L_fb
+        hidden = ctx.hidden
+        scale = ctx.scale
+        N_rows, H = x.shape
+        P = M_proj * L_fb
+
+        # Undo scale
+        d_out = d_out * scale
+
+        # Undo ch_rms
+        if ch_rms_scale is not None:
+            d_out_3d = d_out.view(N_rows, M_proj, L_fb)
+            d_out = (d_out_3d * ch_rms_scale.view(1, 1, L_fb)).view(N_rows, P)
+
+        # Allocate outputs
+        d_x = torch.zeros(N_rows, H, device=x.device, dtype=x.dtype)
+        d_W = torch.zeros_like(W)
+        d_b = torch.zeros_like(b)
+        d_fc1_w = torch.zeros(hidden, device=x.device, dtype=x.dtype)
+        d_fc1_b = torch.zeros(hidden, device=x.device, dtype=x.dtype)
+        d_fc2_w = torch.zeros_like(fc2_w)
+        d_fc2_b = torch.zeros(L_fb, device=x.device, dtype=x.dtype)
+
+        BLOCK_H = triton.next_power_of_2(H)
+        BLOCK_HIDDEN = triton.next_power_of_2(hidden)
+        BLOCK_LFB = triton.next_power_of_2(L_fb)
+
+        fused_phi_b_bwd_kernel[(N_rows,)](
+            # Forward inputs
+            x, W, b, fc1_w_vec, fc1_b, fc2_w,
+            # Grad input
+            d_out,
+            # Grad outputs
+            d_x, d_W, d_b, d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b,
+            # Dims
+            N_rows, H, M_proj, L_fb, hidden,
+            BLOCK_H, BLOCK_HIDDEN, BLOCK_LFB,
+        )
+
+        # d_fc1_w needs to be reshaped back to (hidden, 1) for the parameter
+        d_fc1_w_out = d_fc1_w.view(hidden, 1)
+
+        return d_x, d_W, d_b, d_fc1_w_out, d_fc1_b, d_fc2_w, d_fc2_b, None, None, None, None, None
+
+
 def triton_linear(x, w, b=None):
     M, K = x.shape
     N = w.shape[0]
@@ -1375,8 +1662,18 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # Feature bank in PyTorch (small MLP)
-        Bu_raw = kern.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+        # Feature bank — Triton fused or PyTorch fallback
+        phi = kern.phi_B
+        mlp = phi.channel_mlp
+        B_size, L_size, H = u.shape
+        Bu_raw = _TritonPhiB.apply(
+            u.reshape(B_size * L_size, H),
+            phi.W, phi.b,
+            mlp.fc1.weight, mlp.fc1.bias,
+            mlp.fc2.weight, mlp.fc2.bias,
+            phi.M, phi.L, mlp.fc1.out_features,
+            phi.scale, phi.ch_rms_target if phi.ch_rms else 0.0,
+        ).view(B_size, L_size, -1)  # (B, L, P)
 
         # Split complex C
         C = torch.view_as_complex(s6.C)
