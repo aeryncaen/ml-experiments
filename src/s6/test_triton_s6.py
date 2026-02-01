@@ -291,6 +291,24 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
         return s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
     timed(f_attn, "attention")
 
+    # --- Backward profiling ---
+    # We need to run forward, then time each backward piece.
+    # Strategy: run full fwd, then backward with hooks on intermediate tensors.
+    print("  --- Backward (via torch.autograd.profiler) ---")
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof:
+        xx = x.clone().requires_grad_(True)
+        y = model(xx)
+        y.sum().backward()
+        model.zero_grad()
+
+    # Print top CUDA ops by self time
+    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25)
+    print(table)
+
     # Full fwd+bwd
     print("  --- Full fwd+bwd ---")
     def f_full():
