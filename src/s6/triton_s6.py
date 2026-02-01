@@ -2353,7 +2353,7 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_P_SCAN,
         )
 
-        d_cum_theta_total = d_cum_theta_b + d_cum_theta_c
+        d_cum_theta_total = d_cum_theta_b + d_cum_theta_c.view(B, L, P // 2)
         d_dt_rope = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_dt_half_theta = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
 
