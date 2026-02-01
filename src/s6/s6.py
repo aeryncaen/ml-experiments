@@ -353,11 +353,11 @@ class S6Attention(nn.Module):
         K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
         V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
-        # Positional RoPE on Q, K
-        pos = torch.arange(L, device=u.device, dtype=Q.dtype)
-        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, hd//2)
-        Q = apply_rotary_emb(Q, freqs.unsqueeze(0).unsqueeze(0))  # broadcast over B, nh
-        K = apply_rotary_emb(K, freqs.unsqueeze(0).unsqueeze(0))
+        # # Positional RoPE on Q, K
+        # pos = torch.arange(L, device=u.device, dtype=Q.dtype)
+        # freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, hd//2)
+        # Q = apply_rotary_emb(Q, freqs.unsqueeze(0).unsqueeze(0))  # broadcast over B, nh
+        # K = apply_rotary_emb(K, freqs.unsqueeze(0).unsqueeze(0))
 
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
