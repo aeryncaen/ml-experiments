@@ -2445,11 +2445,15 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
+        # 0. MLP sandwich: up project + act + norm
+        x_up = F.silu(s6.up_proj(u))
+        x_up = s6.up_norm(x_up)
+
         # 1. Multi-scale conv (Triton fused) — before SSM
-        B_size, L_size, H = u.shape
+        B_size, L_size, H = x_up.shape
         msconv = s6.msconv
         x = _TritonMSConv.apply(
-            u,
+            x_up,
             msconv.convs[0].weight, msconv.convs[0].bias,
             msconv.convs[1].weight, msconv.convs[1].bias,
             msconv.convs[2].weight, msconv.convs[2].bias,
@@ -2500,7 +2504,9 @@ class TritonS6(nn.Module):
         # 5. Attention (PyTorch)
         y = s6.attn(x, y_normed)
 
-        return y
+        # 6. MLP sandwich: down norm + project + act + residual
+        y = F.silu(s6.down_proj(s6.down_norm(y)))
+        return u + y
 
     def enable_cuda_graph(self, sample_input):
         """Capture fwd+bwd into a CUDA graph. Call once after warmup.
