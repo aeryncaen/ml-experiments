@@ -158,12 +158,14 @@ class MHABlock(nn.Module):
     def __init__(self, d_model, n_heads=4, mlp_hidden=208):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, mlp_hidden)
 
     def forward(self, x):
         h = self.norm1(x)
+        h = self.conv(h.transpose(1, 2)).transpose(1, 2)
         h, _ = self.attn(h, h, h)
         x = x + h
         x = x + self.mlp(self.norm2(x))

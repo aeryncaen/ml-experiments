@@ -1439,12 +1439,6 @@ if HAS_TRITON:
         adj_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
         adj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-        # Running reverse cumsum for d_cum_theta -> d_dt_half_theta
-        d_ct_accum = tl.zeros((BLOCK_P,), dtype=tl.float32)  # P-wide but only half used
-
-        # Carry for Bu_prev contribution (from t+1 to t during reverse scan)
-        d_Bu_prev_carry = tl.zeros((BLOCK_P,), dtype=tl.float32)
-
         # ---- FORWARD PASS to build Bu_rot array (needed for bwd) ----
         # We need Bu_rot[t] and Bu_rot[t-1] during backward.
         # Option: recompute forward RoPE inline during backward by caching in SRAM.
