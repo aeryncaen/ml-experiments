@@ -3037,10 +3037,14 @@ class TritonS6(nn.Module):
         B_size, L_size, H = u.shape
         x = s6.msconv(u)  # (B, L, H)
 
-        # 2. phi_B projection (PyTorch)
+        # 2. Attention first, then SSM
+        x_attn = s6.attn(x, x)
+        x = s6.post_attn_norm(x_attn) + x
+
+        # 3. phi_B projection (PyTorch)
         Bu_raw = kern.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
-        # 3. SSM core (Triton) — operates on x (post-msconv)
+        # 4. SSM core (Triton) — operates on x (post-attn)
         C = torch.view_as_complex(s6.C)
         C_re = C.real.contiguous()
         C_im = C.imag.contiguous()
@@ -3058,13 +3062,8 @@ class TritonS6(nn.Module):
             self.P, self.chunk_size,
         )
 
-        # 4. Post-readout norm + residual from x (post-msconv)
-        y_normed = s6.readout_norm(y_ssm) + x
-
-        # 5. Attention (PyTorch)
-        y = s6.attn(x, y_normed)
-
-        return y
+        # 5. Post-readout norm + residual
+        return s6.readout_norm(y_ssm) + x
 
     def enable_cuda_graph(self, sample_input):
         """Capture fwd+bwd into a CUDA graph. Call once after warmup.

@@ -408,6 +408,10 @@ class S6(nn.Module):
         # msconv first
         x = self.msconv(u)
 
+        # Attention first, then SSM
+        x_attn = self.attn(x, x)
+        x = self.post_attn_norm(x_attn) + x
+
         # Run SSM scan (phi_B computed internally by kernel)
         h, cum_theta = self.kernel(x)
 
@@ -425,9 +429,5 @@ class S6(nn.Module):
         y = y + x * self.D
         y = F.silu(y)
 
-        # Post-readout norm + residual + attention
-        y_normed = self.readout_norm(y) + x
-        y_attn = self.attn(x, y_normed)
-
-        # Post-attention norm + residual back to SSM output
-        return self.post_attn_norm(y_attn) + y_normed
+        # Post-readout norm + residual
+        return self.readout_norm(y) + x

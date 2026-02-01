@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from collections import defaultdict
 try:
     from torch.profiler import profile, ProfilerActivity
     HAS_PROFILER = True
@@ -412,6 +413,38 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         _step(i)[0].backward()
         opt.zero_grad(set_to_none=True)
 
+    # Module-level memory profiling (CUDA only, S6 only)
+    if device == 'cuda' and isinstance(model, S6Wrapper):
+        mem_stats = defaultdict(int)
+        hooks = []
+        module_names = {m: n for n, m in model.named_modules()}
+
+        def _pre_hook(_module, _inputs):
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
+        def _post_hook(module, _inputs, _outputs):
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+            name = module_names.get(module, module.__class__.__name__)
+            mem_stats[name] = max(mem_stats[name], peak)
+
+        for m in model.modules():
+            if len(list(m.children())) == 0:
+                hooks.append(m.register_forward_pre_hook(_pre_hook))
+                hooks.append(m.register_forward_hook(_post_hook))
+
+        with torch.no_grad():
+            _step(0)
+
+        for h in hooks:
+            h.remove()
+
+        print("\n[Module Memory Peaks] (approx, per leaf module)")
+        top = sorted(mem_stats.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        for name, peak in top:
+            print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
+
     # Optional profiling for S6 on CUDA (forward + backward on one batch)
     if device == 'cuda' and isinstance(model, S6Wrapper) and HAS_PROFILER:
         for i in range(50):
@@ -430,9 +463,11 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         print("\n[S6 profile] Forward+Backward (1 batch)")
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
 
+    mem_baseline = 0
     if device == 'cuda':
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
+        mem_baseline = torch.cuda.memory_allocated()
 
     losses = []
     t0 = time.perf_counter()
@@ -453,7 +488,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
 
     peak_mem = 0
     if device == 'cuda':
-        peak_mem = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+        peak_mem = (torch.cuda.max_memory_allocated() - mem_baseline) / 1024 / 1024  # MB
 
     initial = sum(losses[:10]) / 10
     final = sum(losses[-10:]) / 10
@@ -542,15 +577,11 @@ if __name__ == '__main__':
     print(header)
     print('-' * 90)
 
-    # Pregen all task data (cached to disk, preloaded to GPU)
-    print("Pregenerating task data...")
-    task_data = {}
-    for task in tasks:
-        task_data[task] = pregen_task_data(task, n_steps, B, L, SEED, device=DEVICE)
-        print(f"  {task}: {len(task_data[task])} batches ready on {DEVICE}")
-
     all_names = list(models_info.keys())
     for task in tasks:
+        print(f"Pregenerating {task} data...")
+        task_data = pregen_task_data(task, n_steps, B, L, SEED, device=DEVICE)
+        print(f"  {len(task_data)} batches ready on {DEVICE}")
         for name in all_names:
             random.seed(SEED)
             np.random.seed(SEED)
@@ -559,6 +590,9 @@ if __name__ == '__main__':
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
-                           preloaded_data=task_data[task])
+                           preloaded_data=task_data)
             print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
+        del task_data
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print()
