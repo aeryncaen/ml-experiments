@@ -883,6 +883,507 @@ if HAS_TRITON:
             alpha_prev_re = alpha_re_t
             alpha_prev_im = alpha_im_t
 
+    # ========== Fused discretization (parallel over time) ==========
+    # Computes alpha and inject per position (no recurrence).
+    # Grid: (B, L, cdiv(P, BLOCK_P))
+
+    @triton.jit
+    def fused_discretize_kernel(
+        dt_ptr,  # (B, L, P)
+        lam_ptr,  # (B, L, P)
+        Bu_ptr,  # (B, L, P)
+        cum_theta_ptr,  # (B, L, P//2)
+        A_real_ptr,  # (P,)
+        A_imag_ptr,  # (P,)
+        alpha_re_ptr, alpha_im_ptr,  # (B, L, P)
+        inject_re_ptr, inject_im_ptr,  # (B, L, P)
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        pid_p = tl.program_id(2)
+
+        if pid_b >= B_batch or pid_l >= L:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+
+        half_P = P // 2
+        base = pid_b * L * P
+        base_theta = pid_b * L * half_P
+        t = pid_l
+
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+        partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+        partner_mask = partner_offs < P
+
+        # Load A params (static)
+        a_re = tl.load(A_real_ptr + offs_p, mask=p_mask, other=0.0)
+        a_im = tl.load(A_imag_ptr + offs_p, mask=p_mask, other=0.0)
+
+        off = base + t * P + offs_p
+        off_theta = base_theta + t * half_P + pair_idx
+
+        dt = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+        lam = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
+        Bu = tl.load(Bu_ptr + off, mask=p_mask, other=0.0)
+
+        angle = tl.load(cum_theta_ptr + off_theta, mask=p_mask, other=0.0)
+        cos_a = tl.cos(angle)
+        sin_a = tl.sin(angle)
+        Bu_partner = tl.load(Bu_ptr + base + t * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+        Bu_rot = tl.where(
+            is_odd > 0.5,
+            Bu_partner * sin_a + Bu * cos_a,
+            Bu * cos_a - Bu_partner * sin_a,
+        )
+
+        # Bu_prev1 (t-1)
+        Bu_prev1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        alpha_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        alpha_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        if t > 0:
+            off_prev1 = base + (t - 1) * P + offs_p
+            off_theta_prev1 = base_theta + (t - 1) * half_P + pair_idx
+            Bu_prev1_raw = tl.load(Bu_ptr + off_prev1, mask=p_mask, other=0.0)
+            angle_prev1 = tl.load(cum_theta_ptr + off_theta_prev1, mask=p_mask, other=0.0)
+            cos_prev1 = tl.cos(angle_prev1)
+            sin_prev1 = tl.sin(angle_prev1)
+            Bu_partner_prev1 = tl.load(Bu_ptr + base + (t - 1) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            Bu_prev1 = tl.where(
+                is_odd > 0.5,
+                Bu_partner_prev1 * sin_prev1 + Bu_prev1_raw * cos_prev1,
+                Bu_prev1_raw * cos_prev1 - Bu_partner_prev1 * sin_prev1,
+            )
+            dt_prev1 = tl.load(dt_ptr + off_prev1, mask=p_mask, other=0.0)
+            dt_a_re_prev1 = dt_prev1 * a_re
+            dt_a_im_prev1 = dt_prev1 * a_im
+            exp_prev1 = tl.exp(dt_a_re_prev1)
+            alpha_prev_re = exp_prev1 * tl.cos(dt_a_im_prev1)
+            alpha_prev_im = exp_prev1 * tl.sin(dt_a_im_prev1)
+
+        # Bu_prev2 (t-2)
+        Bu_prev2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        if t > 1:
+            off_prev2 = base + (t - 2) * P + offs_p
+            off_theta_prev2 = base_theta + (t - 2) * half_P + pair_idx
+            Bu_prev2_raw = tl.load(Bu_ptr + off_prev2, mask=p_mask, other=0.0)
+            angle_prev2 = tl.load(cum_theta_ptr + off_theta_prev2, mask=p_mask, other=0.0)
+            cos_prev2 = tl.cos(angle_prev2)
+            sin_prev2 = tl.sin(angle_prev2)
+            Bu_partner_prev2 = tl.load(Bu_ptr + base + (t - 2) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            Bu_prev2 = tl.where(
+                is_odd > 0.5,
+                Bu_partner_prev2 * sin_prev2 + Bu_prev2_raw * cos_prev2,
+                Bu_prev2_raw * cos_prev2 - Bu_partner_prev2 * sin_prev2,
+            )
+
+        # Bu_next1 (t+1)
+        Bu_next1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        alpha_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        alpha_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        if t + 1 < L:
+            off_next1 = base + (t + 1) * P + offs_p
+            off_theta_next1 = base_theta + (t + 1) * half_P + pair_idx
+            Bu_next1_raw = tl.load(Bu_ptr + off_next1, mask=p_mask, other=0.0)
+            angle_next1 = tl.load(cum_theta_ptr + off_theta_next1, mask=p_mask, other=0.0)
+            cos_next1 = tl.cos(angle_next1)
+            sin_next1 = tl.sin(angle_next1)
+            Bu_partner_next1 = tl.load(Bu_ptr + base + (t + 1) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            Bu_next1 = tl.where(
+                is_odd > 0.5,
+                Bu_partner_next1 * sin_next1 + Bu_next1_raw * cos_next1,
+                Bu_next1_raw * cos_next1 - Bu_partner_next1 * sin_next1,
+            )
+            dt_next1 = tl.load(dt_ptr + off_next1, mask=p_mask, other=0.0)
+            dt_a_re_next1 = dt_next1 * a_re
+            dt_a_im_next1 = dt_next1 * a_im
+            exp_next1 = tl.exp(dt_a_re_next1)
+            alpha_next_re = exp_next1 * tl.cos(dt_a_im_next1)
+            alpha_next_im = exp_next1 * tl.sin(dt_a_im_next1)
+
+        # Bu_next2 (t+2)
+        Bu_next2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        if t + 2 < L:
+            off_next2 = base + (t + 2) * P + offs_p
+            off_theta_next2 = base_theta + (t + 2) * half_P + pair_idx
+            Bu_next2_raw = tl.load(Bu_ptr + off_next2, mask=p_mask, other=0.0)
+            angle_next2 = tl.load(cum_theta_ptr + off_theta_next2, mask=p_mask, other=0.0)
+            cos_next2 = tl.cos(angle_next2)
+            sin_next2 = tl.sin(angle_next2)
+            Bu_partner_next2 = tl.load(Bu_ptr + base + (t + 2) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            Bu_next2 = tl.where(
+                is_odd > 0.5,
+                Bu_partner_next2 * sin_next2 + Bu_next2_raw * cos_next2,
+                Bu_next2_raw * cos_next2 - Bu_partner_next2 * sin_next2,
+            )
+
+        # alpha[t]
+        dt_a_re = dt * a_re
+        dt_a_im = dt * a_im
+        exp_re = tl.exp(dt_a_re)
+        alpha_re_t = exp_re * tl.cos(dt_a_im)
+        alpha_im_t = exp_re * tl.sin(dt_a_im)
+
+        tl.store(alpha_re_ptr + off, alpha_re_t, mask=p_mask)
+        tl.store(alpha_im_ptr + off, alpha_im_t, mask=p_mask)
+
+        # alpha products
+        alpha_prod_prev_re = alpha_re_t * alpha_prev_re - alpha_im_t * alpha_prev_im
+        alpha_prod_prev_im = alpha_re_t * alpha_prev_im + alpha_im_t * alpha_prev_re
+        alpha_prod_next_re = alpha_re_t * alpha_next_re - alpha_im_t * alpha_next_im
+        alpha_prod_next_im = alpha_re_t * alpha_next_im + alpha_im_t * alpha_next_re
+
+        term_prev1_re = alpha_re_t * Bu_prev1
+        term_prev1_im = alpha_im_t * Bu_prev1
+        term_prev2_re = alpha_prod_prev_re * Bu_prev2
+        term_prev2_im = alpha_prod_prev_im * Bu_prev2
+
+        term_next1_re = alpha_re_t * Bu_next1
+        term_next1_im = alpha_im_t * Bu_next1
+        term_next2_re = alpha_prod_next_re * Bu_next2
+        term_next2_im = alpha_prod_next_im * Bu_next2
+
+        gsize = P // 4
+        g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
+        g2 = (offs_p >= 2 * gsize) & (offs_p < 3 * gsize)
+        g3 = offs_p >= 3 * gsize
+        m1 = g1.to(tl.float32)
+        m2 = g2.to(tl.float32)
+        m3 = g3.to(tl.float32)
+
+        one_minus_lam = 1.0 - lam
+        inj_re = lam * dt * Bu_rot
+        inj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        inj_re += m1 * one_minus_lam * dt * (term_prev1_re + term_prev2_re)
+        inj_im += m1 * one_minus_lam * dt * (term_prev1_im + term_prev2_im)
+
+        inj_re += m2 * one_minus_lam * dt * (term_next1_re + term_next2_re)
+        inj_im += m2 * one_minus_lam * dt * (term_next1_im + term_next2_im)
+
+        inj_re += m3 * one_minus_lam * dt * (term_prev1_re + term_next1_re)
+        inj_im += m3 * one_minus_lam * dt * (term_prev1_im + term_next1_im)
+
+        tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
+        tl.store(inject_im_ptr + off, inj_im, mask=p_mask)
+
+    # ========== Chunked scan (forward) ==========
+    # Grid for summaries: (B, n_chunks, cdiv(P, BLOCK_P))
+    # Grid for prefix: (B, cdiv(P, BLOCK_P))
+    # Grid for scan: (B, n_chunks, cdiv(P, BLOCK_P))
+
+    @triton.jit
+    def fused_chunk_summary_kernel(
+        alpha_re_ptr, alpha_im_ptr,
+        inject_re_ptr, inject_im_ptr,
+        chunk_a_re_ptr, chunk_a_im_ptr,
+        chunk_b_re_ptr, chunk_b_im_ptr,
+        B_batch, L, P,
+        chunk_size, n_chunks,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_p = tl.program_id(2)
+        if pid_b >= B_batch or pid_c >= n_chunks:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        start = pid_c * chunk_size
+        end = tl.minimum(start + chunk_size, L)
+
+        a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
+        a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for t in range(0, chunk_size):
+            t_idx = start + t
+            if t_idx >= L:
+                break
+            off = base + t_idx * P + offs_p
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            b_re = tl.load(inject_re_ptr + off, mask=p_mask, other=0.0)
+            b_im = tl.load(inject_im_ptr + off, mask=p_mask, other=0.0)
+
+            # b_acc = a * b_acc + b
+            b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
+            b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
+            b_acc_re = b_re_new
+            b_acc_im = b_im_new
+
+            # a_acc = a * a_acc
+            a_re_new = a_re * a_acc_re - a_im * a_acc_im
+            a_im_new = a_re * a_acc_im + a_im * a_acc_re
+            a_acc_re = a_re_new
+            a_acc_im = a_im_new
+
+        off_chunk = (pid_b * n_chunks + pid_c) * P + offs_p
+        tl.store(chunk_a_re_ptr + off_chunk, a_acc_re, mask=p_mask)
+        tl.store(chunk_a_im_ptr + off_chunk, a_acc_im, mask=p_mask)
+        tl.store(chunk_b_re_ptr + off_chunk, b_acc_re, mask=p_mask)
+        tl.store(chunk_b_im_ptr + off_chunk, b_acc_im, mask=p_mask)
+
+    @triton.jit
+    def fused_chunk_prefix_kernel(
+        chunk_a_re_ptr, chunk_a_im_ptr,
+        chunk_b_re_ptr, chunk_b_im_ptr,
+        chunk_h0_re_ptr, chunk_h0_im_ptr,
+        B_batch, n_chunks, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        if pid_b >= B_batch:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+
+        a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
+        a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for c in range(n_chunks):
+            off_chunk = (pid_b * n_chunks + c) * P + offs_p
+            tl.store(chunk_h0_re_ptr + off_chunk, b_acc_re, mask=p_mask)
+            tl.store(chunk_h0_im_ptr + off_chunk, b_acc_im, mask=p_mask)
+
+            a_re = tl.load(chunk_a_re_ptr + off_chunk, mask=p_mask, other=0.0)
+            a_im = tl.load(chunk_a_im_ptr + off_chunk, mask=p_mask, other=0.0)
+            b_re = tl.load(chunk_b_re_ptr + off_chunk, mask=p_mask, other=0.0)
+            b_im = tl.load(chunk_b_im_ptr + off_chunk, mask=p_mask, other=0.0)
+
+            b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
+            b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
+            b_acc_re = b_re_new
+            b_acc_im = b_im_new
+
+            a_re_new = a_re * a_acc_re - a_im * a_acc_im
+            a_im_new = a_re * a_acc_im + a_im * a_acc_re
+            a_acc_re = a_re_new
+            a_acc_im = a_im_new
+
+    @triton.jit
+    def fused_chunk_scan_kernel(
+        alpha_re_ptr, alpha_im_ptr,
+        inject_re_ptr, inject_im_ptr,
+        chunk_h0_re_ptr, chunk_h0_im_ptr,
+        h_re_ptr, h_im_ptr,
+        B_batch, L, P,
+        chunk_size, n_chunks,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_p = tl.program_id(2)
+        if pid_b >= B_batch or pid_c >= n_chunks:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        off_chunk = (pid_b * n_chunks + pid_c) * P + offs_p
+        h_re = tl.load(chunk_h0_re_ptr + off_chunk, mask=p_mask, other=0.0)
+        h_im = tl.load(chunk_h0_im_ptr + off_chunk, mask=p_mask, other=0.0)
+
+        start = pid_c * chunk_size
+        end = tl.minimum(start + chunk_size, L)
+
+        for t in range(0, chunk_size):
+            t_idx = start + t
+            if t_idx >= L:
+                break
+            off = base + t_idx * P + offs_p
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            b_re = tl.load(inject_re_ptr + off, mask=p_mask, other=0.0)
+            b_im = tl.load(inject_im_ptr + off, mask=p_mask, other=0.0)
+
+            h_re_new = a_re * h_re - a_im * h_im + b_re
+            h_im_new = a_re * h_im + a_im * h_re + b_im
+            h_re = h_re_new
+            h_im = h_im_new
+
+            tl.store(h_re_ptr + off, h_re, mask=p_mask)
+            tl.store(h_im_ptr + off, h_im, mask=p_mask)
+
+    # ========== Chunked scan backward (adjoint) ==========
+    # Uses alpha and d_h to produce d_inject and d_alpha.
+
+    @triton.jit
+    def fused_chunk_summary_bwd_kernel(
+        alpha_re_ptr, alpha_im_ptr,
+        d_h_re_ptr, d_h_im_ptr,
+        chunk_a_re_ptr, chunk_a_im_ptr,
+        chunk_b_re_ptr, chunk_b_im_ptr,
+        B_batch, L, P,
+        chunk_size, n_chunks,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_p = tl.program_id(2)
+        if pid_b >= B_batch or pid_c >= n_chunks:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        start = pid_c * chunk_size
+        end = tl.minimum(start + chunk_size, L)
+
+        a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
+        a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for t in range(0, chunk_size):
+            t_idx = end - 1 - t
+            if t_idx < start:
+                break
+            off = base + t_idx * P + offs_p
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            # conj(alpha)
+            a_im = -a_im
+            b_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
+            b_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
+
+            b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
+            b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
+            b_acc_re = b_re_new
+            b_acc_im = b_im_new
+
+            a_re_new = a_re * a_acc_re - a_im * a_acc_im
+            a_im_new = a_re * a_acc_im + a_im * a_acc_re
+            a_acc_re = a_re_new
+            a_acc_im = a_im_new
+
+        off_chunk = (pid_b * n_chunks + pid_c) * P + offs_p
+        tl.store(chunk_a_re_ptr + off_chunk, a_acc_re, mask=p_mask)
+        tl.store(chunk_a_im_ptr + off_chunk, a_acc_im, mask=p_mask)
+        tl.store(chunk_b_re_ptr + off_chunk, b_acc_re, mask=p_mask)
+        tl.store(chunk_b_im_ptr + off_chunk, b_acc_im, mask=p_mask)
+
+    @triton.jit
+    def fused_chunk_prefix_bwd_kernel(
+        chunk_a_re_ptr, chunk_a_im_ptr,
+        chunk_b_re_ptr, chunk_b_im_ptr,
+        chunk_adj0_re_ptr, chunk_adj0_im_ptr,
+        B_batch, n_chunks, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        if pid_b >= B_batch:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+
+        a_acc_re = tl.full((BLOCK_P,), 1.0, dtype=tl.float32)
+        a_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        b_acc_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for c_rev in range(n_chunks):
+            c = n_chunks - 1 - c_rev
+            off_chunk = (pid_b * n_chunks + c) * P + offs_p
+            tl.store(chunk_adj0_re_ptr + off_chunk, b_acc_re, mask=p_mask)
+            tl.store(chunk_adj0_im_ptr + off_chunk, b_acc_im, mask=p_mask)
+
+            a_re = tl.load(chunk_a_re_ptr + off_chunk, mask=p_mask, other=0.0)
+            a_im = tl.load(chunk_a_im_ptr + off_chunk, mask=p_mask, other=0.0)
+            b_re = tl.load(chunk_b_re_ptr + off_chunk, mask=p_mask, other=0.0)
+            b_im = tl.load(chunk_b_im_ptr + off_chunk, mask=p_mask, other=0.0)
+
+            b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
+            b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
+            b_acc_re = b_re_new
+            b_acc_im = b_im_new
+
+            a_re_new = a_re * a_acc_re - a_im * a_acc_im
+            a_im_new = a_re * a_acc_im + a_im * a_acc_re
+            a_acc_re = a_re_new
+            a_acc_im = a_im_new
+
+    @triton.jit
+    def fused_chunk_scan_bwd_kernel(
+        alpha_re_ptr, alpha_im_ptr,
+        h_re_ptr, h_im_ptr,
+        d_h_re_ptr, d_h_im_ptr,
+        chunk_adj0_re_ptr, chunk_adj0_im_ptr,
+        d_inj_re_ptr, d_inj_im_ptr,
+        d_alpha_re_ptr, d_alpha_im_ptr,
+        B_batch, L, P,
+        chunk_size, n_chunks,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_p = tl.program_id(2)
+        if pid_b >= B_batch or pid_c >= n_chunks:
+            return
+
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        off_chunk = (pid_b * n_chunks + pid_c) * P + offs_p
+        adj_re = tl.load(chunk_adj0_re_ptr + off_chunk, mask=p_mask, other=0.0)
+        adj_im = tl.load(chunk_adj0_im_ptr + off_chunk, mask=p_mask, other=0.0)
+
+        start = pid_c * chunk_size
+        end = tl.minimum(start + chunk_size, L)
+
+        for t in range(0, chunk_size):
+            t_idx = end - 1 - t
+            if t_idx < start:
+                break
+            off = base + t_idx * P + offs_p
+
+            d_out_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
+            d_out_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
+            d_h_re = d_out_re + adj_re
+            d_h_im = d_out_im + adj_im
+
+            tl.store(d_inj_re_ptr + off, d_h_re, mask=p_mask)
+            tl.store(d_inj_im_ptr + off, d_h_im, mask=p_mask)
+
+            # Load alpha[t]
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+
+            # Load h[t-1]
+            if t_idx > 0:
+                prev_off = base + (t_idx - 1) * P + offs_p
+                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask, other=0.0)
+                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask, other=0.0)
+            else:
+                h_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+                h_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            d_a_re = d_h_re * h_prev_re + d_h_im * h_prev_im
+            d_a_im = d_h_im * h_prev_re - d_h_re * h_prev_im
+            tl.store(d_alpha_re_ptr + off, d_a_re, mask=p_mask)
+            tl.store(d_alpha_im_ptr + off, d_a_im, mask=p_mask)
+
+            # adj = conj(alpha) * d_h
+            adj_re = a_re * d_h_re + a_im * d_h_im
+            adj_im = a_re * d_h_im - a_im * d_h_re
+
     # ========== Fused kernel 3: postscan ==========
     # Computes c_gate (silu + rmsnorm + bias + RoPE) and stores it.
     # Grid: (M,) where M = B*L
@@ -2154,24 +2655,65 @@ class _TritonS6(torch.autograd.Function):
         # 3. Cumulative theta (PyTorch — one launch)
         cum_theta = torch.cumsum(dt_half_theta.view(B, L, P // 2), dim=1).contiguous()
 
-        # 4. Fused scan: RoPE + discretize + recurrence
+        # 4. Discretize (alpha + inject) + chunked scan
         h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         h_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         alpha_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         alpha_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         inject_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        Bu_rot = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
 
         A_real_neg = -torch.exp(log_A_real)  # (P,)
         BLOCK_P_SCAN = triton.next_power_of_2(P)
 
-        fused_scan_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
-            dt.view(B, L, P).contiguous(), lam.view(B, L, P).contiguous(),
-            Bu.view(B, L, P).contiguous(), cum_theta,
+        fused_discretize_kernel[(B, L, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt.view(B, L, P).contiguous(),
+            lam.view(B, L, P).contiguous(),
+            Bu.view(B, L, P).contiguous(),
+            cum_theta,
             A_real_neg, A_imag,
-            h_re, h_im, alpha_re, alpha_im, inject_re, inject_im, Bu_rot,
+            alpha_re, alpha_im,
+            inject_re, inject_im,
             B, L, P,
+            BLOCK_P_SCAN,
+        )
+
+        chunk_size = min(chunk_size, L)
+        n_chunks = triton.cdiv(L, chunk_size)
+
+        chunk_a_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_a_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_b_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_b_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+
+        fused_chunk_summary_kernel[(B, n_chunks, triton.cdiv(P, BLOCK_P_SCAN))](
+            alpha_re, alpha_im,
+            inject_re, inject_im,
+            chunk_a_re, chunk_a_im,
+            chunk_b_re, chunk_b_im,
+            B, L, P,
+            chunk_size, n_chunks,
+            BLOCK_P_SCAN,
+        )
+
+        chunk_h0_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_h0_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+
+        fused_chunk_prefix_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            chunk_a_re, chunk_a_im,
+            chunk_b_re, chunk_b_im,
+            chunk_h0_re, chunk_h0_im,
+            B, n_chunks, P,
+            BLOCK_P_SCAN,
+        )
+
+        fused_chunk_scan_kernel[(B, n_chunks, triton.cdiv(P, BLOCK_P_SCAN))](
+            alpha_re, alpha_im,
+            inject_re, inject_im,
+            chunk_h0_re, chunk_h0_im,
+            h_re, h_im,
+            B, L, P,
+            chunk_size, n_chunks,
             BLOCK_P_SCAN,
         )
 
@@ -2445,15 +2987,11 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # 0. MLP sandwich: up project + act + norm
-        x_up = F.silu(s6.up_proj(u))
-        x_up = s6.up_norm(x_up)
-
         # 1. Multi-scale conv (Triton fused) — before SSM
-        B_size, L_size, H = x_up.shape
+        B_size, L_size, H = u.shape
         msconv = s6.msconv
         x = _TritonMSConv.apply(
-            x_up,
+            u,
             msconv.convs[0].weight, msconv.convs[0].bias,
             msconv.convs[1].weight, msconv.convs[1].bias,
             msconv.convs[2].weight, msconv.convs[2].bias,
@@ -2504,9 +3042,7 @@ class TritonS6(nn.Module):
         # 5. Attention (PyTorch)
         y = s6.attn(x, y_normed)
 
-        # 6. MLP sandwich: down norm + project + act + residual
-        y = F.silu(s6.down_proj(s6.down_norm(y)))
-        return u + y
+        return y
 
     def enable_cuda_graph(self, sample_input):
         """Capture fwd+bwd into a CUDA graph. Call once after warmup.

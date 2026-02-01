@@ -310,6 +310,8 @@ class S6Attention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('rope_freqs', rope_freqs)
         self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
         self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
 
@@ -351,6 +353,12 @@ class S6Attention(nn.Module):
         K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
         V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
+        # Positional RoPE on Q, K
+        pos = torch.arange(L, device=u.device, dtype=Q.dtype)
+        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, hd//2)
+        Q = apply_rotary_emb(Q, freqs.unsqueeze(0).unsqueeze(0))  # broadcast over B, nh
+        K = apply_rotary_emb(K, freqs.unsqueeze(0).unsqueeze(0))
+
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
@@ -358,57 +366,43 @@ class S6Attention(nn.Module):
 
 
 class S6(nn.Module):
-    def __init__(self, d_model, d_state=64, M=4, layer_idx=None, num_heads=1,
-                 layer_expansion_factor=2, **kernel_args):
+    def __init__(self, d_model, d_state=64, M=4, layer_idx=None, num_heads=1, **kernel_args):
         super().__init__()
 
         self.h = d_model
         self.n = d_state
         self.d_output = self.h
-        d_inner = d_model * layer_expansion_factor
-
-        # MLP sandwich: up projection
-        self.up_proj = nn.Linear(d_model, d_inner)
-        self.up_norm = RMSNorm(d_inner)
 
         # Multi-scale depthwise conv (before projections)
-        assert d_inner % 4 == 0, f"d_inner ({d_inner}) must be divisible by 4 for msconv"
-        self.msconv = MultiScaleDepthwiseConv(d_inner)
+        assert d_model % 4 == 0, f"d_model ({d_model}) must be divisible by 4 for msconv"
+        self.msconv = MultiScaleDepthwiseConv(d_model)
 
         # D skip connection
-        self.D = nn.Parameter(torch.randn(d_inner))
+        self.D = nn.Parameter(torch.randn(self.h))
 
         # SSM Kernel (parallel scan, not FFT conv)
-        self.kernel = S6Kernel(d_inner, N=self.n, M=M, **kernel_args)
+        self.kernel = S6Kernel(self.h, N=self.n, M=M, **kernel_args)
 
-        # C: static MIMO readout (d_inner, P) complex — maps state back to output channels
-        C = torch.randn(d_inner, self.n, dtype=torch.cfloat) / math.sqrt(self.n)
-        self.C = nn.Parameter(torch.view_as_real(C))  # (d_inner, P, 2) stored as real
-        self.c_proj = nn.Linear(d_inner, self.n)  # input-dependent gating of C
+        # C: static MIMO readout (H, P) complex — maps state back to output channels
+        C = torch.randn(self.h, self.n, dtype=torch.cfloat) / math.sqrt(self.n)
+        self.C = nn.Parameter(torch.view_as_real(C))  # (H, P, 2) stored as real
+        self.c_proj = nn.Linear(self.h, self.n)  # input-dependent gating of C
         self.c_norm = RMSNorm(self.n)
         self.c_bias = nn.Parameter(torch.ones(self.n))
 
         # Post-readout norm (before attention residual)
-        self.readout_norm = RMSNorm(d_inner)
+        self.readout_norm = RMSNorm(self.h)
 
         # Attention (80/20 weight sharing with phi_B and c_proj)
-        self.attn = S6Attention(d_inner, d_state, M=M, num_heads=num_heads,
+        self.attn = S6Attention(d_model, d_state, M=M, num_heads=num_heads,
                                 phi_B=self.kernel.phi_B, c_proj=self.c_proj)
-
-        # MLP sandwich: down projection
-        self.down_norm = RMSNorm(d_inner)
-        self.down_proj = nn.Linear(d_inner, d_model)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
         B, L, H = u.shape
 
-        # Up project + act + norm
-        x = F.silu(self.up_proj(u))
-        x = self.up_norm(x)
-
         # msconv first
-        x = self.msconv(x)
+        x = self.msconv(u)
 
         # Run SSM scan (phi_B computed internally by kernel)
         h, cum_theta = self.kernel(x)
@@ -419,8 +413,8 @@ class S6(nn.Module):
         c_gate = apply_rotary_emb(c_gate, cum_theta)  # rotate to match state
         h_gated = h * c_gate  # (B, L, P) — input-dependent selection of state dims
 
-        # MIMO readout: (d_inner, P) complex @ (B, L, P) complex -> (B, L, d_inner), take real
-        C = torch.view_as_complex(self.C)  # (d_inner, P)
+        # MIMO readout: (H, P) complex @ (B, L, P) complex -> (B, L, H), take real
+        C = torch.view_as_complex(self.C)  # (H, P)
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
         # Skip connection + activation
@@ -431,6 +425,4 @@ class S6(nn.Module):
         y_normed = self.readout_norm(y) + x
         y = self.attn(x, y_normed)
 
-        # Down norm + project + act + residual
-        y = F.silu(self.down_proj(self.down_norm(y)))
-        return u + y
+        return y
