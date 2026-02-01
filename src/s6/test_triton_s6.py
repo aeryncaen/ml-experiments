@@ -229,12 +229,18 @@ def debug_forward_stepwise():
         Bu_raw_pt = kern.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
         phi = kern.phi_B
         mlp = phi.channel_mlp
-        Bu_raw_tr = _TritonPhiB.apply(
+        raw_tr = _TritonPhiB.apply(
             x.reshape(ML, H), phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
             phi.M, phi.L, mlp.fc1.out_features,
-            phi.scale, phi.ch_rms_target if phi.ch_rms else 0.0,
-        ).view(B, L, -1)
+        )
+        # Apply ch_rms + scale same as TritonS6.forward
+        if phi.ch_rms:
+            raw_3d = raw_tr.view(ML, phi.M, phi.L)
+            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)
+            s = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            raw_tr = (raw_3d * s.view(1, 1, phi.L)).view(ML, -1)
+        Bu_raw_tr = (raw_tr * phi.scale).view(B, L, -1)
     cmp("phi_B output", Bu_raw_pt, Bu_raw_tr)
 
     # Step 1: x_proj linear

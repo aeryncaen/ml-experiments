@@ -1267,9 +1267,10 @@ if HAS_TRITON:
 # ========== Python wrappers ==========
 
 class _TritonPhiB(torch.autograd.Function):
+    """Raw MLP kernel only — no ch_rms or scale (those go outside for autograd)."""
     @staticmethod
-    def forward(ctx, x, W, b, fc1_w, fc1_b, fc2_w, fc2_b, M_proj, L_fb, hidden, scale, ch_rms_target):
-        """x: (N, H) -> (N, P) where P = M_proj * L_fb."""
+    def forward(ctx, x, W, b, fc1_w, fc1_b, fc2_w, fc2_b, M_proj, L_fb, hidden):
+        """x: (N, H) -> (N, P) where P = M_proj * L_fb. Raw MLP output."""
         N_rows, H = x.shape
         P = M_proj * L_fb
         out = torch.empty(N_rows, P, device=x.device, dtype=x.dtype)
@@ -1289,49 +1290,22 @@ class _TritonPhiB(torch.autograd.Function):
             BLOCK_H, BLOCK_HIDDEN, BLOCK_LFB,
         )
 
-        # ch_rms (small PyTorch ops for global reduction, but fused into the scale)
-        ch_rms_scale = None
-        if ch_rms_target > 0:
-            out_3d = out.view(N_rows, M_proj, L_fb)
-            rms = torch.sqrt(out_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
-            s = (ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
-            ch_rms_scale = s
-            out = (out_3d * s.view(1, 1, L_fb)).view(N_rows, P)
-
-        out = out * scale
-
-        if ch_rms_scale is not None:
-            ctx.save_for_backward(x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b, ch_rms_scale)
-        else:
-            ctx.save_for_backward(x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b)
+        ctx.save_for_backward(x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b)
         ctx.M_proj = M_proj
         ctx.L_fb = L_fb
         ctx.hidden = hidden
-        ctx.scale = scale
-        ctx.ch_rms_target = ch_rms_target
         return out
 
     @staticmethod
     def backward(ctx, d_out):
-        if ctx.ch_rms_target > 0:
-            x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b, ch_rms_scale = ctx.saved_tensors
-        else:
-            x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b = ctx.saved_tensors
-            ch_rms_scale = None
+        x, W, b, fc1_w_vec, fc1_b, fc2_w, fc2_b = ctx.saved_tensors
         M_proj = ctx.M_proj
         L_fb = ctx.L_fb
         hidden = ctx.hidden
-        scale = ctx.scale
         N_rows, H = x.shape
         P = M_proj * L_fb
 
-        # Undo scale
-        d_out = d_out * scale
-
-        # Undo ch_rms
-        if ch_rms_scale is not None:
-            d_out_3d = d_out.view(N_rows, M_proj, L_fb)
-            d_out = (d_out_3d * ch_rms_scale.view(1, 1, L_fb)).view(N_rows, P)
+        d_out = d_out.contiguous()
 
         # Allocate outputs
         d_x = torch.zeros(N_rows, H, device=x.device, dtype=x.dtype)
@@ -1361,7 +1335,7 @@ class _TritonPhiB(torch.autograd.Function):
         # d_fc1_w needs to be reshaped back to (hidden, 1) for the parameter
         d_fc1_w_out = d_fc1_w.view(hidden, 1)
 
-        return d_x, d_W, d_b, d_fc1_w_out, d_fc1_b, d_fc2_w, d_fc2_b, None, None, None, None, None
+        return d_x, d_W, d_b, d_fc1_w_out, d_fc1_b, d_fc2_w, d_fc2_b, None, None, None
 
 
 def triton_linear(x, w, b=None):
@@ -1662,18 +1636,25 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # Feature bank — Triton fused or PyTorch fallback
+        # Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
         phi = kern.phi_B
         mlp = phi.channel_mlp
         B_size, L_size, H = u.shape
-        Bu_raw = _TritonPhiB.apply(
-            u.reshape(B_size * L_size, H),
+        N_rows = B_size * L_size
+        raw = _TritonPhiB.apply(
+            u.reshape(N_rows, H),
             phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias,
             mlp.fc2.weight, mlp.fc2.bias,
             phi.M, phi.L, mlp.fc1.out_features,
-            phi.scale, phi.ch_rms_target if phi.ch_rms else 0.0,
-        ).view(B_size, L_size, -1)  # (B, L, P)
+        )  # (N_rows, P)
+        # ch_rms + scale in PyTorch so autograd handles their gradients
+        if phi.ch_rms:
+            raw_3d = raw.view(N_rows, phi.M, phi.L)
+            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
+            s = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            raw = (raw_3d * s.view(1, 1, phi.L)).view(N_rows, -1)
+        Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
         # Split complex C
         C = torch.view_as_complex(s6.C)
