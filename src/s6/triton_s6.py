@@ -678,6 +678,9 @@ if HAS_TRITON:
         dt_odd = tl.load(dt_ptr + row * P + offs_h * 2 + 1, mask=h_mask, other=0.0)
         dt_half = (dt_even + dt_odd) * 0.5
         theta = tl.load(theta_ptr + row * half_P + offs_h, mask=h_mask, other=0.0)
+        g_pairs = P // 8
+        group_idx = offs_h // g_pairs
+        theta = tl.where(group_idx == 2, theta, 0.0)
         tl.store(dt_half_theta_ptr + row * half_P + offs_h, dt_half * theta, mask=h_mask)
 
     # ========== Fused kernel 2: scan ==========
@@ -2665,6 +2668,14 @@ class _TritonS6(torch.autograd.Function):
 
         # 3. Cumulative theta (PyTorch — one launch)
         cum_theta = torch.cumsum(dt_half_theta.view(B, L, P // 2), dim=1).contiguous()
+        g_pairs = kern.rope_group_pairs
+        if g_pairs > 0:
+            cum_theta_data = cum_theta
+            cum_theta = torch.zeros_like(cum_theta_data)
+            pos = torch.arange(L, device=u.device, dtype=cum_theta.dtype)
+            rope = pos[:, None] * kern.rope_freqs.to(cum_theta.dtype)
+            cum_theta[:, :, g_pairs:2 * g_pairs] = rope.unsqueeze(0)
+            cum_theta[:, :, 2 * g_pairs:3 * g_pairs] = cum_theta_data[:, :, 2 * g_pairs:3 * g_pairs]
 
         # 4. Discretize (alpha + inject) + chunked scan
         h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
@@ -2980,6 +2991,11 @@ class _TritonS6(torch.autograd.Function):
         )
 
         d_cum_theta_total = d_cum_theta_b + d_cum_theta_c.view(B, L, P // 2)
+        g_pairs = kern.rope_group_pairs
+        if g_pairs > 0:
+            mask = torch.zeros(P // 2, device=u.device, dtype=u.dtype)
+            mask[2 * g_pairs:3 * g_pairs] = 1.0
+            d_cum_theta_total = d_cum_theta_total * mask.view(1, 1, -1)
         d_dt_rope = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_dt_half_theta = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
 

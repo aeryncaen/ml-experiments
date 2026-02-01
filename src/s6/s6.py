@@ -116,6 +116,7 @@ class S6Kernel(nn.Module):
         assert P % M == 0, f"d_state ({P}) must be divisible by M ({M})"
         self.H = H
         self.P = P
+        assert P % 8 == 0, "d_state must be divisible by 8 for RoPE groups"
 
         # A: HiPPO-LegS eigenvalues (P,) complex — shared across channels
         Lambda = make_DPLR_HiPPO(P)
@@ -128,6 +129,15 @@ class S6Kernel(nn.Module):
         self.phi_B = nn.Linear(H, P)
         nn.init.kaiming_uniform_(self.phi_B.weight, a=math.sqrt(5))
         nn.init.zeros_(self.phi_B.bias)
+
+        # RoPE group setup (per group pair count)
+        g = P // 4
+        self.rope_group_pairs = g // 2
+        if self.rope_group_pairs > 0:
+            rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, g, 2).float() / g))
+        else:
+            rope_freqs = torch.empty(0)
+        self.register_buffer("rope_freqs", rope_freqs)
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
         # Layout: [dt(P), lam(P), theta(P//2)]
@@ -180,9 +190,21 @@ class S6Kernel(nn.Module):
 
         Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
 
-        # Data-dependent RoPE on B
+        # Mixed RoPE on B: g1 normal, g2 data-dependent, g0/g3 none
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)  # (B, L, P//2)
-        cum_theta = torch.cumsum(dt_half * theta, dim=1)  # (B, L, P//2)
+        if self.rope_group_pairs > 0:
+            g_pairs = self.rope_group_pairs
+            theta_mask = torch.zeros_like(theta)
+            theta_mask[:, :, 2 * g_pairs:3 * g_pairs] = 1.0
+            cum_theta_data = torch.cumsum(dt_half * (theta * theta_mask), dim=1)
+
+            cum_theta = torch.zeros_like(cum_theta_data)
+            pos = torch.arange(L, device=u.device, dtype=dt_half.dtype)
+            rope = pos[:, None] * self.rope_freqs.to(dt_half.dtype)  # (L, g_pairs)
+            cum_theta[:, :, g_pairs:2 * g_pairs] = rope.unsqueeze(0)
+            cum_theta[:, :, 2 * g_pairs:3 * g_pairs] = cum_theta_data[:, :, 2 * g_pairs:3 * g_pairs]
+        else:
+            cum_theta = torch.cumsum(dt_half * theta, dim=1)
         Bu = apply_rotary_emb(Bu, cum_theta)
         # Bu_prev: shift AFTER rotation so position t-1 keeps its own rotation angle
         Bu_prev1 = F.pad(Bu[:, :-1], (0, 0, 1, 0))
