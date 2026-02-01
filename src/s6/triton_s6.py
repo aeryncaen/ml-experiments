@@ -805,6 +805,9 @@ class _TritonS6(torch.autograd.Function):
         dt_raw, lam_raw, theta = x_proj_out.split(split_sizes, dim=-1)
 
         # 2. dt and lam activations
+        dt_raw = dt_raw.contiguous()
+        lam_raw = lam_raw.contiguous()
+        theta = theta.contiguous()
         dt, lam = triton_fused_dt_lam(dt_raw, lam_raw, log_dt_bias.expand(M, P).contiguous())
 
         # 3. B: rmsnorm → + bias (feature bank already applied activation)
