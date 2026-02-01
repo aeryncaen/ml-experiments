@@ -338,7 +338,7 @@ if HAS_TRITON:
         elif pid_g == 1:
             acc = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
             for j in range(K0):
-                src_l = pid_l - (K0 - 1) + j
+                src_l = pid_l - (K0 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(
                     x_ptr + base + src_l * H + group_off + offs_gs,
@@ -351,7 +351,7 @@ if HAS_TRITON:
         elif pid_g == 2:
             acc = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
             for j in range(K1):
-                src_l = pid_l + (K1 - 1) - j
+                src_l = pid_l - (K1 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(
                     x_ptr + base + src_l * H + group_off + offs_gs,
@@ -567,7 +567,7 @@ if HAS_TRITON:
         elif pid_g == 1:
             acc = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
             for j in range(K0):
-                src_l = pid_l - (K0 - 1) + j
+                src_l = pid_l - (K0 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
                 w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
@@ -576,7 +576,7 @@ if HAS_TRITON:
             d_pre = d_out * (sig + acc * sig * (1.0 - sig))
             tl.atomic_add(d_cb0_ptr + offs_gs, d_pre, mask=gs_mask)
             for j in range(K0):
-                src_l = pid_l - (K0 - 1) + j
+                src_l = pid_l - (K0 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
                 w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
@@ -585,7 +585,7 @@ if HAS_TRITON:
         elif pid_g == 2:
             acc = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
             for j in range(K1):
-                src_l = pid_l + (K1 - 1) - j
+                src_l = pid_l - (K1 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
                 w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
@@ -594,7 +594,7 @@ if HAS_TRITON:
             d_pre = d_out * (sig + acc * sig * (1.0 - sig))
             tl.atomic_add(d_cb1_ptr + offs_gs, d_pre, mask=gs_mask)
             for j in range(K1):
-                src_l = pid_l + (K1 - 1) - j
+                src_l = pid_l - (K1 // 2) + j
                 valid = (src_l >= 0) & (src_l < L)
                 x_val = tl.load(x_ptr + base + src_l * H + group_off + offs_gs, mask=gs_mask & valid, other=0.0)
                 w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
@@ -869,17 +869,10 @@ if HAS_TRITON:
             inj_re = lam * dt * Bu_rot
             inj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-            # causal AB2
-            inj_re += m1 * one_minus_lam * dt * (term_prev1_re + term_prev2_re)
-            inj_im += m1 * one_minus_lam * dt * (term_prev1_im + term_prev2_im)
-
-            # retro AB2
-            inj_re += m2 * one_minus_lam * dt * (term_next1_re + term_next2_re)
-            inj_im += m2 * one_minus_lam * dt * (term_next1_im + term_next2_im)
-
-            # center (one behind + one ahead)
-            inj_re += m3 * one_minus_lam * dt * (term_prev1_re + term_next1_re)
-            inj_im += m3 * one_minus_lam * dt * (term_prev1_im + term_next1_im)
+            # acausal center for all non-pass groups
+            m_center = m1 + m2 + m3
+            inj_re += m_center * one_minus_lam * dt * (term_prev1_re + term_next1_re)
+            inj_im += m_center * one_minus_lam * dt * (term_prev1_im + term_next1_im)
 
             # Store inject for backward
             tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
@@ -1079,14 +1072,9 @@ if HAS_TRITON:
         inj_re = lam * dt * Bu_rot
         inj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-        inj_re += m1 * one_minus_lam * dt * (term_prev1_re + term_prev2_re)
-        inj_im += m1 * one_minus_lam * dt * (term_prev1_im + term_prev2_im)
-
-        inj_re += m2 * one_minus_lam * dt * (term_next1_re + term_next2_re)
-        inj_im += m2 * one_minus_lam * dt * (term_next1_im + term_next2_im)
-
-        inj_re += m3 * one_minus_lam * dt * (term_prev1_re + term_next1_re)
-        inj_im += m3 * one_minus_lam * dt * (term_prev1_im + term_next1_im)
+        m_center = m1 + m2 + m3
+        inj_re += m_center * one_minus_lam * dt * (term_prev1_re + term_next1_re)
+        inj_im += m_center * one_minus_lam * dt * (term_prev1_im + term_next1_im)
 
         tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
         tl.store(inject_im_ptr + off, inj_im, mask=p_mask)
@@ -1685,11 +1673,9 @@ if HAS_TRITON:
         a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask & has_next1, other=0.0)
 
         # U for grouped inject: Z = alpha_t * U
-        U_re = (m1 * (Bu_prev1 + a_prev_re * Bu_prev2)
-                + m2 * (Bu_next1 + a_next_re * Bu_next2)
-                + m3 * (Bu_prev1 + Bu_next1))
-        U_im = (m1 * (a_prev_im * Bu_prev2)
-                + m2 * (a_next_im * Bu_next2))
+        m_center = m1 + m2 + m3
+        U_re = m_center * (Bu_prev1 + Bu_next1)
+        U_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         # Z = alpha * U
         Z_re = a_re * U_re - a_im * U_im
@@ -1719,16 +1705,16 @@ if HAS_TRITON:
         dU_im = dZ_im * a_re - dZ_re * a_im
 
         # Group-specific propagation to neighbors
-        d_prev1 = dU_re * (m1 + m3)
-        d_prev2 = dU_re * a_prev_re + dU_im * a_prev_im
-        d_next1 = dU_re * (m2 + m3)
-        d_next2 = dU_re * a_next_re + dU_im * a_next_im
+        d_prev1 = dU_re * m_center
+        d_prev2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_next1 = dU_re * m_center
+        d_next2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         # alpha_prev/alpha_next contributions
-        d_a_prev_re = dU_re * Bu_prev2
-        d_a_prev_im = dU_im * Bu_prev2
-        d_a_next_re = dU_re * Bu_next2
-        d_a_next_im = dU_im * Bu_next2
+        d_a_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_a_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_a_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_a_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         # store contributions (no atomics)
         d_prev1 = tl.where(has_prev1, d_prev1, 0.0)

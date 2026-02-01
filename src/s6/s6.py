@@ -32,8 +32,8 @@ class MultiScaleDepthwiseConv(nn.Module):
         self.group_size = channels // n_groups
         self.kernel_specs = [
             ("pass", None),
-            ("causal", 5),
-            ("retro", 5),
+            ("center", 5),
+            ("center", 5),
             ("center", 5),
         ]
         # Convs for the 3 non-passthrough groups, in the same order as kernel_specs[1:]
@@ -64,13 +64,7 @@ class MultiScaleDepthwiseConv(nn.Module):
             conv = self.convs[conv_idx]
             conv_idx += 1
             x_in = chunk.transpose(1, 2)
-            if mode == "retro":
-                x_in = torch.flip(x_in, dims=(-1,))
             y = conv(x_in)
-            if mode in ("causal", "retro"):
-                y = y[..., :L]
-            if mode == "retro":
-                y = torch.flip(y, dims=(-1,))
             y = F.silu(y).transpose(1, 2)
             out.append(y)
         out = torch.cat(out, dim=-1)  # (B, L, C)
@@ -217,29 +211,14 @@ class S6Kernel(nn.Module):
         inject = torch.zeros_like(Bu_c)
         # pass-through: current only
         inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * Bu_c[:, :, g0]
-        # causal AB2: look behind 2 with stacked decay
-        inject[:, :, g1] = (
-            lam[:, :, g1] * dt_c[:, :, g1] * Bu_c[:, :, g1]
-            + (1 - lam[:, :, g1]) * dt_c[:, :, g1] * (
-                alpha[:, :, g1] * Bu_prev1_c[:, :, g1]
-                + (alpha[:, :, g1] * alpha_prev1[:, :, g1]) * Bu_prev2_c[:, :, g1]
+        # acausal center for all non-pass groups: one behind + one ahead
+        for gs in (g1, g2, g3):
+            inject[:, :, gs] = (
+                lam[:, :, gs] * dt_c[:, :, gs] * Bu_c[:, :, gs]
+                + (1 - lam[:, :, gs]) * dt_c[:, :, gs] * (
+                    alpha[:, :, gs] * (Bu_prev1_c[:, :, gs] + Bu_next1_c[:, :, gs])
+                )
             )
-        )
-        # retro AB2: look ahead 2 with stacked decay
-        inject[:, :, g2] = (
-            lam[:, :, g2] * dt_c[:, :, g2] * Bu_c[:, :, g2]
-            + (1 - lam[:, :, g2]) * dt_c[:, :, g2] * (
-                alpha[:, :, g2] * Bu_next1_c[:, :, g2]
-                + (alpha[:, :, g2] * alpha_next1[:, :, g2]) * Bu_next2_c[:, :, g2]
-            )
-        )
-        # center: one behind + one ahead, single decay both directions
-        inject[:, :, g3] = (
-            lam[:, :, g3] * dt_c[:, :, g3] * Bu_c[:, :, g3]
-            + (1 - lam[:, :, g3]) * dt_c[:, :, g3] * (
-                alpha[:, :, g3] * (Bu_prev1_c[:, :, g3] + Bu_next1_c[:, :, g3])
-            )
-        )
 
         # Parallel scan: h[t] = alpha[t] * h[t-1] + inject[t]
         h = parallel_scan(alpha, inject)  # (B, L, P) complex
