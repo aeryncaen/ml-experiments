@@ -1612,10 +1612,16 @@ if HAS_TRITON:
         BLOCK_P: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
-        pid_p = tl.program_id(1)
+        pid_l = tl.program_id(1)
+        pid_p = tl.program_id(2)
+        if pid_b >= B_batch or pid_l >= L:
+            return
+
         offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
         p_mask = offs_p < P
         base = pid_b * L * P
+        t = pid_l
+
         gsize = P // 4
         g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
         g2 = (offs_p >= 2 * gsize) & (offs_p < 3 * gsize)
@@ -1625,117 +1631,94 @@ if HAS_TRITON:
         m3 = g3.to(tl.float32)
         mZ = m1 + m2 + m3
 
-        for t in range(L):
-            off = base + t * P + offs_p
+        off = base + t * P + offs_p
 
-            dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
-            lam_t = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
-            Bu_t = tl.load(Bu_rot_ptr + off, mask=p_mask, other=0.0)
-            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
-            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
-            d_inj_re = tl.load(d_inj_re_ptr + off, mask=p_mask, other=0.0)
-            d_inj_im = tl.load(d_inj_im_ptr + off, mask=p_mask, other=0.0)
+        dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+        lam_t = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
+        Bu_t = tl.load(Bu_rot_ptr + off, mask=p_mask, other=0.0)
+        a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+        a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+        d_inj_re = tl.load(d_inj_re_ptr + off, mask=p_mask, other=0.0)
+        d_inj_im = tl.load(d_inj_im_ptr + off, mask=p_mask, other=0.0)
 
-            # Neighbor Bu_rot and alpha
-            Bu_prev1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            Bu_prev2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            Bu_next1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            Bu_next2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        has_prev1 = t > 0
+        has_prev2 = t > 1
+        has_next1 = t + 1 < L
+        has_next2 = t + 2 < L
 
-            a_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            a_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            a_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
-            a_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        off_prev1 = base + (t - 1) * P + offs_p
+        off_prev2 = base + (t - 2) * P + offs_p
+        off_next1 = base + (t + 1) * P + offs_p
+        off_next2 = base + (t + 2) * P + offs_p
 
-            if t > 0:
-                off_prev1 = base + (t - 1) * P + offs_p
-                Bu_prev1 = tl.load(Bu_rot_ptr + off_prev1, mask=p_mask, other=0.0)
-                a_prev_re = tl.load(alpha_re_ptr + off_prev1, mask=p_mask, other=0.0)
-                a_prev_im = tl.load(alpha_im_ptr + off_prev1, mask=p_mask, other=0.0)
-            if t > 1:
-                off_prev2 = base + (t - 2) * P + offs_p
-                Bu_prev2 = tl.load(Bu_rot_ptr + off_prev2, mask=p_mask, other=0.0)
-            if t + 1 < L:
-                off_next1 = base + (t + 1) * P + offs_p
-                Bu_next1 = tl.load(Bu_rot_ptr + off_next1, mask=p_mask, other=0.0)
-                a_next_re = tl.load(alpha_re_ptr + off_next1, mask=p_mask, other=0.0)
-                a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask, other=0.0)
-            if t + 2 < L:
-                off_next2 = base + (t + 2) * P + offs_p
-                Bu_next2 = tl.load(Bu_rot_ptr + off_next2, mask=p_mask, other=0.0)
+        Bu_prev1 = tl.load(Bu_rot_ptr + off_prev1, mask=p_mask & has_prev1, other=0.0)
+        Bu_prev2 = tl.load(Bu_rot_ptr + off_prev2, mask=p_mask & has_prev2, other=0.0)
+        Bu_next1 = tl.load(Bu_rot_ptr + off_next1, mask=p_mask & has_next1, other=0.0)
+        Bu_next2 = tl.load(Bu_rot_ptr + off_next2, mask=p_mask & has_next2, other=0.0)
 
-            # U for grouped inject: Z = alpha_t * U
-            U_re = (m1 * (Bu_prev1 + a_prev_re * Bu_prev2)
-                    + m2 * (Bu_next1 + a_next_re * Bu_next2)
-                    + m3 * (Bu_prev1 + Bu_next1))
-            U_im = (m1 * (a_prev_im * Bu_prev2)
-                    + m2 * (a_next_im * Bu_next2))
+        a_prev_re = tl.load(alpha_re_ptr + off_prev1, mask=p_mask & has_prev1, other=0.0)
+        a_prev_im = tl.load(alpha_im_ptr + off_prev1, mask=p_mask & has_prev1, other=0.0)
+        a_next_re = tl.load(alpha_re_ptr + off_next1, mask=p_mask & has_next1, other=0.0)
+        a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask & has_next1, other=0.0)
 
-            # Z = alpha * U
-            Z_re = a_re * U_re - a_im * U_im
-            Z_im = a_re * U_im + a_im * U_re
+        # U for grouped inject: Z = alpha_t * U
+        U_re = (m1 * (Bu_prev1 + a_prev_re * Bu_prev2)
+                + m2 * (Bu_next1 + a_next_re * Bu_next2)
+                + m3 * (Bu_prev1 + Bu_next1))
+        U_im = (m1 * (a_prev_im * Bu_prev2)
+                + m2 * (a_next_im * Bu_next2))
 
-            one_minus_lam = 1.0 - lam_t
-            dZ_re = one_minus_lam * dt_t * d_inj_re * mZ
-            dZ_im = one_minus_lam * dt_t * d_inj_im * mZ
+        # Z = alpha * U
+        Z_re = a_re * U_re - a_im * U_im
+        Z_im = a_re * U_im + a_im * U_re
 
-            d_lam = (d_inj_re * dt_t * (Bu_t - Z_re)
-                     - d_inj_im * dt_t * Z_im)
-            d_dt_inj = (d_inj_re * (lam_t * Bu_t + one_minus_lam * Z_re)
-                        + d_inj_im * (one_minus_lam * Z_im))
+        one_minus_lam = 1.0 - lam_t
+        dZ_re = one_minus_lam * dt_t * d_inj_re * mZ
+        dZ_im = one_minus_lam * dt_t * d_inj_im * mZ
 
-            tl.store(d_lam_ptr + off, d_lam, mask=p_mask)
-            tl.store(d_dt_inj_ptr + off, d_dt_inj, mask=p_mask)
+        d_lam = (d_inj_re * dt_t * (Bu_t - Z_re)
+                 - d_inj_im * dt_t * Z_im)
+        d_dt_inj = (d_inj_re * (lam_t * Bu_t + one_minus_lam * Z_re)
+                    + d_inj_im * (one_minus_lam * Z_im))
 
-            # d_Bu_rot for current position
-            d_Bu_curr = lam_t * dt_t * d_inj_re
-            tl.atomic_add(d_Bu_rot_ptr + off, d_Bu_curr, mask=p_mask)
+        tl.store(d_lam_ptr + off, d_lam, mask=p_mask)
+        tl.store(d_dt_inj_ptr + off, d_dt_inj, mask=p_mask)
 
-            # d_alpha (current) from Z = alpha * U
-            d_a_re_add = dZ_re * U_re + dZ_im * U_im
-            d_a_im_add = dZ_im * U_re - dZ_re * U_im
-            tl.atomic_add(d_alpha_re_ptr + off, d_a_re_add, mask=p_mask)
-            tl.atomic_add(d_alpha_im_ptr + off, d_a_im_add, mask=p_mask)
+        # d_Bu_rot for current position
+        d_Bu_curr = lam_t * dt_t * d_inj_re
+        tl.atomic_add(d_Bu_rot_ptr + off, d_Bu_curr, mask=p_mask)
 
-            # dU from Z = alpha * U
-            dU_re = dZ_re * a_re + dZ_im * a_im
-            dU_im = dZ_im * a_re - dZ_re * a_im
+        # d_alpha (current) from Z = alpha * U
+        d_a_re_add = dZ_re * U_re + dZ_im * U_im
+        d_a_im_add = dZ_im * U_re - dZ_re * U_im
+        tl.atomic_add(d_alpha_re_ptr + off, d_a_re_add, mask=p_mask)
+        tl.atomic_add(d_alpha_im_ptr + off, d_a_im_add, mask=p_mask)
 
-            # Group-specific propagation to neighbors
-            if t > 0:
-                off_prev1 = base + (t - 1) * P + offs_p
-                d_prev1 = dU_re * (m1 + m3)
-                tl.atomic_add(d_Bu_rot_ptr + off_prev1, d_prev1, mask=p_mask)
+        # dU from Z = alpha * U
+        dU_re = dZ_re * a_re + dZ_im * a_im
+        dU_im = dZ_im * a_re - dZ_re * a_im
 
-            if t > 1:
-                off_prev2 = base + (t - 2) * P + offs_p
-                d_prev2 = dU_re * a_prev_re + dU_im * a_prev_im
-                tl.atomic_add(d_Bu_rot_ptr + off_prev2, d_prev2 * m1, mask=p_mask)
+        # Group-specific propagation to neighbors
+        d_prev1 = dU_re * (m1 + m3)
+        d_prev2 = dU_re * a_prev_re + dU_im * a_prev_im
+        d_next1 = dU_re * (m2 + m3)
+        d_next2 = dU_re * a_next_re + dU_im * a_next_im
 
-            if t + 1 < L:
-                off_next1 = base + (t + 1) * P + offs_p
-                d_next1 = dU_re * (m2 + m3)
-                tl.atomic_add(d_Bu_rot_ptr + off_next1, d_next1, mask=p_mask)
+        tl.atomic_add(d_Bu_rot_ptr + off_prev1, d_prev1, mask=p_mask & has_prev1)
+        tl.atomic_add(d_Bu_rot_ptr + off_prev2, d_prev2 * m1, mask=p_mask & has_prev2)
+        tl.atomic_add(d_Bu_rot_ptr + off_next1, d_next1, mask=p_mask & has_next1)
+        tl.atomic_add(d_Bu_rot_ptr + off_next2, d_next2 * m2, mask=p_mask & has_next2)
 
-            if t + 2 < L:
-                off_next2 = base + (t + 2) * P + offs_p
-                d_next2 = dU_re * a_next_re + dU_im * a_next_im
-                tl.atomic_add(d_Bu_rot_ptr + off_next2, d_next2 * m2, mask=p_mask)
+        # alpha_prev/alpha_next contributions
+        d_a_prev_re = dU_re * Bu_prev2
+        d_a_prev_im = dU_im * Bu_prev2
+        d_a_next_re = dU_re * Bu_next2
+        d_a_next_im = dU_im * Bu_next2
 
-            # alpha_prev/alpha_next contributions
-            if t > 0:
-                off_prev1 = base + (t - 1) * P + offs_p
-                d_a_prev_re = dU_re * Bu_prev2
-                d_a_prev_im = dU_im * Bu_prev2
-                tl.atomic_add(d_alpha_re_ptr + off_prev1, d_a_prev_re * m1, mask=p_mask)
-                tl.atomic_add(d_alpha_im_ptr + off_prev1, d_a_prev_im * m1, mask=p_mask)
-
-            if t + 1 < L:
-                off_next1 = base + (t + 1) * P + offs_p
-                d_a_next_re = dU_re * Bu_next2
-                d_a_next_im = dU_im * Bu_next2
-                tl.atomic_add(d_alpha_re_ptr + off_next1, d_a_next_re * m2, mask=p_mask)
-                tl.atomic_add(d_alpha_im_ptr + off_next1, d_a_next_im * m2, mask=p_mask)
+        tl.atomic_add(d_alpha_re_ptr + off_prev1, d_a_prev_re * m1, mask=p_mask & has_prev1)
+        tl.atomic_add(d_alpha_im_ptr + off_prev1, d_a_prev_im * m1, mask=p_mask & has_prev1)
+        tl.atomic_add(d_alpha_re_ptr + off_next1, d_a_next_re * m2, mask=p_mask & has_next1)
+        tl.atomic_add(d_alpha_im_ptr + off_next1, d_a_next_im * m2, mask=p_mask & has_next1)
 
     # ========== Alpha -> dt/A backward ==========
 
@@ -2744,6 +2727,8 @@ class _TritonS6(torch.autograd.Function):
         BLOCK_H = min(64, triton.next_power_of_2(H))
         out = torch.empty(B, L, H, device=u.device, dtype=u.dtype)
 
+        readout_warps = 8 if P >= 64 else 4
+        readout_stages = 4
         fused_readout_kernel[(M, triton.cdiv(H, BLOCK_H))](
             h_re.view(M, P), h_im.view(M, P),
             c_gate,
@@ -2752,6 +2737,8 @@ class _TritonS6(torch.autograd.Function):
             out.view(M, H),
             M, H, P,
             BLOCK_H, BLOCK_P,
+            num_warps=readout_warps,
+            num_stages=readout_stages,
         )
 
         # Save for backward
@@ -2803,6 +2790,8 @@ class _TritonS6(torch.autograd.Function):
         d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
         d_out_flat = d_out.reshape(M, H).contiguous()
 
+        readout_warps = 8 if P >= 64 else 4
+        readout_stages = 4
         fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
             h_re.view(M, P), h_im.view(M, P),
             c_gate, c_proj_out,
@@ -2819,6 +2808,8 @@ class _TritonS6(torch.autograd.Function):
             torch.empty(P, device=u.device, dtype=u.dtype),
             M, H, P,
             BLOCK_H, BLOCK_P,
+            num_warps=readout_warps,
+            num_stages=readout_stages,
         )
 
         # c_gate chain rule
@@ -2894,7 +2885,7 @@ class _TritonS6(torch.autograd.Function):
         d_lam_disc = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_Bu_rot = torch.zeros(B, L, P, device=u.device, dtype=u.dtype)
 
-        fused_inject_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+        fused_inject_bwd_kernel[(B, L, triton.cdiv(P, BLOCK_P_SCAN))](
             dt.view(B, L, P), lam.view(B, L, P),
             Bu_rot.view(B, L, P),
             alpha_re.view(B, L, P), alpha_im.view(B, L, P),

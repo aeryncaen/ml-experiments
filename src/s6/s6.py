@@ -310,7 +310,8 @@ class S6Attention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
-        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.rope_dim = self.head_dim // 4  # only group 0 (passthrough) gets RoPE
+        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
         self.register_buffer('rope_freqs', rope_freqs)
         self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
         self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
@@ -353,11 +354,13 @@ class S6Attention(nn.Module):
         K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
         V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
-        # # Positional RoPE on Q, K
-        # pos = torch.arange(L, device=u.device, dtype=Q.dtype)
-        # freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, hd//2)
-        # Q = apply_rotary_emb(Q, freqs.unsqueeze(0).unsqueeze(0))  # broadcast over B, nh
-        # K = apply_rotary_emb(K, freqs.unsqueeze(0).unsqueeze(0))
+        # Positional RoPE only on group 0 (passthrough) dims
+        rd = self.rope_dim
+        pos = torch.arange(L, device=u.device, dtype=Q.dtype)
+        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, rd//2)
+        freqs = freqs.unsqueeze(0).unsqueeze(0)  # (1, 1, L, rd//2)
+        Q = torch.cat([apply_rotary_emb(Q[..., :rd], freqs), Q[..., rd:]], dim=-1)
+        K = torch.cat([apply_rotary_emb(K[..., :rd], freqs), K[..., rd:]], dim=-1)
 
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
