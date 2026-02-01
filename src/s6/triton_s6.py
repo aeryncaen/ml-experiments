@@ -301,7 +301,7 @@ if HAS_TRITON:
         # Store d_x (no atomic needed — one row per program)
         tl.store(d_x_ptr + row * H + offs_h, d_x_acc, mask=h_mask)
 
-    # ========== Fused MSConv forward: depthwise conv + silu + passthrough ==========
+    # ========== Fused MSConv forward: depthwise conv + silu + passthrough (acausal) ==========
     # Grid: (B, L) — one program per (batch, timestep)
     # 3 conv groups with kernel sizes K0, K1, K2, plus 1 passthrough group
     # Each conv is depthwise: per-channel 1D filter
@@ -331,8 +331,8 @@ if HAS_TRITON:
         # --- Group 0: kernel size K0 ---
         acc0 = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K0):
-            src_l = pid_l - K0 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K0 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(
                 x_ptr + base + src_l * H + offs_gs,
                 mask=gs_mask & valid, other=0.0
@@ -345,8 +345,8 @@ if HAS_TRITON:
         # --- Group 1: kernel size K1 ---
         acc1 = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K1):
-            src_l = pid_l - K1 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K1 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(
                 x_ptr + base + src_l * H + gs + offs_gs,
                 mask=gs_mask & valid, other=0.0
@@ -359,8 +359,8 @@ if HAS_TRITON:
         # --- Group 2: kernel size K2 ---
         acc2 = tl.load(cb2_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K2):
-            src_l = pid_l - K2 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K2 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(
                 x_ptr + base + src_l * H + 2 * gs + offs_gs,
                 mask=gs_mask & valid, other=0.0
@@ -534,7 +534,7 @@ if HAS_TRITON:
             prev = tl.load(d_conv_out_ptr + off + offs_h, mask=h_mask, other=0.0)
             tl.store(d_conv_out_ptr + off + offs_h, prev + d_mean_per_l, mask=h_mask)
 
-    # ========== Fused MSConv conv backward ==========
+    # ========== Fused MSConv conv backward (acausal) ==========
     # Grid: (B, L) — one program per (batch, timestep)
     # Recomputes conv+silu forward, chains backward, atomic d_x for lookback
 
@@ -572,8 +572,8 @@ if HAS_TRITON:
         # --- Recompute group 0 forward + backward ---
         acc0 = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K0):
-            src_l = pid_l - K0 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K0 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
             acc0 += x_val * w_val
@@ -581,8 +581,8 @@ if HAS_TRITON:
         d_pre0 = d_out0 * (sig0 + acc0 * sig0 * (1.0 - sig0))
         tl.atomic_add(d_cb0_ptr + offs_gs, d_pre0, mask=gs_mask)
         for j in range(K0):
-            src_l = pid_l - K0 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K0 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
             tl.atomic_add(d_cw0_ptr + offs_gs * K0 + j, d_pre0 * x_val, mask=gs_mask)
@@ -591,8 +591,8 @@ if HAS_TRITON:
         # --- Recompute group 1 forward + backward ---
         acc1 = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K1):
-            src_l = pid_l - K1 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K1 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + gs + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
             acc1 += x_val * w_val
@@ -600,8 +600,8 @@ if HAS_TRITON:
         d_pre1 = d_out1 * (sig1 + acc1 * sig1 * (1.0 - sig1))
         tl.atomic_add(d_cb1_ptr + offs_gs, d_pre1, mask=gs_mask)
         for j in range(K1):
-            src_l = pid_l - K1 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K1 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + gs + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
             tl.atomic_add(d_cw1_ptr + offs_gs * K1 + j, d_pre1 * x_val, mask=gs_mask)
@@ -610,8 +610,8 @@ if HAS_TRITON:
         # --- Recompute group 2 forward + backward ---
         acc2 = tl.load(cb2_ptr + offs_gs, mask=gs_mask, other=0.0)
         for j in range(K2):
-            src_l = pid_l - K2 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K2 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + 2 * gs + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw2_ptr + offs_gs * K2 + j, mask=gs_mask, other=0.0)
             acc2 += x_val * w_val
@@ -619,8 +619,8 @@ if HAS_TRITON:
         d_pre2 = d_out2 * (sig2 + acc2 * sig2 * (1.0 - sig2))
         tl.atomic_add(d_cb2_ptr + offs_gs, d_pre2, mask=gs_mask)
         for j in range(K2):
-            src_l = pid_l - K2 + 1 + j
-            valid = src_l >= 0
+            src_l = pid_l - (K2 // 2) + j
+            valid = (src_l >= 0) & (src_l < L)
             x_val = tl.load(x_ptr + base + src_l * H + 2 * gs + offs_gs, mask=gs_mask & valid, other=0.0)
             w_val = tl.load(cw2_ptr + offs_gs * K2 + j, mask=gs_mask, other=0.0)
             tl.atomic_add(d_cw2_ptr + offs_gs * K2 + j, d_pre2 * x_val, mask=gs_mask)

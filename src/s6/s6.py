@@ -41,7 +41,7 @@ class MultiScaleDepthwiseConv(nn.Module):
         assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups}"
         self.group_size = channels // n_groups
         self.convs = nn.ModuleList([
-            nn.Conv1d(self.group_size, self.group_size, k, padding=k - 1, groups=self.group_size)
+            nn.Conv1d(self.group_size, self.group_size, k, padding=k // 2, groups=self.group_size)
             for k in kernel_sizes
         ])
         self.se = SqueezeExcite1D(channels)
@@ -55,7 +55,7 @@ class MultiScaleDepthwiseConv(nn.Module):
         passthrough = x[..., n_conv * gs:]
         out = []
         for chunk, conv in zip(conv_chunks, self.convs):
-            y = F.silu(conv(chunk.transpose(1, 2))[..., :L].transpose(1, 2))
+            y = F.silu(conv(chunk.transpose(1, 2)))[..., :L].transpose(1, 2)
             out.append(y)
         out.append(passthrough)
         out = torch.cat(out, dim=-1)  # (B, L, C)
