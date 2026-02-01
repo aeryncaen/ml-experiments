@@ -132,7 +132,7 @@ class S6Kernel(nn.Module):
 
         # B: simple linear projection (H → P)
         self.phi_B = nn.Linear(H, P)
-        nn.init.normal_(self.phi_B.weight, mean=0.0, std=1.0 / math.sqrt(H))
+        nn.init.kaiming_uniform_(self.phi_B.weight, a=math.sqrt(5))
         nn.init.zeros_(self.phi_B.bias)
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
@@ -286,6 +286,8 @@ class S6Attention(nn.Module):
         self._c_proj = c_proj
         self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
         self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
+        nn.init.kaiming_uniform_(self.q_ded_weight, a=math.sqrt(5))
+        nn.init.zeros_(self.q_ded_bias)
 
         # K: 80% rows from phi_B, 20% dedicated
         self.shared_k_rows = int(0.8 * P)
@@ -294,6 +296,8 @@ class S6Attention(nn.Module):
         self._phi_B = phi_B
         self.k_ded_weight = nn.Parameter(torch.randn(self.ded_k_rows, H) / math.sqrt(H))
         self.k_ded_bias = nn.Parameter(torch.zeros(self.ded_k_rows))
+        nn.init.kaiming_uniform_(self.k_ded_weight, a=math.sqrt(5))
+        nn.init.zeros_(self.k_ded_bias)
 
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
