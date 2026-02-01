@@ -297,15 +297,35 @@ class S6Attention(nn.Module):
 
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
-        self.rope_dim = self.head_dim // 4  # only group 0 (passthrough) gets RoPE
-        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
-        self.register_buffer('rope_freqs', rope_freqs)
+        # Differential attention: split each of 4 groups in half for Q1/Q2, K1/K2
+        self.half_head_dim = self.head_dim // 2
+        assert self.head_dim % 8 == 0, "head_dim must be divisible by 8 for diff attn group halving"
+
+        self.q_norm = RMSNorm(self.half_head_dim)
+        self.k_norm = RMSNorm(self.half_head_dim)
         self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
         self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
 
-        self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
+        # RoPE on group 0 passthrough dims per sub-half = head_dim // 8
+        self.rope_dim = self.head_dim // 8
+        assert self.rope_dim >= 2 and self.rope_dim % 2 == 0, "rope_dim must be even and >= 2"
+        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
+        self.register_buffer('rope_freqs', rope_freqs)
+
+        # Learnable λ for differential attention
+        # λ = exp(λq1·λk1) - exp(λq2·λk2) + λ_init
+        self.lambda_init = 0.8
+        self.lambda_q1 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
+
+        # Post-diff sublayer norm (per-head RMSNorm), scaled by (1 - λ_init)
+        self.diff_norm = RMSNorm(self.half_head_dim)
+        self.diff_norm.weight.data = self.diff_norm.weight.data.bfloat16()
+
+        # Diff attn output is half the original dim (P//2)
+        self.out_proj = nn.Linear(P // 2, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, u, y_ssm):
@@ -334,20 +354,73 @@ class S6Attention(nn.Module):
 
         V = F.silu(self.v_proj(u.bfloat16()))  # (B, L, P)
 
-        Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
-        K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
-        V = V.view(B_batch, L, nh, hd).transpose(1, 2)
+        hhd = self.half_head_dim  # head_dim // 2
 
-        # Positional RoPE only on group 0 (passthrough) dims
-        rd = self.rope_dim
-        pos = torch.arange(L, device=u.device, dtype=Q.dtype)
-        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q.dtype)  # (L, rd//2)
-        freqs = freqs.unsqueeze(0).unsqueeze(0)  # (1, 1, L, rd//2)
-        Q = torch.cat([apply_rotary_emb(Q[..., :rd], freqs), Q[..., rd:]], dim=-1)
-        K = torch.cat([apply_rotary_emb(K[..., :rd], freqs), K[..., rd:]], dim=-1)
+        # Reshape to (B, L, nh, hd), then split each head into two halves
+        Q = Q.view(B_batch, L, nh, hd)
+        K = K.view(B_batch, L, nh, hd)
+        V = V.view(B_batch, L, nh, hd)
 
-        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
+        # Split along head_dim: interleave by groups
+        # Groups are [g0, g1, g2, g3] each hd//4 wide
+        # Split each group in half: g0a,g0b, g1a,g1b, g2a,g2b, g3a,g3b
+        # Q1 gets [g0a, g1a, g2a, g3a], Q2 gets [g0b, g1b, g2b, g3b]
+        gw = hd // 4  # group width
+        ghw = gw // 2  # group half-width
+        q_halves_1, q_halves_2 = [], []
+        k_halves_1, k_halves_2 = [], []
+        v_halves_1, v_halves_2 = [], []
+        for i in range(4):
+            s = i * gw
+            q_halves_1.append(Q[..., s:s+ghw])
+            q_halves_2.append(Q[..., s+ghw:s+gw])
+            k_halves_1.append(K[..., s:s+ghw])
+            k_halves_2.append(K[..., s+ghw:s+gw])
+            v_halves_1.append(V[..., s:s+ghw])
+            v_halves_2.append(V[..., s+ghw:s+gw])
+
+        Q1 = torch.cat(q_halves_1, dim=-1)  # (B, L, nh, hhd)
+        Q2 = torch.cat(q_halves_2, dim=-1)
+        K1 = torch.cat(k_halves_1, dim=-1)
+        K2 = torch.cat(k_halves_2, dim=-1)
+        V1 = torch.cat(v_halves_1, dim=-1)
+        V2 = torch.cat(v_halves_2, dim=-1)
+
+        # QK-norm on each half
+        Q1 = self.q_norm(Q1).transpose(1, 2)  # (B, nh, L, hhd)
+        Q2 = self.q_norm(Q2).transpose(1, 2)
+        K1 = self.k_norm(K1).transpose(1, 2)
+        K2 = self.k_norm(K2).transpose(1, 2)
+        V1 = V1.transpose(1, 2)
+        V2 = V2.transpose(1, 2)
+
+        # Positional RoPE only on group 0 (passthrough) dims — now ghw wide per sub-half
+        rd = self.rope_dim  # = ghw = head_dim // 8
+        pos = torch.arange(L, device=u.device, dtype=Q1.dtype)
+        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q1.dtype)
+        freqs = freqs.unsqueeze(0).unsqueeze(0)
+        Q1 = torch.cat([apply_rotary_emb(Q1[..., :rd], freqs), Q1[..., rd:]], dim=-1)
+        Q2 = torch.cat([apply_rotary_emb(Q2[..., :rd], freqs), Q2[..., rd:]], dim=-1)
+        K1 = torch.cat([apply_rotary_emb(K1[..., :rd], freqs), K1[..., rd:]], dim=-1)
+        K2 = torch.cat([apply_rotary_emb(K2[..., :rd], freqs), K2[..., rd:]], dim=-1)
+
+        # Differential attention: (softmax(Q1K1^T) - λ·softmax(Q2K2^T)) · V
+        # Both sub-halves attend over their respective V half
+        attn1 = F.scaled_dot_product_attention(Q1, K1, V1, is_causal=True)  # (B, nh, L, hhd)
+        attn2 = F.scaled_dot_product_attention(Q2, K2, V2, is_causal=True)
+
+        # λ = exp(λq1·λk1) - exp(λq2·λk2) + λ_init
+        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+               + self.lambda_init)
+
+        diff_out = attn1 - lam * attn2  # (B, nh, L, hhd)
+
+        # Per-head sublayer norm scaled by (1 - λ_init)
+        diff_out = self.diff_norm(diff_out.transpose(1, 2))  # (B, L, nh, hhd)
+        diff_out = diff_out * (1.0 - self.lambda_init)
+
+        attn_out = diff_out.reshape(B_batch, L, nh * hhd)  # (B, L, P//2)
 
         return y_ssm + self.gate * F.silu(self.out_proj(attn_out)).float()
 

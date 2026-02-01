@@ -550,7 +550,7 @@ def make_models(dim, n_layers=1):
 
     # S6: ~50K params/layer
     models['S6'] = _stack(
-        lambda: S6Wrapper(d_model=dim, d_state=80, M=4, num_heads=4),
+        lambda: S6Wrapper(d_model=dim, d_state=64, M=4, num_heads=4),
         n_layers, dim)
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
