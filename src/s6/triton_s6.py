@@ -869,10 +869,10 @@ if HAS_TRITON:
             inj_re = lam * dt * Bu_rot
             inj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-            # acausal center for all non-pass groups
-            m_center = m1 + m2 + m3
-            inj_re += m_center * one_minus_lam * dt * (term_prev1_re + term_next1_re)
-            inj_im += m_center * one_minus_lam * dt * (term_prev1_im + term_next1_im)
+            # causal AB2 for all non-pass groups
+            m_causal = m1 + m2 + m3
+            inj_re += m_causal * one_minus_lam * dt * (term_prev1_re + term_prev2_re)
+            inj_im += m_causal * one_minus_lam * dt * (term_prev1_im + term_prev2_im)
 
             # Store inject for backward
             tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
@@ -1673,9 +1673,9 @@ if HAS_TRITON:
         a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask & has_next1, other=0.0)
 
         # U for grouped inject: Z = alpha_t * U
-        m_center = m1 + m2 + m3
-        U_re = m_center * (Bu_prev1 + Bu_next1)
-        U_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        m_causal = m1 + m2 + m3
+        U_re = m_causal * (Bu_prev1 + a_prev_re * Bu_prev2)
+        U_im = m_causal * (a_prev_im * Bu_prev2)
 
         # Z = alpha * U
         Z_re = a_re * U_re - a_im * U_im
@@ -1705,14 +1705,14 @@ if HAS_TRITON:
         dU_im = dZ_im * a_re - dZ_re * a_im
 
         # Group-specific propagation to neighbors
-        d_prev1 = dU_re * m_center
-        d_prev2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
-        d_next1 = dU_re * m_center
+        d_prev1 = dU_re * m_causal
+        d_prev2 = dU_re * a_prev_re + dU_im * a_prev_im
+        d_next1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
         d_next2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
         # alpha_prev/alpha_next contributions
-        d_a_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
-        d_a_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_a_prev_re = dU_re * Bu_prev2
+        d_a_prev_im = dU_im * Bu_prev2
         d_a_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
         d_a_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
