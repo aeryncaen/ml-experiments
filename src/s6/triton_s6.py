@@ -46,7 +46,7 @@ if HAS_TRITON:
             k_mask = (k + offs_k) < K
             x_tile = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & k_mask[None, :], other=0.0)
             w_tile = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & k_mask[None, :], other=0.0)
-            acc = tl.dot(x_tile, tl.trans(w_tile), acc)
+            acc = tl.dot(x_tile, tl.trans(w_tile), acc, allow_tf32=False)
             x_ptrs += BLOCK_K * stride_xk
             w_ptrs += BLOCK_K * stride_wk
         if HAS_BIAS:
@@ -77,7 +77,7 @@ if HAS_TRITON:
             n_mask = (n + offs_n) < N
             do_tile = tl.load(do_ptrs, mask=(offs_m[:, None] < M) & n_mask[None, :], other=0.0)
             w_tile = tl.load(w_ptrs, mask=n_mask[:, None] & (offs_k[None, :] < K), other=0.0)
-            acc = tl.dot(do_tile, w_tile, acc)
+            acc = tl.dot(do_tile, w_tile, acc, allow_tf32=False)
             do_ptrs += BLOCK_N * stride_don
             w_ptrs += BLOCK_N * stride_wn
         dx_ptrs = d_x_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk
@@ -105,7 +105,7 @@ if HAS_TRITON:
             m_mask = (m + offs_m) < M
             do_tile = tl.load(do_ptrs, mask=m_mask[:, None] & (offs_n[None, :] < N), other=0.0)
             x_tile = tl.load(x_ptrs, mask=m_mask[:, None] & (offs_k[None, :] < K), other=0.0)
-            acc = tl.dot(tl.trans(do_tile), x_tile, acc)
+            acc = tl.dot(tl.trans(do_tile), x_tile, acc, allow_tf32=False)
             do_ptrs += BLOCK_M * stride_dom
             x_ptrs += BLOCK_M * stride_xm
         dw_ptrs = d_w_ptr + offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk
