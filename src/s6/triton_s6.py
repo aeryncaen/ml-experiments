@@ -1262,12 +1262,15 @@ if HAS_TRITON:
             a_im = tl.load(alpha_im_ptr + off, mask=p_mask & active, other=0.0)
             # conj(alpha)
             a_im = -a_im
-            b_re = tl.load(d_h_re_ptr + off, mask=p_mask & active, other=0.0)
-            b_im = tl.load(d_h_im_ptr + off, mask=p_mask & active, other=0.0)
+            d_re = tl.load(d_h_re_ptr + off, mask=p_mask & active, other=0.0)
+            d_im = tl.load(d_h_im_ptr + off, mask=p_mask & active, other=0.0)
             a_re = tl.where(active, a_re, 1.0)
             a_im = tl.where(active, a_im, 0.0)
-            b_re = tl.where(active, b_re, 0.0)
-            b_im = tl.where(active, b_im, 0.0)
+            d_re = tl.where(active, d_re, 0.0)
+            d_im = tl.where(active, d_im, 0.0)
+            # b = conj(alpha) * d_out
+            b_re = a_re * d_re - a_im * d_im
+            b_im = a_re * d_im + a_im * d_re
 
             b_re_new = a_re * b_acc_re - a_im * b_acc_im + b_re
             b_im_new = a_re * b_acc_im + a_im * b_acc_re + b_im
