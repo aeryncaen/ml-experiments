@@ -1,4 +1,8 @@
-"""Triton kernels for S6 — fused projections, activations, scan, and readout."""
+"""Triton kernels for S6 — fused projections, activations, scan, and readout.
+
+Rewrite: 3 fused custom kernels + existing linear kernels.
+Forward: x_proj linear → phi_B (PyTorch) → fused_prescan → cumsum → fused_scan → c_proj linear → fused_postscan
+"""
 
 from __future__ import annotations
 
@@ -14,9 +18,11 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+LOG2E = math.log2(math.e)
 
 if HAS_TRITON:
-    # ========== Reusable kernels (from triton_adaptive_conv.py) ==========
+
+    # ========== Linear kernels (unchanged from triton_adaptive_conv.py) ==========
 
     @triton.jit
     def linear_fwd_kernel(
@@ -106,532 +112,482 @@ if HAS_TRITON:
         dw_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
         tl.store(dw_ptrs, acc, mask=dw_mask)
 
+    # ========== Fused kernel 1: prescan ==========
+    # Per row (B*L rows, P cols): dt/lam activations, Bu RMSNorm+bias, dt_half*theta
+    # Grid: (M,) where M = B*L, one program per row
+
     @triton.jit
-    def rmsnorm_fwd_kernel(
-        x_ptr, gamma_ptr, out_ptr,
-        M, N,
-        stride_xm, stride_xn,
-        stride_om, stride_on,
+    def fused_prescan_kernel(
+        # Input pointers
+        dt_raw_ptr, lam_raw_ptr, theta_ptr,  # from x_proj split: (M, P), (M, P), (M, P//2)
+        Bu_raw_ptr,  # (M, P) from phi_B
+        # Param pointers
+        log_dt_bias_ptr,  # (P,)
+        b_norm_gamma_ptr,  # (P,)
+        b_bias_ptr,  # (P,)
+        # Output pointers
+        dt_ptr, lam_ptr, Bu_ptr,  # (M, P) each
+        dt_half_theta_ptr,  # (M, P//2) — for cumsum outside
+        # Dims
+        M, P,
         eps,
-        BLOCK_N: tl.constexpr,
-    ):
-        pid_m = tl.program_id(0)
-        offs_n = tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
-        x_ptrs = x_ptr + pid_m * stride_xm + offs_n * stride_xn
-        x = tl.load(x_ptrs, mask=n_mask, other=0.0)
-        variance = tl.sum(x * x) / N
-        x_normed = x * tl.rsqrt(variance + eps)
-        gamma = tl.load(gamma_ptr + offs_n, mask=n_mask, other=1.0)
-        out = gamma * x_normed
-        out_ptrs = out_ptr + pid_m * stride_om + offs_n * stride_on
-        tl.store(out_ptrs, out, mask=n_mask)
-
-    @triton.jit
-    def silu_fwd_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        x = tl.load(x_ptr + offs, mask=mask)
-        sig = 1.0 / (1.0 + tl.exp(-x))
-        tl.store(out_ptr + offs, x * sig, mask=mask)
-
-    @triton.jit
-    def silu_bwd_kernel(d_out_ptr, x_ptr, d_x_ptr, N, BLOCK: tl.constexpr):
-        """d_x = d_out * silu'(x) = d_out * sigmoid(x) * (1 + x*(1-sigmoid(x)))"""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        d_out = tl.load(d_out_ptr + offs, mask=mask)
-        x = tl.load(x_ptr + offs, mask=mask)
-        sig = 1.0 / (1.0 + tl.exp(-x))
-        d_x = d_out * sig * (1.0 + x * (1.0 - sig))
-        tl.store(d_x_ptr + offs, d_x, mask=mask)
-
-    @triton.jit
-    def rmsnorm_bwd_kernel(
-        d_out_ptr, x_ptr, gamma_ptr,
-        d_x_ptr, d_gamma_ptr,
-        M, N,
-        stride_dom, stride_don,
-        stride_xm, stride_xn,
-        stride_dxm, stride_dxn,
-        eps,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Backward for RMSNorm. One program per row (M rows).
-        d_gamma is accumulated via atomic_add since each row contributes.
-        """
-        pid_m = tl.program_id(0)
-        offs_n = tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
-
-        x = tl.load(x_ptr + pid_m * stride_xm + offs_n * stride_xn, mask=n_mask, other=0.0)
-        d_out = tl.load(d_out_ptr + pid_m * stride_dom + offs_n * stride_don, mask=n_mask, other=0.0)
-        gamma = tl.load(gamma_ptr + offs_n, mask=n_mask, other=1.0)
-
-        # Forward recompute
-        variance = tl.sum(x * x) / N
-        rrms = tl.rsqrt(variance + eps)
-        x_hat = x * rrms  # normalized
-
-        # d_gamma (per-element, atomically accumulated across rows)
-        d_gamma_local = d_out * x_hat
-        tl.atomic_add(d_gamma_ptr + offs_n, d_gamma_local, mask=n_mask)
-
-        # d_x_hat = d_out * gamma
-        d_x_hat = d_out * gamma
-
-        # d_x = rrms * (d_x_hat - x_hat * mean(d_x_hat * x_hat))
-        inner = tl.sum(d_x_hat * x_hat) / N
-        d_x = rrms * (d_x_hat - x_hat * inner)
-
-        tl.store(d_x_ptr + pid_m * stride_dxm + offs_n * stride_dxn, d_x, mask=n_mask)
-
-    # ========== S6-specific kernels ==========
-
-    @triton.jit
-    def fused_dt_lam_kernel(
-        dt_raw_ptr, lam_raw_ptr, log_dt_bias_ptr,
-        dt_out_ptr, lam_out_ptr,
-        N,
-        BLOCK: tl.constexpr,
-    ):
-        """Fused: dt = softplus(silu(dt_raw) + log_dt_bias), lam = sigmoid(lam_raw)"""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-
-        # dt: softplus(silu(x) + bias), bias pre-broadcast by caller to (B*L*P)
-        dt_raw = tl.load(dt_raw_ptr + offs, mask=mask)
-        sig_dt = 1.0 / (1.0 + tl.exp(-dt_raw))
-        silu_dt = dt_raw * sig_dt
-        pre = silu_dt + tl.load(log_dt_bias_ptr + offs, mask=mask)
-        # softplus: log(1 + exp(x)), numerically stable
-        dt = tl.where(pre > 20.0, pre, tl.log(1.0 + tl.exp(pre)))
-        tl.store(dt_out_ptr + offs, dt, mask=mask)
-
-        # lam: sigmoid
-        lam_raw = tl.load(lam_raw_ptr + offs, mask=mask)
-        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
-        tl.store(lam_out_ptr + offs, lam, mask=mask)
-
-    @triton.jit
-    def fused_dt_lam_bwd_kernel(
-        d_dt_ptr, d_lam_ptr,
-        dt_raw_ptr, lam_raw_ptr, log_dt_bias_ptr,
-        d_dt_raw_ptr, d_lam_raw_ptr, d_log_dt_bias_ptr,
-        N,
-        BLOCK: tl.constexpr,
-    ):
-        """Backward for fused dt/lam activations."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-
-        # Forward recompute for dt
-        dt_raw = tl.load(dt_raw_ptr + offs, mask=mask)
-        sig_dt = 1.0 / (1.0 + tl.exp(-dt_raw))
-        silu_dt = dt_raw * sig_dt
-        bias = tl.load(log_dt_bias_ptr + offs, mask=mask)
-        pre = silu_dt + bias
-
-        # softplus backward: d_pre = d_dt * sigmoid(pre)
-        d_dt = tl.load(d_dt_ptr + offs, mask=mask)
-        sig_pre = 1.0 / (1.0 + tl.exp(-pre))
-        d_pre = d_dt * sig_pre
-
-        # d_log_dt_bias = d_pre (additive)
-        tl.store(d_log_dt_bias_ptr + offs, d_pre, mask=mask)
-
-        # silu backward: d_dt_raw = d_pre * (sig_dt + dt_raw * sig_dt * (1 - sig_dt))
-        d_silu = d_pre * (sig_dt + dt_raw * sig_dt * (1.0 - sig_dt))
-        tl.store(d_dt_raw_ptr + offs, d_silu, mask=mask)
-
-        # lam backward: d_lam_raw = d_lam * lam * (1 - lam)
-        lam_raw = tl.load(lam_raw_ptr + offs, mask=mask)
-        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
-        d_lam = tl.load(d_lam_ptr + offs, mask=mask)
-        d_lam_raw = d_lam * lam * (1.0 - lam)
-        tl.store(d_lam_raw_ptr + offs, d_lam_raw, mask=mask)
-
-    @triton.jit
-    def rope_fwd_kernel(
-        x_ptr, angles_ptr, out_ptr,
-        N, P,  # N = total elements in batch dims, P = last dim (even)
-        BLOCK: tl.constexpr,
-    ):
-        """RoPE: rotate pairs of elements by angle. x: (..., P), angles: (..., P//2)."""
-        pid = tl.program_id(0)
-        # Each program handles one row of P elements
-        row = pid
-        if row >= N:
-            return
-        half_P = P // 2
-        offs = tl.arange(0, BLOCK)
-        mask = offs < half_P
-
-        x_base = row * P
-        a_base = row * half_P
-
-        x1 = tl.load(x_ptr + x_base + offs * 2, mask=mask)
-        x2 = tl.load(x_ptr + x_base + offs * 2 + 1, mask=mask)
-        angle = tl.load(angles_ptr + a_base + offs, mask=mask)
-
-        cos_a = tl.cos(angle)
-        sin_a = tl.sin(angle)
-
-        out1 = x1 * cos_a - x2 * sin_a
-        out2 = x1 * sin_a + x2 * cos_a
-
-        tl.store(out_ptr + x_base + offs * 2, out1, mask=mask)
-        tl.store(out_ptr + x_base + offs * 2 + 1, out2, mask=mask)
-
-    @triton.jit
-    def rope_bwd_kernel(
-        d_out_ptr, angles_ptr, d_x_ptr, d_angles_ptr,
-        x_ptr,  # need original x for d_angles
-        N, P,
-        BLOCK: tl.constexpr,
-    ):
-        """Backward for RoPE."""
-        pid = tl.program_id(0)
-        row = pid
-        if row >= N:
-            return
-        half_P = P // 2
-        offs = tl.arange(0, BLOCK)
-        mask = offs < half_P
-
-        x_base = row * P
-        a_base = row * half_P
-
-        d_o1 = tl.load(d_out_ptr + x_base + offs * 2, mask=mask)
-        d_o2 = tl.load(d_out_ptr + x_base + offs * 2 + 1, mask=mask)
-        angle = tl.load(angles_ptr + a_base + offs, mask=mask)
-        x1 = tl.load(x_ptr + x_base + offs * 2, mask=mask)
-        x2 = tl.load(x_ptr + x_base + offs * 2 + 1, mask=mask)
-
-        cos_a = tl.cos(angle)
-        sin_a = tl.sin(angle)
-
-        # d_x1 = d_o1 * cos + d_o2 * sin
-        # d_x2 = -d_o1 * sin + d_o2 * cos
-        d_x1 = d_o1 * cos_a + d_o2 * sin_a
-        d_x2 = -d_o1 * sin_a + d_o2 * cos_a
-        tl.store(d_x_ptr + x_base + offs * 2, d_x1, mask=mask)
-        tl.store(d_x_ptr + x_base + offs * 2 + 1, d_x2, mask=mask)
-
-        # d_angle = d_o1 * (-x1*sin - x2*cos) + d_o2 * (x1*cos - x2*sin)
-        d_a = d_o1 * (-x1 * sin_a - x2 * cos_a) + d_o2 * (x1 * cos_a - x2 * sin_a)
-        tl.store(d_angles_ptr + a_base + offs, d_a, mask=mask)
-
-    @triton.jit
-    def complex_discretize_fwd_kernel(
-        dt_ptr, lam_ptr, Bu_ptr, Bu_prev_ptr,
-        A_real_ptr, A_imag_ptr,
-        alpha_re_ptr, alpha_im_ptr, inject_re_ptr, inject_im_ptr,
-        N, P,
-        BLOCK: tl.constexpr,
-    ):
-        """Compute complex alpha = exp(dt * A) and trapezoidal inject.
-        All inputs real except A which is complex (stored as separate real/imag).
-        Output alpha and inject are complex (stored as separate real/imag).
-        """
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-
-        dt = tl.load(dt_ptr + offs, mask=mask)
-        lam = tl.load(lam_ptr + offs, mask=mask)
-        Bu = tl.load(Bu_ptr + offs, mask=mask)
-        Bu_prev = tl.load(Bu_prev_ptr + offs, mask=mask)
-
-        # A is (P,), index with offs % P
-        p_idx = offs % P
-        a_re = tl.load(A_real_ptr + p_idx, mask=mask)
-        a_im = tl.load(A_imag_ptr + p_idx, mask=mask)
-
-        # alpha = exp(dt * A) where A = a_re + j*a_im
-        # exp(dt*(a_re + j*a_im)) = exp(dt*a_re) * (cos(dt*a_im) + j*sin(dt*a_im))
-        exp_re = tl.exp(dt * a_re)
-        angle = dt * a_im
-        alpha_re = exp_re * tl.cos(angle)
-        alpha_im = exp_re * tl.sin(angle)
-
-        tl.store(alpha_re_ptr + offs, alpha_re, mask=mask)
-        tl.store(alpha_im_ptr + offs, alpha_im, mask=mask)
-
-        # inject = lam * dt * Bu + (1-lam) * dt * alpha * Bu_prev
-        # alpha is complex, Bu/Bu_prev are real, so:
-        # inject_re = lam*dt*Bu + (1-lam)*dt*(alpha_re*Bu_prev)
-        # inject_im = (1-lam)*dt*(alpha_im*Bu_prev)
-        fwd_term = lam * dt * Bu
-        bwd_re = (1.0 - lam) * dt * alpha_re * Bu_prev
-        bwd_im = (1.0 - lam) * dt * alpha_im * Bu_prev
-
-        tl.store(inject_re_ptr + offs, fwd_term + bwd_re, mask=mask)
-        tl.store(inject_im_ptr + offs, bwd_im, mask=mask)
-
-    @triton.jit
-    def complex_discretize_bwd_kernel(
-        d_inject_re_ptr, d_inject_im_ptr, d_alpha_re_ptr, d_alpha_im_ptr,
-        dt_ptr, lam_ptr, Bu_ptr, Bu_prev_ptr,
-        A_real_ptr, A_imag_ptr,
-        alpha_re_ptr, alpha_im_ptr,
-        d_dt_ptr, d_lam_ptr, d_Bu_ptr, d_Bu_prev_ptr,
-        N, P,
-        BLOCK: tl.constexpr,
-    ):
-        """Backward for complex discretization."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-
-        d_inj_re = tl.load(d_inject_re_ptr + offs, mask=mask)
-        d_inj_im = tl.load(d_inject_im_ptr + offs, mask=mask)
-        d_alph_re = tl.load(d_alpha_re_ptr + offs, mask=mask)
-        d_alph_im = tl.load(d_alpha_im_ptr + offs, mask=mask)
-
-        dt = tl.load(dt_ptr + offs, mask=mask)
-        lam = tl.load(lam_ptr + offs, mask=mask)
-        Bu = tl.load(Bu_ptr + offs, mask=mask)
-        Bu_prev = tl.load(Bu_prev_ptr + offs, mask=mask)
-
-        p_idx = offs % P
-        a_re = tl.load(A_real_ptr + p_idx, mask=mask)
-        a_im = tl.load(A_imag_ptr + p_idx, mask=mask)
-        alpha_re = tl.load(alpha_re_ptr + offs, mask=mask)
-        alpha_im = tl.load(alpha_im_ptr + offs, mask=mask)
-
-        one_minus_lam = 1.0 - lam
-
-        # d_Bu = d_inj_re * lam * dt
-        d_Bu = d_inj_re * lam * dt
-        tl.store(d_Bu_ptr + offs, d_Bu, mask=mask)
-
-        # d_Bu_prev = d_inj_re * (1-lam)*dt*alpha_re + d_inj_im * (1-lam)*dt*alpha_im
-        d_Bu_prev = (d_inj_re * alpha_re + d_inj_im * alpha_im) * one_minus_lam * dt
-        tl.store(d_Bu_prev_ptr + offs, d_Bu_prev, mask=mask)
-
-        # d_lam: d_inj_re * (dt*Bu - dt*alpha_re*Bu_prev) + d_inj_im * (-dt*alpha_im*Bu_prev)
-        d_lam = d_inj_re * dt * (Bu - alpha_re * Bu_prev) + d_inj_im * (-dt * alpha_im * Bu_prev)
-        tl.store(d_lam_ptr + offs, d_lam, mask=mask)
-
-        # d_alpha from inject: d_inj_re * (1-lam)*dt*Bu_prev (re part), d_inj_im * (1-lam)*dt*Bu_prev (im part)
-        d_alph_re = d_alph_re + d_inj_re * one_minus_lam * dt * Bu_prev
-        d_alph_im = d_alph_im + d_inj_im * one_minus_lam * dt * Bu_prev
-
-        # d_dt from inject: d_inj_re * (lam*Bu + (1-lam)*alpha_re*Bu_prev) + d_inj_im * (1-lam)*alpha_im*Bu_prev
-        d_dt_from_inject = (d_inj_re * (lam * Bu + one_minus_lam * alpha_re * Bu_prev)
-                           + d_inj_im * one_minus_lam * alpha_im * Bu_prev)
-
-        # d_dt from alpha: alpha = exp(dt*A), d_alpha/d_dt = A * alpha
-        # d_dt += d_alph_re * (a_re*alpha_re - a_im*alpha_im) + d_alph_im * (a_re*alpha_im + a_im*alpha_re)
-        d_dt_from_alpha = (d_alph_re * (a_re * alpha_re - a_im * alpha_im)
-                          + d_alph_im * (a_re * alpha_im + a_im * alpha_re))
-
-        tl.store(d_dt_ptr + offs, d_dt_from_inject + d_dt_from_alpha, mask=mask)
-
-    @triton.jit
-    def chunked_scan_fwd_kernel(
-        alpha_re_ptr, alpha_im_ptr, inject_re_ptr, inject_im_ptr,
-        state_re_ptr, state_im_ptr,
-        out_re_ptr, out_im_ptr,
-        new_state_re_ptr, new_state_im_ptr,
-        B_batch, K, P,
-        stride_al, stride_ap,
         BLOCK_P: tl.constexpr,
     ):
-        """Intra-chunk scan via decay matrix matmul for one (batch, p_block).
-        K = chunk size, P = state dim.
-        Computes h[i] = (prod_{t=j+1}^{i} alpha[t]) * inject[j] summed over j<=i, plus carried state.
-        """
+        row = tl.program_id(0)
+        if row >= M:
+            return
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+
+        # --- dt activation: softplus(silu(dt_raw) + log_dt_bias) ---
+        dt_raw = tl.load(dt_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        sig_dt = 1.0 / (1.0 + tl.exp(-dt_raw))
+        silu_dt = dt_raw * sig_dt
+        bias = tl.load(log_dt_bias_ptr + offs_p, mask=p_mask, other=0.0)
+        pre = silu_dt + bias
+        dt = tl.where(pre > 20.0, pre, tl.log(1.0 + tl.exp(pre)))
+        tl.store(dt_ptr + row * P + offs_p, dt, mask=p_mask)
+
+        # --- lam activation: sigmoid(lam_raw) ---
+        lam_raw = tl.load(lam_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
+        tl.store(lam_ptr + row * P + offs_p, lam, mask=p_mask)
+
+        # --- Bu: RMSNorm(Bu_raw) + b_bias ---
+        Bu_raw = tl.load(Bu_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        variance = tl.sum(Bu_raw * Bu_raw) / P
+        Bu_normed = Bu_raw * tl.rsqrt(variance + eps)
+        gamma = tl.load(b_norm_gamma_ptr + offs_p, mask=p_mask, other=1.0)
+        b_bias = tl.load(b_bias_ptr + offs_p, mask=p_mask, other=0.0)
+        Bu = gamma * Bu_normed + b_bias
+        tl.store(Bu_ptr + row * P + offs_p, Bu, mask=p_mask)
+
+        # --- dt_half * theta: for cumsum ---
+        half_P = P // 2
+        offs_h = tl.arange(0, BLOCK_P // 2)
+        h_mask = offs_h < half_P
+        # dt_half = dt.view(P//2, 2).mean(-1) = (dt[2i] + dt[2i+1]) / 2
+        dt_even = tl.load(dt_ptr + row * P + offs_h * 2, mask=h_mask, other=0.0)
+        dt_odd = tl.load(dt_ptr + row * P + offs_h * 2 + 1, mask=h_mask, other=0.0)
+        dt_half = (dt_even + dt_odd) * 0.5
+        theta = tl.load(theta_ptr + row * half_P + offs_h, mask=h_mask, other=0.0)
+        tl.store(dt_half_theta_ptr + row * half_P + offs_h, dt_half * theta, mask=h_mask)
+
+    # ========== Fused kernel 2: scan ==========
+    # Grid: (B, cdiv(P, BLOCK_P_SCAN))
+    # Each program loops over ALL L positions sequentially for its batch element
+    # and state-dim block. Fuses: RoPE on Bu, shift, complex discretize, recurrence.
+
+    @triton.jit
+    def fused_scan_kernel(
+        # Inputs (all contiguous, row-major)
+        dt_ptr,  # (B, L, P)
+        lam_ptr,  # (B, L, P)
+        Bu_ptr,  # (B, L, P)
+        cum_theta_ptr,  # (B, L, P//2)
+        # SSM params
+        A_real_ptr,  # (P,) negative real parts (already negated: -exp(log_A_real))
+        A_imag_ptr,  # (P,) imaginary parts
+        # Outputs
+        h_re_ptr, h_im_ptr,  # (B, L, P)
+        alpha_re_ptr, alpha_im_ptr,  # (B, L, P) — saved for backward
+        inject_re_ptr, inject_im_ptr,  # (B, L, P) — saved for backward
+        Bu_rot_ptr,  # (B, L, P) — saved for backward (Bu after RoPE)
+        # Dims
+        B_batch, L, P,
+        LOG2E_VAL: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+    ):
         pid_b = tl.program_id(0)
         pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
 
-        p_offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
-        p_mask = p_offs < P
+        # Load A params (static)
+        a_re = tl.load(A_real_ptr + offs_p, mask=p_mask, other=0.0)  # negative
+        a_im = tl.load(A_imag_ptr + offs_p, mask=p_mask, other=0.0)
 
-        # Load incoming state for this batch element
-        s_re = tl.load(state_re_ptr + pid_b * P + p_offs, mask=p_mask, other=0.0)
-        s_im = tl.load(state_im_ptr + pid_b * P + p_offs, mask=p_mask, other=0.0)
+        # Running state (complex)
+        s_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        s_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-        # Sequential scan within chunk (K is small, typically 32-64)
-        for t in range(K):
-            a_off = pid_b * K * P + t * P + p_offs
-            a_re = tl.load(alpha_re_ptr + a_off, mask=p_mask)
-            a_im = tl.load(alpha_im_ptr + a_off, mask=p_mask)
-            inj_re = tl.load(inject_re_ptr + a_off, mask=p_mask)
-            inj_im = tl.load(inject_im_ptr + a_off, mask=p_mask)
+        # Previous Bu_rotated for trapezoidal (initialized to zero)
+        Bu_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        Bu_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-            # complex multiply: s = alpha * s + inject
-            new_re = a_re * s_re - a_im * s_im + inj_re
-            new_im = a_re * s_im + a_im * s_re + inj_im
+        # Base offsets
+        base = pid_b * L * P
+        half_P = P // 2
+        base_theta = pid_b * L * half_P
+
+        # Pair indices for RoPE: offs_p maps to pair index offs_p // 2
+        # and within-pair index offs_p % 2
+        pair_idx = offs_p // 2  # (BLOCK_P,)
+        is_odd = (offs_p % 2).to(tl.float32)  # 0.0 or 1.0
+        is_even = 1.0 - is_odd
+
+        for t in range(L):
+            off = base + t * P + offs_p
+            off_theta = base_theta + t * half_P + pair_idx
+
+            # Load dt, lam, Bu for this position
+            dt = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+            lam = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
+            Bu = tl.load(Bu_ptr + off, mask=p_mask, other=0.0)
+
+            # Load cum_theta for this position (P//2 values, indexed by pair)
+            angle = tl.load(cum_theta_ptr + off_theta, mask=p_mask, other=0.0)
+
+            # RoPE on Bu: rotate pairs
+            # For even index: Bu_rot = Bu_even * cos - Bu_odd * sin
+            # For odd index:  Bu_rot = Bu_even * sin + Bu_odd * cos
+            # We need the paired value. Use shuffle trick:
+            # Even elements need odd partner, odd elements need even partner.
+            cos_a = tl.cos(angle)
+            sin_a = tl.sin(angle)
+
+            # Load the partner value
+            partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+            partner_off = base + t * P + partner_offs
+            partner_mask = partner_offs < P
+            Bu_partner = tl.load(Bu_ptr + partner_off, mask=p_mask & partner_mask, other=0.0)
+
+            # Apply rotation
+            # even: out = Bu * cos - partner * sin
+            # odd:  out = partner * sin + Bu * cos  =>  partner_even * sin + Bu_odd * cos
+            # Wait — standard RoPE:
+            #   x1' = x1*cos - x2*sin  (even)
+            #   x2' = x1*sin + x2*cos  (odd)
+            # So even needs itself*cos - odd_partner*sin
+            #    odd needs even_partner*sin + itself*cos
+            Bu_rot = tl.where(
+                is_odd > 0.5,
+                Bu_partner * sin_a + Bu * cos_a,  # odd: even_partner*sin + self*cos
+                Bu * cos_a - Bu_partner * sin_a,  # even: self*cos - odd_partner*sin
+            )
+
+            # Store Bu_rot for backward
+            tl.store(Bu_rot_ptr + off, Bu_rot, mask=p_mask)
+
+            # Complex discretization: alpha = exp(dt * A)
+            # Using exp2 trick: exp(x) = exp2(x * log2(e))
+            dt_a_re = dt * a_re  # dt * A_real (A_real is negative)
+            dt_a_im = dt * a_im
+
+            exp_re = tl.exp2(dt_a_re * LOG2E_VAL)
+            alpha_re_t = exp_re * tl.cos(dt_a_im)
+            alpha_im_t = exp_re * tl.sin(dt_a_im)
+
+            # Store alpha for backward
+            tl.store(alpha_re_ptr + off, alpha_re_t, mask=p_mask)
+            tl.store(alpha_im_ptr + off, alpha_im_t, mask=p_mask)
+
+            # Trapezoidal inject (Bu_rot is real, alpha is complex)
+            # inject = lam*dt*Bu_rot + (1-lam)*dt*alpha*Bu_prev_rot
+            # Bu_prev_rot is complex (from previous position's RoPE)
+            # Actually — Bu_rot is REAL (RoPE applied to real Bu gives real result)
+            # Bu_prev is the PREVIOUS position's Bu_rot, also real
+            # So inject_re = lam*dt*Bu_rot + (1-lam)*dt*(alpha_re*Bu_prev_re - alpha_im*Bu_prev_im)
+            # inject_im = (1-lam)*dt*(alpha_re*Bu_prev_im + alpha_im*Bu_prev_re)
+            # But Bu_prev_im = 0 since Bu_prev is real! So:
+            # inject_re = lam*dt*Bu_rot + (1-lam)*dt*alpha_re*Bu_prev_re
+            # inject_im = (1-lam)*dt*alpha_im*Bu_prev_re
+            one_minus_lam = 1.0 - lam
+            inj_re = lam * dt * Bu_rot + one_minus_lam * dt * alpha_re_t * Bu_prev_re
+            inj_im = one_minus_lam * dt * alpha_im_t * Bu_prev_re
+
+            # Store inject for backward
+            tl.store(inject_re_ptr + off, inj_re, mask=p_mask)
+            tl.store(inject_im_ptr + off, inj_im, mask=p_mask)
+
+            # Recurrence: h[t] = alpha[t] * h[t-1] + inject[t]
+            new_re = alpha_re_t * s_re - alpha_im_t * s_im + inj_re
+            new_im = alpha_re_t * s_im + alpha_im_t * s_re + inj_im
             s_re = new_re
             s_im = new_im
 
-            tl.store(out_re_ptr + a_off, s_re, mask=p_mask)
-            tl.store(out_im_ptr + a_off, s_im, mask=p_mask)
+            # Store h
+            tl.store(h_re_ptr + off, s_re, mask=p_mask)
+            tl.store(h_im_ptr + off, s_im, mask=p_mask)
 
-        # Store final state
-        tl.store(new_state_re_ptr + pid_b * P + p_offs, s_re, mask=p_mask)
-        tl.store(new_state_im_ptr + pid_b * P + p_offs, s_im, mask=p_mask)
+            # Bu_prev for next iteration (real, from current Bu_rot)
+            Bu_prev_re = Bu_rot
+
+    # ========== Fused kernel 3: postscan ==========
+    # Computes c_gate (silu + rmsnorm + bias + RoPE) and stores it.
+    # Grid: (M,) where M = B*L
+    # Separate readout kernel handles the MIMO matmul + skip + silu.
 
     @triton.jit
-    def chunked_scan_bwd_kernel(
-        alpha_re_ptr, alpha_im_ptr,
-        d_out_re_ptr, d_out_im_ptr,
-        d_alpha_re_ptr, d_alpha_im_ptr,
-        d_inject_re_ptr, d_inject_im_ptr,
-        d_state_re_ptr, d_state_im_ptr,
-        h_re_ptr, h_im_ptr,  # saved forward states (B, K, P) — h[t-1] needed
-        state_re_ptr, state_im_ptr,  # incoming state for this chunk
-        B_batch, K, P,
+    def fused_cgate_kernel(
+        # Inputs
+        c_proj_out_ptr,  # (M, P) — output of c_proj linear
+        cum_theta_ptr,  # (B, L, P//2) — same as used in scan
+        # Params
+        c_norm_gamma_ptr,  # (P,)
+        c_bias_ptr,  # (P,)
+        # Output
+        c_gate_ptr,  # (M, P)
+        # Dims
+        M, P, B_batch, L,
+        eps,
         BLOCK_P: tl.constexpr,
     ):
-        """Backward scan: reverse sequential through chunk.
-        d_h[t] comes from d_out[t] + carried adjoint from d_h[t+1].
-        d_alpha[t] = d_h[t] * conj(h[t-1])  (complex product rule)
-        d_inject[t] = d_h[t]
-        """
+        row = tl.program_id(0)
+        if row >= M:
+            return
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        half_P = P // 2
+
+        # silu(c_proj_out)
+        x = tl.load(c_proj_out_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        sig = 1.0 / (1.0 + tl.exp(-x))
+        x_silu = x * sig
+
+        # RMSNorm
+        variance = tl.sum(x_silu * x_silu) / P
+        x_normed = x_silu * tl.rsqrt(variance + eps)
+        gamma = tl.load(c_norm_gamma_ptr + offs_p, mask=p_mask, other=1.0)
+        c_gate = gamma * x_normed
+
+        # + bias
+        c_b = tl.load(c_bias_ptr + offs_p, mask=p_mask, other=0.0)
+        c_gate = c_gate + c_b
+
+        # RoPE using cum_theta
+        # cum_theta is (B, L, P//2), row index maps to (b, l)
+        # b = row // L, l = row % L — but cum_theta is stored as (B*L, P//2) contiguous
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+
+        angle = tl.load(cum_theta_ptr + row * half_P + pair_idx, mask=p_mask, other=0.0)
+        cos_a = tl.cos(angle)
+        sin_a = tl.sin(angle)
+
+        partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+        partner_mask = partner_offs < P
+        c_gate_partner = tl.load(c_proj_out_ptr + row * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+        # Need to recompute partner's silu + rmsnorm + bias for correct rotation...
+        # Actually we already computed c_gate for ALL elements in this row.
+        # The RoPE needs to rotate c_gate pairs, not c_proj_out pairs.
+        # But we just computed c_gate element-by-element and now need partner's c_gate value.
+        # Problem: we can't easily get the partner's c_gate since it's computed from the same
+        # RMSNorm normalization factor. But c_gate IS fully computed above (before RoPE).
+        # We need c_gate[partner] to do RoPE. Since all elements share the same norm factor,
+        # and we have all elements in registers, we can use the partner index directly.
+        #
+        # Actually c_gate is in registers as a vector — we need to access c_gate[partner_offs].
+        # In Triton, we can't index into a register vector by another vector.
+        # Solution: store c_gate to global memory, then reload partner. Two stores+loads
+        # but on same cache line so should be fast.
+
+        # Store pre-RoPE c_gate temporarily
+        tl.store(c_gate_ptr + row * P + offs_p, c_gate, mask=p_mask)
+
+        # Reload partner value
+        c_gate_partner = tl.load(c_gate_ptr + row * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+
+        c_gate_rot = tl.where(
+            is_odd > 0.5,
+            c_gate_partner * sin_a + c_gate * cos_a,
+            c_gate * cos_a - c_gate_partner * sin_a,
+        )
+
+        tl.store(c_gate_ptr + row * P + offs_p, c_gate_rot, mask=p_mask)
+
+    @triton.jit
+    def fused_readout_kernel(
+        # Inputs
+        h_re_ptr, h_im_ptr,  # (M, P) — scan output
+        c_gate_ptr,  # (M, P) — real gate
+        C_re_ptr, C_im_ptr,  # (H, P) — static MIMO matrix
+        u_ptr,  # (M, H) — original input
+        D_ptr,  # (H,) — skip param
+        # Output
+        out_ptr,  # (M, H)
+        # Dims
+        M, H, P,
+        BLOCK_H: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+    ):
+        """Per (row, h_block): gate h, MIMO readout, skip+silu."""
+        pid_m = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        if pid_m >= M:
+            return
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+
+        # Load h and c_gate for this row (full P in one shot — P<=128 typical)
+        h_re = tl.load(h_re_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+        h_im = tl.load(h_im_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+        gate = tl.load(c_gate_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+
+        # Complex gating: h_gated = h * gate (gate is real)
+        hg_re = h_re * gate  # (BLOCK_P,)
+        hg_im = h_im * gate  # (BLOCK_P,)
+
+        # MIMO readout: y[h] = sum_p (C_re[h,p]*hg_re[p] - C_im[h,p]*hg_im[p])
+        # Load C as (BLOCK_H, BLOCK_P) tile, reduce with elementwise multiply + sum
+        C_re_tile = tl.load(
+            C_re_ptr + offs_h[:, None] * P + offs_p[None, :],
+            mask=h_mask[:, None] & p_mask[None, :], other=0.0
+        )
+        C_im_tile = tl.load(
+            C_im_ptr + offs_h[:, None] * P + offs_p[None, :],
+            mask=h_mask[:, None] & p_mask[None, :], other=0.0
+        )
+        y_vals = tl.sum(C_re_tile * hg_re[None, :] - C_im_tile * hg_im[None, :], axis=1)  # (BLOCK_H,)
+
+        # Skip + silu: out = silu(y + u * D)
+        u_vals = tl.load(u_ptr + pid_m * H + offs_h, mask=h_mask, other=0.0)
+        d_vals = tl.load(D_ptr + offs_h, mask=h_mask, other=0.0)
+        x = y_vals + u_vals * d_vals
+        sig = 1.0 / (1.0 + tl.exp(-x))
+        out = x * sig
+
+        tl.store(out_ptr + pid_m * H + offs_h, out, mask=h_mask)
+
+    # ========== Fused scan backward kernel ==========
+    # Single launch: grid (B, cdiv(P, BLOCK_P)), loops over L in reverse
+
+    @triton.jit
+    def fused_scan_bwd_kernel(
+        # Forward saved tensors
+        alpha_re_ptr, alpha_im_ptr,  # (B, L, P)
+        h_re_ptr, h_im_ptr,  # (B, L, P) — forward hidden states
+        # Gradient inputs
+        d_h_re_ptr, d_h_im_ptr,  # (B, L, P) — grad from postscan
+        # Gradient outputs
+        d_alpha_re_ptr, d_alpha_im_ptr,  # (B, L, P)
+        d_inject_re_ptr, d_inject_im_ptr,  # (B, L, P)
+        # Dims
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
         pid_b = tl.program_id(0)
         pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
 
-        p_offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
-        p_mask = p_offs < P
-
-        # Adjoint state (carried backward)
+        # Adjoint state (carried backward through time)
         adj_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
         adj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
-        for t_rev in range(K):
-            t = K - 1 - t_rev
-            a_off = pid_b * K * P + t * P + p_offs
+        for t_rev in range(L):
+            t = L - 1 - t_rev
+            off = base + t * P + offs_p
 
-            # d_h[t] = d_out[t] + alpha[t+1]^* . adj  (but we process in reverse)
-            # Actually: h[t] = alpha[t]*h[t-1] + inject[t]
-            # d_h[t-1] += alpha[t]^* . d_h[t]  (adjoint through alpha*h[t-1])
-            # d_alpha[t] = d_h[t] . h[t-1]^*
-            # d_inject[t] = d_h[t]
-
-            d_out_re = tl.load(d_out_re_ptr + a_off, mask=p_mask, other=0.0)
-            d_out_im = tl.load(d_out_im_ptr + a_off, mask=p_mask, other=0.0)
-
-            # Total gradient at this position
+            # Total gradient at position t
+            d_out_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
+            d_out_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
             d_h_re = d_out_re + adj_re
             d_h_im = d_out_im + adj_im
 
-            # d_inject = d_h (direct)
-            tl.store(d_inject_re_ptr + a_off, d_h_re, mask=p_mask)
-            tl.store(d_inject_im_ptr + a_off, d_h_im, mask=p_mask)
+            # d_inject = d_h (direct, since h = alpha*h_prev + inject)
+            tl.store(d_inject_re_ptr + off, d_h_re, mask=p_mask)
+            tl.store(d_inject_im_ptr + off, d_h_im, mask=p_mask)
 
             # Load alpha[t]
-            a_re = tl.load(alpha_re_ptr + a_off, mask=p_mask)
-            a_im = tl.load(alpha_im_ptr + a_off, mask=p_mask)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
 
             # Load h[t-1]
             if t > 0:
-                prev_off = pid_b * K * P + (t - 1) * P + p_offs
-                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask)
-                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask)
+                prev_off = base + (t - 1) * P + offs_p
+                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask, other=0.0)
+                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask, other=0.0)
             else:
-                h_prev_re = tl.load(state_re_ptr + pid_b * P + p_offs, mask=p_mask, other=0.0)
-                h_prev_im = tl.load(state_im_ptr + pid_b * P + p_offs, mask=p_mask, other=0.0)
+                h_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+                h_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
 
             # d_alpha[t] = d_h[t] * conj(h[t-1])
-            # (d_re + j*d_im) * (h_re - j*h_im) = (d_re*h_re + d_im*h_im) + j*(d_im*h_re - d_re*h_im)
             d_a_re = d_h_re * h_prev_re + d_h_im * h_prev_im
             d_a_im = d_h_im * h_prev_re - d_h_re * h_prev_im
-            tl.store(d_alpha_re_ptr + a_off, d_a_re, mask=p_mask)
-            tl.store(d_alpha_im_ptr + a_off, d_a_im, mask=p_mask)
+            tl.store(d_alpha_re_ptr + off, d_a_re, mask=p_mask)
+            tl.store(d_alpha_im_ptr + off, d_a_im, mask=p_mask)
 
-            # Carry adjoint: adj = conj(alpha[t]) * d_h[t]
-            # (a_re - j*a_im) * (d_re + j*d_im) = (a_re*d_re + a_im*d_im) + j*(a_re*d_im - a_im*d_re)
+            # Carry adjoint backward: adj = conj(alpha[t]) * d_h[t]
             adj_re = a_re * d_h_re + a_im * d_h_im
             adj_im = a_re * d_h_im - a_im * d_h_re
 
-        # Store adjoint as d_state (gradient w.r.t. incoming state)
-        tl.store(d_state_re_ptr + pid_b * P + p_offs, adj_re, mask=p_mask)
-        tl.store(d_state_im_ptr + pid_b * P + p_offs, adj_im, mask=p_mask)
+    # ========== Fused prescan backward kernel ==========
 
     @triton.jit
-    def complex_gate_readout_fwd_kernel(
-        h_re_ptr, h_im_ptr, gate_ptr, out_re_ptr, out_im_ptr,
-        N,
-        BLOCK: tl.constexpr,
+    def fused_prescan_bwd_kernel(
+        # Gradient inputs
+        d_dt_ptr,  # (M, P) — total gradient on dt
+        d_lam_ptr,  # (M, P) — gradient on lam
+        d_Bu_ptr,  # (M, P) — gradient on Bu (after norm+bias)
+        # Forward saved values
+        dt_raw_ptr, lam_raw_ptr,  # (M, P)
+        log_dt_bias_ptr,  # (P,)
+        Bu_raw_ptr,  # (M, P)
+        b_norm_gamma_ptr,  # (P,)
+        # Gradient outputs
+        d_dt_raw_ptr, d_lam_raw_ptr,  # (M, P)
+        d_log_dt_bias_ptr,  # (M, P) — per-row, caller sums to (P,)
+        d_Bu_raw_ptr,  # (M, P)
+        d_b_norm_gamma_ptr,  # (M, P) — per-row, caller sums to (P,)
+        d_b_bias_ptr,  # (M, P) — per-row, caller sums to (P,)
+        # Dims
+        M, P,
+        eps,
+        BLOCK_P: tl.constexpr,
     ):
-        """h_gated = h * gate where h is complex, gate is real."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        h_re = tl.load(h_re_ptr + offs, mask=mask)
-        h_im = tl.load(h_im_ptr + offs, mask=mask)
-        g = tl.load(gate_ptr + offs, mask=mask)
-        tl.store(out_re_ptr + offs, h_re * g, mask=mask)
-        tl.store(out_im_ptr + offs, h_im * g, mask=mask)
+        row = tl.program_id(0)
+        if row >= M:
+            return
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
 
-    @triton.jit
-    def complex_gate_readout_bwd_kernel(
-        d_out_re_ptr, d_out_im_ptr,
-        h_re_ptr, h_im_ptr, gate_ptr,
-        d_h_re_ptr, d_h_im_ptr, d_gate_ptr,
-        N,
-        BLOCK: tl.constexpr,
-    ):
-        """Backward for h_gated = h * gate."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        d_re = tl.load(d_out_re_ptr + offs, mask=mask)
-        d_im = tl.load(d_out_im_ptr + offs, mask=mask)
-        h_re = tl.load(h_re_ptr + offs, mask=mask)
-        h_im = tl.load(h_im_ptr + offs, mask=mask)
-        g = tl.load(gate_ptr + offs, mask=mask)
-        tl.store(d_h_re_ptr + offs, d_re * g, mask=mask)
-        tl.store(d_h_im_ptr + offs, d_im * g, mask=mask)
-        tl.store(d_gate_ptr + offs, d_re * h_re + d_im * h_im, mask=mask)
+        # --- dt backward: d_dt -> d_dt_raw, d_log_dt_bias ---
+        d_dt = tl.load(d_dt_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        dt_raw = tl.load(dt_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        bias = tl.load(log_dt_bias_ptr + offs_p, mask=p_mask, other=0.0)
 
-    @triton.jit
-    def skip_silu_fwd_kernel(
-        y_ptr, u_ptr, D_ptr, out_ptr,
-        N, H,
-        BLOCK: tl.constexpr,
-    ):
-        """out = silu(y + u * D) where D is (H,) broadcast."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        y = tl.load(y_ptr + offs, mask=mask)
-        u = tl.load(u_ptr + offs, mask=mask)
-        d = tl.load(D_ptr + offs % H, mask=mask)
-        x = y + u * d
-        sig = 1.0 / (1.0 + tl.exp(-x))
-        tl.store(out_ptr + offs, x * sig, mask=mask)
+        sig_dt = 1.0 / (1.0 + tl.exp(-dt_raw))
+        silu_dt = dt_raw * sig_dt
+        pre = silu_dt + bias
+        # softplus backward: d_pre = d_dt * sigmoid(pre)
+        sig_pre = 1.0 / (1.0 + tl.exp(-pre))
+        d_pre = d_dt * sig_pre
+        # d_log_dt_bias = d_pre
+        tl.store(d_log_dt_bias_ptr + row * P + offs_p, d_pre, mask=p_mask)
+        # silu backward: d_dt_raw = d_pre * silu'(dt_raw)
+        d_dt_raw = d_pre * (sig_dt + dt_raw * sig_dt * (1.0 - sig_dt))
+        tl.store(d_dt_raw_ptr + row * P + offs_p, d_dt_raw, mask=p_mask)
 
-    @triton.jit
-    def skip_silu_bwd_kernel(
-        d_out_ptr, y_ptr, u_ptr, D_ptr,
-        d_y_ptr, d_u_ptr, d_D_ptr,
-        N, H,
-        BLOCK: tl.constexpr,
-    ):
-        """Backward for out = silu(y + u*D)."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        d_out = tl.load(d_out_ptr + offs, mask=mask)
-        y = tl.load(y_ptr + offs, mask=mask)
-        u = tl.load(u_ptr + offs, mask=mask)
-        d = tl.load(D_ptr + offs % H, mask=mask)
-        x = y + u * d
-        sig = 1.0 / (1.0 + tl.exp(-x))
-        # silu'(x) = sig(x) + x*sig(x)*(1-sig(x)) = sig(x)*(1 + x*(1-sig(x)))
-        d_x = d_out * sig * (1.0 + x * (1.0 - sig))
-        tl.store(d_y_ptr + offs, d_x, mask=mask)
-        tl.store(d_u_ptr + offs, d_x * d, mask=mask)
-        # d_D: need atomic add since D is (H,) broadcast over B*L
-        tl.atomic_add(d_D_ptr + offs % H, d_x * u, mask=mask)
+        # --- lam backward ---
+        d_lam = tl.load(d_lam_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        lam_raw = tl.load(lam_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        lam = 1.0 / (1.0 + tl.exp(-lam_raw))
+        d_lam_raw = d_lam * lam * (1.0 - lam)
+        tl.store(d_lam_raw_ptr + row * P + offs_p, d_lam_raw, mask=p_mask)
+
+        # --- Bu backward: through bias -> rmsnorm ---
+        d_Bu = tl.load(d_Bu_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        # d_b_bias = d_Bu (additive)
+        tl.store(d_b_bias_ptr + row * P + offs_p, d_Bu, mask=p_mask)
+        # d_Bu_normed = d_Bu (bias is additive, gamma is in rmsnorm)
+        # RMSNorm forward: out = gamma * x / sqrt(var + eps)
+        Bu_raw = tl.load(Bu_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        gamma = tl.load(b_norm_gamma_ptr + offs_p, mask=p_mask, other=1.0)
+        variance = tl.sum(Bu_raw * Bu_raw) / P
+        rrms = tl.rsqrt(variance + eps)
+        x_hat = Bu_raw * rrms
+        # d_gamma = d_Bu * x_hat (per-element)
+        tl.store(d_b_norm_gamma_ptr + row * P + offs_p, d_Bu * x_hat, mask=p_mask)
+        # d_x_hat = d_Bu * gamma
+        d_x_hat = d_Bu * gamma
+        # d_Bu_raw = rrms * (d_x_hat - x_hat * mean(d_x_hat * x_hat))
+        inner = tl.sum(d_x_hat * x_hat) / P
+        d_Bu_raw = rrms * (d_x_hat - x_hat * inner)
+        tl.store(d_Bu_raw_ptr + row * P + offs_p, d_Bu_raw, mask=p_mask)
 
 
 # ========== Python wrappers ==========
@@ -654,229 +610,112 @@ def triton_linear(x, w, b=None):
     return out
 
 
-def triton_rmsnorm(x, gamma, eps=1e-6):
-    M, N = x.shape
-    out = torch.empty_like(x)
-    BLOCK_N = triton.next_power_of_2(N)
-    rmsnorm_fwd_kernel[(M,)](x, gamma, out, M, N, x.stride(0), x.stride(1), out.stride(0), out.stride(1), eps, BLOCK_N)
-    return out
-
-
-def triton_silu(x):
-    out = torch.empty_like(x)
-    N = x.numel()
-    BLOCK = 1024
-    silu_fwd_kernel[(triton.cdiv(N, BLOCK),)](x.view(-1), out.view(-1), N, BLOCK)
-    return out
-
-
-def triton_silu_bwd(d_out, x):
-    d_x = torch.empty_like(x)
-    N = x.numel()
-    BLOCK = 1024
-    silu_bwd_kernel[(triton.cdiv(N, BLOCK),)](d_out.view(-1), x.view(-1), d_x.view(-1), N, BLOCK)
-    return d_x
-
-
-def triton_rmsnorm_bwd(d_out, x, gamma, eps=1e-6):
-    M, N = x.shape
-    d_x = torch.empty_like(x)
-    d_gamma = torch.zeros_like(gamma)
-    BLOCK_N = triton.next_power_of_2(N)
-    rmsnorm_bwd_kernel[(M,)](
-        d_out, x, gamma, d_x, d_gamma,
-        M, N,
-        d_out.stride(0), d_out.stride(1),
-        x.stride(0), x.stride(1),
-        d_x.stride(0), d_x.stride(1),
-        eps, BLOCK_N)
-    return d_x, d_gamma
-
-
-def triton_fused_dt_lam(dt_raw, lam_raw, log_dt_bias):
-    """dt = softplus(silu(dt_raw) + log_dt_bias), lam = sigmoid(lam_raw)."""
-    dt_out = torch.empty_like(dt_raw)
-    lam_out = torch.empty_like(lam_raw)
-    N = dt_raw.numel()
-    BLOCK = 1024
-    # Pre-broadcast log_dt_bias to match dt_raw shape
-    bias_bc = log_dt_bias.expand_as(dt_raw).contiguous().view(-1)
-    fused_dt_lam_kernel[(triton.cdiv(N, BLOCK),)](
-        dt_raw.view(-1), lam_raw.view(-1), bias_bc,
-        dt_out.view(-1), lam_out.view(-1),
-        N, BLOCK,
-    )
-    return dt_out, lam_out
-
-
-def triton_rope(x, angles):
-    """x: (..., P), angles: (..., P//2). Returns rotated x."""
-    shape = x.shape
-    P = shape[-1]
-    N = x.numel() // P  # number of rows
-    out = torch.empty_like(x)
-    BLOCK = triton.next_power_of_2(P // 2)
-    rope_fwd_kernel[(N,)](x.contiguous().view(-1), angles.contiguous().view(-1), out.view(-1), N, P, BLOCK)
-    return out.view(shape)
-
-
-def triton_complex_discretize(dt, lam, Bu, Bu_prev, A_real, A_imag):
-    """Returns (alpha_re, alpha_im, inject_re, inject_im)."""
-    N = dt.numel()
-    P = A_real.shape[0]
-    alpha_re = torch.empty_like(dt)
-    alpha_im = torch.empty_like(dt)
-    inject_re = torch.empty_like(dt)
-    inject_im = torch.empty_like(dt)
-    BLOCK = 1024
-    complex_discretize_fwd_kernel[(triton.cdiv(N, BLOCK),)](
-        dt.view(-1), lam.view(-1), Bu.view(-1), Bu_prev.view(-1),
-        A_real, A_imag,
-        alpha_re.view(-1), alpha_im.view(-1), inject_re.view(-1), inject_im.view(-1),
-        N, P, BLOCK,
-    )
-    return alpha_re, alpha_im, inject_re, inject_im
-
-
-def triton_chunked_scan(alpha_re, alpha_im, inject_re, inject_im, chunk_size=32):
-    """Chunked complex scan. Returns (h_re, h_im) of shape (B, L, P)."""
-    B, L, P = alpha_re.shape
-    device = alpha_re.device
-    dtype = alpha_re.dtype
-
-    h_re = torch.empty(B, L, P, device=device, dtype=dtype)
-    h_im = torch.empty(B, L, P, device=device, dtype=dtype)
-    state_re = torch.zeros(B, P, device=device, dtype=dtype)
-    state_im = torch.zeros(B, P, device=device, dtype=dtype)
-    new_state_re = torch.empty_like(state_re)
-    new_state_im = torch.empty_like(state_im)
-
-    BLOCK_P = triton.next_power_of_2(P)
-
-    for chunk_start in range(0, L, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, L)
-        K = chunk_end - chunk_start
-
-        chunked_scan_fwd_kernel[(B, triton.cdiv(P, BLOCK_P))](
-            alpha_re[:, chunk_start:chunk_end].contiguous(),
-            alpha_im[:, chunk_start:chunk_end].contiguous(),
-            inject_re[:, chunk_start:chunk_end].contiguous(),
-            inject_im[:, chunk_start:chunk_end].contiguous(),
-            state_re, state_im,
-            h_re[:, chunk_start:chunk_end],
-            h_im[:, chunk_start:chunk_end],
-            new_state_re, new_state_im,
-            B, K, P,
-            K * P, P,  # stride_al, stride_ap (not used but kept for interface)
-            BLOCK_P,
-        )
-        state_re, new_state_re = new_state_re, state_re
-        state_im, new_state_im = new_state_im, state_im
-
-    return h_re, h_im
-
-
 # ========== autograd.Function ==========
 
 class _TritonS6(torch.autograd.Function):
     @staticmethod
     def forward(ctx,
                 u,  # (B, L, H)
-                Bu_raw,  # (B, L, P) — from feature bank (computed in PyTorch)
-                # Kernel params (x_proj fused for dt, lam, theta only)
-                x_proj_w, x_proj_b,  # Linear(H, P+P+P//2)
+                Bu_raw,  # (B, L, P) — from feature bank
+                x_proj_w, x_proj_b,
                 b_norm_gamma, b_bias, log_dt_bias,
                 log_A_real, A_imag,
-                # C-side params
                 c_proj_w, c_proj_b,
                 c_norm_gamma, c_bias,
-                C_re, C_im,  # (H, P) each
-                D,  # (H,)
-                # Config
+                C_re, C_im,
+                D,
                 P, chunk_size):
         B, L, H = u.shape
         M = B * L
         split_sizes = [P, P, P // 2]
-
         u_flat = u.reshape(M, H)
 
-        # 1. Fused input projection (dt, lam, theta only — B is from feature bank)
-        x_proj_out = triton_linear(u_flat, x_proj_w, x_proj_b)  # (M, P+P+P//2)
+        # 1. x_proj linear: (M, H) -> (M, P+P+P//2)
+        x_proj_out = triton_linear(u_flat, x_proj_w, x_proj_b)
         dt_raw, lam_raw, theta = x_proj_out.split(split_sizes, dim=-1)
-
-        # 2. dt and lam activations
         dt_raw = dt_raw.contiguous()
         lam_raw = lam_raw.contiguous()
         theta = theta.contiguous()
-        dt, lam = triton_fused_dt_lam(dt_raw, lam_raw, log_dt_bias.expand(M, P).contiguous())
 
-        # 3. B: rmsnorm → + bias (feature bank already applied activation)
-        Bu_raw_flat = Bu_raw.reshape(M, P)
-        Bu_normed = triton_rmsnorm(Bu_raw_flat, b_norm_gamma)  # (M, P)
-        Bu = Bu_normed + b_bias.unsqueeze(0)  # (M, P)
+        # 2. Fused prescan: dt/lam activations, Bu norm+bias, dt_half*theta
+        Bu_raw_flat = Bu_raw.reshape(M, P).contiguous()
+        dt = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        lam = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        Bu = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        dt_half_theta = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
 
-        # 4. RoPE on Bu, then shift to get Bu_prev
-        dt_3d = dt.view(B, L, P)
-        theta_3d = theta.view(B, L, P // 2)
-        dt_half = dt_3d.view(B, L, P // 2, 2).mean(-1)  # (B, L, P//2)
-        cum_theta = torch.cumsum(dt_half * theta_3d, dim=1)  # (B, L, P//2)
+        BLOCK_P = triton.next_power_of_2(P)
+        fused_prescan_kernel[(M,)](
+            dt_raw, lam_raw, theta,
+            Bu_raw_flat,
+            log_dt_bias, b_norm_gamma, b_bias,
+            dt, lam, Bu, dt_half_theta,
+            M, P, 1e-6,
+            BLOCK_P,
+        )
 
-        Bu_3d = Bu.view(B, L, P)
-        Bu_rotated = triton_rope(Bu_3d, cum_theta)
-        # Shift AFTER rotation so position t-1 keeps its own rotation angle
-        Bu_prev_rotated = torch.zeros_like(Bu_rotated)
-        Bu_prev_rotated[:, 1:] = Bu_rotated[:, :-1]
+        # 3. Cumulative theta (PyTorch — one launch)
+        cum_theta = torch.cumsum(dt_half_theta.view(B, L, P // 2), dim=1).contiguous()
 
-        # 5. Complex discretization
+        # 4. Fused scan: RoPE + discretize + recurrence
+        h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        h_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        alpha_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        alpha_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        inject_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        Bu_rot = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+
         A_real_neg = -torch.exp(log_A_real)  # (P,)
-        alpha_re, alpha_im, inject_re, inject_im = triton_complex_discretize(
-            dt_3d, lam.view(B, L, P), Bu_rotated, Bu_prev_rotated, A_real_neg, A_imag)
+        BLOCK_P_SCAN = triton.next_power_of_2(P)
 
-        # 6. Chunked scan
-        h_re, h_im = triton_chunked_scan(alpha_re, alpha_im, inject_re, inject_im, chunk_size)
+        fused_scan_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt.view(B, L, P).contiguous(), lam.view(B, L, P).contiguous(),
+            Bu.view(B, L, P).contiguous(), cum_theta,
+            A_real_neg, A_imag,
+            h_re, h_im, alpha_re, alpha_im, inject_re, inject_im, Bu_rot,
+            B, L, P,
+            LOG2E,
+            BLOCK_P_SCAN,
+        )
 
-        # 7. C-side: projection + silu + rmsnorm + bias + RoPE
-        c_proj_out = triton_linear(u_flat, c_proj_w, c_proj_b)  # (M, P)
-        c_silu = triton_silu(c_proj_out)
-        c_normed = triton_rmsnorm(c_silu, c_norm_gamma)
-        c_gate = (c_normed + c_bias.unsqueeze(0)).view(B, L, P)
-        c_gate_rotated = triton_rope(c_gate, cum_theta)
+        # 5. c_proj linear: (M, H) -> (M, P)
+        c_proj_out = triton_linear(u_flat, c_proj_w, c_proj_b)
 
-        # 8. Complex gating: h_gated = h * c_gate (complex * real)
-        N_elem = B * L * P
-        BLOCK = 1024
-        hg_re = torch.empty_like(h_re)
-        hg_im = torch.empty_like(h_im)
-        complex_gate_readout_fwd_kernel[(triton.cdiv(N_elem, BLOCK),)](
-            h_re.view(-1), h_im.view(-1), c_gate_rotated.contiguous().view(-1),
-            hg_re.view(-1), hg_im.view(-1), N_elem, BLOCK)
+        # 6. Fused c_gate: silu + rmsnorm + bias + RoPE
+        c_gate = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        fused_cgate_kernel[(M,)](
+            c_proj_out, cum_theta.view(M, P // 2),
+            c_norm_gamma, c_bias,
+            c_gate,
+            M, P, B, L, 1e-6,
+            BLOCK_P,
+        )
 
-        # 9. MIMO readout: y = C_re @ hg_re - C_im @ hg_im  (real part of complex matmul)
-        hg_re_flat = hg_re.reshape(M, P)
-        hg_im_flat = hg_im.reshape(M, P)
-        # triton_linear does x @ w^T, so w=(H,P), x=(M,P) → out (M, H)
-        y_re = triton_linear(hg_re_flat, C_re)  # (M, H)
-        y_im = triton_linear(hg_im_flat, C_im)  # (M, H)
-        y = (y_re - y_im).view(B, L, H)  # real part of complex product
-
-        # 10. Skip + SiLU: out = silu(y + u * D)
-        N_out = B * L * H
+        # 7. Fused readout: gate h, MIMO, skip+silu
+        BLOCK_H = min(64, triton.next_power_of_2(H))
         out = torch.empty(B, L, H, device=u.device, dtype=u.dtype)
-        skip_silu_fwd_kernel[(triton.cdiv(N_out, BLOCK),)](
-            y.contiguous().view(-1), u.contiguous().view(-1), D,
-            out.view(-1), N_out, H, BLOCK)
+
+        fused_readout_kernel[(M, triton.cdiv(H, BLOCK_H))](
+            h_re.view(M, P), h_im.view(M, P),
+            c_gate,
+            C_re, C_im,
+            u_flat, D,
+            out.view(M, H),
+            M, H, P,
+            BLOCK_H, BLOCK_P,
+        )
 
         # Save for backward
         ctx.save_for_backward(
-            u, Bu_raw_flat, Bu_normed, Bu_3d,
-            dt_raw, dt, lam_raw, lam, theta, dt_half, cum_theta,
-            Bu_rotated, Bu_prev_rotated,
+            u, Bu_raw_flat,
+            dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
+            Bu, Bu_rot,
             alpha_re, alpha_im, inject_re, inject_im,
             h_re, h_im,
-            c_proj_out, c_silu, c_normed, c_gate, c_gate_rotated,
-            hg_re, hg_im, y,
-            x_proj_w, x_proj_b, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
-            c_proj_w, c_proj_b, c_norm_gamma, c_bias, C_re, C_im, D,
+            c_proj_out, c_gate,
+            x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
+            c_norm_gamma, c_bias, C_re, C_im, D,
         )
         ctx.P = P
         ctx.chunk_size = chunk_size
@@ -886,311 +725,240 @@ class _TritonS6(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_out):
-        (u, Bu_raw_flat, Bu_normed, Bu_3d,
-         dt_raw, dt, lam_raw, lam, theta, dt_half, cum_theta,
-         Bu_rotated, Bu_prev_rotated,
+        (u, Bu_raw_flat,
+         dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
+         Bu, Bu_rot,
          alpha_re, alpha_im, inject_re, inject_im,
          h_re, h_im,
-         c_proj_out, c_silu, c_normed, c_gate, c_gate_rotated,
-         hg_re, hg_im, y,
-         x_proj_w, x_proj_b, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
-         c_proj_w, c_proj_b, c_norm_gamma, c_bias, C_re, C_im, D,
+         c_proj_out, c_gate,
+         x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
+         c_norm_gamma, c_bias, C_re, C_im, D,
         ) = ctx.saved_tensors
 
         P = ctx.P
-        chunk_size = ctx.chunk_size
         split_sizes = ctx.split_sizes
         B, L, H = u.shape
         M = B * L
-        N_elem = B * L * P
-        N_out = B * L * H
-        BLOCK = 1024
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        BLOCK_P = triton.next_power_of_2(P)
 
         u_flat = u.reshape(M, H)
 
-        # ---- 10. Backward through skip_silu: out = silu(y + u*D) ----
-        d_y = torch.empty(B, L, H, device=u.device, dtype=u.dtype)
-        d_u_skip = torch.empty_like(d_y)
-        d_D = torch.zeros_like(D)
-        skip_silu_bwd_kernel[(triton.cdiv(N_out, BLOCK),)](
-            d_out.contiguous().view(-1), y.contiguous().view(-1),
-            u.contiguous().view(-1), D,
-            d_y.view(-1), d_u_skip.view(-1), d_D,
-            N_out, H, BLOCK)
+        # ---- 7. Backward through readout: out = silu(y + u*D) where y = Re(C @ (h*gate)) ----
+        # Use PyTorch for this since it's a mix of matmul + elementwise
+        h_re_flat = h_re.view(M, P)
+        h_im_flat = h_im.view(M, P)
+        c_gate_flat = c_gate
 
-        # ---- 9. Backward through C readout: y = C_re @ hg_re - C_im @ hg_im ----
-        d_y_flat = d_y.reshape(M, H)
-        hg_re_flat = hg_re.reshape(M, P)
-        hg_im_flat = hg_im.reshape(M, P)
+        hg_re = h_re_flat * c_gate_flat
+        hg_im = h_im_flat * c_gate_flat
 
-        # d_hg_re = d_y @ C_re^T ... wait, y_re = hg_re @ C_re^T (triton_linear does x @ w^T)
-        # so d_hg_re = d_y @ C_re (since d/d_x of x@W^T is d_out @ W)
-        d_hg_re = torch.empty(M, P, device=u.device, dtype=u.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(P, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_y_flat, C_re, d_hg_re,
-            M, H, P,
-            d_y_flat.stride(0), d_y_flat.stride(1),
-            C_re.stride(0), C_re.stride(1),
-            d_hg_re.stride(0), d_hg_re.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N)
+        # Recompute y for backward
+        y_re = hg_re @ C_re.t()  # (M, H)
+        y_im = hg_im @ C_im.t()  # (M, H)
+        y = y_re - y_im
 
-        # d_hg_im = -d_y @ C_im (negative from real part of complex product)
-        d_hg_im = torch.empty(M, P, device=u.device, dtype=u.dtype)
-        linear_bwd_dx_kernel[grid](
-            d_y_flat, C_im, d_hg_im,
-            M, H, P,
-            d_y_flat.stride(0), d_y_flat.stride(1),
-            C_im.stride(0), C_im.stride(1),
-            d_hg_im.stride(0), d_hg_im.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N)
-        d_hg_im = -d_hg_im
+        # silu backward: out = silu(y + u*D)
+        x_skip = y + u_flat * D
+        sig_skip = torch.sigmoid(x_skip)
+        d_x_skip = d_out.view(M, H) * (sig_skip + x_skip * sig_skip * (1 - sig_skip))
 
-        # d_C_re = d_y^T @ hg_re
-        d_C_re = torch.zeros_like(C_re)
-        grid = (triton.cdiv(H, BLOCK_N), triton.cdiv(P, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_y_flat, hg_re_flat, d_C_re,
-            M, H, P,
-            d_y_flat.stride(0), d_y_flat.stride(1),
-            hg_re_flat.stride(0), hg_re_flat.stride(1),
-            d_C_re.stride(0), d_C_re.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M)
+        d_y = d_x_skip
+        d_u_skip = d_x_skip * D
+        d_D = (d_x_skip * u_flat).sum(0)
 
-        # d_C_im = -d_y^T @ hg_im
-        d_C_im = torch.zeros_like(C_im)
-        linear_bwd_dw_kernel[grid](
-            d_y_flat, hg_im_flat, d_C_im,
-            M, H, P,
-            d_y_flat.stride(0), d_y_flat.stride(1),
-            hg_im_flat.stride(0), hg_im_flat.stride(1),
-            d_C_im.stride(0), d_C_im.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M)
-        d_C_im = -d_C_im
+        # y = C_re @ hg_re - C_im @ hg_im
+        d_hg_re = d_y @ C_re  # (M, P)
+        d_hg_im = -(d_y @ C_im)  # (M, P)
+        d_C_re = d_y.t() @ hg_re  # (H, P)
+        d_C_im = -(d_y.t() @ hg_im)  # (H, P)
 
-        # ---- 8. Backward through complex gating ----
-        d_h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_h_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_c_gate_rotated = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        complex_gate_readout_bwd_kernel[(triton.cdiv(N_elem, BLOCK),)](
-            d_hg_re.view(B, L, P).contiguous().view(-1),
-            d_hg_im.view(B, L, P).contiguous().view(-1),
-            h_re.contiguous().view(-1), h_im.contiguous().view(-1),
-            c_gate_rotated.contiguous().view(-1),
-            d_h_re.view(-1), d_h_im.view(-1), d_c_gate_rotated.view(-1),
-            N_elem, BLOCK)
+        # hg = h * gate
+        d_h_re = d_hg_re * c_gate_flat
+        d_h_im = d_hg_im * c_gate_flat
+        d_c_gate = d_hg_re * h_re_flat + d_hg_im * h_im_flat
 
-        # ---- 7. Backward through C-side RoPE + rmsnorm + silu + linear ----
-        # d_c_gate from d_c_gate_rotated through RoPE backward
-        d_c_gate = torch.empty_like(d_c_gate_rotated)
-        d_cum_theta_c = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
-        BLOCK_ROPE = triton.next_power_of_2(P // 2)
-        N_rows = B * L
-        rope_bwd_kernel[(N_rows,)](
-            d_c_gate_rotated.contiguous().view(-1), cum_theta.contiguous().view(-1),
-            d_c_gate.view(-1), d_cum_theta_c.view(-1),
-            c_gate.contiguous().view(-1),
-            N_rows, P, BLOCK_ROPE)
+        # ---- 6. Backward through c_gate: RoPE + rmsnorm + silu + bias ----
+        # c_gate = RoPE(rmsnorm(silu(c_proj_out)) + c_bias, cum_theta)
+        # Backward through RoPE
+        cum_theta_flat = cum_theta.view(M, P // 2)
+        from .s6 import apply_rotary_emb  # reuse PyTorch RoPE for backward
 
-        # d_c_bias = sum(d_c_gate)
-        d_c_bias = d_c_gate.view(M, P).sum(0)
+        # Recompute pre-RoPE c_gate for backward
+        c_silu = F.silu(c_proj_out)
+        c_var = c_silu.pow(2).mean(-1, keepdim=True)
+        c_normed = c_silu / torch.sqrt(c_var + 1e-6) * c_norm_gamma
+        c_gate_pre_rope = c_normed + c_bias
 
-        # d_c_normed = d_c_gate (bias is additive)
-        d_c_normed = d_c_gate.view(M, P)
+        # RoPE backward (PyTorch)
+        # d_c_gate is gradient on rotated output
+        # forward: c_gate_rot = apply_rotary_emb(c_gate_pre_rope, cum_theta)
+        # backward: d_c_gate_pre_rope = apply_rotary_emb(d_c_gate, -cum_theta)  (rotate back)
+        # d_cum_theta: need chain rule through angles
+        cos_ct = torch.cos(cum_theta_flat)
+        sin_ct = torch.sin(cum_theta_flat)
 
-        # Backward through rmsnorm (Triton)
-        d_c_silu, d_c_norm_gamma = triton_rmsnorm_bwd(d_c_normed, c_silu, c_norm_gamma)
+        d_cg = d_c_gate.view(M, P)
+        d_cg1, d_cg2 = d_cg[..., 0::2], d_cg[..., 1::2]
+        cg1, cg2 = c_gate_pre_rope[..., 0::2], c_gate_pre_rope[..., 1::2]
 
-        # Backward through silu (Triton)
-        d_c_proj_out = triton_silu_bwd(d_c_silu, c_proj_out)
+        # RoPE bwd: d_x1 = d_o1*cos + d_o2*sin, d_x2 = -d_o1*sin + d_o2*cos
+        d_cgpre = torch.empty_like(c_gate_pre_rope)
+        d_cgpre[..., 0::2] = d_cg1 * cos_ct + d_cg2 * sin_ct
+        d_cgpre[..., 1::2] = -d_cg1 * sin_ct + d_cg2 * cos_ct
 
-        # Backward through c_proj linear
-        d_c_proj_w = torch.zeros_like(c_proj_w)
-        grid = (triton.cdiv(P, BLOCK_N), triton.cdiv(H, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_c_proj_out, u_flat, d_c_proj_w,
-            M, P, H,
-            d_c_proj_out.stride(0), d_c_proj_out.stride(1),
-            u_flat.stride(0), u_flat.stride(1),
-            d_c_proj_w.stride(0), d_c_proj_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M)
+        # d_cum_theta from c_gate RoPE
+        d_cum_theta_c = (d_cg1 * (-cg1 * sin_ct - cg2 * cos_ct) +
+                         d_cg2 * (cg1 * cos_ct - cg2 * sin_ct))
+
+        d_c_bias = d_cgpre.sum(0)
+
+        # rmsnorm backward
+        d_c_normed = d_cgpre
+        rrms_c = torch.rsqrt(c_var + 1e-6)
+        c_hat = c_silu * rrms_c
+        d_c_norm_gamma = (d_c_normed * c_hat).sum(0)
+        d_c_hat = d_c_normed * c_norm_gamma
+        inner_c = (d_c_hat * c_hat).sum(-1, keepdim=True) / P
+        d_c_silu = rrms_c * (d_c_hat - c_hat * inner_c)
+
+        # silu backward
+        sig_c = torch.sigmoid(c_proj_out)
+        d_c_proj_out = d_c_silu * (sig_c + c_proj_out * sig_c * (1 - sig_c))
+
+        # c_proj linear backward (PyTorch for simplicity)
+        d_c_proj_w = d_c_proj_out.t() @ u_flat
         d_c_proj_b = d_c_proj_out.sum(0)
+        d_u_c = d_c_proj_out @ c_proj_w
 
-        d_u_c = torch.zeros(M, H, device=u.device, dtype=u.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(H, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_c_proj_out, c_proj_w, d_u_c,
-            M, P, H,
-            d_c_proj_out.stride(0), d_c_proj_out.stride(1),
-            c_proj_w.stride(0), c_proj_w.stride(1),
-            d_u_c.stride(0), d_u_c.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N)
+        # ---- 5. Backward through scan (fused kernel) ----
+        d_h_re_3d = d_h_re.view(B, L, P).contiguous()
+        d_h_im_3d = d_h_im.view(B, L, P).contiguous()
 
-        # ---- 6. Backward through chunked scan ----
-        # For now use PyTorch sequential backward (scan backward kernel exists but
-        # needs careful chunk-boundary state management)
-        # TODO: use chunked_scan_bwd_kernel with proper inter-chunk adjoint passing
         d_alpha_re = torch.empty_like(alpha_re)
         d_alpha_im = torch.empty_like(alpha_im)
         d_inject_re = torch.empty_like(inject_re)
         d_inject_im = torch.empty_like(inject_im)
 
-        BLOCK_P = triton.next_power_of_2(P)
-        # Process chunks in reverse order
-        # We need the incoming state for each chunk from the forward pass
-        # For simplicity, recompute states
-        states_re = [torch.zeros(B, P, device=u.device, dtype=u.dtype)]
-        for chunk_start in range(0, L, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, L)
-            states_re.append(h_re[:, chunk_end - 1].clone())
-        states_im = [torch.zeros(B, P, device=u.device, dtype=u.dtype)]
-        for chunk_start in range(0, L, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, L)
-            states_im.append(h_im[:, chunk_end - 1].clone())
+        BLOCK_P_SCAN = triton.next_power_of_2(P)
+        fused_scan_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            alpha_re, alpha_im, h_re, h_im,
+            d_h_re_3d, d_h_im_3d,
+            d_alpha_re, d_alpha_im, d_inject_re, d_inject_im,
+            B, L, P,
+            BLOCK_P_SCAN,
+        )
 
-        # Adjoint state carried between chunks (backward)
-        adj_state_re = torch.zeros(B, P, device=u.device, dtype=u.dtype)
-        adj_state_im = torch.zeros(B, P, device=u.device, dtype=u.dtype)
+        # ---- 4. Backward through discretization ----
+        # inject_re = lam*dt*Bu_rot + (1-lam)*dt*alpha_re*Bu_prev_re
+        # inject_im = (1-lam)*dt*alpha_im*Bu_prev_re
+        # where Bu_prev_re[:, t] = Bu_rot[:, t-1] (shifted)
+        dt_3d = dt.view(B, L, P)
+        lam_3d = lam.view(B, L, P)
+        Bu_rot_3d = Bu_rot  # (B, L, P)
+        Bu_prev = torch.zeros_like(Bu_rot_3d)
+        Bu_prev[:, 1:] = Bu_rot_3d[:, :-1]
 
-        chunk_starts = list(range(0, L, chunk_size))
-        for ci in reversed(range(len(chunk_starts))):
-            cs = chunk_starts[ci]
-            ce = min(cs + chunk_size, L)
-            K = ce - cs
-
-            # Add adjoint from next chunk to d_h at last position of this chunk
-            d_h_re_chunk = d_h_re[:, cs:ce].contiguous()
-            d_h_im_chunk = d_h_im[:, cs:ce].contiguous()
-            d_h_re_chunk[:, -1] += adj_state_re
-            d_h_im_chunk[:, -1] += adj_state_im
-
-            d_alpha_re_chunk = torch.empty(B, K, P, device=u.device, dtype=u.dtype)
-            d_alpha_im_chunk = torch.empty(B, K, P, device=u.device, dtype=u.dtype)
-            d_inject_re_chunk = torch.empty(B, K, P, device=u.device, dtype=u.dtype)
-            d_inject_im_chunk = torch.empty(B, K, P, device=u.device, dtype=u.dtype)
-            d_state_re_chunk = torch.empty(B, P, device=u.device, dtype=u.dtype)
-            d_state_im_chunk = torch.empty(B, P, device=u.device, dtype=u.dtype)
-
-            chunked_scan_bwd_kernel[(B, triton.cdiv(P, BLOCK_P))](
-                alpha_re[:, cs:ce].contiguous(), alpha_im[:, cs:ce].contiguous(),
-                d_h_re_chunk, d_h_im_chunk,
-                d_alpha_re_chunk, d_alpha_im_chunk,
-                d_inject_re_chunk, d_inject_im_chunk,
-                d_state_re_chunk, d_state_im_chunk,
-                h_re[:, cs:ce].contiguous(), h_im[:, cs:ce].contiguous(),
-                states_re[ci], states_im[ci],
-                B, K, P, BLOCK_P)
-
-            d_alpha_re[:, cs:ce] = d_alpha_re_chunk
-            d_alpha_im[:, cs:ce] = d_alpha_im_chunk
-            d_inject_re[:, cs:ce] = d_inject_re_chunk
-            d_inject_im[:, cs:ce] = d_inject_im_chunk
-            adj_state_re = d_state_re_chunk
-            adj_state_im = d_state_im_chunk
-
-        # ---- 5. Backward through complex discretization ----
-        d_dt_disc = torch.empty_like(dt).view(B, L, P)
-        d_lam_disc = torch.empty_like(lam).view(B, L, P)
-        d_Bu_rot = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_Bu_prev_rot = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         A_real_neg = -torch.exp(log_A_real)
 
-        complex_discretize_bwd_kernel[(triton.cdiv(N_elem, BLOCK),)](
-            d_inject_re.contiguous().view(-1), d_inject_im.contiguous().view(-1),
-            d_alpha_re.contiguous().view(-1), d_alpha_im.contiguous().view(-1),
-            dt.view(B, L, P).contiguous().view(-1), lam.view(B, L, P).contiguous().view(-1),
-            Bu_rotated.contiguous().view(-1), Bu_prev_rotated.contiguous().view(-1),
-            A_real_neg, A_imag,
-            alpha_re.contiguous().view(-1), alpha_im.contiguous().view(-1),
-            d_dt_disc.view(-1), d_lam_disc.view(-1),
-            d_Bu_rot.view(-1), d_Bu_prev_rot.view(-1),
-            N_elem, P, BLOCK)
+        # d_lam
+        d_lam_disc = (d_inject_re * dt_3d * (Bu_rot_3d - alpha_re * Bu_prev)
+                      + d_inject_im * (-dt_3d * alpha_im * Bu_prev))
 
-        # ---- 4. Backward through Bu_prev shift + RoPE ----
-        # Forward was: Bu_rotated = rope(Bu_3d), Bu_prev_rotated = pad(Bu_rotated[:, :-1])
-        # So d_Bu_rotated = d_Bu_rot + shift_back(d_Bu_prev_rot)
-        d_Bu_rotated = d_Bu_rot.clone()
-        d_Bu_rotated[:, :-1] += d_Bu_prev_rot[:, 1:]
+        # d_Bu_rot
+        d_Bu_rot = d_inject_re * lam_3d * dt_3d
 
-        d_Bu_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_cum_theta_b = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
-        rope_bwd_kernel[(N_rows,)](
-            d_Bu_rotated.contiguous().view(-1), cum_theta.contiguous().view(-1),
-            d_Bu_3d.view(-1), d_cum_theta_b.view(-1),
-            Bu_3d.contiguous().view(-1),
-            N_rows, P, BLOCK_ROPE)
+        # d_Bu_prev
+        d_Bu_prev = ((d_inject_re * alpha_re + d_inject_im * alpha_im)
+                     * (1 - lam_3d) * dt_3d)
 
-        # ---- cum_theta grad: reverse cumsum ----
-        d_cum_theta = d_cum_theta_c + d_cum_theta_b
-        d_dt_half_theta = d_cum_theta.flip(1).cumsum(1).flip(1)  # reverse cumsum
-        d_dt_half = d_dt_half_theta * theta.view(B, L, P // 2)
-        d_theta = d_dt_half_theta * dt_half
-        # d_dt from dt_half: dt_half = dt.view(B,L,P//2,2).mean(-1)
-        d_dt_from_rope = d_dt_half.unsqueeze(-1).expand(B, L, P // 2, 2).reshape(B, L, P) / 2
+        # Reverse shift: d_Bu_rot[:, :-1] += d_Bu_prev[:, 1:]
+        d_Bu_rot[:, :-1] += d_Bu_prev[:, 1:]
 
-        # ---- 3. Backward through B norm + bias ----
-        d_Bu_flat = d_Bu_3d.reshape(M, P)
-        d_b_bias = d_Bu_flat.sum(0)
-        d_Bu_normed = d_Bu_flat  # additive bias
-        # rmsnorm backward (Triton) — no silu step, feature bank already activated
-        d_Bu_raw_flat, d_b_norm_gamma = triton_rmsnorm_bwd(d_Bu_normed, Bu_raw_flat, b_norm_gamma)
+        # d_dt from inject
+        one_minus_lam = 1 - lam_3d
+        d_dt_from_inject = (d_inject_re * (lam_3d * Bu_rot_3d + one_minus_lam * alpha_re * Bu_prev)
+                            + d_inject_im * one_minus_lam * alpha_im * Bu_prev)
 
-        # ---- 2. Backward through dt/lam activations ----
-        d_dt_total = d_dt_disc.reshape(M, P) + d_dt_from_rope.reshape(M, P)
-        d_dt_raw = torch.empty_like(dt_raw)
-        d_lam_raw = torch.empty_like(lam_raw)
-        d_log_dt_bias_flat = torch.empty(M, P, device=u.device, dtype=u.dtype)
-        bias_bc = log_dt_bias.expand(M, P).contiguous()
+        # d_alpha from inject
+        d_alpha_re_total = d_alpha_re + d_inject_re * one_minus_lam * dt_3d * Bu_prev
+        d_alpha_im_total = d_alpha_im + d_inject_im * one_minus_lam * dt_3d * Bu_prev
 
-        fused_dt_lam_bwd_kernel[(triton.cdiv(M * P, BLOCK),)](
-            d_dt_total.contiguous().view(-1), d_lam_disc.reshape(M, P).contiguous().view(-1),
-            dt_raw.contiguous().view(-1), lam_raw.contiguous().view(-1),
-            bias_bc.view(-1),
-            d_dt_raw.view(-1), d_lam_raw.view(-1), d_log_dt_bias_flat.view(-1),
-            M * P, BLOCK)
+        # d_dt from alpha: alpha = exp(dt * A)
+        d_dt_from_alpha = (d_alpha_re_total * (A_real_neg * alpha_re - A_imag * alpha_im)
+                           + d_alpha_im_total * (A_real_neg * alpha_im + A_imag * alpha_re))
 
-        d_log_dt_bias = d_log_dt_bias_flat.sum(0)
+        d_dt_disc = d_dt_from_inject + d_dt_from_alpha
 
-        # ---- 1. Backward through x_proj linear (dt, lam, theta only) ----
-        d_x_proj = torch.cat([d_dt_raw, d_lam_raw, d_theta.reshape(M, P // 2)], dim=-1)
-
-        d_x_proj_w = torch.zeros_like(x_proj_w)
-        out_dim = x_proj_w.shape[0]
-        grid = (triton.cdiv(out_dim, BLOCK_N), triton.cdiv(H, BLOCK_K))
-        linear_bwd_dw_kernel[grid](
-            d_x_proj, u_flat, d_x_proj_w,
-            M, out_dim, H,
-            d_x_proj.stride(0), d_x_proj.stride(1),
-            u_flat.stride(0), u_flat.stride(1),
-            d_x_proj_w.stride(0), d_x_proj_w.stride(1),
-            BLOCK_N, BLOCK_K, BLOCK_M)
-        d_x_proj_b = d_x_proj.sum(0)
-
-        d_u_proj = torch.zeros(M, H, device=u.device, dtype=u.dtype)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(H, BLOCK_K))
-        linear_bwd_dx_kernel[grid](
-            d_x_proj, x_proj_w, d_u_proj,
-            M, out_dim, H,
-            d_x_proj.stride(0), d_x_proj.stride(1),
-            x_proj_w.stride(0), x_proj_w.stride(1),
-            d_u_proj.stride(0), d_u_proj.stride(1),
-            BLOCK_M, BLOCK_K, BLOCK_N)
-
-        # Total d_u (from x_proj + c_proj + skip)
-        d_u = (d_u_proj + d_u_c + d_u_skip.view(M, H)).view(B, L, H)
-
-        # d_Bu_raw: reshape to (B, L, P) to match input
-        d_Bu_raw = d_Bu_raw_flat.view(B, L, P)
-
-        # d_log_A_real: chain rule through A_real_neg = -exp(log_A_real)
-        dt_3d_cont = dt.view(B, L, P)
-        d_A_real = (d_alpha_re * dt_3d_cont * alpha_re + d_alpha_im * dt_3d_cont * alpha_im).sum(dim=(0, 1))
-        d_A_imag = (-d_alpha_re * dt_3d_cont * alpha_im + d_alpha_im * dt_3d_cont * alpha_re).sum(dim=(0, 1))
+        # d_A grads
+        d_A_real = (d_alpha_re_total * dt_3d * alpha_re + d_alpha_im_total * dt_3d * alpha_im).sum(dim=(0, 1))
+        d_A_imag = (-d_alpha_re_total * dt_3d * alpha_im + d_alpha_im_total * dt_3d * alpha_re).sum(dim=(0, 1))
         d_log_A_real = d_A_real * A_real_neg
 
+        # ---- Backward through Bu RoPE ----
+        # Bu_rot = RoPE(Bu, cum_theta)
+        cos_ct_b = torch.cos(cum_theta)
+        sin_ct_b = torch.sin(cum_theta)
+        Bu_3d = Bu.view(B, L, P)
+
+        d_br = d_Bu_rot
+        d_br1, d_br2 = d_br[..., 0::2], d_br[..., 1::2]
+        bu1, bu2 = Bu_3d[..., 0::2], Bu_3d[..., 1::2]
+
+        d_Bu_3d = torch.empty_like(Bu_3d)
+        d_Bu_3d[..., 0::2] = d_br1 * cos_ct_b + d_br2 * sin_ct_b
+        d_Bu_3d[..., 1::2] = -d_br1 * sin_ct_b + d_br2 * cos_ct_b
+
+        d_cum_theta_b = (d_br1 * (-bu1 * sin_ct_b - bu2 * cos_ct_b) +
+                         d_br2 * (bu1 * cos_ct_b - bu2 * sin_ct_b))
+
+        # ---- cum_theta grad: reverse cumsum ----
+        d_cum_theta = d_cum_theta_c.view(B, L, P // 2) + d_cum_theta_b
+        d_dt_half_theta = d_cum_theta.flip(1).cumsum(1).flip(1)
+
+        dt_half = dt_3d.view(B, L, P // 2, 2).mean(-1)
+        d_dt_half = d_dt_half_theta * theta.view(B, L, P // 2)
+        d_theta = d_dt_half_theta * dt_half
+        d_dt_from_rope = d_dt_half.unsqueeze(-1).expand(B, L, P // 2, 2).reshape(B, L, P) / 2
+
+        # ---- 2. Backward through prescan (fused kernel) ----
+        d_dt_total = d_dt_disc.reshape(M, P) + d_dt_from_rope.reshape(M, P)
+        d_dt_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_lam_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_log_dt_bias_rows = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_Bu_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_b_norm_gamma_rows = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_b_bias_rows = torch.empty(M, P, device=u.device, dtype=u.dtype)
+
+        fused_prescan_bwd_kernel[(M,)](
+            d_dt_total, d_lam_disc.reshape(M, P).contiguous(),
+            d_Bu_3d.reshape(M, P).contiguous(),
+            dt_raw, lam_raw, log_dt_bias,
+            Bu_raw_flat, b_norm_gamma,
+            d_dt_raw, d_lam_raw, d_log_dt_bias_rows,
+            d_Bu_raw, d_b_norm_gamma_rows, d_b_bias_rows,
+            M, P, 1e-6,
+            BLOCK_P,
+        )
+
+        d_log_dt_bias = d_log_dt_bias_rows.sum(0)
+        d_b_norm_gamma = d_b_norm_gamma_rows.sum(0)
+        d_b_bias = d_b_bias_rows.sum(0)
+
+        # ---- 1. Backward through x_proj linear ----
+        d_x_proj = torch.cat([d_dt_raw, d_lam_raw, d_theta.reshape(M, P // 2)], dim=-1)
+        d_x_proj_w = d_x_proj.t() @ u_flat
+        d_x_proj_b = d_x_proj.sum(0)
+        d_u_proj = d_x_proj @ x_proj_w
+
+        # Total d_u
+        d_u = (d_u_proj + d_u_c + d_u_skip).view(B, L, H)
+
+        # d_Bu_raw
+        d_Bu_raw_out = d_Bu_raw.view(B, L, P)
+
         return (d_u,
-                d_Bu_raw,  # grad for Bu_raw input
+                d_Bu_raw_out,
                 d_x_proj_w, d_x_proj_b,
                 d_b_norm_gamma, d_b_bias, d_log_dt_bias,
                 d_log_A_real, d_A_imag,
@@ -1198,7 +966,7 @@ class _TritonS6(torch.autograd.Function):
                 d_c_norm_gamma, d_c_bias,
                 d_C_re, d_C_im,
                 d_D,
-                None, None)  # P, chunk_size
+                None, None)
 
 
 # ========== nn.Module wrapper ==========
@@ -1216,11 +984,7 @@ class TritonS6(nn.Module):
         self.P = P
         self.chunk_size = chunk_size
 
-        # Build a PyTorch S6 for init and fallback
         self._pytorch_s6 = S6(d_model, d_state, M=M, layer_idx=layer_idx, **kwargs)
-
-        # Extract references to the actual parameters (shared with _pytorch_s6)
-        # This way the Module's parameters() includes everything
 
     def forward(self, u, **kwargs):
         if not u.is_cuda or not HAS_TRITON:
@@ -1229,11 +993,10 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # Run feature bank in PyTorch (small MLP, not worth Tritonizing)
-        # phi_B expects (B, H, N, d) → unsqueeze dummy head dim
+        # Feature bank in PyTorch (small MLP)
         Bu_raw = kern.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
-        # Split complex C into real/imag for Triton
+        # Split complex C
         C = torch.view_as_complex(s6.C)
         C_re = C.real.contiguous()
         C_im = C.imag.contiguous()
