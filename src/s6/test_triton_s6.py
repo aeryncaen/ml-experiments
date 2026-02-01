@@ -192,11 +192,15 @@ def bench(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
 
 def debug_forward_stepwise():
-    """Step-by-step comparison to find where Triton diverges from PyTorch."""
+    """Step-by-step comparison to find where Triton diverges from PyTorch.
+
+    Tests the new fused kernels: fused_prescan, fused_scan, fused_cgate, fused_readout.
+    """
     from .s6 import S6, apply_rotary_emb
-    from .triton_s6 import (TritonS6, triton_linear, triton_rmsnorm, triton_silu,
-                             triton_fused_dt_lam, triton_rope, triton_complex_discretize,
-                             triton_chunked_scan, complex_gate_readout_fwd_kernel)
+    from .triton_s6 import (TritonS6, triton_linear,
+                             fused_prescan_kernel, fused_scan_kernel,
+                             fused_cgate_kernel, fused_readout_kernel,
+                             LOG2E)
     import triton
 
     torch.manual_seed(SEED)
@@ -229,45 +233,57 @@ def debug_forward_stepwise():
         xp_tr = triton_linear(x.reshape(ML, H), kern.x_proj.weight, kern.x_proj.bias)
     cmp("x_proj", xp_pt.reshape(ML, -1), xp_tr)
 
-    # Step 2: split and dt/lam
+    # Step 2: fused_prescan (dt/lam activations + Bu rmsnorm + bias + dt_half*theta)
     with torch.no_grad():
-        dt_raw_pt, lam_raw_pt, theta_pt = xp_pt.split(kern._split_sizes, dim=-1)
-        dt_pt = torch.nn.functional.softplus(torch.nn.functional.silu(dt_raw_pt) + kern.log_dt_bias)
-        lam_pt = torch.sigmoid(lam_raw_pt)
+        import torch.nn.functional as F
 
+        # PyTorch reference
+        dt_raw_pt, lam_raw_pt, theta_pt = xp_pt.split(kern._split_sizes, dim=-1)
+        dt_pt = F.softplus(F.silu(dt_raw_pt) + kern.log_dt_bias)
+        lam_pt = torch.sigmoid(lam_raw_pt)
+        Bu_pt = kern.b_norm(Bu_raw_pt) + kern.b_bias
+        dt_half_pt = dt_pt.view(B, L, P // 2, 2).mean(-1)
+        dt_half_theta_pt = dt_half_pt * theta_pt
+
+        # Triton fused prescan
         dt_raw_tr, lam_raw_tr, theta_tr = xp_tr.split(kern._split_sizes, dim=-1)
         dt_raw_tr = dt_raw_tr.contiguous()
         lam_raw_tr = lam_raw_tr.contiguous()
         theta_tr = theta_tr.contiguous()
-        dt_tr, lam_tr = triton_fused_dt_lam(dt_raw_tr, lam_raw_tr,
-                                             kern.log_dt_bias.expand(ML, P).contiguous())
+        Bu_raw_flat = Bu_raw_pt.reshape(ML, P).contiguous()
+
+        dt_tr = torch.empty(ML, P, device='cuda')
+        lam_tr = torch.empty(ML, P, device='cuda')
+        Bu_tr = torch.empty(ML, P, device='cuda')
+        dt_half_theta_tr = torch.empty(ML, P // 2, device='cuda')
+
+        BLOCK_P = triton.next_power_of_2(P)
+        fused_prescan_kernel[(ML,)](
+            dt_raw_tr, lam_raw_tr, theta_tr,
+            Bu_raw_flat,
+            kern.log_dt_bias, kern.b_norm.weight, kern.b_bias,
+            dt_tr, lam_tr, Bu_tr, dt_half_theta_tr,
+            ML, P, 1e-6,
+            BLOCK_P,
+        )
+
     cmp("dt", dt_pt.reshape(ML, P), dt_tr)
     cmp("lam", lam_pt.reshape(ML, P), lam_tr)
-
-    # Step 3: B rmsnorm + bias
-    with torch.no_grad():
-        Bu_pt = kern.b_norm(Bu_raw_pt) + kern.b_bias
-        Bu_normed_tr = triton_rmsnorm(Bu_raw_pt.reshape(ML, P), kern.b_norm.weight)
-        Bu_tr = Bu_normed_tr + kern.b_bias.unsqueeze(0)
     cmp("Bu (norm+bias)", Bu_pt.reshape(ML, P), Bu_tr)
+    cmp("dt_half*theta", dt_half_theta_pt.reshape(ML, P // 2), dt_half_theta_tr)
 
-    # Step 4: RoPE + shift
+    # Step 3: cumsum (same op)
     with torch.no_grad():
+        cum_theta_pt = torch.cumsum(dt_half_theta_pt, dim=1)
+        cum_theta_tr = torch.cumsum(dt_half_theta_tr.view(B, L, P // 2), dim=1).contiguous()
+    cmp("cum_theta", cum_theta_pt, cum_theta_tr)
+
+    # Step 4: fused_scan (RoPE + discretize + recurrence)
+    with torch.no_grad():
+        # PyTorch reference
+        Bu_rot_pt = apply_rotary_emb(Bu_pt, cum_theta_pt)
+        Bu_prev_pt = F.pad(Bu_rot_pt[:, :-1], (0, 0, 1, 0))
         dt_3d = dt_pt.view(B, L, P)
-        dt_half = dt_3d.view(B, L, P//2, 2).mean(-1)
-        cum_theta = torch.cumsum(dt_half * theta_pt, dim=1)
-
-        Bu_rot_pt = apply_rotary_emb(Bu_pt, cum_theta)
-        Bu_prev_pt = torch.nn.functional.pad(Bu_rot_pt[:, :-1], (0, 0, 1, 0))
-
-        Bu_rot_tr = triton_rope(Bu_pt, cum_theta)  # use same Bu_pt to isolate rope
-        Bu_prev_tr = torch.zeros_like(Bu_rot_tr)
-        Bu_prev_tr[:, 1:] = Bu_rot_tr[:, :-1]
-    cmp("Bu rotated", Bu_rot_pt, Bu_rot_tr)
-    cmp("Bu_prev", Bu_prev_pt, Bu_prev_tr)
-
-    # Step 5: discretization
-    with torch.no_grad():
         A = -torch.exp(kern.log_A_real) + 1j * kern.A_imag
         alpha_pt = torch.exp(dt_3d.to(torch.cfloat) * A)
         Bu_c = Bu_rot_pt.to(torch.cfloat)
@@ -275,71 +291,87 @@ def debug_forward_stepwise():
         dt_c = dt_3d.to(torch.cfloat)
         lam_3d = lam_pt.view(B, L, P)
         inject_pt = lam_3d * dt_c * Bu_c + (1 - lam_3d) * dt_c * alpha_pt * Bu_prev_c
-
-        A_real_neg = -torch.exp(kern.log_A_real)
-        a_re_tr, a_im_tr, i_re_tr, i_im_tr = triton_complex_discretize(
-            dt_3d, lam_3d, Bu_rot_pt, Bu_prev_pt, A_real_neg, kern.A_imag)
-    cmp("alpha real", alpha_pt.real, a_re_tr)
-    cmp("alpha imag", alpha_pt.imag, a_im_tr)
-    cmp("inject real", inject_pt.real, i_re_tr)
-    cmp("inject imag", inject_pt.imag, i_im_tr)
-
-    # Step 6: scan
-    with torch.no_grad():
         from .scan import sequential_scan
         h_pt = sequential_scan(alpha_pt, inject_pt)
 
-        h_re_tr, h_im_tr = triton_chunked_scan(a_re_tr, a_im_tr, i_re_tr, i_im_tr, 32)
+        # Triton fused scan
+        A_real_neg = -torch.exp(kern.log_A_real)
+        h_re_tr = torch.empty(B, L, P, device='cuda')
+        h_im_tr = torch.empty(B, L, P, device='cuda')
+        alpha_re_tr = torch.empty(B, L, P, device='cuda')
+        alpha_im_tr = torch.empty(B, L, P, device='cuda')
+        inject_re_tr = torch.empty(B, L, P, device='cuda')
+        inject_im_tr = torch.empty(B, L, P, device='cuda')
+        Bu_rot_tr = torch.empty(B, L, P, device='cuda')
+
+        BLOCK_P_SCAN = triton.next_power_of_2(P)
+        fused_scan_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt_tr.view(B, L, P).contiguous(), lam_tr.view(B, L, P).contiguous(),
+            Bu_tr.view(B, L, P).contiguous(), cum_theta_tr,
+            A_real_neg, kern.A_imag,
+            h_re_tr, h_im_tr, alpha_re_tr, alpha_im_tr,
+            inject_re_tr, inject_im_tr, Bu_rot_tr,
+            B, L, P,
+            LOG2E,
+            BLOCK_P_SCAN,
+        )
+
+    cmp("Bu rotated", Bu_rot_pt, Bu_rot_tr)
+    cmp("alpha real", alpha_pt.real, alpha_re_tr)
+    cmp("alpha imag", alpha_pt.imag, alpha_im_tr)
+    cmp("inject real", inject_pt.real, inject_re_tr)
+    cmp("inject imag", inject_pt.imag, inject_im_tr)
     cmp("h real", h_pt.real, h_re_tr)
     cmp("h imag", h_pt.imag, h_im_tr)
 
-    # Step 7: C gate
+    # Step 5: c_proj linear
     with torch.no_grad():
-        import torch.nn.functional as F
-        c_gate_pt = s6.c_norm(F.silu(s6.c_proj(x))) + s6.c_bias
-        c_gate_pt = apply_rotary_emb(c_gate_pt, cum_theta)
+        c_proj_pt = s6.c_proj(x)  # (B, L, P)
+        c_proj_tr = triton_linear(x.reshape(ML, H), s6.c_proj.weight, s6.c_proj.bias)
+    cmp("c_proj", c_proj_pt.reshape(ML, P), c_proj_tr)
 
-        c_proj_out = triton_linear(x.reshape(ML, H), s6.c_proj.weight, s6.c_proj.bias)
-        from .triton_s6 import triton_silu
-        c_silu = triton_silu(c_proj_out)
-        c_normed = triton_rmsnorm(c_silu, s6.c_norm.weight)
-        c_gate_tr = (c_normed + s6.c_bias.unsqueeze(0)).view(B, L, P)
-        c_gate_tr = triton_rope(c_gate_tr, cum_theta)
-    cmp("c_gate", c_gate_pt, c_gate_tr)
+    # Step 6: fused_cgate (silu + rmsnorm + bias + RoPE)
+    with torch.no_grad():
+        c_gate_pt = s6.c_norm(F.silu(c_proj_pt)) + s6.c_bias
+        c_gate_pt = apply_rotary_emb(c_gate_pt, cum_theta_pt)
 
-    # Step 8: gated readout
+        c_gate_tr = torch.empty(ML, P, device='cuda')
+        fused_cgate_kernel[(ML,)](
+            c_proj_tr, cum_theta_tr.view(ML, P // 2),
+            s6.c_norm.weight, s6.c_bias,
+            c_gate_tr,
+            ML, P, B, L, 1e-6,
+            BLOCK_P,
+        )
+    cmp("c_gate", c_gate_pt.reshape(ML, P), c_gate_tr)
+
+    # Step 7: fused_readout (gate + MIMO + skip + silu)
     with torch.no_grad():
         h_gated_pt = h_pt * c_gate_pt
         C = torch.view_as_complex(s6.C)
         y_pt = torch.einsum('hp,blp->blh', C, h_gated_pt.to(C.dtype)).real
-
-        # Triton gating
-        N_elem = B * L * P
-        BLOCK = 1024
-        hg_re_tr = torch.empty(B, L, P, device='cuda')
-        hg_im_tr = torch.empty(B, L, P, device='cuda')
-        complex_gate_readout_fwd_kernel[(triton.cdiv(N_elem, BLOCK),)](
-            h_re_tr.contiguous().view(-1), h_im_tr.contiguous().view(-1),
-            c_gate_tr.contiguous().view(-1),
-            hg_re_tr.view(-1), hg_im_tr.view(-1), N_elem, BLOCK)
-        C_re = C.real.contiguous()
-        C_im = C.imag.contiguous()
-        y_re_tr = triton_linear(hg_re_tr.reshape(ML, P), C_re)
-        y_im_tr = triton_linear(hg_im_tr.reshape(ML, P), C_im)
-        y_tr = (y_re_tr - y_im_tr).view(B, L, H)
-    cmp("y (readout)", y_pt, y_tr)
-
-    # Step 9: skip + silu
-    with torch.no_grad():
         out_pt = F.silu(y_pt + x * s6.D)
 
-        from .triton_s6 import skip_silu_fwd_kernel
-        N_out = B * L * H
+        C_re = C.real.contiguous()
+        C_im = C.imag.contiguous()
+        BLOCK_H = min(64, triton.next_power_of_2(H))
         out_tr = torch.empty(B, L, H, device='cuda')
-        skip_silu_fwd_kernel[(triton.cdiv(N_out, BLOCK),)](
-            y_tr.contiguous().view(-1), x.contiguous().view(-1), s6.D,
-            out_tr.view(-1), N_out, H, BLOCK)
-    cmp("output (skip+silu)", out_pt, out_tr)
+        fused_readout_kernel[(ML, triton.cdiv(H, BLOCK_H))](
+            h_re_tr.view(ML, P), h_im_tr.view(ML, P),
+            c_gate_tr,
+            C_re, C_im,
+            x.reshape(ML, H), s6.D,
+            out_tr.view(ML, H),
+            ML, H, P,
+            BLOCK_H, BLOCK_P,
+        )
+    cmp("output", out_pt, out_tr.view(B, L, H))
+
+    # Step 8: full forward comparison (end-to-end)
+    with torch.no_grad():
+        full_pt = s6(x)
+        full_tr = model(x)
+    cmp("FULL FORWARD", full_pt, full_tr)
 
 
 if __name__ == '__main__':
