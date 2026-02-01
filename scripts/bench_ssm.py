@@ -12,6 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+try:
+    from torch.profiler import profile, ProfilerActivity
+    HAS_PROFILER = True
+except Exception:
+    HAS_PROFILER = False
 from einops import rearrange, repeat
 
 SEED = 42
@@ -358,6 +363,24 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     for _ in range(3):
         _step(task_name)[0].backward()
         opt.zero_grad(set_to_none=True)
+
+    # Optional profiling for S6 on CUDA (forward + backward on one batch)
+    if device == 'cuda' and isinstance(model, S6Wrapper) and HAS_PROFILER:
+        for _ in range(50):
+            loss, _ = _step(task_name)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+        torch.cuda.synchronize()
+        opt.zero_grad(set_to_none=True)
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     record_shapes=True,
+                     profile_memory=True) as prof:
+            loss, _ = _step(task_name)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+        torch.cuda.synchronize()
+        print("\n[S6 profile] Forward+Backward (1 batch)")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
 
     if device == 'cuda':
         torch.cuda.reset_peak_memory_stats()

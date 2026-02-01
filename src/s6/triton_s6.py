@@ -1599,7 +1599,8 @@ if HAS_TRITON:
     @triton.jit
     def fused_inject_bwd_kernel(
         dt_ptr, lam_ptr,
-        Bu_rot_ptr,  # (B, L, P)
+        Bu_ptr,  # (B, L, P) pre-rotation
+        cum_theta_ptr,  # (B, L, P//2)
         alpha_re_ptr, alpha_im_ptr,  # (B, L, P)
         d_inj_re_ptr, d_inj_im_ptr,  # (B, L, P)
         d_dt_inj_ptr,  # (B, L, P)
@@ -1614,6 +1615,13 @@ if HAS_TRITON:
         offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
         p_mask = offs_p < P
         base = pid_b * L * P
+        half_P = P // 2
+        base_theta = pid_b * L * half_P
+
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+        partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+        partner_mask = partner_offs < P
 
         gsize = P // 4
         g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
@@ -1629,7 +1637,17 @@ if HAS_TRITON:
 
             dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
             lam_t = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
-            Bu_t = tl.load(Bu_rot_ptr + off, mask=p_mask, other=0.0)
+            off_theta = base_theta + t * half_P + pair_idx
+            Bu_raw = tl.load(Bu_ptr + off, mask=p_mask, other=0.0)
+            angle = tl.load(cum_theta_ptr + off_theta, mask=p_mask, other=0.0)
+            cos_a = tl.cos(angle)
+            sin_a = tl.sin(angle)
+            Bu_partner = tl.load(Bu_ptr + base + t * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            Bu_t = tl.where(
+                is_odd > 0.5,
+                Bu_partner * sin_a + Bu_raw * cos_a,
+                Bu_raw * cos_a - Bu_partner * sin_a,
+            )
             a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
             a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
             d_inj_re = tl.load(d_inj_re_ptr + off, mask=p_mask, other=0.0)
@@ -1648,20 +1666,60 @@ if HAS_TRITON:
 
             if t > 0:
                 off_prev1 = base + (t - 1) * P + offs_p
-                Bu_prev1 = tl.load(Bu_rot_ptr + off_prev1, mask=p_mask, other=0.0)
+                off_theta_prev1 = base_theta + (t - 1) * half_P + pair_idx
+                Bu_prev1_raw = tl.load(Bu_ptr + off_prev1, mask=p_mask, other=0.0)
+                angle_prev1 = tl.load(cum_theta_ptr + off_theta_prev1, mask=p_mask, other=0.0)
+                cos_prev1 = tl.cos(angle_prev1)
+                sin_prev1 = tl.sin(angle_prev1)
+                Bu_partner_prev1 = tl.load(Bu_ptr + base + (t - 1) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+                Bu_prev1 = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_prev1 * sin_prev1 + Bu_prev1_raw * cos_prev1,
+                    Bu_prev1_raw * cos_prev1 - Bu_partner_prev1 * sin_prev1,
+                )
                 a_prev_re = tl.load(alpha_re_ptr + off_prev1, mask=p_mask, other=0.0)
                 a_prev_im = tl.load(alpha_im_ptr + off_prev1, mask=p_mask, other=0.0)
             if t > 1:
                 off_prev2 = base + (t - 2) * P + offs_p
-                Bu_prev2 = tl.load(Bu_rot_ptr + off_prev2, mask=p_mask, other=0.0)
+                off_theta_prev2 = base_theta + (t - 2) * half_P + pair_idx
+                Bu_prev2_raw = tl.load(Bu_ptr + off_prev2, mask=p_mask, other=0.0)
+                angle_prev2 = tl.load(cum_theta_ptr + off_theta_prev2, mask=p_mask, other=0.0)
+                cos_prev2 = tl.cos(angle_prev2)
+                sin_prev2 = tl.sin(angle_prev2)
+                Bu_partner_prev2 = tl.load(Bu_ptr + base + (t - 2) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+                Bu_prev2 = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_prev2 * sin_prev2 + Bu_prev2_raw * cos_prev2,
+                    Bu_prev2_raw * cos_prev2 - Bu_partner_prev2 * sin_prev2,
+                )
             if t + 1 < L:
                 off_next1 = base + (t + 1) * P + offs_p
-                Bu_next1 = tl.load(Bu_rot_ptr + off_next1, mask=p_mask, other=0.0)
+                off_theta_next1 = base_theta + (t + 1) * half_P + pair_idx
+                Bu_next1_raw = tl.load(Bu_ptr + off_next1, mask=p_mask, other=0.0)
+                angle_next1 = tl.load(cum_theta_ptr + off_theta_next1, mask=p_mask, other=0.0)
+                cos_next1 = tl.cos(angle_next1)
+                sin_next1 = tl.sin(angle_next1)
+                Bu_partner_next1 = tl.load(Bu_ptr + base + (t + 1) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+                Bu_next1 = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_next1 * sin_next1 + Bu_next1_raw * cos_next1,
+                    Bu_next1_raw * cos_next1 - Bu_partner_next1 * sin_next1,
+                )
                 a_next_re = tl.load(alpha_re_ptr + off_next1, mask=p_mask, other=0.0)
                 a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask, other=0.0)
             if t + 2 < L:
                 off_next2 = base + (t + 2) * P + offs_p
-                Bu_next2 = tl.load(Bu_rot_ptr + off_next2, mask=p_mask, other=0.0)
+                off_theta_next2 = base_theta + (t + 2) * half_P + pair_idx
+                Bu_next2_raw = tl.load(Bu_ptr + off_next2, mask=p_mask, other=0.0)
+                angle_next2 = tl.load(cum_theta_ptr + off_theta_next2, mask=p_mask, other=0.0)
+                cos_next2 = tl.cos(angle_next2)
+                sin_next2 = tl.sin(angle_next2)
+                Bu_partner_next2 = tl.load(Bu_ptr + base + (t + 2) * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+                Bu_next2 = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_next2 * sin_next2 + Bu_next2_raw * cos_next2,
+                    Bu_next2_raw * cos_next2 - Bu_partner_next2 * sin_next2,
+                )
 
             # U for grouped inject: Z = alpha_t * U
             U_re = (m1 * (Bu_prev1 + a_prev_re * Bu_prev2)
@@ -2845,13 +2903,44 @@ class _TritonS6(torch.autograd.Function):
         d_inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_inject_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
 
-        fused_scan_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+        chunk_size = min(ctx.chunk_size, L)
+        n_chunks = triton.cdiv(L, chunk_size)
+
+        chunk_a_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_a_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_b_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_b_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+
+        fused_chunk_summary_bwd_kernel[(B, n_chunks, triton.cdiv(P, BLOCK_P_SCAN))](
+            alpha_re.view(B, L, P), alpha_im.view(B, L, P),
+            d_h_re.view(B, L, P), d_h_im.view(B, L, P),
+            chunk_a_re, chunk_a_im,
+            chunk_b_re, chunk_b_im,
+            B, L, P,
+            chunk_size, n_chunks,
+            BLOCK_P_SCAN,
+        )
+
+        chunk_adj0_re = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+        chunk_adj0_im = torch.empty(B, n_chunks, P, device=u.device, dtype=u.dtype)
+
+        fused_chunk_prefix_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            chunk_a_re, chunk_a_im,
+            chunk_b_re, chunk_b_im,
+            chunk_adj0_re, chunk_adj0_im,
+            B, n_chunks, P,
+            BLOCK_P_SCAN,
+        )
+
+        fused_chunk_scan_bwd_kernel[(B, n_chunks, triton.cdiv(P, BLOCK_P_SCAN))](
             alpha_re.view(B, L, P), alpha_im.view(B, L, P),
             h_re, h_im,
             d_h_re.view(B, L, P), d_h_im.view(B, L, P),
-            d_alpha_re, d_alpha_im,
+            chunk_adj0_re, chunk_adj0_im,
             d_inject_re, d_inject_im,
+            d_alpha_re, d_alpha_im,
             B, L, P,
+            chunk_size, n_chunks,
             BLOCK_P_SCAN,
         )
 
@@ -2861,7 +2950,7 @@ class _TritonS6(torch.autograd.Function):
 
         fused_inject_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
             dt.view(B, L, P), lam.view(B, L, P),
-            Bu_rot.view(B, L, P),
+            Bu.view(B, L, P), cum_theta,
             alpha_re.view(B, L, P), alpha_im.view(B, L, P),
             d_inject_re, d_inject_im,
             d_dt_inj, d_lam_disc,
