@@ -311,7 +311,6 @@ def debug_forward_stepwise():
             h_re_tr, h_im_tr, alpha_re_tr, alpha_im_tr,
             inject_re_tr, inject_im_tr, Bu_rot_tr,
             B, L, P,
-            LOG2E,
             BLOCK_P_SCAN,
         )
 
