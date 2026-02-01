@@ -2744,23 +2744,19 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_P,
         )
 
-        # 7. Fused readout: gate h, MIMO, skip+silu
-        BLOCK_H = min(64, triton.next_power_of_2(H))
-        out = torch.empty(B, L, H, device=u.device, dtype=u.dtype)
+        # 7. Readout via GEMM: gate h, MIMO, skip+silu
+        h_re_m = h_re.view(M, P)
+        h_im_m = h_im.view(M, P)
+        c_gate_m = c_gate
+        h_gated_re = h_re_m * c_gate_m
+        h_gated_im = h_im_m * c_gate_m
 
-        readout_warps = 8 if P >= 64 else 4
-        readout_stages = 4
-        fused_readout_kernel[(M, triton.cdiv(H, BLOCK_H))](
-            h_re.view(M, P), h_im.view(M, P),
-            c_gate,
-            C_re, C_im,
-            u_flat, D,
-            out.view(M, H),
-            M, H, P,
-            BLOCK_H, BLOCK_P,
-            num_warps=readout_warps,
-            num_stages=readout_stages,
-        )
+        C_re_t = C_re.t()
+        C_im_t = C_im.t()
+        y = h_gated_re @ C_re_t - h_gated_im @ C_im_t
+        y = y + u_flat * D
+        y = F.silu(y)
+        out = y.view(B, L, H)
 
         # Save for backward
         ctx.save_for_backward(
@@ -2800,38 +2796,35 @@ class _TritonS6(torch.autograd.Function):
         u_flat = u.reshape(M, H)
         A_real_neg = -torch.exp(log_A_real)
 
-        # ---- Steps 7+6: Fused readout + c_gate backward ----
-        BLOCK_H = min(64, triton.next_power_of_2(H))
-        d_h_re = torch.zeros(M, P, device=u.device, dtype=u.dtype)
-        d_h_im = torch.zeros(M, P, device=u.device, dtype=u.dtype)
-        d_c_gate_buf = torch.zeros(M, P, device=u.device, dtype=u.dtype)
-        d_u_skip = torch.empty(M, H, device=u.device, dtype=u.dtype)
-        d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
-        d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
-        d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
+        # ---- Steps 7+6: Readout backward via GEMM + c_gate chain ----
         d_out_flat = d_out.reshape(M, H).contiguous()
 
-        readout_warps = 8 if P >= 64 else 4
-        readout_stages = 4
-        fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
-            h_re.view(M, P), h_im.view(M, P),
-            c_gate, c_proj_out,
-            cum_theta.view(M, P // 2),
-            C_re, C_im, u_flat, D,
-            c_norm_gamma, c_bias,
-            d_out_flat,
-            d_h_re, d_h_im,
-            d_c_gate_buf,
-            torch.empty(M, P // 2, device=u.device, dtype=u.dtype),
-            d_u_skip,
-            d_C_re, d_C_im, d_D,
-            torch.empty(P, device=u.device, dtype=u.dtype),
-            torch.empty(P, device=u.device, dtype=u.dtype),
-            M, H, P,
-            BLOCK_H, BLOCK_P,
-            num_warps=readout_warps,
-            num_stages=readout_stages,
-        )
+        h_re_m = h_re.view(M, P)
+        h_im_m = h_im.view(M, P)
+        c_gate_m = c_gate
+
+        h_gated_re = h_re_m * c_gate_m
+        h_gated_im = h_im_m * c_gate_m
+
+        C_re_t = C_re.t()
+        C_im_t = C_im.t()
+        y = h_gated_re @ C_re_t - h_gated_im @ C_im_t
+        y = y + u_flat * D
+        sig = torch.sigmoid(y)
+        d_y = d_out_flat * (sig + y * sig * (1.0 - sig))
+
+        d_u_skip = d_y * D
+        d_D = (d_y * u_flat).sum(0)
+
+        d_h_gated_re = d_y @ C_re
+        d_h_gated_im = -d_y @ C_im
+
+        d_C_re = d_y.t() @ h_gated_re
+        d_C_im = -d_y.t() @ h_gated_im
+
+        d_h_re = d_h_gated_re * c_gate_m
+        d_h_im = d_h_gated_im * c_gate_m
+        d_c_gate_buf = d_h_gated_re * h_re_m + d_h_gated_im * h_im_m
 
         # c_gate chain rule
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
