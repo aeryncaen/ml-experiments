@@ -33,22 +33,28 @@ class SqueezeExcite1D(nn.Module):
 
 
 class MultiScaleDepthwiseConv(nn.Module):
-    """Split channels into 4 groups: 3 causal, 3 retrocausal, 9 causal, 9 retrocausal. Then SE."""
+    """Split channels into 4 groups: passthrough, 5 causal, 5 retro, 5 center. Then SE."""
     def __init__(self, channels):
         super().__init__()
         n_groups = 4
         assert channels % n_groups == 0, f"channels {channels} not divisible by {n_groups}"
         self.group_size = channels // n_groups
-        self.kernel_specs = [(3, "causal"), (3, "retro"), (9, "causal"), (9, "retro")]
+        self.kernel_specs = [
+            ("pass", None),
+            ("causal", 5),
+            ("retro", 5),
+            ("center", 5),
+        ]
+        # Convs for the 3 non-passthrough groups, in the same order as kernel_specs[1:]
         self.convs = nn.ModuleList([
             nn.Conv1d(
                 self.group_size,
                 self.group_size,
                 k,
-                padding=(k - 1),
+                padding=(k - 1 if mode in ("causal", "retro") else k // 2),
                 groups=self.group_size,
             )
-            for k, _mode in self.kernel_specs
+            for mode, k in self.kernel_specs[1:]
         ])
         self.se = SqueezeExcite1D(channels)
 
@@ -56,14 +62,22 @@ class MultiScaleDepthwiseConv(nn.Module):
         # x: (B, L, C)
         B, L, C = x.shape
         gs = self.group_size
-        n_conv = len(self.kernel_specs)
-        conv_chunks = [x[..., i * gs:(i + 1) * gs] for i in range(n_conv)]
+        n_groups = len(self.kernel_specs)
+        conv_chunks = [x[..., i * gs:(i + 1) * gs] for i in range(n_groups)]
         out = []
-        for (chunk, conv, (k, mode)) in zip(conv_chunks, self.convs, self.kernel_specs):
+        conv_idx = 0
+        for chunk, (mode, _k) in zip(conv_chunks, self.kernel_specs):
+            if mode == "pass":
+                out.append(chunk)
+                continue
+            conv = self.convs[conv_idx]
+            conv_idx += 1
             x_in = chunk.transpose(1, 2)
             if mode == "retro":
                 x_in = torch.flip(x_in, dims=(-1,))
-            y = conv(x_in)[..., :L]
+            y = conv(x_in)
+            if mode in ("causal", "retro"):
+                y = y[..., :L]
             if mode == "retro":
                 y = torch.flip(y, dims=(-1,))
             y = F.silu(y).transpose(1, 2)
