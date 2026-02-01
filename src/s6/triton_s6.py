@@ -1271,6 +1271,14 @@ class _TritonS6(torch.autograd.Function):
         )
 
         # DEBUG: print debug info for NaN rows
+        # DEBUG: always check d_out
+        _d_out_flat = d_out.view(M, H)
+        print(f"d_out: min={_d_out_flat.min():.6g} max={_d_out_flat.max():.6g} mean={_d_out_flat.mean():.6g} nan={_d_out_flat.isnan().any()}")
+        if _d_out_flat.max() > 10:
+            bad = (_d_out_flat.abs() > 10).any(dim=1).nonzero(as_tuple=False).squeeze()
+            print(f"  rows with |d_out|>10: {bad[:10]}")
+            print(f"  d_out[{bad[0].item()}] = {_d_out_flat[bad[0].item()][:8]}")
+
         if d_h_re.isnan().any():
             nan_rows = d_h_re.isnan().any(dim=1).nonzero(as_tuple=False).squeeze()
             for r in nan_rows[:3]:
