@@ -340,8 +340,8 @@ def debug_forward_stepwise():
     # Step 1: x_proj linear
     with torch.no_grad():
         xp_pt = F.silu(kern.x_proj(x))  # (B, L, P+P+P//2)
-        xp_tr = triton_linear(x.reshape(ML, H), kern.x_proj.weight, kern.x_proj.bias)
-        xp_tr = F.silu(xp_tr)
+        xp_tr_raw = triton_linear(x.reshape(ML, H), kern.x_proj.weight, kern.x_proj.bias)
+        xp_tr = F.silu(xp_tr_raw)
     cmp("x_proj", xp_pt.reshape(ML, -1), xp_tr)
 
     # Step 2: fused_prescan (dt/lam activations + Bu rmsnorm + bias + dt_half*theta)
@@ -357,7 +357,7 @@ def debug_forward_stepwise():
         dt_half_theta_pt = dt_half_pt * theta_pt
 
         # Triton fused prescan
-        dt_raw_tr, lam_raw_tr, theta_tr = xp_tr.split(kern._split_sizes, dim=-1)
+        dt_raw_tr, lam_raw_tr, theta_tr = xp_tr_raw.split(kern._split_sizes, dim=-1)
         dt_raw_tr = dt_raw_tr.contiguous()
         lam_raw_tr = lam_raw_tr.contiguous()
         theta_tr = theta_tr.contiguous()
