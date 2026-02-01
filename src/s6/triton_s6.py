@@ -615,6 +615,8 @@ if HAS_TRITON:
         d_c_norm_gamma_ptr,  # (P,) — atomically accumulated
         # Dims
         M, H, P,
+        # Debug
+        dbg_ptr,  # (M, 4) for debug: [max_abs_y, max_abs_xskip, max_abs_dxskip, max_abs_dhgre]
         BLOCK_H: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
@@ -671,6 +673,13 @@ if HAS_TRITON:
         # d_hg_re[p] = sum_h C_re[h,p] * d_y[h]
         d_hg_re = tl.sum(C_re_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
         d_hg_im = -tl.sum(C_im_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
+
+        # DEBUG: write intermediates
+        if pid_h == 0:
+            tl.store(dbg_ptr + pid_m * 4 + 0, tl.max(tl.abs(y_vals), axis=0))
+            tl.store(dbg_ptr + pid_m * 4 + 1, tl.max(tl.abs(d_x_skip), axis=0))
+            tl.store(dbg_ptr + pid_m * 4 + 2, tl.max(tl.abs(d_hg_re), axis=0))
+            tl.store(dbg_ptr + pid_m * 4 + 3, tl.max(tl.abs(d_hg_re * gate), axis=0))
 
         # d_C: atomic add (H, P)
         # d_C_re[h,p] += d_y[h] * hg_re[p]
@@ -1226,67 +1235,61 @@ class _TritonS6(torch.autograd.Function):
         u_flat = u.reshape(M, H)
         A_real_neg = -torch.exp(log_A_real)
 
-        # ---- Steps 7+6: PyTorch readout + c_gate backward (DEBUG) ----
-        h_re_flat = h_re.view(M, P)
-        h_im_flat = h_im.view(M, P)
-        c_gate_flat = c_gate
+        # ---- Steps 7+6: Fused readout + c_gate backward ----
+        BLOCK_H = min(64, triton.next_power_of_2(H))
+        d_h_re = torch.zeros(M, P, device=u.device, dtype=u.dtype)
+        d_h_im = torch.zeros(M, P, device=u.device, dtype=u.dtype)
+        d_c_gate_buf = torch.zeros(M, P, device=u.device, dtype=u.dtype)
+        d_u_skip = torch.empty(M, H, device=u.device, dtype=u.dtype)
+        d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
+        d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
+        d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
+        _dbg = torch.zeros(M, 4, device=u.device, dtype=u.dtype)
 
-        hg_re = h_re_flat * c_gate_flat
-        hg_im = h_im_flat * c_gate_flat
+        fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
+            h_re.view(M, P), h_im.view(M, P),
+            c_gate, c_proj_out,
+            cum_theta.view(M, P // 2),
+            C_re, C_im, u_flat, D,
+            c_norm_gamma, c_bias,
+            d_out.view(M, H),
+            d_h_re, d_h_im,
+            d_c_gate_buf,
+            torch.empty(M, P // 2, device=u.device, dtype=u.dtype),
+            d_u_skip,
+            d_C_re, d_C_im, d_D,
+            torch.empty(P, device=u.device, dtype=u.dtype),
+            torch.empty(P, device=u.device, dtype=u.dtype),
+            M, H, P,
+            _dbg,
+            BLOCK_H, BLOCK_P,
+        )
 
-        y_re = hg_re @ C_re.t()
-        y_im = hg_im @ C_im.t()
-        y = y_re - y_im
+        # DEBUG: print debug info for NaN rows
+        if d_h_re.isnan().any():
+            nan_rows = d_h_re.isnan().any(dim=1).nonzero(as_tuple=False).squeeze()
+            for r in nan_rows[:3]:
+                r = r.item()
+                print(f"Row {r}: max_y={_dbg[r,0]:.4f} max_dxskip={_dbg[r,1]:.4f} max_dhgre={_dbg[r,2]:.4f} max_dhre={_dbg[r,3]:.4f}")
+                print(f"  d_h_re[{r}]={d_h_re[r]}")
+                print(f"  h_re[{r}] range=[{h_re.view(M,P)[r].min():.4f}, {h_re.view(M,P)[r].max():.4f}]")
+                print(f"  gate[{r}] range=[{c_gate[r].min():.4f}, {c_gate[r].max():.4f}]")
 
-        x_skip = y + u_flat * D
-        sig_skip = torch.sigmoid(x_skip)
-        d_x_skip = d_out.view(M, H) * (sig_skip + x_skip * sig_skip * (1 - sig_skip))
+        # c_gate chain rule
+        d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_cum_theta_c = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
+        d_c_bias = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_c_norm_gamma = torch.zeros(P, device=u.device, dtype=u.dtype)
 
-        d_y = d_x_skip
-        d_u_skip = d_x_skip * D
-        d_D = (d_x_skip * u_flat).sum(0)
-
-        d_hg_re = d_y @ C_re
-        d_hg_im = -(d_y @ C_im)
-        d_C_re = d_y.t() @ hg_re
-        d_C_im = -(d_y.t() @ hg_im)
-
-        d_h_re = d_hg_re * c_gate_flat
-        d_h_im = d_hg_im * c_gate_flat
-        d_c_gate = d_hg_re * h_re_flat + d_hg_im * h_im_flat
-
-        # c_gate backward (PyTorch)
-        cum_theta_flat = cum_theta.view(M, P // 2)
-        c_silu = F.silu(c_proj_out)
-        c_var = c_silu.pow(2).mean(-1, keepdim=True)
-        c_normed = c_silu / torch.sqrt(c_var + 1e-6) * c_norm_gamma
-        c_gate_pre_rope = c_normed + c_bias
-
-        cos_ct = torch.cos(cum_theta_flat)
-        sin_ct = torch.sin(cum_theta_flat)
-
-        d_cg = d_c_gate.view(M, P)
-        d_cg1, d_cg2 = d_cg[..., 0::2], d_cg[..., 1::2]
-        cg1, cg2 = c_gate_pre_rope[..., 0::2], c_gate_pre_rope[..., 1::2]
-
-        d_cgpre = torch.empty_like(c_gate_pre_rope)
-        d_cgpre[..., 0::2] = d_cg1 * cos_ct + d_cg2 * sin_ct
-        d_cgpre[..., 1::2] = -d_cg1 * sin_ct + d_cg2 * cos_ct
-
-        d_cum_theta_c = (d_cg1 * (-cg1 * sin_ct - cg2 * cos_ct) +
-                         d_cg2 * (cg1 * cos_ct - cg2 * sin_ct))
-
-        d_c_bias = d_cgpre.sum(0)
-
-        rrms_c = torch.rsqrt(c_var + 1e-6)
-        c_hat = c_silu * rrms_c
-        d_c_norm_gamma = (d_cgpre * c_hat).sum(0)
-        d_c_hat = d_cgpre * c_norm_gamma
-        inner_c = (d_c_hat * c_hat).sum(-1, keepdim=True) / P
-        d_c_silu = rrms_c * (d_c_hat - c_hat * inner_c)
-
-        sig_c = torch.sigmoid(c_proj_out)
-        d_c_proj_out = d_c_silu * (sig_c + c_proj_out * sig_c * (1 - sig_c))
+        fused_bwd_cgate_chain_kernel[(M,)](
+            d_c_gate_buf,
+            c_proj_out, cum_theta.view(M, P // 2),
+            c_norm_gamma, c_bias,
+            d_c_proj_out, d_cum_theta_c,
+            d_c_bias, d_c_norm_gamma,
+            M, P, 1e-6,
+            BLOCK_P,
+        )
 
         # c_proj linear backward
         d_c_proj_w = d_c_proj_out.t() @ u_flat
