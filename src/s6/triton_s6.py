@@ -195,7 +195,6 @@ if HAS_TRITON:
         Bu_rot_ptr,  # (B, L, P) — saved for backward (Bu after RoPE)
         # Dims
         B_batch, L, P,
-        LOG2E_VAL: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
@@ -270,11 +269,10 @@ if HAS_TRITON:
             tl.store(Bu_rot_ptr + off, Bu_rot, mask=p_mask)
 
             # Complex discretization: alpha = exp(dt * A)
-            # Using exp2 trick: exp(x) = exp2(x * log2(e))
             dt_a_re = dt * a_re  # dt * A_real (A_real is negative)
             dt_a_im = dt * a_im
 
-            exp_re = tl.exp2(dt_a_re * LOG2E_VAL)
+            exp_re = tl.exp(dt_a_re)
             alpha_re_t = exp_re * tl.cos(dt_a_im)
             alpha_im_t = exp_re * tl.sin(dt_a_im)
 
@@ -675,7 +673,6 @@ class _TritonS6(torch.autograd.Function):
             A_real_neg, A_imag,
             h_re, h_im, alpha_re, alpha_im, inject_re, inject_im, Bu_rot,
             B, L, P,
-            LOG2E,
             BLOCK_P_SCAN,
         )
 
