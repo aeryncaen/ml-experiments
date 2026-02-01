@@ -24,6 +24,7 @@ if torch.cuda.is_available():
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mamba'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 's5-pytorch'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'zoology'))
 
 DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 
@@ -116,6 +117,29 @@ class MambaWrapper(nn.Module):
 # DS1 wrapper
 # ---------------------------------------------------------------------------
 from ds_moe.model import DS1
+
+# ---------------------------------------------------------------------------
+# S6
+# ---------------------------------------------------------------------------
+from s6.s6 import S6 as S6Module
+try:
+    from s6.triton_s6 import TritonS6 as TritonS6Module
+    HAS_TRITON_S6 = True
+except ImportError:
+    HAS_TRITON_S6 = False
+
+
+class S6Wrapper(nn.Module):
+    """Wraps S6 to accept (B, L, H) and return (B, L, H)."""
+    def __init__(self, d_model, d_state=64, M=4, use_triton=True, **kwargs):
+        super().__init__()
+        if use_triton and HAS_TRITON_S6 and torch.cuda.is_available():
+            self.s6 = TritonS6Module(d_model=d_model, d_state=d_state, M=M, **kwargs)
+        else:
+            self.s6 = S6Module(d_model=d_model, d_state=d_state, M=M, **kwargs)
+
+    def forward(self, x):
+        return self.s6(x)
 
 
 class DS1Wrapper(nn.Module):
@@ -327,12 +351,16 @@ def make_models(dim):
     # Mamba: 1 layer, expand=2, d_state=64 = ~51K params
     mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
+    # S6: 1 layer
+    s6 = S6Wrapper(d_model=dim, d_state=64, M=4)
+
     return {
         # 'DS1': ds1,
         'DS1++': ds1_pp,
         # 'S4D': s4d,
         # 'S5': s5,
         # 'Mamba': mamba,
+        'S6': s6,
     }
 
 
