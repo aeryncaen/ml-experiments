@@ -197,10 +197,11 @@ class QuadConvMix(nn.Module):
 
 class MHABlock(nn.Module):
     """Single block of multi-head attention (SDPA) + SwiGLU MLP."""
-    def __init__(self, d_model, n_heads=4, mlp_hidden=208, se_reduction=4):
+    def __init__(self, d_model, n_heads=4, mlp_hidden=208, se_reduction=4, s4d_state=64):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.quad_conv = QuadConvMix(d_model, k=3, reduction=se_reduction)
+        self.s4d = S4D(d_model=d_model, d_state=s4d_state)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, mlp_hidden)
@@ -208,6 +209,7 @@ class MHABlock(nn.Module):
     def forward(self, x):
         h = self.norm1(x)
         h = self.quad_conv(h)
+        h = self.s4d(h)
         h, _ = self.attn(h, h, h)
         x = x + h
         x = x + self.mlp(self.norm2(x))
