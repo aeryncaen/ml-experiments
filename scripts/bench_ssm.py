@@ -203,20 +203,15 @@ class QuadConvMix(nn.Module):
 
 
 class MHABlock(nn.Module):
-    """Single block of multi-head attention (SDPA) + SwiGLU MLP."""
-    def __init__(self, d_model, n_heads=4, mlp_hidden=208, se_reduction=4, mamba_state=16):
+    """QuadConv → MHA."""
+    def __init__(self, d_model, n_heads=4, se_reduction=4):
         super().__init__()
         self.quad_conv = QuadConvMix(d_model, k=3, reduction=se_reduction)
-        self.mamba = Mamba(d_model=d_model, d_state=mamba_state, d_conv=4, expand=1, use_fast_path=True)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm2 = RMSNorm(d_model)
-        self.mlp = SwiGLUMLP(d_model, mlp_hidden)
 
     def forward(self, x):
         h = self.quad_conv(x)
-        h = self.mamba(h)
         h, _ = self.attn(h, h, h)
-        h = h + self.mlp(self.norm2(h))
         return h
 
 
@@ -544,23 +539,23 @@ def make_models(dim, n_layers=1):
         lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True),
         n_layers, dim)
 
-    # S4D: d_state=384 = ~57.6K params/layer
-    # models['S4D'] = _stack(lambda: S4D(d_model=dim, d_state=384), n_layers, dim)
+    # S4D: ~50K params/layer
+    models['S4D'] = _stack(lambda: S4D(d_model=dim, d_state=320), n_layers, dim)
 
-    # S5: state_width=256 = ~49.7K params/layer
-    # models['S5'] = _stack(lambda: S5Wrapper(width=dim, state_width=256), n_layers, dim)
+    # S5: ~50K params/layer
+    models['S5'] = _stack(lambda: S5Wrapper(width=dim, state_width=256), n_layers, dim)
 
-    # Mamba: expand=2, d_state=64 = ~51K params/layer
-    # models['Mamba'] = _stack(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2), n_layers, dim)
+    # Mamba: ~51K params/layer
+    models['Mamba'] = _stack(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2), n_layers, dim)
 
-    # S6: d_state=104 = ~57K params/layer
+    # S6: ~50K params/layer
     models['S6'] = _stack(
-        lambda: S6Wrapper(d_model=dim, d_state=104, M=4, num_heads=4),
+        lambda: S6Wrapper(d_model=dim, d_state=80, M=4, num_heads=4),
         n_layers, dim)
 
-    # MHA+SwiGLU: ~57K params/layer
+    # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     models['MHA'] = _stack(
-        lambda: MHABlock(d_model=dim, n_heads=4, mlp_hidden=208),
+        lambda: MHABlock(d_model=dim, n_heads=4),
         n_layers, dim)
 
     return models
