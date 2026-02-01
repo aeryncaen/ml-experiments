@@ -434,8 +434,8 @@ def make_models(dim):
     # Mamba: 1 layer, expand=2, d_state=64 = ~51K params
     mamba = MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2)
 
-    # S6: 1 layer, d_state=104 to match ~57K param budget
-    s6 = S6Wrapper(d_model=dim, d_state=104, M=4, num_heads=4)
+    # S6: 1 layer, d_model=32 (expands 2x internally), d_state tuned to ~57K param budget
+    s6 = S6Wrapper(d_model=dim // 2, d_state=104, M=4, num_heads=4)
 
     # MHA+SwiGLU: 1 block, ~57K params (MHA 4-head ~16.6K + SwiGLU mlp_hidden=208 ~40.4K)
     mha = MHABlock(d_model=dim, n_heads=4, mlp_hidden=208)
