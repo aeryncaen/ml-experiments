@@ -7,6 +7,9 @@ Run on CUDA box:
 import torch
 import torch.nn as nn
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 SEED = 42
 
 
