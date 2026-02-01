@@ -1250,6 +1250,7 @@ class _TritonS6(torch.autograd.Function):
         d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
         d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
         _dbg = torch.zeros(M, 8, device=u.device, dtype=u.dtype)
+        d_out_flat = d_out.reshape(M, H).contiguous()
 
         fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
             h_re.view(M, P), h_im.view(M, P),
@@ -1257,7 +1258,7 @@ class _TritonS6(torch.autograd.Function):
             cum_theta.view(M, P // 2),
             C_re, C_im, u_flat, D,
             c_norm_gamma, c_bias,
-            d_out.view(M, H),
+            d_out_flat,
             d_h_re, d_h_im,
             d_c_gate_buf,
             torch.empty(M, P // 2, device=u.device, dtype=u.dtype),
@@ -1272,6 +1273,9 @@ class _TritonS6(torch.autograd.Function):
 
         # DEBUG: print debug info for NaN rows
         # DEBUG: always check d_out
+        print(f"d_out shape={d_out.shape} stride={d_out.stride()} contiguous={d_out.is_contiguous()} dtype={d_out.dtype}")
+        print(f"d_out data_ptr={d_out.data_ptr()}")
+        d_out = d_out.contiguous()
         _d_out_flat = d_out.view(M, H)
         print(f"d_out: min={_d_out_flat.min():.6g} max={_d_out_flat.max():.6g} mean={_d_out_flat.mean():.6g} nan={_d_out_flat.isnan().any()}")
         if _d_out_flat.max() > 10:
