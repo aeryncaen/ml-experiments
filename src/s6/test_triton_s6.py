@@ -194,6 +194,113 @@ def bench(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
     print(f"  Speedup: {pt_ms / tr_ms:.2f}x")
 
 
+def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
+    """Profile where time is spent in the Triton path."""
+    import time
+    from .triton_s6 import TritonS6, _TritonPhiB, _TritonS6
+
+    torch.manual_seed(SEED)
+    model = TritonS6(d_model=H, d_state=P, M=M, chunk_size=32).cuda()
+    x = torch.randn(B, L, H, device='cuda')
+
+    s6 = model._pytorch_s6
+    kern = s6.kernel
+    phi = kern.phi_B
+    mlp = phi.channel_mlp
+
+    def sync():
+        torch.cuda.synchronize()
+
+    def timed(fn, label):
+        # warmup
+        for _ in range(warmup):
+            fn()
+        sync()
+        start = time.perf_counter()
+        for _ in range(iters):
+            fn()
+            sync()
+        ms = (time.perf_counter() - start) / iters * 1000
+        print(f"  {label:30s}: {ms:.2f} ms")
+        return ms
+
+    print(f"\nProfile (H={H}, P={P}, L={L}, B={B}, M={M}):")
+    print("  --- Forward ---")
+
+    N_rows = B * L
+
+    # msconv
+    def f_msconv():
+        return s6.msconv(x)
+    timed(f_msconv, "msconv")
+
+    u_conv = s6.msconv(x)
+
+    # phi_B (Triton)
+    def f_phi_b():
+        raw = _TritonPhiB.apply(
+            u_conv.reshape(N_rows, H), phi.W, phi.b,
+            mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
+            phi.M, phi.L, mlp.fc1.out_features,
+        )
+        if phi.ch_rms:
+            raw_3d = raw.view(N_rows, phi.M, phi.L)
+            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)
+            s = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            raw = (raw_3d * s.view(1, 1, phi.L)).view(N_rows, -1)
+        return (raw * phi.scale).view(B, L, -1)
+    timed(f_phi_b, "phi_B (Triton)")
+
+    Bu_raw = f_phi_b()
+
+    # SSM core (Triton)
+    C = torch.view_as_complex(s6.C)
+    C_re = C.real.contiguous()
+    C_im = C.imag.contiguous()
+
+    def f_ssm():
+        return _TritonS6.apply(
+            u_conv, Bu_raw,
+            kern.x_proj.weight, kern.x_proj.bias,
+            kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
+            kern.log_A_real, kern.A_imag,
+            s6.c_proj.weight, s6.c_proj.bias,
+            s6.c_norm.weight, s6.c_bias,
+            C_re, C_im, s6.D,
+            P, 32,
+        )
+    timed(f_ssm, "SSM core (Triton)")
+
+    y_ssm = f_ssm()
+
+    # readout norm
+    def f_norm():
+        return s6.readout_norm(y_ssm)
+    timed(f_norm, "readout_norm")
+
+    y_normed = f_norm()
+    c_proj_out = s6.c_proj(u_conv)
+
+    # c_proj recompute
+    def f_cproj():
+        return s6.c_proj(u_conv)
+    timed(f_cproj, "c_proj recompute")
+
+    # attention
+    def f_attn():
+        return s6.attn(u_conv, y_normed, Bu_raw, c_proj_out)
+    timed(f_attn, "attention")
+
+    # Full fwd+bwd
+    print("  --- Full fwd+bwd ---")
+    def f_full():
+        xx = x.clone().requires_grad_(True)
+        y = model(xx)
+        y.sum().backward()
+        model.zero_grad()
+    timed(f_full, "TOTAL fwd+bwd")
+
+
 def debug_forward_stepwise():
     """Step-by-step comparison to find where Triton diverges from PyTorch.
 
@@ -408,3 +515,4 @@ if __name__ == '__main__':
     print("=" * 60)
 
     bench()
+    bench_profile()
