@@ -571,21 +571,507 @@ if HAS_TRITON:
         d_Bu = tl.load(d_Bu_ptr + row * P + offs_p, mask=p_mask, other=0.0)
         # d_b_bias = d_Bu (additive)
         tl.store(d_b_bias_ptr + row * P + offs_p, d_Bu, mask=p_mask)
-        # d_Bu_normed = d_Bu (bias is additive, gamma is in rmsnorm)
         # RMSNorm forward: out = gamma * x / sqrt(var + eps)
         Bu_raw = tl.load(Bu_raw_ptr + row * P + offs_p, mask=p_mask, other=0.0)
         gamma = tl.load(b_norm_gamma_ptr + offs_p, mask=p_mask, other=1.0)
         variance = tl.sum(Bu_raw * Bu_raw) / P
         rrms = tl.rsqrt(variance + eps)
         x_hat = Bu_raw * rrms
-        # d_gamma = d_Bu * x_hat (per-element)
         tl.store(d_b_norm_gamma_ptr + row * P + offs_p, d_Bu * x_hat, mask=p_mask)
-        # d_x_hat = d_Bu * gamma
         d_x_hat = d_Bu * gamma
-        # d_Bu_raw = rrms * (d_x_hat - x_hat * mean(d_x_hat * x_hat))
         inner = tl.sum(d_x_hat * x_hat) / P
         d_Bu_raw = rrms * (d_x_hat - x_hat * inner)
         tl.store(d_Bu_raw_ptr + row * P + offs_p, d_Bu_raw, mask=p_mask)
+
+    # ========== Fused backward: readout + cgate (steps 7+6) ==========
+    # Grid: (M, cdiv(H, BLOCK_H)) — one program per (row, h_block)
+    # Handles: silu bwd on readout, MIMO matmul bwd, c_gate RoPE bwd, rmsnorm bwd, silu bwd
+    # Accumulates d_C_re/im per row — caller reduces across M.
+
+    @triton.jit
+    def fused_bwd_readout_cgate_kernel(
+        # Forward saved
+        h_re_ptr, h_im_ptr,  # (M, P)
+        c_gate_ptr,  # (M, P)
+        c_proj_out_ptr,  # (M, P)
+        cum_theta_ptr,  # (M, P//2)
+        C_re_ptr, C_im_ptr,  # (H, P)
+        u_ptr,  # (M, H)
+        D_ptr,  # (H,)
+        c_norm_gamma_ptr,  # (P,)
+        c_bias_ptr,  # (P,)
+        # Gradient input
+        d_out_ptr,  # (M, H)
+        # Gradient outputs
+        d_h_re_ptr, d_h_im_ptr,  # (M, P) — only written by h_block 0
+        d_c_proj_out_ptr,  # (M, P) — only written by h_block 0
+        d_cum_theta_c_ptr,  # (M, P//2) — only written by h_block 0
+        d_u_ptr,  # (M, H) — skip contribution, per h_block
+        # Per-row accumulators for reduction (M, H, P) would be too big
+        # Instead: d_C_re/im accumulated via atomics (H, P)
+        d_C_re_ptr, d_C_im_ptr,  # (H, P)
+        d_D_ptr,  # (H,) — atomically accumulated
+        d_c_bias_ptr,  # (P,) — atomically accumulated
+        d_c_norm_gamma_ptr,  # (P,) — atomically accumulated
+        # Dims
+        M, H, P,
+        BLOCK_H: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        if pid_m >= M:
+            return
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        half_P = P // 2
+
+        # Load h, c_gate for this row
+        h_re = tl.load(h_re_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+        h_im = tl.load(h_im_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+        gate = tl.load(c_gate_ptr + pid_m * P + offs_p, mask=p_mask, other=0.0)
+
+        hg_re = h_re * gate
+        hg_im = h_im * gate
+
+        # Load C tile (BLOCK_H, P)
+        C_re_tile = tl.load(
+            C_re_ptr + offs_h[:, None] * P + offs_p[None, :],
+            mask=h_mask[:, None] & p_mask[None, :], other=0.0
+        )
+        C_im_tile = tl.load(
+            C_im_ptr + offs_h[:, None] * P + offs_p[None, :],
+            mask=h_mask[:, None] & p_mask[None, :], other=0.0
+        )
+
+        # Recompute y for silu backward
+        y_vals = tl.sum(C_re_tile * hg_re[None, :] - C_im_tile * hg_im[None, :], axis=1)
+
+        # silu backward on (y + u*D)
+        u_vals = tl.load(u_ptr + pid_m * H + offs_h, mask=h_mask, other=0.0)
+        d_vals = tl.load(D_ptr + offs_h, mask=h_mask, other=0.0)
+        x_skip = y_vals + u_vals * d_vals
+        sig_skip = 1.0 / (1.0 + tl.exp(-x_skip))
+        d_out = tl.load(d_out_ptr + pid_m * H + offs_h, mask=h_mask, other=0.0)
+        d_x_skip = d_out * (sig_skip + x_skip * sig_skip * (1.0 - sig_skip))
+
+        # d_u_skip = d_x_skip * D
+        d_u_skip = d_x_skip * d_vals
+        tl.store(d_u_ptr + pid_m * H + offs_h, d_u_skip, mask=h_mask)
+
+        # d_D: atomic add (d_x_skip * u)
+        tl.atomic_add(d_D_ptr + offs_h, d_x_skip * u_vals, mask=h_mask)
+
+        # d_y = d_x_skip (BLOCK_H,)
+        d_y = d_x_skip
+
+        # MIMO backward: d_hg_re = C_re^T @ d_y, d_hg_im = -C_im^T @ d_y
+        # d_hg_re[p] = sum_h C_re[h,p] * d_y[h]
+        d_hg_re = tl.sum(C_re_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
+        d_hg_im = -tl.sum(C_im_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
+
+        # d_C: atomic add (H, P)
+        # d_C_re[h,p] += d_y[h] * hg_re[p]
+        tl.atomic_add(
+            d_C_re_ptr + offs_h[:, None] * P + offs_p[None, :],
+            d_y[:, None] * hg_re[None, :],
+            mask=h_mask[:, None] & p_mask[None, :],
+        )
+        tl.atomic_add(
+            d_C_im_ptr + offs_h[:, None] * P + offs_p[None, :],
+            -d_y[:, None] * hg_im[None, :],
+            mask=h_mask[:, None] & p_mask[None, :],
+        )
+
+        # d_h and d_c_gate: only first h_block writes (all h_blocks computed the same d_hg)
+        # Actually d_hg depends on C tile — each h_block sees different C rows.
+        # We need to SUM d_hg across h_blocks. Use atomics on d_h_re/im.
+        # d_h_re = d_hg_re * gate, d_h_im = d_hg_im * gate
+        tl.atomic_add(d_h_re_ptr + pid_m * P + offs_p, d_hg_re * gate, mask=p_mask)
+        tl.atomic_add(d_h_im_ptr + pid_m * P + offs_p, d_hg_im * gate, mask=p_mask)
+
+        # d_c_gate = d_hg_re * h_re + d_hg_im * h_im (also needs sum across h_blocks)
+        d_c_gate_contrib = d_hg_re * h_re + d_hg_im * h_im
+
+        # Only first h_block does the c_gate backward chain (RoPE, rmsnorm, silu)
+        # Others just contribute to d_c_gate via atomics on a temp buffer.
+        # Actually simpler: accumulate d_c_gate via atomics, then do cgate bwd in separate pass.
+        # BUT that adds a launch. Instead: each h_block atomics its d_c_gate contribution,
+        # and the LAST h_block (or a separate tiny kernel) does the chain rule.
+        #
+        # Simplest correct approach: store per-(m, h_block) d_c_gate contributions,
+        # then reduce. But that's memory. Let's use atomics on a (M, P) buffer.
+
+        # We'll use a separate small kernel for the c_gate chain. Write d_c_gate atomically.
+        # Actually — d_c_proj_out_ptr is (M, P), we can repurpose it as d_c_gate accumulator
+        # and then run cgate_bwd separately. This is still only 2 kernels vs 60 PyTorch ops.
+        tl.atomic_add(d_c_proj_out_ptr + pid_m * P + offs_p, d_c_gate_contrib, mask=p_mask)
+
+    # ========== Fused backward: c_gate chain rule (RoPE, rmsnorm, silu) ==========
+    # Grid: (M,) — one program per row
+    # Input: d_c_gate (accumulated from readout bwd) in d_c_proj_out_ptr
+    # Output: d_c_proj_out (overwritten), d_cum_theta_c, d_c_bias, d_c_norm_gamma
+
+    @triton.jit
+    def fused_bwd_cgate_chain_kernel(
+        # d_c_gate is stored in d_c_gate_ptr (M, P) — INPUT
+        d_c_gate_ptr,  # (M, P) — accumulated d_c_gate from readout bwd
+        # Forward saved
+        c_proj_out_ptr,  # (M, P)
+        cum_theta_ptr,  # (M, P//2)
+        c_norm_gamma_ptr,  # (P,)
+        c_bias_ptr,  # (P,)
+        # Outputs
+        d_c_proj_out_ptr,  # (M, P) — overwrite with actual d_c_proj_out
+        d_cum_theta_c_ptr,  # (M, P//2)
+        d_c_bias_ptr,  # (P,) — atomic
+        d_c_norm_gamma_ptr,  # (P,) — atomic
+        # Dims
+        M, P,
+        eps,
+        BLOCK_P: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        if row >= M:
+            return
+        offs_p = tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        half_P = P // 2
+
+        # Load accumulated d_c_gate
+        d_cg = tl.load(d_c_gate_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+
+        # Load cum_theta for RoPE backward
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+        angle = tl.load(cum_theta_ptr + row * half_P + pair_idx, mask=p_mask, other=0.0)
+        cos_a = tl.cos(angle)
+        sin_a = tl.sin(angle)
+
+        # Recompute c_gate_pre_rope = rmsnorm(silu(c_proj_out)) + c_bias
+        c_proj = tl.load(c_proj_out_ptr + row * P + offs_p, mask=p_mask, other=0.0)
+        sig_c = 1.0 / (1.0 + tl.exp(-c_proj))
+        c_silu = c_proj * sig_c
+        variance_c = tl.sum(c_silu * c_silu) / P
+        rrms_c = tl.rsqrt(variance_c + eps)
+        gamma = tl.load(c_norm_gamma_ptr + offs_p, mask=p_mask, other=1.0)
+        c_normed = c_silu * rrms_c * gamma
+        c_b = tl.load(c_bias_ptr + offs_p, mask=p_mask, other=0.0)
+        cg_pre = c_normed + c_b
+
+        # RoPE backward: d_cg is gradient on rotated output
+        # Need partner values of d_cg and cg_pre
+        partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+        partner_mask = partner_offs < P
+
+        # Store d_cg and cg_pre temporarily for partner access
+        tl.store(d_c_proj_out_ptr + row * P + offs_p, d_cg, mask=p_mask)
+        d_cg_partner = tl.load(d_c_proj_out_ptr + row * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+
+        # even: d_x1 = d_o1*cos + d_o2*sin
+        # odd:  d_x2 = -d_o1*sin + d_o2*cos
+        d_cgpre = tl.where(
+            is_odd > 0.5,
+            -d_cg_partner * sin_a + d_cg * cos_a,
+            d_cg * cos_a + d_cg_partner * sin_a,
+        )
+
+        # d_cum_theta from c_gate RoPE
+        # Store cg_pre for partner access
+        tl.store(d_c_proj_out_ptr + row * P + offs_p, cg_pre, mask=p_mask)
+        cg_pre_partner = tl.load(d_c_proj_out_ptr + row * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+
+        # even elements: cg1 = cg_pre[even], cg2 = cg_pre[odd] = partner
+        # odd elements: cg1 = cg_pre[even] = partner, cg2 = cg_pre[odd] = self
+        cg1 = tl.where(is_odd > 0.5, cg_pre_partner, cg_pre)
+        cg2 = tl.where(is_odd > 0.5, cg_pre, cg_pre_partner)
+        d_o1 = tl.where(is_odd > 0.5, d_cg_partner, d_cg)
+        d_o2 = tl.where(is_odd > 0.5, d_cg, d_cg_partner)
+
+        # d_theta = d_o1 * (-cg1*sin - cg2*cos) + d_o2 * (cg1*cos - cg2*sin)
+        # Only store for even indices (pair_idx based)
+        d_ct = d_o1 * (-cg1 * sin_a - cg2 * cos_a) + d_o2 * (cg1 * cos_a - cg2 * sin_a)
+        # Only even elements write (to avoid double-writing)
+        even_mask = (offs_p % 2 == 0) & p_mask & (pair_idx < half_P)
+        tl.store(d_cum_theta_c_ptr + row * half_P + pair_idx, d_ct, mask=even_mask)
+
+        # d_c_bias = d_cgpre (atomic)
+        tl.atomic_add(d_c_bias_ptr + offs_p, d_cgpre, mask=p_mask)
+
+        # rmsnorm backward
+        c_hat = c_silu * rrms_c
+        d_c_normed = d_cgpre
+        # d_c_norm_gamma = d_c_normed * c_hat (atomic)
+        tl.atomic_add(d_c_norm_gamma_ptr + offs_p, d_c_normed * c_hat, mask=p_mask)
+        # d_c_hat = d_c_normed * gamma
+        d_c_hat = d_c_normed * gamma
+        inner_c = tl.sum(d_c_hat * c_hat) / P
+        d_c_silu = rrms_c * (d_c_hat - c_hat * inner_c)
+
+        # silu backward
+        d_c_proj_final = d_c_silu * (sig_c + c_proj * sig_c * (1.0 - sig_c))
+        tl.store(d_c_proj_out_ptr + row * P + offs_p, d_c_proj_final, mask=p_mask)
+
+    # ========== Fused backward: scan + discretization + RoPE (steps 5+4+RoPE+cumsum) ==========
+    # Grid: (B, cdiv(P, BLOCK_P))
+    # Loops over L in reverse. RECOMPUTES alpha, inject, Bu_rot from saved dt/lam/Bu/cum_theta/A.
+    # This eliminates 5 x (B,L,P) saved tensors.
+
+    @triton.jit
+    def fused_bwd_scan_disc_kernel(
+        # Forward saved (read-only)
+        dt_ptr,  # (B, L, P)
+        lam_ptr,  # (B, L, P)
+        Bu_ptr,  # (B, L, P) — Bu after norm+bias
+        cum_theta_ptr,  # (B, L, P//2)
+        A_real_ptr,  # (P,) — negative real parts (-exp(log_A_real))
+        A_imag_ptr,  # (P,)
+        h_re_ptr, h_im_ptr,  # (B, L, P) — forward hidden states
+        theta_ptr,  # (B*L, P//2) — for d_dt_half_theta -> d_dt from rope
+        # Gradient input
+        d_h_re_ptr, d_h_im_ptr,  # (B, L, P)
+        d_cum_theta_c_ptr,  # (B*L, P//2) — from c_gate RoPE backward
+        # Gradient outputs
+        d_dt_ptr,  # (B, L, P) — total d_dt (from inject + alpha + rope)
+        d_lam_ptr,  # (B, L, P)
+        d_Bu_ptr,  # (B, L, P) — gradient on Bu (to feed into prescan_bwd)
+        d_log_A_real_ptr,  # (P,) — atomic
+        d_A_imag_ptr,  # (P,) — atomic
+        d_dt_half_theta_ptr,  # (B, L, P//2) — for prescan bwd to handle
+        # Dims
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+        half_P = P // 2
+        base_theta = pid_b * L * half_P
+
+        # Load A params
+        a_re = tl.load(A_real_ptr + offs_p, mask=p_mask, other=0.0)  # negative
+        a_im = tl.load(A_imag_ptr + offs_p, mask=p_mask, other=0.0)
+
+        # RoPE helpers
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+
+        # Accumulators for A grads
+        d_A_real_acc = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_A_imag_acc = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        # Adjoint state (carried backward through time)
+        adj_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        adj_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        # Running reverse cumsum for d_cum_theta -> d_dt_half_theta
+        d_ct_accum = tl.zeros((BLOCK_P,), dtype=tl.float32)  # P-wide but only half used
+
+        # Carry for Bu_prev contribution (from t+1 to t during reverse scan)
+        d_Bu_prev_carry = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        # ---- FORWARD PASS to build Bu_rot array (needed for bwd) ----
+        # We need Bu_rot[t] and Bu_rot[t-1] during backward.
+        # Option: recompute forward RoPE inline during backward by caching in SRAM.
+        # With L up to 512 and BLOCK_P up to 128, storing all L Bu_rots is too much.
+        # Instead: do TWO passes. First forward pass builds Bu_rot into a temp buffer.
+        # But that needs memory we're trying to save...
+        #
+        # Better: recompute Bu_rot[t] and Bu_rot[t-1] on the fly during backward.
+        # At each reverse step t, compute Bu_rot[t] from Bu[t] + cum_theta[t],
+        # and Bu_prev = Bu_rot[t-1] from Bu[t-1] + cum_theta[t-1].
+        # This is 2 RoPE computations per step instead of storing. Worth it for memory.
+
+        for t_rev in range(L):
+            t = L - 1 - t_rev
+            off = base + t * P + offs_p
+            off_theta = base_theta + t * half_P + pair_idx
+
+            # --- Recompute alpha[t], Bu_rot[t], Bu_prev[t], inject[t] ---
+            dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+            lam_t = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
+            Bu_t = tl.load(Bu_ptr + off, mask=p_mask, other=0.0)
+            angle_t = tl.load(cum_theta_ptr + off_theta, mask=p_mask, other=0.0)
+
+            # RoPE on Bu[t]
+            cos_t = tl.cos(angle_t)
+            sin_t = tl.sin(angle_t)
+            partner_p = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+            partner_off_t = base + t * P + partner_p
+            partner_mask_p = partner_p < P
+            Bu_partner_t = tl.load(Bu_ptr + partner_off_t, mask=p_mask & partner_mask_p, other=0.0)
+            Bu_rot_t = tl.where(
+                is_odd > 0.5,
+                Bu_partner_t * sin_t + Bu_t * cos_t,
+                Bu_t * cos_t - Bu_partner_t * sin_t,
+            )
+
+            # Bu_prev = Bu_rot[t-1] (zero if t==0)
+            Bu_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            if t > 0:
+                off_prev = base + (t - 1) * P + offs_p
+                off_theta_prev = base_theta + (t - 1) * half_P + pair_idx
+                Bu_prev_raw = tl.load(Bu_ptr + off_prev, mask=p_mask, other=0.0)
+                angle_prev = tl.load(cum_theta_ptr + off_theta_prev, mask=p_mask, other=0.0)
+                cos_prev = tl.cos(angle_prev)
+                sin_prev = tl.sin(angle_prev)
+                partner_off_prev = base + (t - 1) * P + partner_p
+                Bu_partner_prev = tl.load(Bu_ptr + partner_off_prev, mask=p_mask & partner_mask_p, other=0.0)
+                Bu_prev_re = tl.where(
+                    is_odd > 0.5,
+                    Bu_partner_prev * sin_prev + Bu_prev_raw * cos_prev,
+                    Bu_prev_raw * cos_prev - Bu_partner_prev * sin_prev,
+                )
+
+            # alpha = exp(dt * A)
+            dt_a_re = dt_t * a_re
+            dt_a_im = dt_t * a_im
+            exp_re = tl.exp(dt_a_re)
+            alpha_re_t = exp_re * tl.cos(dt_a_im)
+            alpha_im_t = exp_re * tl.sin(dt_a_im)
+
+            # --- Scan backward: adjoint propagation ---
+            d_out_re = tl.load(d_h_re_ptr + off, mask=p_mask, other=0.0)
+            d_out_im = tl.load(d_h_im_ptr + off, mask=p_mask, other=0.0)
+            d_h_re_t = d_out_re + adj_re
+            d_h_im_t = d_out_im + adj_im
+
+            # d_inject = d_h
+            d_inj_re = d_h_re_t
+            d_inj_im = d_h_im_t
+
+            # d_alpha from recurrence: h = alpha*h_prev + inject
+            if t > 0:
+                prev_off = base + (t - 1) * P + offs_p
+                h_prev_re = tl.load(h_re_ptr + prev_off, mask=p_mask, other=0.0)
+                h_prev_im = tl.load(h_im_ptr + prev_off, mask=p_mask, other=0.0)
+            else:
+                h_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+                h_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            d_a_re = d_h_re_t * h_prev_re + d_h_im_t * h_prev_im
+            d_a_im = d_h_im_t * h_prev_re - d_h_re_t * h_prev_im
+
+            # Carry adjoint: adj = conj(alpha) * d_h
+            adj_re = alpha_re_t * d_h_re_t + alpha_im_t * d_h_im_t
+            adj_im = alpha_re_t * d_h_im_t - alpha_im_t * d_h_re_t
+
+            # --- Discretization backward ---
+            one_minus_lam = 1.0 - lam_t
+
+            # d_lam from inject
+            d_lam_t = (d_inj_re * dt_t * (Bu_rot_t - alpha_re_t * Bu_prev_re)
+                       + d_inj_im * (-dt_t * alpha_im_t * Bu_prev_re))
+            tl.store(d_lam_ptr + off, d_lam_t, mask=p_mask)
+
+            # d_Bu_rot from inject (current position)
+            d_Bu_rot_t = d_inj_re * lam_t * dt_t
+
+            # d_Bu_prev from inject
+            d_Bu_prev_t = ((d_inj_re * alpha_re_t + d_inj_im * alpha_im_t)
+                           * one_minus_lam * dt_t)
+
+            # d_dt from inject
+            d_dt_from_inject = (d_inj_re * (lam_t * Bu_rot_t + one_minus_lam * alpha_re_t * Bu_prev_re)
+                                + d_inj_im * one_minus_lam * alpha_im_t * Bu_prev_re)
+
+            # d_alpha from inject (add to scan's d_alpha)
+            d_a_re_total = d_a_re + d_inj_re * one_minus_lam * dt_t * Bu_prev_re
+            d_a_im_total = d_a_im + d_inj_im * one_minus_lam * dt_t * Bu_prev_re
+
+            # d_dt from alpha: alpha = exp(dt*A), d_dt = d_alpha * alpha * A
+            d_dt_from_alpha = (d_a_re_total * (a_re * alpha_re_t - a_im * alpha_im_t)
+                               + d_a_im_total * (a_re * alpha_im_t + a_im * alpha_re_t))
+
+            d_dt_disc = d_dt_from_inject + d_dt_from_alpha
+
+            # Accumulate A grads
+            d_A_real_acc += d_a_re_total * dt_t * alpha_re_t + d_a_im_total * dt_t * alpha_im_t
+            d_A_imag_acc += -d_a_re_total * dt_t * alpha_im_t + d_a_im_total * dt_t * alpha_re_t
+
+            # --- Bu RoPE backward ---
+            # d_Bu_rot_t needs to include contribution from NEXT position's d_Bu_prev
+            # We handle this by loading d_Bu_prev from next step.
+            # But we compute d_Bu_prev[t] above which applies to Bu_rot[t-1].
+            # So at step t, we have d_Bu_rot[t] from current inject, and we need to
+            # ADD d_Bu_prev[t+1] which was computed at step t+1 (the previous iteration).
+            # Store d_Bu_rot[t] now; at t-1 we'll add d_Bu_prev[t] to d_Bu_rot[t-1].
+            #
+            # Actually simpler: store d_Bu_prev[t] into d_Bu output for position t-1.
+            # We do this at the NEXT reverse iteration when t_rev processes t-1.
+            # For now, store d_Bu_rot[t] into d_Bu buffer for position t.
+            # After the loop, shift d_Bu_prev contributions.
+            #
+            # Cleanest approach: write d_Bu_rot[t] and d_Bu_prev_for_tminus1[t] separately,
+            # then combine. But that doubles memory.
+            #
+            # Instead: at each step, we also apply Bu_prev contribution from previous iteration.
+            # Keep d_Bu_prev_carry in registers.
+
+            # Actually let me just do it right:
+            # At reverse step processing time t:
+            # - We compute d_Bu_rot[t] from inject at t
+            # - We have d_Bu_prev_carry from the previous reverse step (which was t+1)
+            #   This is the d_Bu_prev[t+1] = contribution to Bu_rot[t]
+            # - Total d_Bu_rot[t] = d_Bu_rot_t + d_Bu_prev_carry
+
+            d_Bu_rot_total = d_Bu_rot_t + d_Bu_prev_carry
+
+            # Update carry for next iteration (this position's d_Bu_prev goes to t-1)
+            d_Bu_prev_carry = d_Bu_prev_t
+
+            # RoPE backward on Bu: d_Bu from d_Bu_rot_total
+            # forward: Bu_rot = RoPE(Bu, angle)
+            # bwd: d_Bu_even = d_rot_even*cos + d_rot_odd*sin
+            #      d_Bu_odd = -d_rot_even*sin + d_rot_odd*cos
+            # Need partner of d_Bu_rot_total
+            # Store temporarily for partner access
+            tl.store(d_Bu_ptr + off, d_Bu_rot_total, mask=p_mask)
+            d_br_partner = tl.load(d_Bu_ptr + (base + t * P + partner_p),
+                                   mask=p_mask & partner_mask_p, other=0.0)
+
+            d_Bu_final = tl.where(
+                is_odd > 0.5,
+                -d_br_partner * sin_t + d_Bu_rot_total * cos_t,
+                d_Bu_rot_total * cos_t + d_br_partner * sin_t,
+            )
+            tl.store(d_Bu_ptr + off, d_Bu_final, mask=p_mask)
+
+            # d_cum_theta from Bu RoPE
+            bu1 = tl.where(is_odd > 0.5, Bu_partner_t, Bu_t)
+            bu2 = tl.where(is_odd > 0.5, Bu_t, Bu_partner_t)
+            d_rot1 = tl.where(is_odd > 0.5, d_br_partner, d_Bu_rot_total)
+            d_rot2 = tl.where(is_odd > 0.5, d_Bu_rot_total, d_br_partner)
+            d_ct_b = d_rot1 * (-bu1 * sin_t - bu2 * cos_t) + d_rot2 * (bu1 * cos_t - bu2 * sin_t)
+
+            # d_dt from rope: need reverse cumsum of d_cum_theta * theta -> d_dt_half
+            # Accumulate reverse cumsum inline (includes c_gate and Bu RoPE contributions)
+            even_mask_p = (offs_p % 2 == 0) & p_mask & (pair_idx < half_P)
+            # Load d_cum_theta_c for this position
+            row_idx_ct = pid_b * L + t
+            d_ct_c = tl.load(d_cum_theta_c_ptr + row_idx_ct * half_P + pair_idx, mask=even_mask_p, other=0.0)
+            # Only even elements carry the pair's d_ct (avoid double)
+            d_ct_accum += tl.where(offs_p % 2 == 0, d_ct_b + d_ct_c, 0.0)
+
+            # d_dt_half_theta[t] = d_ct_accum (this IS the reverse cumsum)
+            tl.store(d_dt_half_theta_ptr + off_theta, d_ct_accum, mask=even_mask_p)
+
+            # d_dt from rope: load the stored value back (even wrote, both read via pair_idx)
+            row_idx = pid_b * L + t
+            theta_t = tl.load(theta_ptr + row_idx * half_P + pair_idx, mask=p_mask & (pair_idx < half_P), other=0.0)
+            d_ct_val = tl.load(d_dt_half_theta_ptr + off_theta, mask=p_mask & (pair_idx < half_P), other=0.0)
+            d_dt_rope_val = d_ct_val * theta_t * 0.5  # both even/odd get same value
+            d_dt_total_t = d_dt_disc + d_dt_rope_val
+            tl.store(d_dt_ptr + off, d_dt_total_t, mask=p_mask)
+
+        # Store A grads (atomic across batch and p-blocks)
+        # d_log_A_real = d_A_real * A_real_neg = d_A_real_acc * a_re (since a_re = -exp(log_A_real) = A_real_neg)
+        tl.atomic_add(d_log_A_real_ptr + offs_p, d_A_real_acc * a_re, mask=p_mask)
+        tl.atomic_add(d_A_imag_ptr + offs_p, d_A_imag_acc, mask=p_mask)
 
 
 # ========== Python wrappers ==========
@@ -658,6 +1144,7 @@ class _TritonS6(torch.autograd.Function):
         # 4. Fused scan: RoPE + discretize + recurrence
         h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         h_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        # alpha/inject/Bu_rot no longer saved — recomputed in backward
         alpha_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         alpha_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
@@ -703,12 +1190,11 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_H, BLOCK_P,
         )
 
-        # Save for backward
+        # Save for backward — no alpha/inject/Bu_rot (recomputed in bwd)
         ctx.save_for_backward(
             u, Bu_raw_flat,
             dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
-            Bu, Bu_rot,
-            alpha_re, alpha_im, inject_re, inject_im,
+            Bu,
             h_re, h_im,
             c_proj_out, c_gate,
             x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
@@ -724,8 +1210,7 @@ class _TritonS6(torch.autograd.Function):
     def backward(ctx, d_out):
         (u, Bu_raw_flat,
          dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
-         Bu, Bu_rot,
-         alpha_re, alpha_im, inject_re, inject_im,
+         Bu,
          h_re, h_im,
          c_proj_out, c_gate,
          x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
@@ -736,190 +1221,89 @@ class _TritonS6(torch.autograd.Function):
         split_sizes = ctx.split_sizes
         B, L, H = u.shape
         M = B * L
-        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         BLOCK_P = triton.next_power_of_2(P)
 
         u_flat = u.reshape(M, H)
+        A_real_neg = -torch.exp(log_A_real)
 
-        # ---- 7. Backward through readout: out = silu(y + u*D) where y = Re(C @ (h*gate)) ----
-        # Use PyTorch for this since it's a mix of matmul + elementwise
-        h_re_flat = h_re.view(M, P)
-        h_im_flat = h_im.view(M, P)
-        c_gate_flat = c_gate
+        # ---- Steps 7+6: Fused readout + c_gate backward ----
+        BLOCK_H = min(64, triton.next_power_of_2(H))
+        d_h_re = torch.zeros(M, P, device=u.device, dtype=u.dtype)
+        d_h_im = torch.zeros(M, P, device=u.device, dtype=u.dtype)
+        d_c_gate_buf = torch.zeros(M, P, device=u.device, dtype=u.dtype)  # accumulator
+        d_u_skip = torch.empty(M, H, device=u.device, dtype=u.dtype)
+        d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
+        d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
+        d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
 
-        hg_re = h_re_flat * c_gate_flat
-        hg_im = h_im_flat * c_gate_flat
+        fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
+            h_re.view(M, P), h_im.view(M, P),
+            c_gate, c_proj_out,
+            cum_theta.view(M, P // 2),
+            C_re, C_im, u_flat, D,
+            c_norm_gamma, c_bias,
+            d_out.view(M, H),
+            d_h_re, d_h_im,
+            d_c_gate_buf,
+            torch.empty(M, P // 2, device=u.device, dtype=u.dtype),  # placeholder, cgate chain does this
+            d_u_skip,
+            d_C_re, d_C_im, d_D,
+            torch.empty(P, device=u.device, dtype=u.dtype),  # d_c_bias placeholder
+            torch.empty(P, device=u.device, dtype=u.dtype),  # d_c_norm_gamma placeholder
+            M, H, P,
+            BLOCK_H, BLOCK_P,
+        )
 
-        # Recompute y for backward
-        y_re = hg_re @ C_re.t()  # (M, H)
-        y_im = hg_im @ C_im.t()  # (M, H)
-        y = y_re - y_im
+        # c_gate chain rule (RoPE, rmsnorm, silu backward)
+        d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_cum_theta_c = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
+        d_c_bias = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_c_norm_gamma = torch.zeros(P, device=u.device, dtype=u.dtype)
 
-        # silu backward: out = silu(y + u*D)
-        x_skip = y + u_flat * D
-        sig_skip = torch.sigmoid(x_skip)
-        d_x_skip = d_out.view(M, H) * (sig_skip + x_skip * sig_skip * (1 - sig_skip))
+        fused_bwd_cgate_chain_kernel[(M,)](
+            d_c_gate_buf,
+            c_proj_out, cum_theta.view(M, P // 2),
+            c_norm_gamma, c_bias,
+            d_c_proj_out, d_cum_theta_c,
+            d_c_bias, d_c_norm_gamma,
+            M, P, 1e-6,
+            BLOCK_P,
+        )
 
-        d_y = d_x_skip
-        d_u_skip = d_x_skip * D
-        d_D = (d_x_skip * u_flat).sum(0)
-
-        # y = C_re @ hg_re - C_im @ hg_im
-        d_hg_re = d_y @ C_re  # (M, P)
-        d_hg_im = -(d_y @ C_im)  # (M, P)
-        d_C_re = d_y.t() @ hg_re  # (H, P)
-        d_C_im = -(d_y.t() @ hg_im)  # (H, P)
-
-        # hg = h * gate
-        d_h_re = d_hg_re * c_gate_flat
-        d_h_im = d_hg_im * c_gate_flat
-        d_c_gate = d_hg_re * h_re_flat + d_hg_im * h_im_flat
-
-        # ---- 6. Backward through c_gate: RoPE + rmsnorm + silu + bias ----
-        # c_gate = RoPE(rmsnorm(silu(c_proj_out)) + c_bias, cum_theta)
-        # Backward through RoPE
-        cum_theta_flat = cum_theta.view(M, P // 2)
-        from .s6 import apply_rotary_emb  # reuse PyTorch RoPE for backward
-
-        # Recompute pre-RoPE c_gate for backward
-        c_silu = F.silu(c_proj_out)
-        c_var = c_silu.pow(2).mean(-1, keepdim=True)
-        c_normed = c_silu / torch.sqrt(c_var + 1e-6) * c_norm_gamma
-        c_gate_pre_rope = c_normed + c_bias
-
-        # RoPE backward (PyTorch)
-        # d_c_gate is gradient on rotated output
-        # forward: c_gate_rot = apply_rotary_emb(c_gate_pre_rope, cum_theta)
-        # backward: d_c_gate_pre_rope = apply_rotary_emb(d_c_gate, -cum_theta)  (rotate back)
-        # d_cum_theta: need chain rule through angles
-        cos_ct = torch.cos(cum_theta_flat)
-        sin_ct = torch.sin(cum_theta_flat)
-
-        d_cg = d_c_gate.view(M, P)
-        d_cg1, d_cg2 = d_cg[..., 0::2], d_cg[..., 1::2]
-        cg1, cg2 = c_gate_pre_rope[..., 0::2], c_gate_pre_rope[..., 1::2]
-
-        # RoPE bwd: d_x1 = d_o1*cos + d_o2*sin, d_x2 = -d_o1*sin + d_o2*cos
-        d_cgpre = torch.empty_like(c_gate_pre_rope)
-        d_cgpre[..., 0::2] = d_cg1 * cos_ct + d_cg2 * sin_ct
-        d_cgpre[..., 1::2] = -d_cg1 * sin_ct + d_cg2 * cos_ct
-
-        # d_cum_theta from c_gate RoPE
-        d_cum_theta_c = (d_cg1 * (-cg1 * sin_ct - cg2 * cos_ct) +
-                         d_cg2 * (cg1 * cos_ct - cg2 * sin_ct))
-
-        d_c_bias = d_cgpre.sum(0)
-
-        # rmsnorm backward
-        d_c_normed = d_cgpre
-        rrms_c = torch.rsqrt(c_var + 1e-6)
-        c_hat = c_silu * rrms_c
-        d_c_norm_gamma = (d_c_normed * c_hat).sum(0)
-        d_c_hat = d_c_normed * c_norm_gamma
-        inner_c = (d_c_hat * c_hat).sum(-1, keepdim=True) / P
-        d_c_silu = rrms_c * (d_c_hat - c_hat * inner_c)
-
-        # silu backward
-        sig_c = torch.sigmoid(c_proj_out)
-        d_c_proj_out = d_c_silu * (sig_c + c_proj_out * sig_c * (1 - sig_c))
-
-        # c_proj linear backward (PyTorch for simplicity)
+        # c_proj linear backward
         d_c_proj_w = d_c_proj_out.t() @ u_flat
         d_c_proj_b = d_c_proj_out.sum(0)
         d_u_c = d_c_proj_out @ c_proj_w
 
-        # ---- 5. Backward through scan (fused kernel) ----
-        d_h_re_3d = d_h_re.view(B, L, P).contiguous()
-        d_h_im_3d = d_h_im.view(B, L, P).contiguous()
-
-        d_alpha_re = torch.empty_like(alpha_re)
-        d_alpha_im = torch.empty_like(alpha_im)
-        d_inject_re = torch.empty_like(inject_re)
-        d_inject_im = torch.empty_like(inject_im)
-
+        # ---- Steps 5+4+RoPE+cumsum: Fused scan + disc + RoPE backward ----
         BLOCK_P_SCAN = triton.next_power_of_2(P)
-        fused_scan_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
-            alpha_re, alpha_im, h_re, h_im,
-            d_h_re_3d, d_h_im_3d,
-            d_alpha_re, d_alpha_im, d_inject_re, d_inject_im,
+        d_dt_total = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_lam_disc = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_log_A_real = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_A_imag = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_dt_half_theta = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
+
+        fused_bwd_scan_disc_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt.view(B, L, P), lam.view(B, L, P),
+            Bu.view(B, L, P), cum_theta,
+            A_real_neg, A_imag,
+            h_re, h_im,
+            theta.view(M, P // 2),
+            d_h_re.view(B, L, P), d_h_im.view(B, L, P),
+            d_cum_theta_c,
+            d_dt_total, d_lam_disc, d_Bu_3d,
+            d_log_A_real, d_A_imag,
+            d_dt_half_theta,
             B, L, P,
             BLOCK_P_SCAN,
         )
 
-        # ---- 4. Backward through discretization ----
-        # inject_re = lam*dt*Bu_rot + (1-lam)*dt*alpha_re*Bu_prev_re
-        # inject_im = (1-lam)*dt*alpha_im*Bu_prev_re
-        # where Bu_prev_re[:, t] = Bu_rot[:, t-1] (shifted)
-        dt_3d = dt.view(B, L, P)
-        lam_3d = lam.view(B, L, P)
-        Bu_rot_3d = Bu_rot  # (B, L, P)
-        Bu_prev = torch.zeros_like(Bu_rot_3d)
-        Bu_prev[:, 1:] = Bu_rot_3d[:, :-1]
+        # d_theta from d_dt_half_theta: d_theta[t] = d_dt_half_theta[t] * dt_half[t]
+        dt_half = dt.view(B, L, P // 2, 2).mean(-1)
+        d_theta = (d_dt_half_theta * dt_half).view(M, P // 2)
 
-        A_real_neg = -torch.exp(log_A_real)
-
-        # d_lam
-        d_lam_disc = (d_inject_re * dt_3d * (Bu_rot_3d - alpha_re * Bu_prev)
-                      + d_inject_im * (-dt_3d * alpha_im * Bu_prev))
-
-        # d_Bu_rot
-        d_Bu_rot = d_inject_re * lam_3d * dt_3d
-
-        # d_Bu_prev
-        d_Bu_prev = ((d_inject_re * alpha_re + d_inject_im * alpha_im)
-                     * (1 - lam_3d) * dt_3d)
-
-        # Reverse shift: d_Bu_rot[:, :-1] += d_Bu_prev[:, 1:]
-        d_Bu_rot[:, :-1] += d_Bu_prev[:, 1:]
-
-        # d_dt from inject
-        one_minus_lam = 1 - lam_3d
-        d_dt_from_inject = (d_inject_re * (lam_3d * Bu_rot_3d + one_minus_lam * alpha_re * Bu_prev)
-                            + d_inject_im * one_minus_lam * alpha_im * Bu_prev)
-
-        # d_alpha from inject
-        d_alpha_re_total = d_alpha_re + d_inject_re * one_minus_lam * dt_3d * Bu_prev
-        d_alpha_im_total = d_alpha_im + d_inject_im * one_minus_lam * dt_3d * Bu_prev
-
-        # d_dt from alpha: alpha = exp(dt * A)
-        d_dt_from_alpha = (d_alpha_re_total * (A_real_neg * alpha_re - A_imag * alpha_im)
-                           + d_alpha_im_total * (A_real_neg * alpha_im + A_imag * alpha_re))
-
-        d_dt_disc = d_dt_from_inject + d_dt_from_alpha
-
-        # d_A grads
-        d_A_real = (d_alpha_re_total * dt_3d * alpha_re + d_alpha_im_total * dt_3d * alpha_im).sum(dim=(0, 1))
-        d_A_imag = (-d_alpha_re_total * dt_3d * alpha_im + d_alpha_im_total * dt_3d * alpha_re).sum(dim=(0, 1))
-        d_log_A_real = d_A_real * A_real_neg
-
-        # ---- Backward through Bu RoPE ----
-        # Bu_rot = RoPE(Bu, cum_theta)
-        cos_ct_b = torch.cos(cum_theta)
-        sin_ct_b = torch.sin(cum_theta)
-        Bu_3d = Bu.view(B, L, P)
-
-        d_br = d_Bu_rot
-        d_br1, d_br2 = d_br[..., 0::2], d_br[..., 1::2]
-        bu1, bu2 = Bu_3d[..., 0::2], Bu_3d[..., 1::2]
-
-        d_Bu_3d = torch.empty_like(Bu_3d)
-        d_Bu_3d[..., 0::2] = d_br1 * cos_ct_b + d_br2 * sin_ct_b
-        d_Bu_3d[..., 1::2] = -d_br1 * sin_ct_b + d_br2 * cos_ct_b
-
-        d_cum_theta_b = (d_br1 * (-bu1 * sin_ct_b - bu2 * cos_ct_b) +
-                         d_br2 * (bu1 * cos_ct_b - bu2 * sin_ct_b))
-
-        # ---- cum_theta grad: reverse cumsum ----
-        d_cum_theta = d_cum_theta_c.view(B, L, P // 2) + d_cum_theta_b
-        d_dt_half_theta = d_cum_theta.flip(1).cumsum(1).flip(1)
-
-        dt_half = dt_3d.view(B, L, P // 2, 2).mean(-1)
-        d_dt_half = d_dt_half_theta * theta.view(B, L, P // 2)
-        d_theta = d_dt_half_theta * dt_half
-        d_dt_from_rope = d_dt_half.unsqueeze(-1).expand(B, L, P // 2, 2).reshape(B, L, P) / 2
-
-        # ---- 2. Backward through prescan (fused kernel) ----
-        d_dt_total = d_dt_disc.reshape(M, P) + d_dt_from_rope.reshape(M, P)
+        # ---- 2. Prescan backward (dt/lam activations, Bu rmsnorm) ----
         d_dt_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)
         d_lam_raw = torch.empty(M, P, device=u.device, dtype=u.dtype)
         d_log_dt_bias_rows = torch.empty(M, P, device=u.device, dtype=u.dtype)
@@ -928,7 +1312,7 @@ class _TritonS6(torch.autograd.Function):
         d_b_bias_rows = torch.empty(M, P, device=u.device, dtype=u.dtype)
 
         fused_prescan_bwd_kernel[(M,)](
-            d_dt_total, d_lam_disc.reshape(M, P).contiguous(),
+            d_dt_total.reshape(M, P), d_lam_disc.reshape(M, P).contiguous(),
             d_Bu_3d.reshape(M, P).contiguous(),
             dt_raw, lam_raw, log_dt_bias,
             Bu_raw_flat, b_norm_gamma,
@@ -942,8 +1326,8 @@ class _TritonS6(torch.autograd.Function):
         d_b_norm_gamma = d_b_norm_gamma_rows.sum(0)
         d_b_bias = d_b_bias_rows.sum(0)
 
-        # ---- 1. Backward through x_proj linear ----
-        d_x_proj = torch.cat([d_dt_raw, d_lam_raw, d_theta.reshape(M, P // 2)], dim=-1)
+        # ---- 1. x_proj linear backward ----
+        d_x_proj = torch.cat([d_dt_raw, d_lam_raw, d_theta], dim=-1)
         d_x_proj_w = d_x_proj.t() @ u_flat
         d_x_proj_b = d_x_proj.sum(0)
         d_u_proj = d_x_proj @ x_proj_w
@@ -951,7 +1335,6 @@ class _TritonS6(torch.autograd.Function):
         # Total d_u
         d_u = (d_u_proj + d_u_c + d_u_skip).view(B, L, H)
 
-        # d_Bu_raw
         d_Bu_raw_out = d_Bu_raw.view(B, L, P)
 
         return (d_u,
