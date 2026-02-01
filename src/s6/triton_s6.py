@@ -1375,8 +1375,8 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # Feature bank in PyTorch (small MLP)
-        Bu_raw = kern.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+        # B projection in PyTorch
+        Bu_raw = kern.phi_B(u)  # (B, L, P)
 
         # Split complex C
         C = torch.view_as_complex(s6.C)

@@ -72,11 +72,10 @@ class S6Kernel(nn.Module):
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
-        # B: LUNA feature bank (H → P) — learned nonlinear input selectivity
-        L_fb = P // M
-        self.phi_B = LearnableFeatureMap(
-            d=H, M=M, L=L_fb, hidden=64,
-            nonneg=False, act="silu", ch_rms=True,
+        # B: input projection (H → P) with SiLU activation
+        self.phi_B = nn.Sequential(
+            nn.Linear(H, P),
+            nn.SiLU(),
         )
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
@@ -115,9 +114,8 @@ class S6Kernel(nn.Module):
         # Materialize complex A
         A = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (P,) complex
 
-        # B: feature bank projection (nonlinear, learned selectivity)
-        # phi_B expects (B, H, N, d) → unsqueeze dummy head dim
-        Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
+        # B: input projection with SiLU
+        Bu_raw = self.phi_B(u)  # (B, L, P)
 
         # dt, lam, theta from fused linear projection
         x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
