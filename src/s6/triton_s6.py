@@ -2110,8 +2110,8 @@ class TritonS6(nn.Module):
             self.P, self.chunk_size,
         )
 
-        # 4. Post-readout norm + residual from u
-        y_normed = s6.readout_norm(y_ssm) + u
+        # 4. Post-readout norm + residual from x (post-msconv)
+        y_normed = s6.readout_norm(y_ssm) + x
 
         # 5. Attention (PyTorch) — standalone Q, gate-mixed K
         y = s6.attn(x, y_normed, K_attn)

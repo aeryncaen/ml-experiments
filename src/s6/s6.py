@@ -331,7 +331,7 @@ class S6(nn.Module):
         y = F.silu(y)
 
         # Post-readout norm + residual + attention
-        y_normed = self.readout_norm(y) + u
+        y_normed = self.readout_norm(y) + x
         y = self.attn(x, y_normed, K_attn)
 
         return y
