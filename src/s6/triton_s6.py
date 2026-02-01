@@ -2104,8 +2104,8 @@ if HAS_TRITON:
         # Outputs
         d_c_proj_out_ptr,  # (M, P) — overwrite with actual d_c_proj_out
         d_cum_theta_c_ptr,  # (M, P//2)
-        d_c_bias_ptr,  # (P,) — atomic
-        d_c_norm_gamma_ptr,  # (P,) — atomic
+        d_c_bias_buf_ptr,  # (M, P)
+        d_c_norm_gamma_buf_ptr,  # (M, P)
         # Dims
         M, P,
         eps,
@@ -2175,14 +2175,14 @@ if HAS_TRITON:
         even_mask = (offs_p % 2 == 0) & p_mask & (pair_idx < half_P)
         tl.store(d_cum_theta_c_ptr + row * half_P + pair_idx, d_ct, mask=even_mask)
 
-        # d_c_bias = d_cgpre (atomic)
-        tl.atomic_add(d_c_bias_ptr + offs_p, d_cgpre, mask=p_mask)
+        # d_c_bias per-row
+        tl.store(d_c_bias_buf_ptr + row * P + offs_p, d_cgpre, mask=p_mask)
 
         # rmsnorm backward
         c_hat = c_silu * rrms_c
         d_c_normed = d_cgpre
-        # d_c_norm_gamma = d_c_normed * c_hat (atomic)
-        tl.atomic_add(d_c_norm_gamma_ptr + offs_p, d_c_normed * c_hat, mask=p_mask)
+        # d_c_norm_gamma per-row
+        tl.store(d_c_norm_gamma_buf_ptr + row * P + offs_p, d_c_normed * c_hat, mask=p_mask)
         # d_c_hat = d_c_normed * gamma
         d_c_hat = d_c_normed * gamma
         inner_c = tl.sum(d_c_hat * c_hat) / P
@@ -2843,18 +2843,21 @@ class _TritonS6(torch.autograd.Function):
         # c_gate chain rule
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
         d_cum_theta_c = torch.empty(M, P // 2, device=u.device, dtype=u.dtype)
-        d_c_bias = torch.zeros(P, device=u.device, dtype=u.dtype)
-        d_c_norm_gamma = torch.zeros(P, device=u.device, dtype=u.dtype)
+        d_c_bias_buf = torch.empty(M, P, device=u.device, dtype=u.dtype)
+        d_c_norm_gamma_buf = torch.empty(M, P, device=u.device, dtype=u.dtype)
 
         fused_bwd_cgate_chain_kernel[(M,)](
             d_c_gate_buf,
             c_proj_out, cum_theta.view(M, P // 2),
             c_norm_gamma, c_bias,
             d_c_proj_out, d_cum_theta_c,
-            d_c_bias, d_c_norm_gamma,
+            d_c_bias_buf, d_c_norm_gamma_buf,
             M, P, 1e-6,
             BLOCK_P,
         )
+
+        d_c_bias = d_c_bias_buf.sum(dim=0)
+        d_c_norm_gamma = d_c_norm_gamma_buf.sum(dim=0)
 
         # c_proj linear backward
         d_c_proj_w = d_c_proj_out.t() @ u_flat
