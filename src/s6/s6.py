@@ -7,7 +7,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from pathlib import Path
 from .scan import parallel_scan
+
+# Import LearnableFeatureMap from zoology (sibling repo)
+_zoology_path = str(Path(__file__).resolve().parents[2] / 'zoology')
+import sys as _sys
+if _zoology_path not in _sys.path:
+    _sys.path.insert(0, _zoology_path)
+from zoology.mixers.luna import LearnableFeatureMap
 
 
 class SqueezeExcite1D(nn.Module):
@@ -130,10 +138,12 @@ class S6Kernel(nn.Module):
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
-        # B: simple linear projection (H → P)
-        self.phi_B = nn.Linear(H, P)
-        nn.init.normal_(self.phi_B.weight, mean=0.0, std=1.0 / math.sqrt(H))
-        nn.init.zeros_(self.phi_B.bias)
+        # B: LUNA feature bank (H → P) — learned nonlinear input selectivity
+        L_fb = P // M
+        self.phi_B = LearnableFeatureMap(
+            d=H, M=M, L=L_fb, hidden=64,
+            nonneg=False, act="silu", ch_rms=True,
+        )
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
         # Layout: [dt(P), lam(P), theta(P//2)]
@@ -175,7 +185,7 @@ class S6Kernel(nn.Module):
 
         # B: use provided Bu_raw or compute from phi_B
         if Bu_raw is None:
-            Bu_raw = F.silu(self.phi_B(u))  # (B, L, P)
+            Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
         # dt, lam, theta from fused linear projection
         x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
@@ -287,13 +297,13 @@ class S6Attention(nn.Module):
         self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
         self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
 
-        # K: 80% rows from phi_B, 20% dedicated
-        self.shared_k_rows = int(0.8 * P)
-        self.ded_k_rows = P - self.shared_k_rows
+        # K: 80% W rows from phi_B, 20% dedicated
+        self.shared_k_dirs = int(0.8 * M)
+        self.ded_k_dirs = M - self.shared_k_dirs
         assert phi_B is not None
         self._phi_B = phi_B
-        self.k_ded_weight = nn.Parameter(torch.randn(self.ded_k_rows, H) / math.sqrt(H))
-        self.k_ded_bias = nn.Parameter(torch.zeros(self.ded_k_rows))
+        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
+        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
 
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
@@ -306,9 +316,9 @@ class S6Attention(nn.Module):
         self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
         self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
 
-        # RoPE on group 0 passthrough dims per sub-half = head_dim // 8
-        self.rope_dim = self.head_dim // 8
-        assert self.rope_dim >= 2 and self.rope_dim % 2 == 0, "rope_dim must be even and >= 2"
+        # RoPE on group 0 passthrough dims — ensure even
+        self.rope_dim = max(2, (self.head_dim // 8) * 2)
+        self.rope_dim = min(self.rope_dim, self.head_dim)
         rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
         self.register_buffer('rope_freqs', rope_freqs)
 
@@ -345,12 +355,16 @@ class S6Attention(nn.Module):
                          self.q_ded_bias], dim=0)
         Q = F.silu(F.linear(u, q_w, q_b)).bfloat16()  # (B, L, P)
 
-        # K: assemble shared phi_B rows + dedicated rows, run feature map
-        k_W = torch.cat([self._phi_B.weight[:self.shared_k_rows],
-                         self.k_ded_weight], dim=0)  # (P, H)
-        k_b = torch.cat([self._phi_B.bias[:self.shared_k_rows],
-                         self.k_ded_bias], dim=0)  # (P,)
-        K = F.silu(F.linear(u, k_W, k_b)).bfloat16()  # (B, L, P)
+        # K: assemble shared phi_B dirs + dedicated dirs, run feature map
+        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
+                         self.k_ded_W], dim=0)  # (M, H)
+        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
+                         self.k_ded_b], dim=0)  # (M,)
+        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
+        k_flat = k_proj.reshape(-1, 1).float()
+        k_feat = self._phi_B.channel_mlp(k_flat)
+        k_feat = k_feat.view(B_batch, L, self._phi_B.M, self._phi_B.L)
+        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()
 
         V = F.silu(self.v_proj(u.bfloat16()))  # (B, L, P)
 

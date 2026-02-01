@@ -3037,8 +3037,24 @@ class TritonS6(nn.Module):
         B_size, L_size, H = u.shape
         x = s6.msconv(u)  # (B, L, H)
 
-        # 2. phi_B projection (PyTorch)
-        Bu_raw = F.silu(kern.phi_B(x))  # (B, L, P)
+        # 2. phi_B projection (Triton)
+        phi = kern.phi_B
+        mlp = phi.channel_mlp
+        N_rows = B_size * L_size
+        raw = _TritonPhiB.apply(
+            x.reshape(N_rows, H),
+            phi.W, phi.b,
+            mlp.fc1.weight, mlp.fc1.bias,
+            mlp.fc2.weight, mlp.fc2.bias,
+            phi.M, phi.L, mlp.fc1.out_features,
+        )  # (N_rows, P)
+        # ch_rms + scale in PyTorch so autograd handles their gradients
+        if phi.ch_rms:
+            raw_3d = raw.view(N_rows, phi.M, phi.L)
+            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
+            sc = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
+            raw = (raw_3d * sc.view(1, 1, phi.L)).view(N_rows, -1)
+        Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
         # 3. SSM core (Triton)
         C = torch.view_as_complex(s6.C)
