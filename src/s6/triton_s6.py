@@ -1641,10 +1641,10 @@ class _TritonPhiB(torch.autograd.Function):
 class _TritonMSConv(torch.autograd.Function):
     """Fused multi-scale depthwise conv + SE. Forward: 2 kernels. Backward: 2 kernels."""
     @staticmethod
-    def forward(ctx, x, cw0, cb0, cw1, cb1, cw2, cb2, cw3, cb3, se_fc1_w, se_fc2_w, gs):
-        """x: (B, L, H). Conv weights: cw0..cw3 (gs,1,K), cb0..cb3 (gs,). SE weights: fc1 (hid,H), fc2 (H,hid)."""
+    def forward(ctx, x, cw0, cb0, cw1, cb1, cw2, cb2, se_fc1_w, se_fc2_w, gs):
+        """x: (B, L, H). Conv weights: cw0..cw2 (gs,1,K), cb0..cb2 (gs,). SE weights: fc1 (hid,H), fc2 (H,hid)."""
         B, L, H = x.shape
-        K0, K1, K2, K3 = cw0.shape[2], cw1.shape[2], cw2.shape[2], cw3.shape[2]
+        K0, K1, K2 = cw0.shape[2], cw1.shape[2], cw2.shape[2]
         hidden = se_fc1_w.shape[0]
 
         BLOCK_GS = triton.next_power_of_2(gs)
