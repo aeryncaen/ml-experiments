@@ -2993,7 +2993,7 @@ class _TritonS6(torch.autograd.Function):
         )
 
         d_cum_theta_total = d_cum_theta_b + d_cum_theta_c.view(B, L, P // 2)
-        g_pairs = kern.rope_group_pairs
+        g_pairs = ctx.rope_group_pairs
         if g_pairs > 0:
             mask = torch.zeros(P // 2, device=u.device, dtype=u.dtype)
             mask[2 * g_pairs:3 * g_pairs] = 1.0
@@ -3104,6 +3104,7 @@ class TritonS6(nn.Module):
         y_ssm = _TritonS6.apply(
             x,
             Bu_raw,
+            kern.rope_group_pairs, kern.rope_freqs,
             kern.x_proj.weight, kern.x_proj.bias,
             kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
             kern.log_A_real, kern.A_imag,
