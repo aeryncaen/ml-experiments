@@ -1085,6 +1085,285 @@ if HAS_TRITON:
             adj_re = a_re * d_h_re + a_im * d_h_im
             adj_im = a_re * d_h_im - a_im * d_h_re
 
+    # ========== Inject/discretization backward (grouped AB2) ==========
+    # Computes d_dt (inject part), d_lam, d_Bu_rot and adds to d_alpha
+    # via atomic adds for alpha_t, alpha_prev (t-1), alpha_next (t+1).
+
+    @triton.jit
+    def fused_inject_bwd_kernel(
+        dt_ptr, lam_ptr,
+        Bu_rot_ptr,  # (B, L, P)
+        alpha_re_ptr, alpha_im_ptr,  # (B, L, P)
+        d_inj_re_ptr, d_inj_im_ptr,  # (B, L, P)
+        d_dt_inj_ptr,  # (B, L, P)
+        d_lam_ptr,  # (B, L, P)
+        d_Bu_rot_ptr,  # (B, L, P) atomic add
+        d_alpha_re_ptr, d_alpha_im_ptr,  # (B, L, P) atomic add
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        gsize = P // 4
+        g1 = (offs_p >= gsize) & (offs_p < 2 * gsize)
+        g2 = (offs_p >= 2 * gsize) & (offs_p < 3 * gsize)
+        g3 = offs_p >= 3 * gsize
+        m1 = g1.to(tl.float32)
+        m2 = g2.to(tl.float32)
+        m3 = g3.to(tl.float32)
+        mZ = m1 + m2 + m3
+
+        for t in range(L):
+            off = base + t * P + offs_p
+
+            dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+            lam_t = tl.load(lam_ptr + off, mask=p_mask, other=0.0)
+            Bu_t = tl.load(Bu_rot_ptr + off, mask=p_mask, other=0.0)
+            a_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            a_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            d_inj_re = tl.load(d_inj_re_ptr + off, mask=p_mask, other=0.0)
+            d_inj_im = tl.load(d_inj_im_ptr + off, mask=p_mask, other=0.0)
+
+            # Neighbor Bu_rot and alpha
+            Bu_prev1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            Bu_prev2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            Bu_next1 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            Bu_next2 = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            a_prev_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            a_prev_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            a_next_re = tl.zeros((BLOCK_P,), dtype=tl.float32)
+            a_next_im = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+            if t > 0:
+                off_prev1 = base + (t - 1) * P + offs_p
+                Bu_prev1 = tl.load(Bu_rot_ptr + off_prev1, mask=p_mask, other=0.0)
+                a_prev_re = tl.load(alpha_re_ptr + off_prev1, mask=p_mask, other=0.0)
+                a_prev_im = tl.load(alpha_im_ptr + off_prev1, mask=p_mask, other=0.0)
+            if t > 1:
+                off_prev2 = base + (t - 2) * P + offs_p
+                Bu_prev2 = tl.load(Bu_rot_ptr + off_prev2, mask=p_mask, other=0.0)
+            if t + 1 < L:
+                off_next1 = base + (t + 1) * P + offs_p
+                Bu_next1 = tl.load(Bu_rot_ptr + off_next1, mask=p_mask, other=0.0)
+                a_next_re = tl.load(alpha_re_ptr + off_next1, mask=p_mask, other=0.0)
+                a_next_im = tl.load(alpha_im_ptr + off_next1, mask=p_mask, other=0.0)
+            if t + 2 < L:
+                off_next2 = base + (t + 2) * P + offs_p
+                Bu_next2 = tl.load(Bu_rot_ptr + off_next2, mask=p_mask, other=0.0)
+
+            # U for grouped inject: Z = alpha_t * U
+            U_re = (m1 * (Bu_prev1 + a_prev_re * Bu_prev2)
+                    + m2 * (Bu_next1 + a_next_re * Bu_next2)
+                    + m3 * (Bu_prev1 + Bu_next1))
+            U_im = (m1 * (a_prev_im * Bu_prev2)
+                    + m2 * (a_next_im * Bu_next2))
+
+            # Z = alpha * U
+            Z_re = a_re * U_re - a_im * U_im
+            Z_im = a_re * U_im + a_im * U_re
+
+            one_minus_lam = 1.0 - lam_t
+            dZ_re = one_minus_lam * dt_t * d_inj_re * mZ
+            dZ_im = one_minus_lam * dt_t * d_inj_im * mZ
+
+            d_lam = (d_inj_re * dt_t * (Bu_t - Z_re)
+                     - d_inj_im * dt_t * Z_im)
+            d_dt_inj = (d_inj_re * (lam_t * Bu_t + one_minus_lam * Z_re)
+                        + d_inj_im * (one_minus_lam * Z_im))
+
+            tl.store(d_lam_ptr + off, d_lam, mask=p_mask)
+            tl.store(d_dt_inj_ptr + off, d_dt_inj, mask=p_mask)
+
+            # d_Bu_rot for current position
+            d_Bu_curr = lam_t * dt_t * d_inj_re
+            tl.atomic_add(d_Bu_rot_ptr + off, d_Bu_curr, mask=p_mask)
+
+            # d_alpha (current) from Z = alpha * U
+            d_a_re_add = dZ_re * U_re + dZ_im * U_im
+            d_a_im_add = dZ_im * U_re - dZ_re * U_im
+            tl.atomic_add(d_alpha_re_ptr + off, d_a_re_add, mask=p_mask)
+            tl.atomic_add(d_alpha_im_ptr + off, d_a_im_add, mask=p_mask)
+
+            # dU from Z = alpha * U
+            dU_re = dZ_re * a_re + dZ_im * a_im
+            dU_im = dZ_im * a_re - dZ_re * a_im
+
+            # Group-specific propagation to neighbors
+            if t > 0:
+                off_prev1 = base + (t - 1) * P + offs_p
+                d_prev1 = dU_re * (m1 + m3)
+                tl.atomic_add(d_Bu_rot_ptr + off_prev1, d_prev1, mask=p_mask)
+
+            if t > 1:
+                off_prev2 = base + (t - 2) * P + offs_p
+                d_prev2 = dU_re * a_prev_re + dU_im * a_prev_im
+                tl.atomic_add(d_Bu_rot_ptr + off_prev2, d_prev2 * m1, mask=p_mask)
+
+            if t + 1 < L:
+                off_next1 = base + (t + 1) * P + offs_p
+                d_next1 = dU_re * (m2 + m3)
+                tl.atomic_add(d_Bu_rot_ptr + off_next1, d_next1, mask=p_mask)
+
+            if t + 2 < L:
+                off_next2 = base + (t + 2) * P + offs_p
+                d_next2 = dU_re * a_next_re + dU_im * a_next_im
+                tl.atomic_add(d_Bu_rot_ptr + off_next2, d_next2 * m2, mask=p_mask)
+
+            # alpha_prev/alpha_next contributions
+            if t > 0:
+                off_prev1 = base + (t - 1) * P + offs_p
+                d_a_prev_re = dU_re * Bu_prev2
+                d_a_prev_im = dU_im * Bu_prev2
+                tl.atomic_add(d_alpha_re_ptr + off_prev1, d_a_prev_re * m1, mask=p_mask)
+                tl.atomic_add(d_alpha_im_ptr + off_prev1, d_a_prev_im * m1, mask=p_mask)
+
+            if t + 1 < L:
+                off_next1 = base + (t + 1) * P + offs_p
+                d_a_next_re = dU_re * Bu_next2
+                d_a_next_im = dU_im * Bu_next2
+                tl.atomic_add(d_alpha_re_ptr + off_next1, d_a_next_re * m2, mask=p_mask)
+                tl.atomic_add(d_alpha_im_ptr + off_next1, d_a_next_im * m2, mask=p_mask)
+
+    # ========== Alpha -> dt/A backward ==========
+
+    @triton.jit
+    def fused_alpha_bwd_kernel(
+        dt_ptr,
+        alpha_re_ptr, alpha_im_ptr,
+        d_alpha_re_ptr, d_alpha_im_ptr,
+        A_real_ptr, A_imag_ptr,
+        d_dt_ptr,
+        d_log_A_real_ptr, d_A_imag_ptr,
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+
+        a_re = tl.load(A_real_ptr + offs_p, mask=p_mask, other=0.0)
+        a_im = tl.load(A_imag_ptr + offs_p, mask=p_mask, other=0.0)
+
+        d_A_real_acc = tl.zeros((BLOCK_P,), dtype=tl.float32)
+        d_A_imag_acc = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for t in range(L):
+            off = base + t * P + offs_p
+            dt_t = tl.load(dt_ptr + off, mask=p_mask, other=0.0)
+            alpha_re = tl.load(alpha_re_ptr + off, mask=p_mask, other=0.0)
+            alpha_im = tl.load(alpha_im_ptr + off, mask=p_mask, other=0.0)
+            d_a_re = tl.load(d_alpha_re_ptr + off, mask=p_mask, other=0.0)
+            d_a_im = tl.load(d_alpha_im_ptr + off, mask=p_mask, other=0.0)
+
+            d_dt_alpha = (d_a_re * (a_re * alpha_re - a_im * alpha_im)
+                          + d_a_im * (a_re * alpha_im + a_im * alpha_re))
+            tl.store(d_dt_ptr + off, d_dt_alpha, mask=p_mask)
+
+            d_A_real_acc += d_a_re * dt_t * alpha_re + d_a_im * dt_t * alpha_im
+            d_A_imag_acc += -d_a_re * dt_t * alpha_im + d_a_im * dt_t * alpha_re
+
+        tl.atomic_add(d_log_A_real_ptr + offs_p, d_A_real_acc * a_re, mask=p_mask)
+        tl.atomic_add(d_A_imag_ptr + offs_p, d_A_imag_acc, mask=p_mask)
+
+    # ========== RoPE backward for Bu ==========
+
+    @triton.jit
+    def fused_rope_bwd_kernel(
+        Bu_ptr,  # (B, L, P) pre-rotation
+        d_Bu_rot_ptr,  # (B, L, P)
+        cum_theta_ptr,  # (B, L, P//2)
+        d_Bu_ptr,  # (B, L, P)
+        d_cum_theta_b_ptr,  # (B, L, P//2)
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = offs_p < P
+        base = pid_b * L * P
+        half_P = P // 2
+        base_theta = pid_b * L * half_P
+
+        pair_idx = offs_p // 2
+        is_odd = (offs_p % 2).to(tl.float32)
+
+        for t in range(L):
+            off = base + t * P + offs_p
+            off_theta = base_theta + t * half_P + pair_idx
+
+            Bu = tl.load(Bu_ptr + off, mask=p_mask, other=0.0)
+            d_rot = tl.load(d_Bu_rot_ptr + off, mask=p_mask, other=0.0)
+            angle = tl.load(cum_theta_ptr + off_theta, mask=p_mask, other=0.0)
+
+            cos_t = tl.cos(angle)
+            sin_t = tl.sin(angle)
+
+            partner_offs = tl.where(is_odd > 0.5, offs_p - 1, offs_p + 1)
+            partner_mask = partner_offs < P
+            Bu_partner = tl.load(Bu_ptr + base + t * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+            d_rot_partner = tl.load(d_Bu_rot_ptr + base + t * P + partner_offs, mask=p_mask & partner_mask, other=0.0)
+
+            d_Bu = tl.where(
+                is_odd > 0.5,
+                -d_rot_partner * sin_t + d_rot * cos_t,
+                d_rot * cos_t + d_rot_partner * sin_t,
+            )
+            tl.store(d_Bu_ptr + off, d_Bu, mask=p_mask)
+
+            # d_cum_theta from Bu RoPE (even indices only)
+            bu1 = tl.where(is_odd > 0.5, Bu_partner, Bu)
+            bu2 = tl.where(is_odd > 0.5, Bu, Bu_partner)
+            d_rot1 = tl.where(is_odd > 0.5, d_rot_partner, d_rot)
+            d_rot2 = tl.where(is_odd > 0.5, d_rot, d_rot_partner)
+            d_ct = d_rot1 * (-bu1 * sin_t - bu2 * cos_t) + d_rot2 * (bu1 * cos_t - bu2 * sin_t)
+
+            even_mask = (offs_p % 2 == 0) & p_mask & (pair_idx < half_P)
+            tl.store(d_cum_theta_b_ptr + off_theta, d_ct, mask=even_mask)
+
+    # ========== Reverse cumsum for dt rope ==========
+
+    @triton.jit
+    def fused_dt_rope_kernel(
+        d_cum_theta_ptr,  # (B, L, P//2)
+        theta_ptr,  # (B, L, P//2)
+        d_dt_rope_ptr,  # (B, L, P)
+        d_dt_half_ptr,  # (B, L, P//2)
+        B_batch, L, P,
+        BLOCK_P: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+        half_P = P // 2
+        offs_h = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        h_mask = offs_h < half_P
+        base_half = pid_b * L * half_P
+        base = pid_b * L * P
+
+        acc = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        for t_rev in range(L):
+            t = L - 1 - t_rev
+            off_h = base_half + t * half_P + offs_h
+            d_ct = tl.load(d_cum_theta_ptr + off_h, mask=h_mask, other=0.0)
+            acc += d_ct
+            tl.store(d_dt_half_ptr + off_h, acc, mask=h_mask)
+
+            theta_t = tl.load(theta_ptr + off_h, mask=h_mask, other=0.0)
+            d_dt_val = acc * theta_t * 0.5
+
+            off_even = base + t * P + offs_h * 2
+            off_odd = off_even + 1
+            tl.store(d_dt_rope_ptr + off_even, d_dt_val, mask=h_mask & (offs_h * 2 < P))
+            tl.store(d_dt_rope_ptr + off_odd, d_dt_val, mask=h_mask & (offs_h * 2 + 1 < P))
+
     # ========== Fused prescan backward kernel ==========
 
     @triton.jit
@@ -1878,7 +2157,6 @@ class _TritonS6(torch.autograd.Function):
         # 4. Fused scan: RoPE + discretize + recurrence
         h_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         h_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        # alpha/inject/Bu_rot no longer saved — recomputed in backward
         alpha_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         alpha_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
@@ -1924,12 +2202,13 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_H, BLOCK_P,
         )
 
-        # Save for backward — no alpha/inject/Bu_rot (recomputed in bwd)
+        # Save for backward
         ctx.save_for_backward(
             u, Bu_raw_flat,
             dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
             Bu,
             h_re, h_im,
+            alpha_re, alpha_im, Bu_rot,
             c_proj_out, c_gate,
             x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
             c_norm_gamma, c_bias, C_re, C_im, D,
@@ -1946,6 +2225,7 @@ class _TritonS6(torch.autograd.Function):
          dt_raw, dt, lam_raw, lam, theta, dt_half_theta, cum_theta,
          Bu,
          h_re, h_im,
+         alpha_re, alpha_im, Bu_rot,
          c_proj_out, c_gate,
          x_proj_w, c_proj_w, b_norm_gamma, b_bias, log_dt_bias, log_A_real, A_imag,
          c_norm_gamma, c_bias, C_re, C_im, D,
@@ -2010,29 +2290,83 @@ class _TritonS6(torch.autograd.Function):
         d_c_proj_b = d_c_proj_out.sum(0)
         d_u_c = d_c_proj_out @ c_proj_w
 
-        # ---- Steps 5+4+RoPE+cumsum: Fused scan + disc + RoPE backward ----
+        # ---- Steps 5+4+RoPE+cumsum: scan + grouped inject + RoPE backward ----
         BLOCK_P_SCAN = triton.next_power_of_2(P)
-        d_dt_total = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_alpha_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_inject_re = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_inject_im = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+
+        fused_scan_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            alpha_re.view(B, L, P), alpha_im.view(B, L, P),
+            h_re, h_im,
+            d_h_re.view(B, L, P), d_h_im.view(B, L, P),
+            d_alpha_re, d_alpha_im,
+            d_inject_re, d_inject_im,
+            B, L, P,
+            BLOCK_P_SCAN,
+        )
+
+        d_dt_inj = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_lam_disc = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
-        d_Bu_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_Bu_rot = torch.zeros(B, L, P, device=u.device, dtype=u.dtype)
+
+        fused_inject_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt.view(B, L, P), lam.view(B, L, P),
+            Bu_rot.view(B, L, P),
+            alpha_re.view(B, L, P), alpha_im.view(B, L, P),
+            d_inject_re, d_inject_im,
+            d_dt_inj, d_lam_disc,
+            d_Bu_rot,
+            d_alpha_re, d_alpha_im,
+            B, L, P,
+            BLOCK_P_SCAN,
+        )
+
+        d_dt_alpha = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_log_A_real = torch.zeros(P, device=u.device, dtype=u.dtype)
         d_A_imag = torch.zeros(P, device=u.device, dtype=u.dtype)
+
+        fused_alpha_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            dt.view(B, L, P),
+            alpha_re.view(B, L, P), alpha_im.view(B, L, P),
+            d_alpha_re, d_alpha_im,
+            A_real_neg, A_imag,
+            d_dt_alpha,
+            d_log_A_real, d_A_imag,
+            B, L, P,
+            BLOCK_P_SCAN,
+        )
+
+        d_dt_total = d_dt_inj + d_dt_alpha
+
+        d_Bu_3d = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
+        d_cum_theta_b = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
+
+        fused_rope_bwd_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
+            Bu.view(B, L, P),
+            d_Bu_rot,
+            cum_theta,
+            d_Bu_3d,
+            d_cum_theta_b,
+            B, L, P,
+            BLOCK_P_SCAN,
+        )
+
+        d_cum_theta_total = d_cum_theta_b + d_cum_theta_c
+        d_dt_rope = torch.empty(B, L, P, device=u.device, dtype=u.dtype)
         d_dt_half_theta = torch.empty(B, L, P // 2, device=u.device, dtype=u.dtype)
 
-        fused_bwd_scan_disc_kernel[(B, triton.cdiv(P, BLOCK_P_SCAN))](
-            dt.view(B, L, P), lam.view(B, L, P),
-            Bu.view(B, L, P), cum_theta,
-            A_real_neg, A_imag,
-            h_re, h_im,
-            theta.view(M, P // 2),
-            d_h_re.view(B, L, P), d_h_im.view(B, L, P),
-            d_cum_theta_c,
-            d_dt_total, d_lam_disc, d_Bu_3d,
-            d_log_A_real, d_A_imag,
+        fused_dt_rope_kernel[(B, triton.cdiv(P // 2, BLOCK_P_SCAN))](
+            d_cum_theta_total,
+            theta.view(B, L, P // 2),
+            d_dt_rope,
             d_dt_half_theta,
             B, L, P,
             BLOCK_P_SCAN,
         )
+
+        d_dt_total = d_dt_total + d_dt_rope
 
         # d_theta from d_dt_half_theta: d_theta[t] = d_dt_half_theta[t] * dt_half[t]
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)
