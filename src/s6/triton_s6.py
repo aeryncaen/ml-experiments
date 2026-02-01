@@ -675,11 +675,16 @@ if HAS_TRITON:
         d_hg_im = -tl.sum(C_im_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
 
         # DEBUG: write intermediates
+        silu_deriv = sig_skip + x_skip * sig_skip * (1.0 - sig_skip)
         if pid_h == 0:
-            tl.store(dbg_ptr + pid_m * 4 + 0, tl.max(tl.abs(y_vals), axis=0))
-            tl.store(dbg_ptr + pid_m * 4 + 1, tl.max(tl.abs(d_x_skip), axis=0))
-            tl.store(dbg_ptr + pid_m * 4 + 2, tl.max(tl.abs(d_hg_re), axis=0))
-            tl.store(dbg_ptr + pid_m * 4 + 3, tl.max(tl.abs(d_hg_re * gate), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 0, tl.max(tl.abs(y_vals), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 1, tl.max(tl.abs(d_x_skip), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 2, tl.max(tl.abs(d_hg_re), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 3, tl.max(tl.abs(d_hg_re * gate), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 4, tl.max(tl.abs(d_out), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 5, tl.max(tl.abs(silu_deriv), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 6, tl.max(tl.abs(x_skip), axis=0))
+            tl.store(dbg_ptr + pid_m * 8 + 7, tl.max(tl.abs(sig_skip), axis=0))
 
         # d_C: atomic add (H, P)
         # d_C_re[h,p] += d_y[h] * hg_re[p]
@@ -1244,7 +1249,7 @@ class _TritonS6(torch.autograd.Function):
         d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
         d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
         d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
-        _dbg = torch.zeros(M, 4, device=u.device, dtype=u.dtype)
+        _dbg = torch.zeros(M, 8, device=u.device, dtype=u.dtype)
 
         fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
             h_re.view(M, P), h_im.view(M, P),
