@@ -394,15 +394,23 @@ def debug_forward_stepwise():
     with torch.no_grad():
         # PyTorch reference
         Bu_rot_pt = apply_rotary_emb(Bu_pt, cum_theta_pt)
-        Bu_prev_pt = F.pad(Bu_rot_pt[:, :-1], (0, 0, 1, 0))
+        Bu_next_pt = F.pad(Bu_rot_pt[:, 1:], (0, 0, 0, 1))
+        Bu_next2_pt = F.pad(Bu_rot_pt[:, 2:], (0, 0, 0, 2))
         dt_3d = dt_pt.view(B, L, P)
         A = -torch.exp(kern.log_A_real) + 1j * kern.A_imag
         alpha_pt = torch.exp(dt_3d.to(torch.cfloat) * A)
         Bu_c = Bu_rot_pt.to(torch.cfloat)
-        Bu_prev_c = Bu_prev_pt.to(torch.cfloat)
+        Bu_next_c = Bu_next_pt.to(torch.cfloat)
+        Bu_next2_c = Bu_next2_pt.to(torch.cfloat)
         dt_c = dt_3d.to(torch.cfloat)
         lam_3d = lam_pt.view(B, L, P)
-        inject_pt = lam_3d * dt_c * Bu_c + (1 - lam_3d) * dt_c * alpha_pt * Bu_prev_c
+        alpha_next1 = F.pad(alpha_pt[:, 1:], (0, 0, 0, 1))
+        inject_pt = (
+            lam_3d * dt_c * Bu_c
+            + (1 - lam_3d) * dt_c * (
+                alpha_pt * Bu_next_c + (alpha_pt * alpha_next1) * Bu_next2_c
+            )
+        )
         from .scan import sequential_scan
         h_pt = sequential_scan(alpha_pt, inject_pt)
 

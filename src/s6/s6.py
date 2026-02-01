@@ -211,13 +211,13 @@ class S6Kernel(nn.Module):
         inject = torch.zeros_like(Bu_c)
         # pass-through: current only
         inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * Bu_c[:, :, g0]
-        # causal AB2 for all non-pass groups: look behind 2 with stacked decay
+        # retrocausal AB2 for all non-pass groups: look ahead 2 with stacked decay
         for gs in (g1, g2, g3):
             inject[:, :, gs] = (
                 lam[:, :, gs] * dt_c[:, :, gs] * Bu_c[:, :, gs]
                 + (1 - lam[:, :, gs]) * dt_c[:, :, gs] * (
-                    alpha[:, :, gs] * Bu_prev1_c[:, :, gs]
-                    + (alpha[:, :, gs] * alpha_prev1[:, :, gs]) * Bu_prev2_c[:, :, gs]
+                    alpha[:, :, gs] * Bu_next1_c[:, :, gs]
+                    + (alpha[:, :, gs] * alpha_next1[:, :, gs]) * Bu_next2_c[:, :, gs]
                 )
             )
 
