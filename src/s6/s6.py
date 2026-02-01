@@ -205,8 +205,14 @@ class S6Kernel(nn.Module):
 
 
 class SharedAttention(nn.Module):
-    """Causal attention sharing 80% of Q/K dims with SSM B/C projections. bf16 internally."""
-    def __init__(self, d_model, d_state, M=4, num_heads=1, layer_idx=0):
+    """Causal attention with 80/20 weight sharing.
+
+    Q: linear projection sharing 80% of weight rows with c_proj, 20% dedicated.
+    K: feature map sharing 80% of W rows with phi_B, 20% dedicated.
+    V: standalone.
+    """
+    def __init__(self, d_model, d_state, M=4, num_heads=1, layer_idx=0,
+                 phi_B=None, c_proj=None):
         super().__init__()
         H = d_model
         P = d_state
@@ -217,16 +223,28 @@ class SharedAttention(nn.Module):
         assert P % num_heads == 0
 
         # 80/20 split
-        self.shared_dims = int(0.8 * P)
-        self.ded_dims = P - self.shared_dims
+        self.shared_q_rows = int(0.8 * P)
+        self.ded_q_rows = P - self.shared_q_rows
+        self.shared_k_dirs = int(0.8 * M)
+        self.ded_k_dirs = M - self.shared_k_dirs
 
-        # All attention params in bf16
-        self.q_ded = nn.Linear(H, self.ded_dims, bias=False, dtype=torch.bfloat16)
-        self.k_ded = nn.Linear(H, self.ded_dims, bias=False, dtype=torch.bfloat16)
+        # Q: shares 80% of c_proj weight rows, 20% dedicated
+        # c_proj.weight is (P, H) — Q uses the first shared_q_rows rows directly
+        assert c_proj is not None
+        self._c_proj = c_proj  # reference, not a copy
+        self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
+        self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
+
+        # K: feature map sharing 80% of phi_B.W rows, 20% dedicated
+        # phi_B.W is (M, H) — K uses first shared_k_dirs rows directly
+        assert phi_B is not None
+        self._phi_B = phi_B  # reference, not a copy
+        L_fb = P // M  # feature map output per direction
+        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
+        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
+        # Dedicated directions share the same ScalarMLP as phi_B
+
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
-
-        self.q_bias = nn.Parameter(torch.ones(P, dtype=torch.bfloat16))
-        self.k_bias = nn.Parameter(torch.ones(P, dtype=torch.bfloat16))
 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
@@ -236,27 +254,40 @@ class SharedAttention(nn.Module):
         self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, u, y_ssm, B_shared, C_shared):
+    def forward(self, u, y_ssm):
         """
-        u: (B, L, H) — pre-SSM hidden states
-        y_ssm: (B, L, H) — SSM readout (after norm)
-        B_shared: (B, L, P) — Bu_raw from phi_B (first 80% reused for Q)
-        C_shared: (B, L, P) — c_proj output (first 80% reused for K)
+        u: (B, L, H) — input to project Q/K/V from
+        y_ssm: (B, L, H) — SSM output (residual target)
         """
-        B_batch, L, _ = u.shape
-        sd = self.shared_dims
+        B_batch, L, H = u.shape
+        P = self.P
         nh = self.num_heads
         hd = self.head_dim
 
-        # Cast shared inputs to bf16 at boundary
-        u_bf = u.bfloat16()
-        B_sh = B_shared[..., :sd].bfloat16()
-        C_sh = C_shared[..., :sd].bfloat16()
+        # --- Q: linear with 80% shared weights from c_proj ---
+        # c_proj.weight: (P, H), c_proj.bias: (P,)
+        # Concat shared rows + dedicated rows to form full Q projection
+        q_weight = torch.cat([self._c_proj.weight[:self.shared_q_rows],
+                              self.q_ded_weight], dim=0)  # (P, H)
+        q_bias = torch.cat([self._c_proj.bias[:self.shared_q_rows],
+                            self.q_ded_bias], dim=0)  # (P,)
+        Q = F.linear(u, q_weight, q_bias).bfloat16()  # (B, L, P)
 
-        # Q = [B_shared[:sd] | q_ded] + bias, K = [C_shared[:sd] | k_ded] + bias
-        Q = F.silu(torch.cat([B_sh, self.q_ded(u_bf)], dim=-1) + self.q_bias)
-        K = F.silu(torch.cat([C_sh, self.k_ded(u_bf)], dim=-1) + self.k_bias)
-        V = self.v_proj(u_bf)  # (B, L, P)
+        # --- K: feature map with 80% shared W from phi_B ---
+        # Assemble full W: [phi_B.W[:shared], k_ded_W] → (M, H)
+        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
+                         self.k_ded_W], dim=0)  # (M, H)
+        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
+                         self.k_ded_b], dim=0)  # (M,)
+        # Project: (B, L, H) → (B, L, M) via assembled W
+        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
+        # Run through shared ScalarMLP: (B*L*M, 1) → (B*L*M, L_fb)
+        k_flat = k_proj.reshape(-1, 1).float()
+        k_feat = self._phi_B.channel_mlp(k_flat)  # (B*L*M, L_fb)
+        k_feat = k_feat.view(B_batch, L, self._phi_B.M, self._phi_B.L)
+        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()  # (B, L, P)
+
+        V = self.v_proj(u.bfloat16())  # (B, L, P)
 
         # Reshape to (B, nh, L, hd) and normalize
         Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
@@ -264,9 +295,8 @@ class SharedAttention(nn.Module):
         V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, self.P)
+        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
-        # Cast back to f32 at boundary
         return y_ssm + self.gate * self.out_proj(attn_out).float()
 
 
@@ -299,17 +329,22 @@ class S6(nn.Module):
         self.readout_norm = RMSNorm(self.h)
 
         # Shared attention (after readout)
-        self.attn = SharedAttention(d_model, d_state, M=M, num_heads=num_heads, layer_idx=layer_idx or 0)
+        self.attn = SharedAttention(d_model, d_state, M=M, num_heads=num_heads,
+                                    layer_idx=layer_idx or 0,
+                                    phi_B=self.kernel.phi_B, c_proj=self.c_proj)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
         B, L, H = u.shape
 
+        # msconv first
+        x = self.msconv(u)
+
         # Run SSM scan
-        h, cum_theta, Bu_raw = self.kernel(u)  # h: (B,L,P), cum_theta: (B,L,P//2), Bu_raw: (B,L,P)
+        h, cum_theta, Bu_raw = self.kernel(x)  # h: (B,L,P), cum_theta: (B,L,P//2), Bu_raw: (B,L,P)
 
         # Input-dependent C gating + static C readout
-        c_proj_out = self.c_proj(u)  # (B, L, P) — save for attention K sharing
+        c_proj_out = self.c_proj(x)  # (B, L, P) — save for attention K sharing
         c_gate = self.c_norm(F.silu(c_proj_out)) + self.c_bias  # (B, L, P)
         c_gate = apply_rotary_emb(c_gate, cum_theta)  # rotate to match state
         h_gated = h * c_gate  # (B, L, P) — input-dependent selection of state dims
@@ -319,12 +354,11 @@ class S6(nn.Module):
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
         # Skip connection + activation
-        y = y + u * self.D
+        y = y + x * self.D
         y = F.silu(y)
 
-        # Post-readout norm + residual from x + msconv + attention
+        # Post-readout norm + residual + attention
         y_normed = self.readout_norm(y) + u
-        y_conv = self.msconv(y_normed)  # (B, L, H)
-        y = self.attn(y_conv, y_conv, Bu_raw, c_proj_out)
+        y = self.attn(x, y_normed)
 
         return y
