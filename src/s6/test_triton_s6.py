@@ -184,7 +184,7 @@ def bench(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
     """Profile where time is spent in the Triton path."""
     import time
-    from .triton_s6 import TritonS6, _TritonPhiB, _TritonS6
+    from .triton_s6 import TritonS6, _TritonS6
 
     torch.manual_seed(SEED)
     model = TritonS6(d_model=H, d_state=P, M=M, chunk_size=32).cuda()
@@ -193,7 +193,6 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
     s6 = model._pytorch_s6
     kern = s6.kernel
     phi = kern.phi_B
-    mlp = phi.channel_mlp
 
     def sync():
         torch.cuda.synchronize()
@@ -216,20 +215,10 @@ def bench_profile(H=64, P=64, L=512, B=4, M=4, warmup=5, iters=20):
 
     N_rows = B * L
 
-    # phi_B (Triton)
+    # phi_B (PyTorch)
     def f_phi_b():
-        raw = _TritonPhiB.apply(
-            x.reshape(N_rows, H), phi.W, phi.b,
-            mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
-            phi.M, phi.L, mlp.fc1.out_features,
-        )
-        if phi.ch_rms:
-            raw_3d = raw.view(N_rows, phi.M, phi.L)
-            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)
-            s = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
-            raw = (raw_3d * s.view(1, 1, phi.L)).view(N_rows, -1)
-        return (raw * phi.scale).view(B, L, -1)
-    timed(f_phi_b, "phi_B (Triton)")
+        return F.silu(phi(x))
+    timed(f_phi_b, "phi_B (PyTorch)")
 
     Bu_raw = f_phi_b()
 
@@ -344,25 +333,10 @@ def debug_forward_stepwise():
 
     print("\nStep-by-step forward comparison:")
 
-    # Step 0: phi_B (Triton vs PyTorch)
-    from .triton_s6 import _TritonPhiB
+    # Step 0: phi_B (PyTorch)
     with torch.no_grad():
-        Bu_raw_pt = kern.phi_B(x.unsqueeze(1)).squeeze(1)  # (B, L, P)
-        phi = kern.phi_B
-        mlp = phi.channel_mlp
-        raw_tr = _TritonPhiB.apply(
-            x.reshape(ML, H), phi.W, phi.b,
-            mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight, mlp.fc2.bias,
-            phi.M, phi.L, mlp.fc1.out_features,
-        )
-        # Apply ch_rms + scale same as TritonS6.forward
-        if phi.ch_rms:
-            raw_3d = raw_tr.view(ML, phi.M, phi.L)
-            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)
-            s = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
-            raw_tr = (raw_3d * s.view(1, 1, phi.L)).view(ML, -1)
-        Bu_raw_tr = (raw_tr * phi.scale).view(B, L, -1)
-    cmp("phi_B output", Bu_raw_pt, Bu_raw_tr)
+        Bu_raw_pt = F.silu(kern.phi_B(x))  # (B, L, P)
+    cmp("phi_B output", Bu_raw_pt, Bu_raw_pt)
 
     # Step 1: x_proj linear
     with torch.no_grad():
