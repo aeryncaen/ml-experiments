@@ -301,6 +301,334 @@ if HAS_TRITON:
         # Store d_x (no atomic needed — one row per program)
         tl.store(d_x_ptr + row * H + offs_h, d_x_acc, mask=h_mask)
 
+    # ========== Fused MSConv forward: depthwise conv + silu + passthrough ==========
+    # Grid: (B, L) — one program per (batch, timestep)
+    # 3 conv groups with kernel sizes K0, K1, K2, plus 1 passthrough group
+    # Each conv is depthwise: per-channel 1D filter
+    # Output: conv_out (B, L, H) — before SE
+
+    @triton.jit
+    def fused_msconv_fwd_kernel(
+        x_ptr,          # (B, L, H)
+        # Conv weights: each (gs, 1, k) stored contiguously as (gs, k)
+        cw0_ptr, cb0_ptr,  # conv 0: (gs, K0), (gs,)
+        cw1_ptr, cb1_ptr,  # conv 1: (gs, K1), (gs,)
+        cw2_ptr, cb2_ptr,  # conv 2: (gs, K2), (gs,)
+        out_ptr,        # (B, L, H)
+        B_batch, L, H: tl.constexpr, gs: tl.constexpr,
+        K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
+        BLOCK_GS: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        if pid_b >= B_batch or pid_l >= L:
+            return
+
+        offs_gs = tl.arange(0, BLOCK_GS)
+        gs_mask = offs_gs < gs
+        base = pid_b * L * H
+
+        # --- Group 0: kernel size K0 ---
+        acc0 = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K0):
+            src_l = pid_l - K0 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(
+                x_ptr + base + src_l * H + offs_gs,
+                mask=gs_mask & valid, other=0.0
+            )
+            w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
+            acc0 += x_val * w_val
+        sig0 = 1.0 / (1.0 + tl.exp(-acc0))
+        out0 = acc0 * sig0
+
+        # --- Group 1: kernel size K1 ---
+        acc1 = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K1):
+            src_l = pid_l - K1 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(
+                x_ptr + base + src_l * H + gs + offs_gs,
+                mask=gs_mask & valid, other=0.0
+            )
+            w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
+            acc1 += x_val * w_val
+        sig1 = 1.0 / (1.0 + tl.exp(-acc1))
+        out1 = acc1 * sig1
+
+        # --- Group 2: kernel size K2 ---
+        acc2 = tl.load(cb2_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K2):
+            src_l = pid_l - K2 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(
+                x_ptr + base + src_l * H + 2 * gs + offs_gs,
+                mask=gs_mask & valid, other=0.0
+            )
+            w_val = tl.load(cw2_ptr + offs_gs * K2 + j, mask=gs_mask, other=0.0)
+            acc2 += x_val * w_val
+        sig2 = 1.0 / (1.0 + tl.exp(-acc2))
+        out2 = acc2 * sig2
+
+        # --- Passthrough group ---
+        pass_val = tl.load(
+            x_ptr + base + pid_l * H + 3 * gs + offs_gs,
+            mask=gs_mask, other=0.0
+        )
+
+        # Store all groups
+        row_off = base + pid_l * H
+        tl.store(out_ptr + row_off + offs_gs, out0, mask=gs_mask)
+        tl.store(out_ptr + row_off + gs + offs_gs, out1, mask=gs_mask)
+        tl.store(out_ptr + row_off + 2 * gs + offs_gs, out2, mask=gs_mask)
+        tl.store(out_ptr + row_off + 3 * gs + offs_gs, pass_val, mask=gs_mask)
+
+    # ========== Fused MSConv SE forward: mean -> fc1 -> silu -> fc2 -> sigmoid -> scale ==========
+    # Grid: (B,) — one program per batch element
+    # Loops over L twice: first pass for mean, second pass for broadcast multiply
+
+    @triton.jit
+    def fused_msconv_se_fwd_kernel(
+        conv_out_ptr,   # (B, L, H) — input (from conv fwd)
+        fc1_w_ptr,      # (hidden, H) — SE fc1 weight
+        fc2_w_ptr,      # (H, hidden) — SE fc2 weight
+        out_ptr,        # (B, L, H) — final output
+        B_batch, L, H: tl.constexpr, hidden: tl.constexpr,
+        BLOCK_H: tl.constexpr, BLOCK_HID: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        if pid_b >= B_batch:
+            return
+
+        offs_h = tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        offs_hid = tl.arange(0, BLOCK_HID)
+        hid_mask = offs_hid < hidden
+        base = pid_b * L * H
+
+        # Pass 1: compute mean over L
+        mean_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+        for l in range(L):
+            val = tl.load(conv_out_ptr + base + l * H + offs_h, mask=h_mask, other=0.0)
+            mean_acc += val
+        mean_val = mean_acc / L  # (H,)
+
+        # fc1: (hidden, H) @ (H,) -> (hidden,)
+        fc1_w = tl.load(
+            fc1_w_ptr + offs_hid[:, None] * H + offs_h[None, :],
+            mask=hid_mask[:, None] & h_mask[None, :], other=0.0
+        )  # (BLOCK_HID, BLOCK_H)
+        fc1_out = tl.sum(fc1_w * mean_val[None, :], axis=1)  # (BLOCK_HID,)
+
+        # silu
+        fc1_sig = 1.0 / (1.0 + tl.exp(-fc1_out))
+        fc1_act = fc1_out * fc1_sig  # (hidden,)
+
+        # fc2: (H, hidden) @ (hidden,) -> (H,)
+        fc2_w = tl.load(
+            fc2_w_ptr + offs_h[:, None] * hidden + offs_hid[None, :],
+            mask=h_mask[:, None] & hid_mask[None, :], other=0.0
+        )  # (BLOCK_H, BLOCK_HID)
+        fc2_out = tl.sum(fc2_w * fc1_act[None, :], axis=1)  # (BLOCK_H,)
+
+        # sigmoid
+        scale = 1.0 / (1.0 + tl.exp(-fc2_out))  # (H,)
+
+        # Pass 2: broadcast multiply
+        for l in range(L):
+            off = base + l * H
+            val = tl.load(conv_out_ptr + off + offs_h, mask=h_mask, other=0.0)
+            tl.store(out_ptr + off + offs_h, val * scale, mask=h_mask)
+
+    # ========== Fused MSConv SE backward ==========
+    # Grid: (B,) — one program per batch element
+    # Recomputes SE forward, then chains backward
+
+    @triton.jit
+    def fused_msconv_se_bwd_kernel(
+        conv_out_ptr,   # (B, L, H) — saved from forward
+        d_out_ptr,      # (B, L, H) — grad from downstream
+        fc1_w_ptr,      # (hidden, H)
+        fc2_w_ptr,      # (H, hidden)
+        d_conv_out_ptr, # (B, L, H) — grad to pass back to conv bwd
+        d_fc1_w_ptr,    # (hidden, H) — atomic across B
+        d_fc2_w_ptr,    # (H, hidden) — atomic across B
+        B_batch, L, H: tl.constexpr, hidden: tl.constexpr,
+        BLOCK_H: tl.constexpr, BLOCK_HID: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        if pid_b >= B_batch:
+            return
+
+        offs_h = tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        offs_hid = tl.arange(0, BLOCK_HID)
+        hid_mask = offs_hid < hidden
+        base = pid_b * L * H
+
+        # --- Recompute SE forward ---
+        mean_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+        for l in range(L):
+            val = tl.load(conv_out_ptr + base + l * H + offs_h, mask=h_mask, other=0.0)
+            mean_acc += val
+        mean_val = mean_acc / L
+
+        fc1_w = tl.load(
+            fc1_w_ptr + offs_hid[:, None] * H + offs_h[None, :],
+            mask=hid_mask[:, None] & h_mask[None, :], other=0.0
+        )
+        fc1_pre = tl.sum(fc1_w * mean_val[None, :], axis=1)
+        fc1_sig = 1.0 / (1.0 + tl.exp(-fc1_pre))
+        fc1_act = fc1_pre * fc1_sig
+
+        fc2_w = tl.load(
+            fc2_w_ptr + offs_h[:, None] * hidden + offs_hid[None, :],
+            mask=h_mask[:, None] & hid_mask[None, :], other=0.0
+        )
+        fc2_pre = tl.sum(fc2_w * fc1_act[None, :], axis=1)
+        scale = 1.0 / (1.0 + tl.exp(-fc2_pre))
+
+        # --- Backward ---
+        # Pass 1: accumulate d_scale and write d_conv_out (scale part)
+        d_scale = tl.zeros((BLOCK_H,), dtype=tl.float32)
+        for l in range(L):
+            off = base + l * H
+            d_o = tl.load(d_out_ptr + off + offs_h, mask=h_mask, other=0.0)
+            c_o = tl.load(conv_out_ptr + off + offs_h, mask=h_mask, other=0.0)
+            # d_conv_out = d_out * scale (will add d_mean/L later)
+            tl.store(d_conv_out_ptr + off + offs_h, d_o * scale, mask=h_mask)
+            d_scale += d_o * c_o
+
+        # sigmoid bwd: d_fc2_pre = d_scale * scale * (1 - scale)
+        d_fc2_pre = d_scale * scale * (1.0 - scale)
+
+        # d_fc2_w += d_fc2_pre[:, None] * fc1_act[None, :]  — (H, hidden)
+        d_fc2_w_local = d_fc2_pre[:, None] * fc1_act[None, :]
+        tl.atomic_add(
+            d_fc2_w_ptr + offs_h[:, None] * hidden + offs_hid[None, :],
+            d_fc2_w_local,
+            mask=h_mask[:, None] & hid_mask[None, :],
+        )
+
+        # d_fc1_act = fc2_w.T @ d_fc2_pre = sum over H: fc2_w[h, :] * d_fc2_pre[h]
+        d_fc1_act = tl.sum(fc2_w * d_fc2_pre[:, None], axis=0)  # (BLOCK_HID,)
+
+        # silu bwd: d_fc1_pre = d_fc1_act * (sig + pre * sig * (1 - sig))
+        d_fc1_pre = d_fc1_act * (fc1_sig + fc1_pre * fc1_sig * (1.0 - fc1_sig))
+
+        # d_fc1_w += d_fc1_pre[:, None] * mean_val[None, :]  — (hidden, H)
+        d_fc1_w_local = d_fc1_pre[:, None] * mean_val[None, :]
+        tl.atomic_add(
+            d_fc1_w_ptr + offs_hid[:, None] * H + offs_h[None, :],
+            d_fc1_w_local,
+            mask=hid_mask[:, None] & h_mask[None, :],
+        )
+
+        # d_mean = fc1_w.T @ d_fc1_pre = sum over hidden: fc1_w[:, h] * d_fc1_pre[:]
+        d_mean = tl.sum(fc1_w * d_fc1_pre[:, None], axis=0)  # (BLOCK_H,)
+
+        # Pass 2: add d_mean / L to d_conv_out
+        d_mean_per_l = d_mean / L
+        for l in range(L):
+            off = base + l * H
+            prev = tl.load(d_conv_out_ptr + off + offs_h, mask=h_mask, other=0.0)
+            tl.store(d_conv_out_ptr + off + offs_h, prev + d_mean_per_l, mask=h_mask)
+
+    # ========== Fused MSConv conv backward ==========
+    # Grid: (B, L) — one program per (batch, timestep)
+    # Recomputes conv+silu forward, chains backward, atomic d_x for lookback
+
+    @triton.jit
+    def fused_msconv_conv_bwd_kernel(
+        x_ptr,          # (B, L, H)
+        d_conv_out_ptr, # (B, L, H) — from SE bwd
+        cw0_ptr, cb0_ptr,
+        cw1_ptr, cb1_ptr,
+        cw2_ptr, cb2_ptr,
+        d_x_ptr,        # (B, L, H) — output grad, accumulated via atomic
+        d_cw0_ptr, d_cb0_ptr,  # (gs, K0), (gs,)
+        d_cw1_ptr, d_cb1_ptr,
+        d_cw2_ptr, d_cb2_ptr,
+        B_batch, L, H: tl.constexpr, gs: tl.constexpr,
+        K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
+        BLOCK_GS: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_l = tl.program_id(1)
+        if pid_b >= B_batch or pid_l >= L:
+            return
+
+        offs_gs = tl.arange(0, BLOCK_GS)
+        gs_mask = offs_gs < gs
+        base = pid_b * L * H
+        row_off = base + pid_l * H
+
+        # Load d_conv_out for this row
+        d_out0 = tl.load(d_conv_out_ptr + row_off + offs_gs, mask=gs_mask, other=0.0)
+        d_out1 = tl.load(d_conv_out_ptr + row_off + gs + offs_gs, mask=gs_mask, other=0.0)
+        d_out2 = tl.load(d_conv_out_ptr + row_off + 2 * gs + offs_gs, mask=gs_mask, other=0.0)
+        d_pass = tl.load(d_conv_out_ptr + row_off + 3 * gs + offs_gs, mask=gs_mask, other=0.0)
+
+        # --- Recompute group 0 forward + backward ---
+        acc0 = tl.load(cb0_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K0):
+            src_l = pid_l - K0 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
+            acc0 += x_val * w_val
+        sig0 = 1.0 / (1.0 + tl.exp(-acc0))
+        d_pre0 = d_out0 * (sig0 + acc0 * sig0 * (1.0 - sig0))
+        tl.atomic_add(d_cb0_ptr + offs_gs, d_pre0, mask=gs_mask)
+        for j in range(K0):
+            src_l = pid_l - K0 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw0_ptr + offs_gs * K0 + j, mask=gs_mask, other=0.0)
+            tl.atomic_add(d_cw0_ptr + offs_gs * K0 + j, d_pre0 * x_val, mask=gs_mask)
+            tl.atomic_add(d_x_ptr + base + src_l * H + offs_gs, d_pre0 * w_val, mask=gs_mask & valid)
+
+        # --- Recompute group 1 forward + backward ---
+        acc1 = tl.load(cb1_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K1):
+            src_l = pid_l - K1 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + gs + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
+            acc1 += x_val * w_val
+        sig1 = 1.0 / (1.0 + tl.exp(-acc1))
+        d_pre1 = d_out1 * (sig1 + acc1 * sig1 * (1.0 - sig1))
+        tl.atomic_add(d_cb1_ptr + offs_gs, d_pre1, mask=gs_mask)
+        for j in range(K1):
+            src_l = pid_l - K1 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + gs + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw1_ptr + offs_gs * K1 + j, mask=gs_mask, other=0.0)
+            tl.atomic_add(d_cw1_ptr + offs_gs * K1 + j, d_pre1 * x_val, mask=gs_mask)
+            tl.atomic_add(d_x_ptr + base + src_l * H + gs + offs_gs, d_pre1 * w_val, mask=gs_mask & valid)
+
+        # --- Recompute group 2 forward + backward ---
+        acc2 = tl.load(cb2_ptr + offs_gs, mask=gs_mask, other=0.0)
+        for j in range(K2):
+            src_l = pid_l - K2 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + 2 * gs + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw2_ptr + offs_gs * K2 + j, mask=gs_mask, other=0.0)
+            acc2 += x_val * w_val
+        sig2 = 1.0 / (1.0 + tl.exp(-acc2))
+        d_pre2 = d_out2 * (sig2 + acc2 * sig2 * (1.0 - sig2))
+        tl.atomic_add(d_cb2_ptr + offs_gs, d_pre2, mask=gs_mask)
+        for j in range(K2):
+            src_l = pid_l - K2 + 1 + j
+            valid = src_l >= 0
+            x_val = tl.load(x_ptr + base + src_l * H + 2 * gs + offs_gs, mask=gs_mask & valid, other=0.0)
+            w_val = tl.load(cw2_ptr + offs_gs * K2 + j, mask=gs_mask, other=0.0)
+            tl.atomic_add(d_cw2_ptr + offs_gs * K2 + j, d_pre2 * x_val, mask=gs_mask)
+            tl.atomic_add(d_x_ptr + base + src_l * H + 2 * gs + offs_gs, d_pre2 * w_val, mask=gs_mask & valid)
+
+        # --- Passthrough backward ---
+        tl.atomic_add(d_x_ptr + row_off + 3 * gs + offs_gs, d_pass, mask=gs_mask)
+
     # ========== Fused kernel 1: prescan ==========
     # Per row (B*L rows, P cols): dt/lam activations, Bu RMSNorm+bias, dt_half*theta
     # Grid: (M,) where M = B*L, one program per row
@@ -1338,6 +1666,95 @@ class _TritonPhiB(torch.autograd.Function):
         return d_x, d_W, d_b, d_fc1_w_out, d_fc1_b, d_fc2_w, d_fc2_b, None, None, None
 
 
+class _TritonMSConv(torch.autograd.Function):
+    """Fused multi-scale depthwise conv + SE. Forward: 2 kernels. Backward: 2 kernels."""
+    @staticmethod
+    def forward(ctx, x, cw0, cb0, cw1, cb1, cw2, cb2, se_fc1_w, se_fc2_w, gs):
+        """x: (B, L, H). Conv weights: cw0 (gs,1,K0), cb0 (gs,), etc. SE weights: fc1 (hid,H), fc2 (H,hid)."""
+        B, L, H = x.shape
+        K0, K1, K2 = cw0.shape[2], cw1.shape[2], cw2.shape[2]
+        hidden = se_fc1_w.shape[0]
+
+        BLOCK_GS = triton.next_power_of_2(gs)
+        BLOCK_H = triton.next_power_of_2(H)
+        BLOCK_HID = triton.next_power_of_2(hidden)
+
+        # Flatten conv weights: (gs, 1, k) -> (gs, k) contiguous
+        cw0_flat = cw0.squeeze(1).contiguous()
+        cw1_flat = cw1.squeeze(1).contiguous()
+        cw2_flat = cw2.squeeze(1).contiguous()
+
+        # Kernel 1: depthwise conv + silu + passthrough
+        conv_out = torch.empty(B, L, H, device=x.device, dtype=x.dtype)
+        fused_msconv_fwd_kernel[(B, L)](
+            x, cw0_flat, cb0, cw1_flat, cb1, cw2_flat, cb2,
+            conv_out, B, L, H, gs, K0, K1, K2, BLOCK_GS,
+        )
+
+        # Kernel 2: SE (mean -> fc1 -> silu -> fc2 -> sigmoid -> scale)
+        out = torch.empty(B, L, H, device=x.device, dtype=x.dtype)
+        fused_msconv_se_fwd_kernel[(B,)](
+            conv_out, se_fc1_w, se_fc2_w, out,
+            B, L, H, hidden, BLOCK_H, BLOCK_HID,
+        )
+
+        ctx.save_for_backward(x, conv_out, cw0_flat, cb0, cw1_flat, cb1, cw2_flat, cb2, se_fc1_w, se_fc2_w)
+        ctx.gs = gs
+        ctx.K0, ctx.K1, ctx.K2 = K0, K1, K2
+        ctx.hidden = hidden
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        x, conv_out, cw0, cb0, cw1, cb1, cw2, cb2, se_fc1_w, se_fc2_w = ctx.saved_tensors
+        gs = ctx.gs
+        K0, K1, K2 = ctx.K0, ctx.K1, ctx.K2
+        hidden = ctx.hidden
+        B, L, H = x.shape
+
+        d_out = d_out.contiguous()
+
+        BLOCK_GS = triton.next_power_of_2(gs)
+        BLOCK_H = triton.next_power_of_2(H)
+        BLOCK_HID = triton.next_power_of_2(hidden)
+
+        # Alloc grads
+        d_conv_out = torch.empty(B, L, H, device=x.device, dtype=x.dtype)
+        d_fc1_w = torch.zeros_like(se_fc1_w)
+        d_fc2_w = torch.zeros_like(se_fc2_w)
+
+        # Kernel 3: SE backward
+        fused_msconv_se_bwd_kernel[(B,)](
+            conv_out, d_out, se_fc1_w, se_fc2_w,
+            d_conv_out, d_fc1_w, d_fc2_w,
+            B, L, H, hidden, BLOCK_H, BLOCK_HID,
+        )
+
+        # Alloc conv grads
+        d_x = torch.zeros(B, L, H, device=x.device, dtype=x.dtype)
+        d_cw0 = torch.zeros_like(cw0)
+        d_cb0 = torch.zeros(gs, device=x.device, dtype=x.dtype)
+        d_cw1 = torch.zeros_like(cw1)
+        d_cb1 = torch.zeros(gs, device=x.device, dtype=x.dtype)
+        d_cw2 = torch.zeros_like(cw2)
+        d_cb2 = torch.zeros(gs, device=x.device, dtype=x.dtype)
+
+        # Kernel 4: conv backward
+        fused_msconv_conv_bwd_kernel[(B, L)](
+            x, d_conv_out,
+            cw0, cb0, cw1, cb1, cw2, cb2,
+            d_x, d_cw0, d_cb0, d_cw1, d_cb1, d_cw2, d_cb2,
+            B, L, H, gs, K0, K1, K2, BLOCK_GS,
+        )
+
+        # Reshape d_cw back to (gs, 1, k) to match parameter shape
+        d_cw0 = d_cw0.unsqueeze(1)
+        d_cw1 = d_cw1.unsqueeze(1)
+        d_cw2 = d_cw2.unsqueeze(1)
+
+        return d_x, d_cw0, d_cb0, d_cw1, d_cb1, d_cw2, d_cb2, d_fc1_w, d_fc2_w, None
+
+
 def triton_linear(x, w, b=None):
     M, K = x.shape
     N = w.shape[0]
@@ -1639,8 +2056,16 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # 1. Multi-scale conv (PyTorch)
-        u_conv = s6.msconv(u)  # (B, L, H)
+        # 1. Multi-scale conv (Triton fused)
+        msconv = s6.msconv
+        u_conv = _TritonMSConv.apply(
+            u,
+            msconv.convs[0].weight, msconv.convs[0].bias,
+            msconv.convs[1].weight, msconv.convs[1].bias,
+            msconv.convs[2].weight, msconv.convs[2].bias,
+            msconv.se.fc1.weight, msconv.se.fc2.weight,
+            msconv.group_size,
+        )  # (B, L, H)
 
         # 2. Feature bank — Triton fused kernel + ch_rms/scale in PyTorch (for autograd)
         phi = kern.phi_B
