@@ -28,6 +28,24 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
+DETERMINISTIC = os.getenv("BENCH_DETERMINISTIC", "0") == "1"
+if DETERMINISTIC:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+        except Exception:
+            pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mamba'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 's5-pytorch'))
