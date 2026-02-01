@@ -615,8 +615,6 @@ if HAS_TRITON:
         d_c_norm_gamma_ptr,  # (P,) — atomically accumulated
         # Dims
         M, H, P,
-        # Debug
-        dbg_ptr,  # (M, 4) for debug: [max_abs_y, max_abs_xskip, max_abs_dxskip, max_abs_dhgre]
         BLOCK_H: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
@@ -674,17 +672,6 @@ if HAS_TRITON:
         d_hg_re = tl.sum(C_re_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
         d_hg_im = -tl.sum(C_im_tile * d_y[:, None], axis=0)  # (BLOCK_P,)
 
-        # DEBUG: write intermediates
-        silu_deriv = sig_skip + x_skip * sig_skip * (1.0 - sig_skip)
-        if pid_h == 0:
-            tl.store(dbg_ptr + pid_m * 8 + 0, tl.max(tl.abs(y_vals), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 1, tl.max(tl.abs(d_x_skip), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 2, tl.max(tl.abs(d_hg_re), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 3, tl.max(tl.abs(d_hg_re * gate), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 4, tl.max(tl.abs(d_out), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 5, tl.max(tl.abs(silu_deriv), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 6, tl.max(tl.abs(x_skip), axis=0))
-            tl.store(dbg_ptr + pid_m * 8 + 7, tl.max(tl.abs(sig_skip), axis=0))
 
         # d_C: atomic add (H, P)
         # d_C_re[h,p] += d_y[h] * hg_re[p]
@@ -1249,7 +1236,6 @@ class _TritonS6(torch.autograd.Function):
         d_C_re = torch.zeros(H, P, device=u.device, dtype=u.dtype)
         d_C_im = torch.zeros(H, P, device=u.device, dtype=u.dtype)
         d_D = torch.zeros(H, device=u.device, dtype=u.dtype)
-        _dbg = torch.zeros(M, 8, device=u.device, dtype=u.dtype)
         d_out_flat = d_out.reshape(M, H).contiguous()
 
         fused_bwd_readout_cgate_kernel[(M, triton.cdiv(H, BLOCK_H))](
@@ -1266,30 +1252,10 @@ class _TritonS6(torch.autograd.Function):
             d_C_re, d_C_im, d_D,
             torch.empty(P, device=u.device, dtype=u.dtype),
             torch.empty(P, device=u.device, dtype=u.dtype),
+            torch.empty(P, device=u.device, dtype=u.dtype),
             M, H, P,
-            _dbg,
             BLOCK_H, BLOCK_P,
         )
-
-        # DEBUG: print debug info for NaN rows
-        # DEBUG: always check d_out
-        print(f"d_out shape={d_out.shape} stride={d_out.stride()} contiguous={d_out.is_contiguous()} dtype={d_out.dtype}")
-        print(f"d_out data_ptr={d_out.data_ptr()}")
-        d_out = d_out.contiguous()
-        _d_out_flat = d_out.view(M, H)
-        print(f"d_out: min={_d_out_flat.min():.6g} max={_d_out_flat.max():.6g} mean={_d_out_flat.mean():.6g} nan={_d_out_flat.isnan().any()}")
-        if _d_out_flat.max() > 10:
-            bad = (_d_out_flat.abs() > 10).any(dim=1).nonzero(as_tuple=False).squeeze()
-            print(f"  rows with |d_out|>10: {bad[:10]}")
-            print(f"  d_out[{bad[0].item()}] = {_d_out_flat[bad[0].item()][:8]}")
-
-        if d_h_re.isnan().any():
-            nan_rows = d_h_re.isnan().any(dim=1).nonzero(as_tuple=False).squeeze()
-            for r in nan_rows[:3]:
-                r = r.item()
-                print(f"Row {r}: max_y={_dbg[r,0]:.6g} max_dxskip={_dbg[r,1]:.6g} max_dhgre={_dbg[r,2]:.6g} max_dhre={_dbg[r,3]:.6g}")
-                print(f"  max_dout={_dbg[r,4]:.6g} max_silu_deriv={_dbg[r,5]:.6g} max_xskip={_dbg[r,6]:.6g} max_sigskip={_dbg[r,7]:.6g}")
-            raise AssertionError("NaN in d_h_re")
 
         # c_gate chain rule
         d_c_proj_out = torch.empty(M, P, device=u.device, dtype=u.dtype)
@@ -1335,14 +1301,6 @@ class _TritonS6(torch.autograd.Function):
             B, L, P,
             BLOCK_P_SCAN,
         )
-
-        # DEBUG: check for NaN after scan_disc kernel
-        assert not d_dt_total.isnan().any(), "NaN in d_dt_total after scan_disc"
-        assert not d_lam_disc.isnan().any(), "NaN in d_lam_disc after scan_disc"
-        assert not d_Bu_3d.isnan().any(), "NaN in d_Bu_3d after scan_disc"
-        assert not d_log_A_real.isnan().any(), "NaN in d_log_A_real after scan_disc"
-        assert not d_A_imag.isnan().any(), "NaN in d_A_imag after scan_disc"
-        assert not d_dt_half_theta.isnan().any(), "NaN in d_dt_half_theta after scan_disc"
 
         # d_theta from d_dt_half_theta: d_theta[t] = d_dt_half_theta[t] * dt_half[t]
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)
