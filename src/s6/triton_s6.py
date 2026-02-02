@@ -2756,7 +2756,7 @@ class _TritonS6(torch.autograd.Function):
             BLOCK_P,
         )
 
-        # 7. Readout via GEMM: gate h, MIMO, skip+silu
+        # 7. Readout via GEMM: gate h, MIMO, silu + gain
         h_re_m = h_re.view(M, P)
         h_im_m = h_im.view(M, P)
         c_gate_m = c_gate
@@ -2766,8 +2766,8 @@ class _TritonS6(torch.autograd.Function):
         C_re_t = C_re.t()
         C_im_t = C_im.t()
         y = h_gated_re @ C_re_t - h_gated_im @ C_im_t
-        y = y + u_flat * D
         y = F.silu(y)
+        y = y * (1.0 + D)
         out = y.view(B, L, H)
 
         # Save for backward
@@ -2822,12 +2822,11 @@ class _TritonS6(torch.autograd.Function):
         C_re_t = C_re.t()
         C_im_t = C_im.t()
         y = h_gated_re @ C_re_t - h_gated_im @ C_im_t
-        y = y + u_flat * D
         sig = torch.sigmoid(y)
-        d_y = d_out_flat * (sig + y * sig * (1.0 - sig))
+        d_y = d_out_flat * (1.0 + D) * (sig + y * sig * (1.0 - sig))
 
-        d_u_skip = d_y * D
-        d_D = (d_y * u_flat).sum(0)
+        d_u_skip = 0.0
+        d_D = (d_out_flat * F.silu(y)).sum(0)
 
         d_h_gated_re = d_y @ C_re
         d_h_gated_im = -d_y @ C_im
@@ -3046,7 +3045,7 @@ class _TritonS6(torch.autograd.Function):
         d_u_proj = d_x_proj @ x_proj_w
 
         # Total d_u
-        d_u = (d_u_proj + d_u_c + d_u_skip).view(B, L, H)
+        d_u = (d_u_proj + d_u_c).view(B, L, H)
 
         d_Bu_raw_out = d_Bu_raw.view(B, L, P)
 
@@ -3117,11 +3116,11 @@ class TritonS6(nn.Module):
         )
 
         # 4. Post-readout norm + residual + attention
-        y_normed = s6.readout_norm(y_ssm) + x
+        y_normed = s6.readout_norm(y_ssm)
         y_attn = s6.attn(x, y_normed)
 
-        # 5. Post-attention norm + residual back to SSM output
-        return s6.post_attn_norm(y_attn) + y_normed
+        # 5. Post-attention norm (no residual)
+        return s6.post_attn_norm(y_attn)
 
     def enable_cuda_graph(self, sample_input):
         """Capture fwd+bwd into a CUDA graph. Call once after warmup.

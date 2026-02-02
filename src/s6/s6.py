@@ -420,7 +420,7 @@ class S6Attention(nn.Module):
 
         attn_out = diff_out.reshape(B_batch, L, P)  # (B, L, P)
 
-        return y_ssm + self.gate * F.silu(self.out_proj(attn_out)).float()
+        return self.gate * F.silu(self.out_proj(attn_out)).float()
 
 
 class S6(nn.Module):
@@ -476,13 +476,13 @@ class S6(nn.Module):
         C = torch.view_as_complex(self.C)  # (H, P)
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
-        # Skip connection + activation
-        y = y + x * self.D
+        # Activation + per-channel gain (no residual skip)
         y = F.silu(y)
+        y = y * (1.0 + self.D)
 
-        # Post-readout norm + residual + attention
-        y_normed = self.readout_norm(y) + x
+        # Post-readout norm (no residual)
+        y_normed = self.readout_norm(y)
         y_attn = self.attn(x, y_normed)
 
-        # Post-attention norm + residual back to SSM output
-        return self.post_attn_norm(y_attn) + y_normed
+        # Post-attention norm (no residual)
+        return self.post_attn_norm(y_attn)
