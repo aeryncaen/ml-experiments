@@ -1303,12 +1303,12 @@ class GPT(nn.Module):
         # Eigen learning rates: α_A for attention, α_M for MLP
         # Shape: (num_layers, model_dim) - learnable per dimension
         self.alpha_A_bank = nn.Parameter(torch.full((num_layers, model_dim), ngpt_alpha_scale))
-        self.alpha_A_bank.label = 'ngpt_alpha'
+        self.alpha_A_bank.label = 'ngpt_alpha_a'
         self.alpha_A_bank.ngpt_init = ngpt_alpha_init
         self.alpha_A_bank.ngpt_scale = ngpt_alpha_scale
         
         self.alpha_M_bank = nn.Parameter(torch.full((num_layers, model_dim), ngpt_alpha_scale))
-        self.alpha_M_bank.label = 'ngpt_alpha'
+        self.alpha_M_bank.label = 'ngpt_alpha_m'
         self.alpha_M_bank.ngpt_init = ngpt_alpha_init
         self.alpha_M_bank.ngpt_scale = ngpt_alpha_scale
         
@@ -1895,7 +1895,8 @@ class TrainingManager():
         
         # nGPT parameters: eigen learning rates and scaling factors
         # Paper: no weight decay needed since norms are controlled via normalization
-        self.param_table["ngpt_alpha"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        self.param_table["ngpt_alpha_a"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        self.param_table["ngpt_alpha_m"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
         self.param_table["ngpt_sqk"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
         self.param_table["ngpt_sz"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
 
