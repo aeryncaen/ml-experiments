@@ -991,9 +991,13 @@ class CausalSelfAttention(nn.Module):
             # Initialized small so exp(q·k) ≈ 1, making λ ≈ λ_init initially
             half_head_dim = head_dim // 2
             self.lambda_q1 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_q1.label = 'diff_attn_lambda'
             self.lambda_k1 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_k1.label = 'diff_attn_lambda'
             self.lambda_q2 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_q2.label = 'diff_attn_lambda'
             self.lambda_k2 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_k2.label = 'diff_attn_lambda'
         # Weights are stored in parameter banks and passed via forward()
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
@@ -1227,8 +1231,12 @@ class GPT(nn.Module):
             linear_attn_hidden = 2 * model_dim  # 1536
             self.linear_attn_qkv_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 3 * linear_attn_hidden, model_dim))
             self.linear_attn_qkv_bank.label = 'linear_attn_qkv'
+            # Reshape for sharding: (12, 4608, 768) -> (72, 768, 768) where 4608 = 6*768, 72 % 8 = 0
+            self.linear_attn_qkv_bank.reshape = (num_mlp_with_padding * 6, model_dim, model_dim)
             self.linear_attn_out_bank = nn.Parameter(torch.empty(num_mlp_with_padding, model_dim, linear_attn_hidden))
             self.linear_attn_out_bank.label = 'linear_attn_out'
+            # Reshape for sharding: (12, 768, 1536) -> (24, 768, 768) where 1536 = 2*768, 24 % 8 = 0
+            self.linear_attn_out_bank.reshape = (num_mlp_with_padding * 2, model_dim, model_dim)
             self.mlp_bank = None  # Not used in linear attention mode
         else:
             self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
