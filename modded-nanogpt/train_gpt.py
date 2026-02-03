@@ -1908,7 +1908,7 @@ class TrainingManager():
         if args.use_diff_attn:
             self.work_order.append("diff_attn_lambda")
         # nGPT parameters: small, fast to process
-        self.work_order.extend(["ngpt_alpha", "ngpt_sqk", "ngpt_sz"])
+        self.work_order.extend(["ngpt_alpha_a", "ngpt_alpha_m", "ngpt_sqk", "ngpt_sz"])
         self.work_order.extend(["value_embed", "bigram_embed"])  # Medium
         self.work_order.extend(["lm_head", "embed"])  # lm_head must complete before embed sync (when tied)
         self.work_order.append("attn")  # Large
