@@ -232,6 +232,8 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # nGPT: dimension to normalize along after update (None = don't normalize)
+    ngpt_norm_dim: int | None = None
 
 
 class NorMuonAndAdam:
@@ -340,6 +342,7 @@ class NorMuonAndAdam:
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
+        ngpt_norm_dim = table_entry.get("ngpt_norm_dim")  # nGPT normalization dim
 
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms == "sharded" else None
@@ -355,6 +358,7 @@ class NorMuonAndAdam:
                 weight_decay=self.adam_defaults["weight_decay"],
                 eps=self.adam_defaults["eps"],
                 chunk_size=chunk_size,
+                ngpt_norm_dim=ngpt_norm_dim,
             )
         elif optim == "normuon":
             reshape = getattr(param, "reshape", None)
@@ -395,6 +399,7 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                ngpt_norm_dim=ngpt_norm_dim,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -656,6 +661,14 @@ class NorMuonAndAdam:
             fut.wait()
 
         self._reduce_futures.clear()
+        
+        # nGPT: Normalize weight matrices to unit norm along specified dimension
+        # This maintains the hypersphere constraint after optimizer updates
+        for param, p_cfg in self.param_cfgs.items():
+            if p_cfg.ngpt_norm_dim is not None:
+                if p_cfg.optim == "adam" and not do_adam:
+                    continue  # Skip Adam params on even steps
+                NorMuonAndAdam._ngpt_normalize_inplace(param.data, p_cfg.ngpt_norm_dim)
 
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
@@ -787,6 +800,16 @@ class NorMuonAndAdam:
         v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
         final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
         return v_chunk.mul_(final_scale.type_as(v_chunk))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _ngpt_normalize_inplace(p: Tensor, dim: int):
+        """
+        nGPT: Normalize weight matrix to unit L2 norm along specified dimension.
+        This maintains the hypersphere constraint for representation learning.
+        """
+        p_norm = p.float().norm(p=2, dim=dim, keepdim=True).clamp_min(1e-12)
+        p.div_(p_norm.type_as(p))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1899,6 +1922,19 @@ class TrainingManager():
         self.param_table["ngpt_alpha_m"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
         self.param_table["ngpt_sqk"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
         self.param_table["ngpt_sz"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        
+        # nGPT: Add normalization dimension for weight matrices
+        # After optimizer step, normalize along this dim (None = don't normalize)
+        self.param_table["attn"]["ngpt_norm_dim"] = -1  # normalize rows
+        self.param_table["lm_head"]["ngpt_norm_dim"] = 0  # normalize columns (transposed storage)
+        self.param_table["embed"]["ngpt_norm_dim"] = -1  # normalize rows
+        self.param_table["value_embed"]["ngpt_norm_dim"] = -1  # normalize rows
+        self.param_table["bigram_embed"]["ngpt_norm_dim"] = -1  # normalize rows
+        if args.use_linear_attn_mlp:
+            self.param_table["linear_attn_qkv"]["ngpt_norm_dim"] = -1
+            self.param_table["linear_attn_out"]["ngpt_norm_dim"] = -2  # normalize along model_dim
+        else:
+            self.param_table["mlp"]["ngpt_norm_dim"] = -1
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
@@ -1990,12 +2026,8 @@ class TrainingManager():
                 p_cfg.momentum = muon_momentum
 
         # Step optimizer with do_adam flag
+        # nGPT: weight normalization is now integrated into the optimizer step
         self.optimizer.step(do_adam=do_adam)
-        
-        # nGPT: normalize weight matrices after optimizer step
-        # Access original model if wrapped by torch.compile
-        raw_model = getattr(self.model, '_orig_mod', self.model)
-        raw_model.normalize_weights()
 
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
