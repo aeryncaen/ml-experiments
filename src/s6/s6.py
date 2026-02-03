@@ -7,7 +7,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from pathlib import Path
+
 from .scan import parallel_scan
+
+# Import LearnableFeatureMap from zoology (sibling repo)
+_zoology_path = str(Path(__file__).resolve().parents[2] / 'zoology')
+import sys as _sys
+if _zoology_path not in _sys.path:
+    _sys.path.insert(0, _zoology_path)
+from zoology.mixers.luna import LearnableFeatureMap
 
 
 class SqueezeExcite1D(nn.Module):
@@ -32,8 +41,8 @@ class MultiScaleDepthwiseConv(nn.Module):
         self.group_size = channels // n_groups
         self.kernel_specs = [
             ("pass", None),
-            ("center", 5),
-            ("center", 5),
+            ("causal", 5),
+            ("retro", 5),
             ("center", 5),
         ]
         # Convs for the 3 non-passthrough groups, in the same order as kernel_specs[1:]
@@ -64,7 +73,13 @@ class MultiScaleDepthwiseConv(nn.Module):
             conv = self.convs[conv_idx]
             conv_idx += 1
             x_in = chunk.transpose(1, 2)
+            if mode == "retro":
+                x_in = torch.flip(x_in, dims=(-1,))
             y = conv(x_in)
+            if mode in ("causal", "retro"):
+                y = y[..., :L]
+            if mode == "retro":
+                y = torch.flip(y, dims=(-1,))
             y = F.silu(y).transpose(1, 2)
             out.append(y)
         out = torch.cat(out, dim=-1)  # (B, L, C)
@@ -116,7 +131,6 @@ class S6Kernel(nn.Module):
         assert P % M == 0, f"d_state ({P}) must be divisible by M ({M})"
         self.H = H
         self.P = P
-        assert P % 8 == 0, "d_state must be divisible by 8 for RoPE groups"
 
         # A: HiPPO-LegS eigenvalues (P,) complex — shared across channels
         Lambda = make_DPLR_HiPPO(P)
@@ -125,19 +139,12 @@ class S6Kernel(nn.Module):
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
-        # B: simple linear projection (H → P)
-        self.phi_B = nn.Linear(H, P)
-        nn.init.kaiming_uniform_(self.phi_B.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.phi_B.bias)
-
-        # RoPE group setup (per group pair count)
-        g = P // 4
-        self.rope_group_pairs = g // 2
-        if self.rope_group_pairs > 0:
-            rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, g, 2).float() / g))
-        else:
-            rope_freqs = torch.empty(0)
-        self.register_buffer("rope_freqs", rope_freqs)
+        # B: LUNA feature bank (H → P) — learned nonlinear input selectivity
+        L_fb = P // M
+        self.phi_B = LearnableFeatureMap(
+            d=H, M=M, L=L_fb, hidden=64,
+            nonneg=False, act="silu", ch_rms=True,
+        )
 
         # Fused input projection for dt, lam, theta (B is now separate via feature bank)
         # Layout: [dt(P), lam(P), theta(P//2)]
@@ -179,7 +186,7 @@ class S6Kernel(nn.Module):
 
         # B: use provided Bu_raw or compute from phi_B
         if Bu_raw is None:
-            Bu_raw = F.silu(self.phi_B(u))  # (B, L, P)
+            Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
         # dt, lam, theta from fused linear projection
         x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
@@ -190,21 +197,9 @@ class S6Kernel(nn.Module):
 
         Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
 
-        # Mixed RoPE on B: g1 normal, g2 data-dependent, g0/g3 none
+        # Data-dependent RoPE on B
         dt_half = dt.view(B, L, P // 2, 2).mean(-1)  # (B, L, P//2)
-        if self.rope_group_pairs > 0:
-            g_pairs = self.rope_group_pairs
-            theta_mask = torch.zeros_like(theta)
-            theta_mask[:, :, 2 * g_pairs:3 * g_pairs] = 1.0
-            cum_theta_data = torch.cumsum(dt_half * (theta * theta_mask), dim=1)
-
-            cum_theta = torch.zeros_like(cum_theta_data)
-            pos = torch.arange(L, device=u.device, dtype=dt_half.dtype)
-            rope = pos[:, None] * self.rope_freqs.to(dt_half.dtype)  # (L, g_pairs)
-            cum_theta[:, :, g_pairs:2 * g_pairs] = rope.unsqueeze(0)
-            cum_theta[:, :, 2 * g_pairs:3 * g_pairs] = cum_theta_data[:, :, 2 * g_pairs:3 * g_pairs]
-        else:
-            cum_theta = torch.cumsum(dt_half * theta, dim=1)
+        cum_theta = torch.cumsum(dt_half * theta, dim=1)  # (B, L, P//2)
         Bu = apply_rotary_emb(Bu, cum_theta)
         # Bu_prev: shift AFTER rotation so position t-1 keeps its own rotation angle
         Bu_prev1 = F.pad(Bu[:, :-1], (0, 0, 1, 0))
@@ -233,14 +228,29 @@ class S6Kernel(nn.Module):
         inject = torch.zeros_like(Bu_c)
         # pass-through: current only
         inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * Bu_c[:, :, g0]
-        # acausal center for all non-pass groups: one behind + one ahead
-        for gs in (g1, g2, g3):
-            inject[:, :, gs] = (
-                lam[:, :, gs] * dt_c[:, :, gs] * Bu_c[:, :, gs]
-                + (1 - lam[:, :, gs]) * dt_c[:, :, gs] * (
-                    alpha[:, :, gs] * (Bu_prev1_c[:, :, gs] + Bu_next1_c[:, :, gs])
-                )
+        # causal AB2: look behind 2 with stacked decay
+        inject[:, :, g1] = (
+            lam[:, :, g1] * dt_c[:, :, g1] * Bu_c[:, :, g1]
+            + (1 - lam[:, :, g1]) * dt_c[:, :, g1] * (
+                alpha[:, :, g1] * Bu_prev1_c[:, :, g1]
+                + (alpha[:, :, g1] * alpha_prev1[:, :, g1]) * Bu_prev2_c[:, :, g1]
             )
+        )
+        # retro AB2: look ahead 2 with stacked decay
+        inject[:, :, g2] = (
+            lam[:, :, g2] * dt_c[:, :, g2] * Bu_c[:, :, g2]
+            + (1 - lam[:, :, g2]) * dt_c[:, :, g2] * (
+                alpha[:, :, g2] * Bu_next1_c[:, :, g2]
+                + (alpha[:, :, g2] * alpha_next1[:, :, g2]) * Bu_next2_c[:, :, g2]
+            )
+        )
+        # center: one behind + one ahead, single decay both directions
+        inject[:, :, g3] = (
+            lam[:, :, g3] * dt_c[:, :, g3] * Bu_c[:, :, g3]
+            + (1 - lam[:, :, g3]) * dt_c[:, :, g3] * (
+                alpha[:, :, g3] * (Bu_prev1_c[:, :, g3] + Bu_next1_c[:, :, g3])
+            )
+        )
 
         # Parallel scan: h[t] = alpha[t] * h[t-1] + inject[t]
         h = parallel_scan(alpha, inject)  # (B, L, P) complex
@@ -264,7 +274,7 @@ class S6Attention(nn.Module):
     """Causal attention with 80/20 weight sharing.
 
     Q: 80% of rows shared with c_proj, 20% dedicated.
-    K: 80% of rows shared with phi_B, 20% dedicated.
+    K: 80% of rows shared with phi_B.W, 20% dedicated.
     V: standalone.
     Separate forward ops — just shared Parameter storage.
     """
@@ -287,47 +297,21 @@ class S6Attention(nn.Module):
         self._c_proj = c_proj
         self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
         self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
-        nn.init.kaiming_uniform_(self.q_ded_weight, a=math.sqrt(5))
-        nn.init.zeros_(self.q_ded_bias)
 
-        # K: 80% rows from phi_B, 20% dedicated
-        self.shared_k_rows = int(0.8 * P)
-        self.ded_k_rows = P - self.shared_k_rows
+        # K: 80% W rows from phi_B, 20% dedicated
+        self.shared_k_dirs = int(0.8 * M)
+        self.ded_k_dirs = M - self.shared_k_dirs
         assert phi_B is not None
         self._phi_B = phi_B
-        self.k_ded_weight = nn.Parameter(torch.randn(self.ded_k_rows, H) / math.sqrt(H))
-        self.k_ded_bias = nn.Parameter(torch.zeros(self.ded_k_rows))
-        nn.init.kaiming_uniform_(self.k_ded_weight, a=math.sqrt(5))
-        nn.init.zeros_(self.k_ded_bias)
+        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
+        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
 
         self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
 
-        # Differential attention: split each of 4 groups in half for Q1/Q2, K1/K2
-        self.half_head_dim = self.head_dim // 2
-        assert self.head_dim % 8 == 0, "head_dim must be divisible by 8 for diff attn group halving"
-
-        self.q_norm = RMSNorm(self.half_head_dim)
-        self.k_norm = RMSNorm(self.half_head_dim)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
         self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
-
-        # RoPE on group 0 passthrough dims — ensure even
-        self.rope_dim = max(2, (self.head_dim // 8) * 2)
-        self.rope_dim = min(self.rope_dim, self.head_dim)
-        rope_freqs = 1.0 / (10000.0 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
-        self.register_buffer('rope_freqs', rope_freqs)
-
-        # Learnable λ for differential attention
-        # λ = exp(λq1·λk1) - exp(λq2·λk2) + λ_init
-        self.lambda_init = 0.8
-        self.lambda_q1 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(self.half_head_dim) * 0.1)
-
-        # Post-diff head norm on full head_dim, scaled by (1 - λ_init)
-        self.head_norm = RMSNorm(self.head_dim)
-        self.head_norm.weight.data = self.head_norm.weight.data.bfloat16()
 
         self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
         self.gate = nn.Parameter(torch.tensor(0.5))
@@ -339,6 +323,7 @@ class S6Attention(nn.Module):
         """
         B_batch, L, H = u.shape
         P = self.P
+        M = self.M
         nh = self.num_heads
         hd = self.head_dim
 
@@ -347,80 +332,29 @@ class S6Attention(nn.Module):
                          self.q_ded_weight], dim=0)
         q_b = torch.cat([self._c_proj.bias[:self.shared_q_rows],
                          self.q_ded_bias], dim=0)
-        Q = F.silu(F.linear(u, q_w, q_b)).bfloat16()  # (B, L, P)
+        Q = F.linear(u, q_w, q_b).bfloat16()  # (B, L, P)
 
-        # K: assemble shared phi_B rows + dedicated rows
-        k_W = torch.cat([self._phi_B.weight[:self.shared_k_rows],
-                         self.k_ded_weight], dim=0)  # (P, H)
-        k_b = torch.cat([self._phi_B.bias[:self.shared_k_rows],
-                         self.k_ded_bias], dim=0)  # (P,)
-        K = F.silu(F.linear(u, k_W, k_b)).bfloat16()  # (B, L, P)
+        # K: assemble shared phi_B rows + dedicated rows, run feature map
+        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
+                         self.k_ded_W], dim=0)  # (M, H)
+        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
+                         self.k_ded_b], dim=0)  # (M,)
+        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
+        k_flat = k_proj.reshape(-1, 1).float()
+        k_feat = self._phi_B.channel_mlp(k_flat)
+        k_feat = k_feat.view(B_batch, L, M, self._phi_B.L)
+        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()
 
-        V = F.silu(self.v_proj(u.bfloat16()))  # (B, L, P)
+        V = self.v_proj(u.bfloat16())  # (B, L, P)
 
-        hhd = self.half_head_dim  # head_dim // 2
+        Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
+        K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
+        V = V.view(B_batch, L, nh, hd).transpose(1, 2)
 
-        # Reshape to (B, L, nh, hd), then split each head into two halves
-        Q = Q.view(B_batch, L, nh, hd)
-        K = K.view(B_batch, L, nh, hd)
-        V = V.view(B_batch, L, nh, hd)
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
-        # Split along head_dim: interleave by groups
-        # Groups are [g0, g1, g2, g3] each hd//4 wide
-        # Split each group in half: g0a,g0b, g1a,g1b, g2a,g2b, g3a,g3b
-        # Q1 gets [g0a, g1a, g2a, g3a], Q2 gets [g0b, g1b, g2b, g3b]
-        gw = hd // 4  # group width
-        ghw = gw // 2  # group half-width
-        q_halves_1, q_halves_2 = [], []
-        k_halves_1, k_halves_2 = [], []
-        for i in range(4):
-            s = i * gw
-            q_halves_1.append(Q[..., s:s+ghw])
-            q_halves_2.append(Q[..., s+ghw:s+gw])
-            k_halves_1.append(K[..., s:s+ghw])
-            k_halves_2.append(K[..., s+ghw:s+gw])
-
-        Q1 = torch.cat(q_halves_1, dim=-1)  # (B, L, nh, hhd)
-        Q2 = torch.cat(q_halves_2, dim=-1)
-        K1 = torch.cat(k_halves_1, dim=-1)
-        K2 = torch.cat(k_halves_2, dim=-1)
-
-        # QK-norm on each half
-        Q1 = self.q_norm(Q1).transpose(1, 2)  # (B, nh, L, hhd)
-        Q2 = self.q_norm(Q2).transpose(1, 2)
-        K1 = self.k_norm(K1).transpose(1, 2)
-        K2 = self.k_norm(K2).transpose(1, 2)
-        V = V.transpose(1, 2)  # (B, nh, L, hd) — full V, shared by both maps
-
-        # Positional RoPE only on group 0 (passthrough) dims
-        rd = self.rope_dim
-        pos = torch.arange(L, device=u.device, dtype=Q1.dtype)
-        freqs = pos.unsqueeze(-1) * self.rope_freqs.to(Q1.dtype)
-        freqs = freqs.unsqueeze(0).unsqueeze(0)
-        Q1 = torch.cat([apply_rotary_emb(Q1[..., :rd], freqs), Q1[..., rd:]], dim=-1)
-        Q2 = torch.cat([apply_rotary_emb(Q2[..., :rd], freqs), Q2[..., rd:]], dim=-1)
-        K1 = torch.cat([apply_rotary_emb(K1[..., :rd], freqs), K1[..., rd:]], dim=-1)
-        K2 = torch.cat([apply_rotary_emb(K2[..., :rd], freqs), K2[..., rd:]], dim=-1)
-
-        # Differential attention: (softmax(Q1K1^T) - λ·softmax(Q2K2^T)) · V
-        # Same V for both — only Q/K split for noise cancellation
-        attn1 = F.scaled_dot_product_attention(Q1, K1, V, is_causal=True)  # (B, nh, L, hd)
-        attn2 = F.scaled_dot_product_attention(Q2, K2, V, is_causal=True)
-
-        # λ = exp(λq1·λk1) - exp(λq2·λk2) + λ_init
-        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
-               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
-               + self.lambda_init)
-
-        diff_out = attn1 - lam * attn2  # (B, nh, L, hd)
-
-        # Per-head norm scaled by (1 - λ_init)
-        diff_out = self.head_norm(diff_out.transpose(1, 2))  # (B, L, nh, hd)
-        diff_out = diff_out * (1.0 - self.lambda_init)
-
-        attn_out = diff_out.reshape(B_batch, L, P)  # (B, L, P)
-
-        return self.gate * F.silu(self.out_proj(attn_out)).float()
+        return y_ssm + self.gate * self.out_proj(attn_out).float()
 
 
 class S6(nn.Module):
@@ -454,7 +388,6 @@ class S6(nn.Module):
         # Attention (80/20 weight sharing with phi_B and c_proj)
         self.attn = S6Attention(d_model, d_state, M=M, num_heads=num_heads,
                                 phi_B=self.kernel.phi_B, c_proj=self.c_proj)
-        self.post_attn_norm = RMSNorm(self.h)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
@@ -476,13 +409,12 @@ class S6(nn.Module):
         C = torch.view_as_complex(self.C)  # (H, P)
         y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
-        # Activation + per-channel gain (no residual skip)
+        # Skip connection + activation
+        y = y + x * self.D
         y = F.silu(y)
-        y = y * (1.0 + self.D)
 
-        # Post-readout norm (no residual)
-        y_normed = self.readout_norm(y)
-        y_attn = self.attn(x, y_normed)
+        # Post-readout norm + residual + attention
+        y_normed = self.readout_norm(y) + x
+        y = self.attn(x, y_normed)
 
-        # Post-attention norm (no residual)
-        return self.post_attn_norm(y_attn)
+        return y

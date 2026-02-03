@@ -223,6 +223,68 @@ class QuadConvMix(nn.Module):
         return self.norm(self.se(out) + x)
 
 
+class LearnedAct(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(2) * 0.5)
+
+    @staticmethod
+    def rms_norm(x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+    def forward(self, x):
+        w = self.w.clamp(0.05, 1.0)
+        return self.rms_norm(F.silu(x)) + w[0] * self.rms_norm(F.relu(x)) + w[1] * self.rms_norm(torch.tanh(x))
+
+
+class LearnedAttnAct(nn.Module):
+    """Linear attention as activation: φ(Q) @ (φ(K)^T @ V) with learned act as φ."""
+    def __init__(self, hidden, n_heads=4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = hidden // n_heads
+        self.wq = nn.Linear(hidden, hidden)
+        self.wk = nn.Linear(hidden, hidden)
+        self.wv = nn.Linear(hidden, hidden)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.phi = LearnedAct()
+
+    @staticmethod
+    def rms_norm(x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+    def forward(self, x):
+        *leading, D = x.shape
+        flat = x.reshape(-1, D)
+        B = flat.shape[0]
+        Q = self.phi(self.q_norm(self.wq(flat).view(B, self.n_heads, self.head_dim)))
+        K = self.phi(self.k_norm(self.wk(flat).view(B, self.n_heads, self.head_dim)))
+        V = self.wv(flat).view(B, self.n_heads, self.head_dim)
+        KtV = torch.einsum('bni,bnj->bij', K, V)
+        out = torch.einsum('bni,bij->bnj', Q, KtV)
+        out = self.rms_norm(out)
+        return out.reshape(*leading, D)
+
+
+class LearnedAttnActMLP(nn.Module):
+    """SwiGLU MLP with LearnedAttnAct as the activation. (B, L, D) -> (B, L, D)."""
+    def __init__(self, d_model, ffn_mult=4, n_heads=4):
+        super().__init__()
+        hidden = int(d_model * ffn_mult)
+        self.w1 = nn.Linear(d_model, hidden)
+        self.w2 = nn.Linear(d_model, hidden)
+        self.w3 = nn.Linear(hidden, d_model)
+        self.act = LearnedAttnAct(hidden, n_heads)
+
+    @staticmethod
+    def rms_norm(x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+    def forward(self, x):
+        return self.w3(self.rms_norm(self.act(self.w1(x))) * self.w2(x))
+
+
 class MHABlock(nn.Module):
     """QuadConv → MHA."""
     def __init__(self, d_model, n_heads=4, se_reduction=4):
@@ -577,6 +639,11 @@ def make_models(dim, n_layers=1):
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     models['MHA'] = _stack(
         lambda: MHABlock(d_model=dim, n_heads=4),
+        n_layers, dim)
+
+    # LearnedAttnAct MLP: SwiGLU with linear attention activation
+    models['AttnActMLP'] = _stack(
+        lambda: LearnedAttnActMLP(d_model=dim, ffn_mult=4, n_heads=4),
         n_layers, dim)
 
     return models
