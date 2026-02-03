@@ -832,8 +832,15 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 def unit_norm(x: Tensor):
-    """Normalize to unit L2 norm along last dimension (for nGPT hypersphere)."""
-    return F.normalize(x, p=2, dim=-1, eps=1e-12)
+    """
+    Normalize to unit L2 norm along last dimension (for nGPT hypersphere).
+    
+    Uses a larger eps (0.1) to clamp the denominator, preventing gradient explosion
+    when input has small norm. The gradient of x/||x|| is O(1/||x||), so we need
+    ||x|| >= eps to keep gradients bounded.
+    """
+    x_norm = x.norm(p=2, dim=-1, keepdim=True).clamp_min(0.1)
+    return x / x_norm
 
 # Debug flag for NaN detection - set via environment variable
 NGPT_DEBUG = os.environ.get("NGPT_DEBUG", "0") == "1"
@@ -858,11 +865,14 @@ def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
     Returns:
         Updated hidden state on hypersphere
     """
-    # Normalize block output, then LERP, then normalize result
-    # eps=1e-12 ensures zero vectors don't produce NaN
-    h_block_norm = F.normalize(h_block, p=2, dim=-1, eps=1e-12)
+    # Normalize block output with gradient-safe unit_norm
+    h_block_norm = unit_norm(h_block)
+    
+    # LERP: h_new = (1-alpha)*h + alpha*h_block_norm
     h_new = h + alpha * (h_block_norm - h)
-    return F.normalize(h_new, p=2, dim=-1, eps=1e-12)
+    
+    # Normalize result with gradient-safe unit_norm
+    return unit_norm(h_new)
 
 
 class CastedLinearT(nn.Module):
@@ -2270,16 +2280,31 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale).backward()
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        
+        # NaN detection in loss (when NGPT_DEBUG=1)
+        if NGPT_DEBUG and (torch.isnan(loss) or torch.isinf(loss)):
+            print0(f"[NaN ALERT step={step}] Loss is NaN/Inf: {loss.item()}", console=True)
+        
+        (loss * grad_scale).backward()
+        
+        # Check gradients before optimizer step
+        if NGPT_DEBUG and step < 5:  # Check first few steps in detail
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    nan_count = torch.isnan(param.grad).sum().item()
+                    inf_count = torch.isinf(param.grad).sum().item()
+                    print0(f"[NaN GRAD step={step}] {name}: NaN={nan_count}, Inf={inf_count}", console=True)
+    
     training_manager.step_optimizers(step)
     
-    # NaN detection (when NGPT_DEBUG=1)
-    if NGPT_DEBUG and step % 10 == 0:  # Check every 10 steps
+    # NaN detection in parameters (when NGPT_DEBUG=1) - check every step for first 20 steps
+    if NGPT_DEBUG and step < 20:
         for name, param in model.named_parameters():
             if torch.isnan(param.data).any() or torch.isinf(param.data).any():
                 nan_count = torch.isnan(param.data).sum().item()
                 inf_count = torch.isinf(param.data).sum().item()
-                print0(f"[NaN ALERT step={step}] {name}: NaN={nan_count}, Inf={inf_count}", console=True)
+                print0(f"[NaN PARAM step={step}] {name}: NaN={nan_count}, Inf={inf_count}", console=True)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
