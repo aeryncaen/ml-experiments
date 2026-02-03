@@ -794,6 +794,27 @@ class NorMuonAndAdam:
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+def unit_norm(x: Tensor):
+    """Normalize to unit L2 norm along last dimension (for nGPT hypersphere)."""
+    return F.normalize(x, p=2, dim=-1)
+
+def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
+    """
+    nGPT residual update: h = Norm(h + α * (Norm(h_block) - h))
+    
+    Args:
+        h: current hidden state (B, T, D)
+        h_block: output from attention/MLP block (B, T, D)
+        alpha: eigen learning rate (D,) - learnable per-dimension
+    Returns:
+        Updated hidden state on hypersphere
+    """
+    h_block_norm = unit_norm(h_block)
+    # α * (h_block - h) is the update direction
+    # alpha shape (D,) broadcasts with (B, T, D)
+    h_new = h + alpha * (h_block_norm - h)
+    return unit_norm(h_new)
+
 
 class CastedLinearT(nn.Module):
     """
@@ -921,9 +942,11 @@ def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_s
     FlashAttention3 supports different head dims for Q/K vs V.
     
     diff_lambda: (num_heads,) tensor - learnable per-head λ values
+    attn_scale: for nGPT this is sqrt(full_head_dim), we adjust for half
     """
-    # Scale for half head_dim: sqrt(d/2) instead of sqrt(d)
-    half_scale = attn_scale * (2 ** 0.5)  # Adjust scale for halved head dim
+    # For nGPT: attn_scale is sqrt(head_dim), but Q1/K1 have half the dims
+    # For half head_dim d/2: scale should be sqrt(d/2) = sqrt(d)/sqrt(2)
+    half_scale = attn_scale / (2 ** 0.5)  # Adjust for halved head dim
     
     a1 = flash_attn_interface.flash_attn_varlen_func(
         q1, k1, v, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
@@ -1000,7 +1023,7 @@ class CausalSelfAttention(nn.Module):
             self.lambda_k2.label = 'diff_attn_lambda'
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor, s_qk: Tensor = None):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1015,8 +1038,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-
+        # nGPT: apply RoPE first, then normalize Q and K to unit norm and scale by s_qk
         if not self.paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
 
@@ -1049,6 +1071,14 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
+        # nGPT: normalize Q and K to unit norm, then scale by s_qk
+        # s_qk shape: (head_dim,) broadcasts to (..., head_dim)
+        q = unit_norm(q) * s_qk
+        k = unit_norm(k) * s_qk
+        
+        # nGPT softmax scale: sqrt(d_k) instead of 1/sqrt(d_k) since Q, K are normalized
+        ngpt_attn_scale = math.sqrt(self.head_dim)
+
         if self.use_diff_attn:
             # Differential attention: split Q and K along head_dim, keep V whole
             # Works for both regular and paired heads (paired heads have 2x head_dim after reshape)
@@ -1067,16 +1097,17 @@ class CausalSelfAttention(nn.Module):
             
             # Remove batch dim for varlen flash attention
             # diff_lambda needs to be per-head, expanded for broadcasting: (num_heads, 1, 1)
-            y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], diff_lambda, seqlens, max_len, yarn.attn_scale, bm_size)
+            # For diff_attn with nGPT: use ngpt_attn_scale, but diff_attn internally adjusts for half head_dim
+            y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], diff_lambda, seqlens, max_len, ngpt_attn_scale, bm_size)
             
             # Apply per-head GroupNorm (RMSNorm) and scale by (1 - λ_init) per paper
             # v.shape[-1] gives correct head_dim for both regular and paired heads
             y = F.rms_norm(y, (v.shape[-1],)) * (1 - self.lambda_init)
         else:
-            # Standard attention
+            # nGPT attention with sqrt(d_k) scale
             y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                             max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+                                                            causal=True, softmax_scale=ngpt_attn_scale, window_size=(bm_size, 0))
         
         # Reshape back to (B, T, num_heads, head_dim) - crucial for paired heads which have
         # (T*2, num_heads//2, head_dim) that needs to become (T, num_heads, head_dim)
@@ -1141,14 +1172,19 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, 
                 c_fc: Tensor = None, c_proj: Tensor = None,
-                w_qkv: Tensor = None, w_out: Tensor = None):
+                w_qkv: Tensor = None, w_out: Tensor = None,
+                alpha_A: Tensor = None, alpha_M: Tensor = None,
+                s_qk: Tensor = None):
+        # nGPT: no norm before blocks, use LERP residual with eigen learning rates
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
+            h_A = self.attn(x, attn_args, qkvo_w, s_qk)  # attention output (not normalized yet inside)
+            x = ngpt_lerp(x, h_A, alpha_A.abs())  # α must be positive, use abs()
         if self.mlp is not None:
             if self.use_linear_attn_mlp:
-                x = x + self.mlp(norm(x), w_qkv=w_qkv, w_out=w_out)
+                h_M = self.mlp(x, w_qkv=w_qkv, w_out=w_out)
             else:
-                x = x + self.mlp(norm(x), c_fc, c_proj)
+                h_M = self.mlp(x, c_fc, c_proj)
+            x = ngpt_lerp(x, h_M, alpha_M.abs())  # α must be positive, use abs()
         return x
 
 # -----------------------------------------------------------------------------
@@ -1257,6 +1293,34 @@ class GPT(nn.Module):
                 self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
                 self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
+        # -----------------------------------
+        # nGPT parameters: eigen learning rates and scaling factors
+        # Paper: α_init ≈ 0.05 (order of 1/n_layers), α_scale = 1/√dmodel for effective LR control
+        
+        ngpt_alpha_init = 0.05  # Paper suggests ~1/n_layers
+        ngpt_alpha_scale = model_dim ** -0.5  # For optimizer effective LR
+        
+        # Eigen learning rates: α_A for attention, α_M for MLP
+        # Shape: (num_layers, model_dim) - learnable per dimension
+        self.alpha_A_bank = nn.Parameter(torch.full((num_layers, model_dim), ngpt_alpha_scale))
+        self.alpha_A_bank.label = 'ngpt_alpha'
+        self.alpha_A_bank.ngpt_init = ngpt_alpha_init
+        self.alpha_A_bank.ngpt_scale = ngpt_alpha_scale
+        
+        self.alpha_M_bank = nn.Parameter(torch.full((num_layers, model_dim), ngpt_alpha_scale))
+        self.alpha_M_bank.label = 'ngpt_alpha'
+        self.alpha_M_bank.ngpt_init = ngpt_alpha_init
+        self.alpha_M_bank.ngpt_scale = ngpt_alpha_scale
+        
+        # QK scaling: s_qk per attention layer per head_dim
+        # Paper: sqk_init = 1, sqk_scale = 1/√dmodel
+        ngpt_sqk_init = 1.0
+        ngpt_sqk_scale = model_dim ** -0.5
+        self.s_qk_bank = nn.Parameter(torch.full((len(self.attn_layer_indices), head_dim), ngpt_sqk_scale))
+        self.s_qk_bank.label = 'ngpt_sqk'
+        self.s_qk_bank.ngpt_init = ngpt_sqk_init
+        self.s_qk_bank.ngpt_scale = ngpt_sqk_scale
+
         # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
         self.blocks = nn.ModuleList([
@@ -1308,6 +1372,55 @@ class GPT(nn.Module):
             )
         )
         self.scalars.label = 'scalars'
+        
+        # nGPT: logit scaling s_z per vocabulary token
+        # Paper: sz_init = 1, sz_scale = 1/√dmodel
+        # Logits are bounded in [-1, 1] due to normalized embeddings, s_z controls softmax temperature
+        ngpt_sz_init = 1.0
+        ngpt_sz_scale = model_dim ** -0.5
+        self.s_z = nn.Parameter(torch.full((self.vocab_size,), ngpt_sz_scale))
+        self.s_z.label = 'ngpt_sz'
+        self.s_z.ngpt_init = ngpt_sz_init
+        self.s_z.ngpt_scale = ngpt_sz_scale
+
+    @torch.no_grad()
+    def normalize_weights(self):
+        """
+        nGPT: Normalize all weight matrices along their embedding dimension.
+        Called after each optimizer step to maintain hypersphere constraint.
+        
+        Paper Section 2.6: "After each training step, normalize matrices Einput, Eoutput,
+        Wq, Wk, Wv, Wo, Wu, Wv and WoMLP along their embedding dimension."
+        """
+        # Attention bank: (num_attn_layers, 4*model_dim, head_dim)
+        # Each row is a weight vector; normalize along last dim (head_dim)
+        self.attn_bank.data = F.normalize(self.attn_bank.data, p=2, dim=-1)
+        
+        # MLP bank (if using standard MLP): (num_layers+1, 2, mlp_hdim, model_dim)
+        # Each row is a weight vector; normalize along last dim (model_dim)
+        if self.mlp_bank is not None:
+            self.mlp_bank.data = F.normalize(self.mlp_bank.data, p=2, dim=-1)
+        
+        # Linear attention MLP banks (if using linear attention MLP)
+        if self.linear_attn_qkv_bank is not None:
+            # (num_layers+1, 3*hidden, model_dim) - normalize along model_dim
+            self.linear_attn_qkv_bank.data = F.normalize(self.linear_attn_qkv_bank.data, p=2, dim=-1)
+        if self.linear_attn_out_bank is not None:
+            # (num_layers+1, model_dim, hidden) - normalize along model_dim (dim=-2)
+            self.linear_attn_out_bank.data = F.normalize(self.linear_attn_out_bank.data, p=2, dim=-2)
+        
+        # Input embeddings: (vocab_size, model_dim) - normalize each embedding
+        self.embed.weight.data = F.normalize(self.embed.weight.data, p=2, dim=-1)
+        
+        # Output embeddings (lm_head): (model_dim, vocab_size) - transposed storage
+        # Each column is a vocab embedding; normalize along dim=0
+        self.lm_head.weight.data = F.normalize(self.lm_head.weight.data, p=2, dim=0)
+        
+        # Value embeddings: (5, vocab_size, model_dim) - normalize each embedding
+        self.value_embeds.data = F.normalize(self.value_embeds.data, p=2, dim=-1)
+        
+        # Bigram embeddings: (bigram_vocab_size, model_dim) - normalize each embedding
+        self.bigram_embed.weight.data = F.normalize(self.bigram_embed.weight.data, p=2, dim=-1)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1336,7 +1449,7 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
+        # nGPT: Embedding lookup with unit norm (embeddings should be normalized)
         x = self.embed(input_seq)
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
@@ -1349,7 +1462,8 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None])
+        # nGPT: normalize to unit norm on hypersphere
+        x = x0 = unit_norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
@@ -1370,6 +1484,11 @@ class GPT(nn.Module):
             mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
             mlp_qkvs = mlp_outs = [None] * len(mlp_fcs)  # Not used
 
+        # nGPT: unbind eigen learning rates and scaling factors
+        alpha_As = self.alpha_A_bank.unbind(0)  # tuple of (model_dim,) per layer
+        alpha_Ms = self.alpha_M_bank.unbind(0)  # tuple of (model_dim,) per layer
+        s_qks = self.s_qk_bank.unbind(0)  # tuple of (head_dim,) per attn layer
+
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1385,10 +1504,12 @@ class GPT(nn.Module):
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
+                x = unit_norm(x)  # nGPT: re-normalize after skip connection
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+            x = unit_norm(x)  # nGPT: ensure x is on hypersphere before block
 
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
@@ -1397,8 +1518,14 @@ class GPT(nn.Module):
             c_proj = mlp_projs[mlp_idx] if mlp_idx is not None else None
             w_qkv = mlp_qkvs[mlp_idx] if mlp_idx is not None else None
             w_out = mlp_outs[mlp_idx] if mlp_idx is not None else None
+            
+            # nGPT: get eigen learning rates and s_qk for this layer
+            # Restore actual value: param_stored * (init / scale) 
+            alpha_A = alpha_As[i] * (self.alpha_A_bank.ngpt_init / self.alpha_A_bank.ngpt_scale)
+            alpha_M = alpha_Ms[i] * (self.alpha_M_bank.ngpt_init / self.alpha_M_bank.ngpt_scale)
+            s_qk = s_qks[self.layer_to_attn_idx[i]] * (self.s_qk_bank.ngpt_init / self.s_qk_bank.ngpt_scale) if i in self.layer_to_attn_idx else None
 
-            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, w_qkv, w_out)
+            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, w_qkv, w_out, alpha_A, alpha_M, s_qk)
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1406,8 +1533,13 @@ class GPT(nn.Module):
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
-        x = norm(x)
+        x = unit_norm(x)  # nGPT: final unit norm before logits
         logits = self.lm_head(x)
+        
+        # nGPT: scale logits by s_z (compensates for bounded [-1,1] dot products)
+        # Restore actual s_z value: stored * (init / scale)
+        s_z_actual = self.s_z * (self.s_z.ngpt_init / self.s_z.ngpt_scale)
+        logits = logits * s_z_actual
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
@@ -1760,6 +1892,12 @@ class TrainingManager():
         # Conditionally add diff attention lambda params
         if args.use_diff_attn:
             self.param_table["diff_attn_lambda"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        
+        # nGPT parameters: eigen learning rates and scaling factors
+        # Paper: no weight decay needed since norms are controlled via normalization
+        self.param_table["ngpt_alpha"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        self.param_table["ngpt_sqk"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
+        self.param_table["ngpt_sz"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
@@ -1768,6 +1906,8 @@ class TrainingManager():
         ]
         if args.use_diff_attn:
             self.work_order.append("diff_attn_lambda")
+        # nGPT parameters: small, fast to process
+        self.work_order.extend(["ngpt_alpha", "ngpt_sqk", "ngpt_sz"])
         self.work_order.extend(["value_embed", "bigram_embed"])  # Medium
         self.work_order.extend(["lm_head", "embed"])  # lm_head must complete before embed sync (when tied)
         self.work_order.append("attn")  # Large
@@ -1850,6 +1990,11 @@ class TrainingManager():
 
         # Step optimizer with do_adam flag
         self.optimizer.step(do_adam=do_adam)
+        
+        # nGPT: normalize weight matrices after optimizer step
+        # Access original model if wrapped by torch.compile
+        raw_model = getattr(self.model, '_orig_mod', self.model)
+        raw_model.normalize_weights()
 
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
@@ -1927,6 +2072,19 @@ if args.use_linear_attn_mlp:
     model.linear_attn_out_bank.data = model.linear_attn_out_bank.data.bfloat16()
 else:
     model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+
+# nGPT parameters to bfloat16
+model.alpha_A_bank.data = model.alpha_A_bank.data.bfloat16()
+model.alpha_M_bank.data = model.alpha_M_bank.data.bfloat16()
+model.s_qk_bank.data = model.s_qk_bank.data.bfloat16()
+model.s_z.data = model.s_z.data.bfloat16()
+
+# nGPT: Normalize all weight matrices at initialization
+# Paper: "After each training step (and, optionally, during the forward pass), normalize matrices..."
+# We also normalize at init to ensure starting on the hypersphere
+model.normalize_weights()
+print0("nGPT: Normalized transformer with representation learning on the hypersphere", console=True)
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
