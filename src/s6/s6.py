@@ -21,7 +21,8 @@ class RMSNorm(nn.Module):
 class S6Kernel(nn.Module):
     """Simplified S6: scan directly in H dimensions, no bottleneck."""
 
-    def __init__(self, d_model, dt_min=0.001, dt_max=0.1, lr=None):
+    def __init__(self, d_model, d_state=None, M=None, dt_min=0.001, dt_max=0.1, lr=None, **kwargs):
+        # d_state and M are ignored - kept for API compatibility
         super().__init__()
         H = d_model
         self.H = H
@@ -127,7 +128,8 @@ class S6Attention(nn.Module):
 
 
 class S6(nn.Module):
-    def __init__(self, d_model, num_heads=1, layer_idx=None, **kernel_args):
+    def __init__(self, d_model, d_state=None, M=None, num_heads=1, layer_idx=None, **kernel_args):
+        # d_state and M are ignored - kept for API compatibility
         super().__init__()
         self.h = d_model
         self.d_output = self.h
