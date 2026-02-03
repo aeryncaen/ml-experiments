@@ -1137,9 +1137,10 @@ class CausalSelfAttention(nn.Module):
             # For diff_attn with nGPT: use ngpt_attn_scale, but diff_attn internally adjusts for half head_dim
             y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], diff_lambda, seqlens, max_len, ngpt_attn_scale, bm_size)
             
-            # Apply per-head GroupNorm (RMSNorm) and scale by (1 - λ_init) per paper
-            # v.shape[-1] gives correct head_dim for both regular and paired heads
-            y = F.rms_norm(y, (v.shape[-1],)) * (1 - self.lambda_init)
+            # nGPT: Use unit norm instead of RMSNorm for consistency with hypersphere
+            # Original diff_attn paper uses RMSNorm, but nGPT removes all normalization layers
+            # Scale by (1 - λ_init) to maintain diff_attn's output scaling
+            y = unit_norm(y) * (1 - self.lambda_init)
         else:
             # nGPT attention with sqrt(d_k) scale
             y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
@@ -1909,26 +1910,28 @@ class TrainingManager():
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
+        # nGPT: Paper Section 2.6 says "Remove weight decay" for normalized weights
+        # since normalization controls the norms. Set wd_mul=0.0 for all normalized params.
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "wd_mul": 0.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 0.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 0.0},
+            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 0.0},
         }
         
         # Conditionally add MLP params based on mode
         if args.use_linear_attn_mlp:
-            self.param_table["linear_attn_qkv"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
-            self.param_table["linear_attn_out"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
+            self.param_table["linear_attn_qkv"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None, "wd_mul": 0.0}
+            self.param_table["linear_attn_out"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None, "wd_mul": 0.0}
         else:
-            self.param_table["mlp"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
+            self.param_table["mlp"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None, "wd_mul": 0.0}
         
         # Conditionally add diff attention lambda params
         if args.use_diff_attn:
