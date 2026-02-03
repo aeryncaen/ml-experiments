@@ -2094,8 +2094,8 @@ class _TritonS6(torch.autograd.Function):
 class TritonS6(nn.Module):
     """S6 using Triton kernels. Falls back to PyTorch S6 on non-CUDA devices."""
 
-    def __init__(self, d_model, d_state=None, M=None, num_heads=1, chunk_size=32, layer_idx=None, **kwargs):
-        # d_state and M are ignored - kept for API compatibility
+    def __init__(self, d_model, d_state=None, M=4, num_heads=1, chunk_size=32, layer_idx=None, **kwargs):
+        # d_state is ignored - we work in H dimensions (no bottleneck)
         super().__init__()
         from .s6 import S6
 
@@ -2103,7 +2103,7 @@ class TritonS6(nn.Module):
         self.H = H
         self.chunk_size = chunk_size
 
-        self._pytorch_s6 = S6(d_model, num_heads=num_heads, layer_idx=layer_idx, **kwargs)
+        self._pytorch_s6 = S6(d_model, M=M, num_heads=num_heads, layer_idx=layer_idx, **kwargs)
 
         # CUDA graph state
         self._graph = None
