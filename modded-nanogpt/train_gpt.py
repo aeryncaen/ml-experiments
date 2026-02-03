@@ -824,7 +824,7 @@ def norm(x: Tensor):
 
 def unit_norm(x: Tensor):
     """Normalize to unit L2 norm along last dimension (for nGPT hypersphere)."""
-    return F.normalize(x, p=2, dim=-1)
+    return F.normalize(x, p=2, dim=-1, eps=1e-12)
 
 def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
     """
@@ -836,21 +836,12 @@ def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
         alpha: eigen learning rate (D,) - learnable per-dimension
     Returns:
         Updated hidden state on hypersphere
-    
-    Note: If h_block is zero (e.g., from zero-init c_proj), we skip the update
-    and just return h (already on hypersphere).
     """
-    # Check if h_block is effectively zero (e.g., from zero-init weights)
-    h_block_norm_val = h_block.norm(p=2, dim=-1, keepdim=True)
-    is_zero = h_block_norm_val < 1e-12
-    
-    # Safe normalize: if zero, use h as fallback (no update)
-    h_block_norm = torch.where(is_zero, h, h_block / h_block_norm_val.clamp_min(1e-12))
-    
-    # α * (h_block - h) is the update direction
-    # alpha shape (D,) broadcasts with (B, T, D)
+    # Normalize block output, then LERP, then normalize result
+    # eps=1e-12 ensures zero vectors don't produce NaN
+    h_block_norm = F.normalize(h_block, p=2, dim=-1, eps=1e-12)
     h_new = h + alpha * (h_block_norm - h)
-    return unit_norm(h_new)
+    return F.normalize(h_new, p=2, dim=-1, eps=1e-12)
 
 
 class CastedLinearT(nn.Module):
