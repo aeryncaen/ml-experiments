@@ -58,6 +58,9 @@ class LearnedAttnAct(nn.Module):
     Reshapes hidden dim into [n_heads, head_dim] for attention. Input/output: [batch, hidden]."""
     def __init__(self, hidden, n_heads=4):
         super().__init__()
+        # find largest n_heads that divides hidden
+        while n_heads > 1 and hidden % n_heads != 0:
+            n_heads -= 1
         self.n_heads = n_heads
         self.head_dim = hidden // n_heads
         self.wq = nn.Linear(hidden, hidden)
@@ -84,20 +87,29 @@ class LearnedAttnAct(nn.Module):
 
 
 class SwiGLUBlock(nn.Module):
-    def __init__(self, width, ffn_mult=4, learned_act=False, differential=None, learned_attn_act=False):
+    def __init__(self, width, ffn_mult=4, learned_act=False, differential=None,
+                 learned_attn_act=False, squeeze=False, hourglass=False):
         super().__init__()
-        hidden = int(width * ffn_mult)
-        self.differential = differential  # None, 'partial', or 'full'
-        self.half_hidden = hidden // 2
-        self.w1 = nn.Linear(width, hidden)
-        self.w2 = nn.Linear(width, hidden)
-        self.w3 = nn.Linear(hidden, width)
-        if learned_attn_act:
-            self.act = LearnedAttnAct(hidden)
-        elif learned_act:
-            self.act = LearnedAct()
+        self.hourglass = hourglass
+        self.differential = differential
+        self.act = LearnedAct() if learned_act else F.silu
+
+        if hourglass:
+            expand = int(width * 2)
+            neck = max(1, expand // 4)
+            self.w_expand = nn.Linear(width, expand)
+            self.w_squeeze = nn.Linear(expand, neck)
+            self.w_out = nn.Linear(neck, width)
+            # attn act only on the squeeze
+            self.squeeze_act = LearnedAttnAct(neck) if learned_attn_act else self.act
         else:
-            self.act = F.silu
+            hidden = max(1, int(width // ffn_mult)) if squeeze else int(width * ffn_mult)
+            self.half_hidden = hidden // 2
+            self.w1 = nn.Linear(width, hidden)
+            self.w2 = nn.Linear(width, hidden)
+            self.w3 = nn.Linear(hidden, width)
+            if learned_attn_act:
+                self.act = LearnedAttnAct(hidden)
 
         if differential in ('partial', 'full'):
             self.lam = nn.Parameter(torch.tensor(0.5))
@@ -107,8 +119,12 @@ class SwiGLUBlock(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
 
     def forward(self, x):
+        if self.hourglass:
+            h = self.rms_norm(self.act(self.w_expand(x)))
+            h = self.rms_norm(self.squeeze_act(self.w_squeeze(h)))
+            return x + self.w_out(h)
+
         if self.differential == 'partial':
-            # shared gate/up, split hidden for differential readout
             h = self.rms_norm(self.act(self.w1(x))) * self.w2(x)
             h1, h2 = h[..., :self.half_hidden], h[..., self.half_hidden:]
             w3_1, w3_2 = self.w3.weight[:, :self.half_hidden], self.w3.weight[:, self.half_hidden:]
@@ -117,7 +133,6 @@ class SwiGLUBlock(nn.Module):
             return out1 - self.lam * out2
 
         elif self.differential == 'full':
-            # full gate/up path, then split hidden for differential readout
             g = self.act(self.w1(x))
             u = self.w2(x)
             g1, g2 = g[..., :self.half_hidden], g[..., self.half_hidden:]
@@ -135,15 +150,19 @@ class SwiGLUBlock(nn.Module):
 
 def make_mlp(d_in: int, d_out: int, width: int, depth: int = 2, ffn_mult: int = 4,
              learned_act: bool = False, differential: str | None = None,
-             learned_attn_act: bool = False) -> nn.Module:
+             learned_attn_act: bool = False, squeeze: bool = False,
+             hourglass: bool = False) -> nn.Module:
     layers: list[nn.Module] = [nn.Linear(d_in, width)]
     for _ in range(depth):
-        layers.append(SwiGLUBlock(width, ffn_mult, learned_act, differential, learned_attn_act))
+        layers.append(SwiGLUBlock(width, ffn_mult, learned_act, differential,
+                                  learned_attn_act, squeeze, hourglass))
     layers.append(nn.Linear(width, d_out))
     return nn.Sequential(*layers)
 
 
-def get_device() -> torch.device:
+def get_device(force_cpu: bool = False) -> torch.device:
+    if force_cpu:
+        return torch.device("cpu")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
@@ -155,8 +174,9 @@ def train(d: int = 64, k: int = 3, width: int = 64, n_train: int = 100_000,
           n_test: int = 10_000, depth: int = 2, ffn_mult: int = 4, lr: float = 1e-3,
           epochs: int = 100, batch_size: int = 512, hard: bool = False,
           learned_act: bool = False, differential: str | None = None,
-          learned_attn_act: bool = False):
-    device = get_device()
+          learned_attn_act: bool = False, squeeze: bool = False,
+          hourglass: bool = False, force_cpu: bool = False):
+    device = get_device(force_cpu)
     d_out = d // k
     indices = make_sparse_indices(d, k) if hard else None
     if hard:
@@ -167,7 +187,7 @@ def train(d: int = 64, k: int = 3, width: int = 64, n_train: int = 100_000,
 
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
 
-    model = make_mlp(d, d_out, width, depth, ffn_mult, learned_act, differential, learned_attn_act).to(device)
+    model = make_mlp(d, d_out, width, depth, ffn_mult, learned_act, differential, learned_attn_act, squeeze, hourglass).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"d={d} k={k} d_out={d_out} width={width} ffn_mult={ffn_mult} depth={depth} params={n_params:,} device={device}")
 
@@ -231,11 +251,15 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--n-train", type=int, default=100_000)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--hard", action="store_true", help="sparse parity: random index assignments instead of adjacent groups")
     p.add_argument("--learned-act", action="store_true", help="learned activation: silu + w0*relu + w1*tanh")
     p.add_argument("--differential-partial", action="store_true", help="shared gate/up, differential down readout")
     p.add_argument("--differential-full", action="store_true", help="fully independent second SwiGLU path")
     p.add_argument("--learned-attn-act", action="store_true", help="linear attention with learned act as kernel replaces activation")
+    p.add_argument("--squeeze", action="store_true", help="bottleneck MLP: squeeze down by ffn_mult instead of expanding")
+    p.add_argument("--hourglass", action="store_true", help="expand to 2d, squeeze to d/2, project back to d")
+    p.add_argument("--cpu", action="store_true", help="force CPU")
     p.add_argument("--runs", type=int, default=3, help="number of runs to average")
     args = p.parse_args()
 
@@ -246,8 +270,11 @@ if __name__ == "__main__":
         print(f"\n=== run {run+1}/{args.runs} ===")
         ep = train(d=args.d, k=args.k, width=args.width, ffn_mult=args.ffn_mult,
                    depth=args.depth, epochs=args.epochs, n_train=args.n_train,
-                   lr=args.lr, hard=args.hard, learned_act=args.learned_act,
-                   differential=differential, learned_attn_act=args.learned_attn_act)
+                   lr=args.lr, batch_size=args.batch_size, hard=args.hard,
+                   learned_act=args.learned_act, differential=differential,
+                   learned_attn_act=args.learned_attn_act,
+                   squeeze=args.squeeze, hourglass=args.hourglass,
+                   force_cpu=args.cpu)
         results.append(ep)
 
     print(f"\n=== results: {results}  avg epochs to converge: {sum(results)/len(results):.1f} ===")
