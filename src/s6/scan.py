@@ -86,14 +86,11 @@ def chunked_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32
 
 
 def parallel_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
-    """Chunked parallel scan — cuBLAS matmul within chunks, sequential across chunks.
-    Falls back to sequential scan on MPS or for complex values (log of small values causes NaN).
+    """Parallel scan. Currently uses sequential due to numerical issues in chunked version.
+    
+    The chunked scan uses log-space computation which overflows when alpha is very small
+    (e.g., exp(-16) per step) and we compute cumulative products over many steps.
+    TODO: Implement numerically stable chunked scan or use Triton kernel.
     """
-    if alpha.device.type == 'mps':
-        return sequential_scan(alpha, inject)
-    # Use sequential for complex - chunked_scan has numerical issues with very small alpha magnitudes
-    if alpha.is_complex():
-        return sequential_scan(alpha, inject)
-    if alpha.shape[1] <= chunk_size:
-        return chunked_scan(alpha, inject, chunk_size=alpha.shape[1])
-    return chunked_scan(alpha, inject, chunk_size=chunk_size)
+    # Sequential is numerically stable, just slower
+    return sequential_scan(alpha, inject)

@@ -106,29 +106,26 @@ def apply_rotary_emb(x, angles):
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
 class S6Kernel(nn.Module):
-    """S6 SSM: input-dependent discretization + parallel scan, direct H-dim (no bottleneck)."""
+    """S6 SSM: input-dependent discretization + parallel scan, direct H-dim (no bottleneck), real-valued."""
 
     def __init__(self, d_model, N=None, M=4, dt_min=0.001, dt_max=0.1, lr=None):
         # N (d_state) is ignored - we work directly in H dimensions
         super().__init__()
         H = d_model
         P = H  # No bottleneck: scan in model dimension
-        assert P % 2 == 0, "d_model must be even for RoPE"
-        assert P % M == 0, f"d_model ({P}) must be divisible by M ({M})"
+        assert P % 4 == 0, f"d_model ({P}) must be divisible by 4 for grouping"
         self.H = H
         self.P = P
 
-        # A: learnable decay (H,) - spread of decay rates
-        log_A_real = torch.log(torch.linspace(1, H, H).float())
-        A_imag = torch.zeros(H)
-        self.register("log_A_real", log_A_real, lr)
-        self.register("A_imag", A_imag, lr)
+        # A: learnable decay (H,) - spread of decay rates, all negative for stability
+        log_A = torch.log(torch.linspace(1, H, H).float())
+        self.register("log_A", log_A, lr)
 
-        # Fused input projection for dt, lam, theta, alpha2
-        # Layout: [dt(H), lam(H), theta(H//2), alpha2_mag(H), alpha2_phase(H)]
+        # Fused input projection for dt, lam, alpha2
+        # Layout: [dt(H), lam(H), alpha2(H)]
         # alpha2 is separate learned decay for t-1 position in AB-2
-        self.x_proj = nn.Linear(H, H + H + H // 2 + H + H)
-        self._split_sizes = [H, H, H // 2, H, H]
+        self.x_proj = nn.Linear(H, H + H + H)
+        self._split_sizes = [H, H, H]
 
         # Input norm + bias
         self.in_norm = RMSNorm(H)
@@ -143,62 +140,39 @@ class S6Kernel(nn.Module):
             bias = self.x_proj.bias
             # lam: sigmoid(2) ≈ 0.88 biased toward current input
             bias[H:2*H] = 2.0
-            # theta: zero init
-            self.x_proj.weight[2*H:2*H + H//2] = 0.0
-            bias[2*H:2*H + H//2] = 0.0
-            # alpha2_mag: sigmoid(2) ≈ 0.88
-            bias[2*H + H//2:3*H + H//2] = 2.0
-            # alpha2_phase: tanh(0) = 0
-            bias[3*H + H//2:] = 0.0
+            # alpha2: sigmoid(2) ≈ 0.88
+            bias[2*H:] = 2.0
 
     def forward(self, u):
         """
         Args:
             u: (B, L, H) input sequence
         Returns:
-            h: (B, L, H) scanned output (real)
+            h: (B, L, H) scanned output
         """
         B, L, H = u.shape
-        P = self.P  # P == H, no bottleneck
-        assert P % 4 == 0, "d_model must be divisible by 4 for scan grouping"
 
-        # Materialize complex A
-        log_A_real: torch.Tensor = self.log_A_real  # type: ignore
-        A_imag: torch.Tensor = self.A_imag  # type: ignore
-        A = -torch.exp(log_A_real) + 1j * A_imag  # (H,) complex
+        # Materialize A (negative for stable decay)
+        log_A: torch.Tensor = self.log_A  # type: ignore
+        A = -torch.exp(log_A)  # (H,) negative real
 
-        # Norm + bias on input (no phi_B projection)
+        # Norm + bias on input
         x = self.in_norm(u) + self.in_bias  # (B, L, H)
 
-        # dt, lam, theta, alpha2 from fused projection
+        # dt, lam, alpha2 from fused projection
         proj = self.x_proj(u)
-        dt_raw, lam_raw, theta, alpha2_mag_raw, alpha2_phase_raw = proj.split(self._split_sizes, dim=-1)
+        dt_raw, lam_raw, alpha2_raw = proj.split(self._split_sizes, dim=-1)
 
         dt = F.softplus(F.silu(dt_raw) + self.log_dt_bias)  # (B, L, H)
         lam = torch.sigmoid(lam_raw)  # (B, L, H)
-        
-        # alpha2: separate learned decay for t-1 position
-        # magnitude in (0, 1), phase in (-pi, pi)
-        alpha2_mag = torch.sigmoid(alpha2_mag_raw)  # (B, L, H)
-        alpha2_phase = torch.tanh(alpha2_phase_raw) * math.pi  # (B, L, H)
-        alpha2 = alpha2_mag * torch.exp(1j * alpha2_phase.to(torch.cfloat))  # (B, L, H) complex
+        alpha2 = torch.sigmoid(alpha2_raw)  # (B, L, H) in (0, 1)
 
-        # Data-dependent RoPE
-        dt_half = dt.view(B, L, H // 2, 2).mean(-1)  # (B, L, H//2)
-        cum_theta = torch.cumsum(dt_half * theta, dim=1)  # (B, L, H//2)
-        x_rot = apply_rotary_emb(x, cum_theta)  # (B, L, H)
-        
         # Shifted inputs for AB-2
-        x_prev1 = F.pad(x_rot[:, :-1], (0, 0, 1, 0))
-        x_next1 = F.pad(x_rot[:, 1:], (0, 0, 0, 1))
+        x_prev1 = F.pad(x[:, :-1], (0, 0, 1, 0))
+        x_next1 = F.pad(x[:, 1:], (0, 0, 0, 1))
 
-        # Primary decay from dt * A
-        alpha = torch.exp(dt.to(torch.cfloat) * A)  # (B, L, H) complex
-
-        x_c = x_rot.to(torch.cfloat)
-        x_prev1_c = x_prev1.to(torch.cfloat)
-        x_next1_c = x_next1.to(torch.cfloat)
-        dt_c = dt.to(torch.cfloat)
+        # Primary decay: alpha = exp(dt * A), in (0, 1) since A < 0
+        alpha = torch.exp(dt * A)  # (B, L, H)
 
         g = H // 4
         g0 = slice(0, g)
@@ -206,22 +180,22 @@ class S6Kernel(nn.Module):
         g2 = slice(2 * g, 3 * g)
         g3 = slice(3 * g, 4 * g)
 
-        inject = torch.zeros_like(x_c)
+        inject = torch.zeros_like(x)
         # pass-through: current only
-        inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * x_c[:, :, g0]
-        # AB-2 groups: use alpha2 for t-1 term (separate learned decay)
+        inject[:, :, g0] = lam[:, :, g0] * dt[:, :, g0] * x[:, :, g0]
+        # AB-2 groups: alpha2 for t-1, alpha for t+1
         for gs in (g1, g2, g3):
             inject[:, :, gs] = (
-                lam[:, :, gs] * dt_c[:, :, gs] * x_c[:, :, gs]
-                + (1 - lam[:, :, gs]) * dt_c[:, :, gs] * (
-                    alpha2[:, :, gs] * x_prev1_c[:, :, gs] + alpha[:, :, gs] * x_next1_c[:, :, gs]
+                lam[:, :, gs] * dt[:, :, gs] * x[:, :, gs]
+                + (1 - lam[:, :, gs]) * dt[:, :, gs] * (
+                    alpha2[:, :, gs] * x_prev1[:, :, gs] + alpha[:, :, gs] * x_next1[:, :, gs]
                 )
             )
 
         # Parallel scan: h[t] = alpha[t] * h[t-1] + inject[t]
-        h = parallel_scan(alpha, inject)  # (B, L, H) complex
+        h = parallel_scan(alpha, inject)  # (B, L, H)
 
-        return h.real
+        return h
 
     def register(self, name, tensor, lr=None):
         """Register a tensor with a configurable learning rate and 0 weight decay"""
