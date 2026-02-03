@@ -919,6 +919,8 @@ def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_s
     Differential attention: A1 - λ*A2 where A1 = softmax(Q1K1^T)V, A2 = softmax(Q2K2^T)V
     Q1, K1, Q2, K2 have head_dim/2, V has full head_dim.
     FlashAttention3 supports different head dims for Q/K vs V.
+    
+    diff_lambda: (num_heads,) tensor - learnable per-head λ values
     """
     # Scale for half head_dim: sqrt(d/2) instead of sqrt(d)
     half_scale = attn_scale * (2 ** 0.5)  # Adjust scale for halved head dim
@@ -933,6 +935,8 @@ def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_s
         max_seqlen_q=max_len, max_seqlen_k=max_len,
         causal=True, softmax_scale=half_scale, window_size=(bm_size, 0)
     )
+    # a1, a2: (T, H, D) - reshape diff_lambda for broadcasting: (1, H, 1)
+    diff_lambda = diff_lambda.view(1, -1, 1)
     return a1 - diff_lambda * a2
 
 
@@ -977,11 +981,19 @@ class CausalSelfAttention(nn.Module):
         self.layer_idx = layer_idx
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         
-        # Differential attention λ initialization per paper: λ_init = 0.8 - 0.6 * exp(-0.3 * (l-1))
-        # where l is 1-indexed layer number
+        # Differential attention λ per paper (arXiv:2410.05258)
+        # λ = exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
+        # where λ_init = 0.8 - 0.6 * exp(-0.3 * (l-1)), l is 1-indexed layer
         if use_diff_attn:
             l = layer_idx + 1  # 1-indexed
             self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1))
+            # Learnable λ parameters - vectors of size head_dim//2 per head
+            # Initialized small so exp(q·k) ≈ 1, making λ ≈ λ_init initially
+            half_head_dim = head_dim // 2
+            self.lambda_q1 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_k1 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_q2 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
+            self.lambda_k2 = nn.Parameter(torch.randn(num_heads, half_head_dim) * 0.1)
         # Weights are stored in parameter banks and passed via forward()
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
@@ -1039,8 +1051,19 @@ class CausalSelfAttention(nn.Module):
             q1, q2 = q.chunk(2, dim=-1)
             k1, k2 = k.chunk(2, dim=-1)
             
+            # Compute learnable λ per head: λ = exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+            lambda_1 = (self.lambda_q1 * self.lambda_k1).sum(dim=-1).exp()  # (num_heads,)
+            lambda_2 = (self.lambda_q2 * self.lambda_k2).sum(dim=-1).exp()  # (num_heads,)
+            diff_lambda = lambda_1 - lambda_2 + self.lambda_init  # (num_heads,)
+            
+            # For paired heads, we have num_heads//2 actual heads
+            if self.paired:
+                # Average adjacent head lambdas for paired mode
+                diff_lambda = (diff_lambda[::2] + diff_lambda[1::2]) / 2
+            
             # Remove batch dim for varlen flash attention
-            y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], self.lambda_init, seqlens, max_len, yarn.attn_scale, bm_size)
+            # diff_lambda needs to be per-head, expanded for broadcasting: (num_heads, 1, 1)
+            y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], diff_lambda, seqlens, max_len, yarn.attn_scale, bm_size)
             
             # Apply per-head GroupNorm (RMSNorm) and scale by (1 - λ_init) per paper
             # v.shape[-1] gives correct head_dim for both regular and paired heads
@@ -1708,6 +1731,8 @@ class TrainingManager():
         self.param_table = {
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "linear_attn_qkv": {"optim": "normuon", "comms": "sharded",   "adam_betas": None},  # Linear attn MLP
+            "linear_attn_out": {"optim": "normuon", "comms": "sharded",   "adam_betas": None},  # Linear attn MLP
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
@@ -1718,15 +1743,16 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "diff_attn_lambda": {"optim": "adam",  "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0},  # Diff attn learnable λ
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas", "diff_attn_lambda",  # Small, fast
             "value_embed", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "attn", "mlp", "linear_attn_qkv", "linear_attn_out",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
