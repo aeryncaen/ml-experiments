@@ -2094,7 +2094,8 @@ class _TritonS6(torch.autograd.Function):
 class TritonS6(nn.Module):
     """S6 using Triton kernels. Falls back to PyTorch S6 on non-CUDA devices."""
 
-    def __init__(self, d_model, num_heads=1, chunk_size=32, layer_idx=None, **kwargs):
+    def __init__(self, d_model, d_state=None, M=None, num_heads=1, chunk_size=32, layer_idx=None, **kwargs):
+        # d_state and M are ignored - kept for API compatibility
         super().__init__()
         from .s6 import S6
 
