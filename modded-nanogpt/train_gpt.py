@@ -909,15 +909,50 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# -----------------------------------------------------------------------------
+# Differential Attention - arXiv:2410.05258
+# Computes attention as: (softmax(Q1K1^T) - λ*softmax(Q2K2^T)) * V
+# This cancels attention noise and promotes sparse attention patterns.
+
+def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_size):
+    """
+    Differential attention: A1 - λ*A2 where A1 = softmax(Q1K1^T)V, A2 = softmax(Q2K2^T)V
+    Q1, K1, Q2, K2 have head_dim/2, V has full head_dim.
+    FlashAttention3 supports different head dims for Q/K vs V.
+    """
+    # Scale for half head_dim: sqrt(d/2) instead of sqrt(d)
+    half_scale = attn_scale * (2 ** 0.5)  # Adjust scale for halved head dim
+    
+    a1 = flash_attn_interface.flash_attn_varlen_func(
+        q1, k1, v, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        max_seqlen_q=max_len, max_seqlen_k=max_len,
+        causal=True, softmax_scale=half_scale, window_size=(bm_size, 0)
+    )
+    a2 = flash_attn_interface.flash_attn_varlen_func(
+        q2, k2, v, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        max_seqlen_q=max_len, max_seqlen_k=max_len,
+        causal=True, softmax_scale=half_scale, window_size=(bm_size, 0)
+    )
+    return a1 - diff_lambda * a2
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False, use_diff_attn: bool = False, layer_idx: int = 0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
         self.paired = paired
+        self.use_diff_attn = use_diff_attn
+        self.layer_idx = layer_idx
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
+        
+        # Differential attention λ initialization per paper: λ_init = 0.8 - 0.6 * exp(-0.3 * (l-1))
+        # where l is 1-indexed layer number
+        if use_diff_attn:
+            l = layer_idx + 1  # 1-indexed
+            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1))
         # Weights are stored in parameter banks and passed via forward()
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
@@ -969,10 +1004,26 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        if self.use_diff_attn:
+            # Differential attention: split Q and K along head_dim, keep V whole
+            # Works for both regular and paired heads (paired heads have 2x head_dim after reshape)
+            q1, q2 = q.chunk(2, dim=-1)
+            k1, k2 = k.chunk(2, dim=-1)
+            
+            # Remove batch dim for varlen flash attention
+            y = diff_attn(q1[0], k1[0], q2[0], k2[0], v[0], self.lambda_init, seqlens, max_len, yarn.attn_scale, bm_size)
+            
+            # Apply per-head GroupNorm (RMSNorm) and scale by (1 - λ_init) per paper
+            # v.shape[-1] gives correct head_dim for both regular and paired heads
+            y = F.rms_norm(y, (v.shape[-1],)) * (1 - self.lambda_init)
+        else:
+            # Standard attention
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        
+        # Reshape back to (B, T, num_heads, head_dim) - crucial for paired heads which have
+        # (T*2, num_heads//2, head_dim) that needs to become (T, num_heads, head_dim)
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -991,10 +1042,10 @@ class MLP(nn.Module):
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool, use_diff_attn: bool = False, layer_idx: int = 0):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head, use_diff_attn=use_diff_attn, layer_idx=layer_idx) if has_attn else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP() if has_mlp else None
 
@@ -1018,9 +1069,10 @@ class ForwardScheduleConfig:
     ws_long: int
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, use_diff_attn: bool = False):
         super().__init__()
         self.num_layers = num_layers
+        self.use_diff_attn = use_diff_attn
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -1091,7 +1143,9 @@ class GPT(nn.Module):
             Block(model_dim, head_dim, num_heads,
                   has_attn=(i in self.layer_to_attn_idx),
                   has_mlp=(i in self.layer_to_mlp_idx),
-                  use_paired_head=(i in self.paired_head_layers))
+                  use_paired_head=(i in self.paired_head_layers),
+                  use_diff_attn=use_diff_attn,
+                  layer_idx=i)
             for i in range(num_layers)
         ])
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1435,6 +1489,8 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # differential attention (arXiv:2410.05258) - cancels attention noise via (softmax(Q1K1) - λ*softmax(Q2K2)) * V
+    use_diff_attn: bool = False
 
 args = Hyperparameters()
 
@@ -1703,8 +1759,11 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+    use_diff_attn=args.use_diff_attn
 ).cuda()
+if args.use_diff_attn:
+    print0("Using Differential Attention (arXiv:2410.05258)", console=True)
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
@@ -1787,6 +1846,20 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        
+        # Early stopping when loss hits target
+        if val_loss <= 3.28:
+            print0(f"=" * 60, console=True)
+            print0(f"TARGET REACHED! val_loss={val_loss:.4f} <= 3.28", console=True)
+            print0(f"Time to target: {training_time_ms:.0f}ms ({training_time_ms/1000:.2f}s)", console=True)
+            print0(f"Steps: {step}/{train_steps}", console=True)
+            print0(f"=" * 60, console=True)
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            break
+        
         model.train()
         # start the clock again
         torch.cuda.synchronize()

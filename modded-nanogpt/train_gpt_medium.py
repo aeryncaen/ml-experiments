@@ -1773,6 +1773,20 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        
+        # Early stopping when loss hits target
+        if val_loss <= 3.28:
+            print0(f"=" * 60, console=True)
+            print0(f"TARGET REACHED! val_loss={val_loss:.4f} <= 3.28", console=True)
+            print0(f"Time to target: {training_time_ms:.0f}ms ({training_time_ms/1000:.2f}s)", console=True)
+            print0(f"Steps: {step}/{train_steps}", console=True)
+            print0(f"=" * 60, console=True)
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in training_manager.optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            break
+        
         model.train()
         # start the clock again
         torch.cuda.synchronize()
