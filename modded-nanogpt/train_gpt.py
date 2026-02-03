@@ -809,12 +809,10 @@ class NorMuonAndAdam:
         This maintains the hypersphere constraint for representation learning.
         Handles zero vectors by leaving them as zero (they'll get gradients and become non-zero).
         """
-        p_norm = p.float().norm(p=2, dim=dim, keepdim=True)
-        # Only normalize non-zero vectors; zero vectors stay zero
-        mask = p_norm > 1e-12
-        p_norm = p_norm.clamp_min(1e-12)  # Avoid div by zero
-        p.div_(p_norm.type_as(p))
-        p.mul_(mask.type_as(p))  # Zero out vectors that were originally zero
+        # Replace any NaN/inf with zero before normalizing
+        p_clean = torch.where(torch.isfinite(p), p, torch.zeros_like(p))
+        p_norm = p_clean.float().norm(p=2, dim=dim, keepdim=True).clamp_min(1e-12)
+        p.copy_(p_clean / p_norm.type_as(p))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
