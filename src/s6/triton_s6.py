@@ -1,7 +1,14 @@
-"""Triton kernels for S6 — fused projections, activations, scan, and readout.
+"""Triton kernels for S6.
 
-Rewrite: 3 fused custom kernels + existing linear kernels.
-Forward: x_proj linear → phi_B (PyTorch) → fused_prescan → cumsum → fused_scan → c_proj linear → fused_postscan
+NOTE: The architecture was simplified to scan directly in H dimensions with no bottleneck.
+Many kernels below are from the old architecture (phi_B, msconv, C readout) and are now unused.
+TODO: Clean up old kernels once the new architecture is stable.
+
+Current architecture:
+- Input u: (B, L, H)
+- Scan directly in H dims: h[t] = alpha[t] * h[t-1] + inject[t]
+- Output: (B, L, H)
+- No phi_B projection, no C readout, no msconv
 """
 
 from __future__ import annotations
@@ -2087,17 +2094,15 @@ class _TritonS6(torch.autograd.Function):
 class TritonS6(nn.Module):
     """S6 using Triton kernels. Falls back to PyTorch S6 on non-CUDA devices."""
 
-    def __init__(self, d_model, d_state=64, M=4, chunk_size=32, layer_idx=None, **kwargs):
+    def __init__(self, d_model, num_heads=1, chunk_size=32, layer_idx=None, **kwargs):
         super().__init__()
         from .s6 import S6
 
         H = d_model
-        P = d_state
         self.H = H
-        self.P = P
         self.chunk_size = chunk_size
 
-        self._pytorch_s6 = S6(d_model, d_state, M=M, layer_idx=layer_idx, **kwargs)
+        self._pytorch_s6 = S6(d_model, num_heads=num_heads, layer_idx=layer_idx, **kwargs)
 
         # CUDA graph state
         self._graph = None
@@ -2106,57 +2111,10 @@ class TritonS6(nn.Module):
         self._graph_shape = None
 
     def _forward_impl(self, u):
-        s6 = self._pytorch_s6
-        kern = s6.kernel
-
-        B_size, L_size, H = u.shape
-        P = self.P
-
-        # 1. phi_B projection (Triton) — directly on input u
-        phi = kern.phi_B
-        mlp = phi.channel_mlp
-        N_rows = B_size * L_size
-        raw = _TritonPhiB.apply(
-            u.reshape(N_rows, H),
-            phi.W, phi.b,
-            mlp.fc1.weight, mlp.fc1.bias,
-            mlp.fc2.weight, mlp.fc2.bias,
-            phi.M, phi.L, mlp.fc1.out_features,
-        )  # (N_rows, P)
-        # ch_rms + scale in PyTorch so autograd handles their gradients
-        if phi.ch_rms:
-            raw_3d = raw.view(N_rows, phi.M, phi.L)
-            rms = torch.sqrt(raw_3d.pow(2).mean(dim=(0, 1)) + 1e-6)  # (L_fb,)
-            sc = (phi.ch_rms_target / (rms + 1e-6)).clamp(max=1.0)
-            raw = (raw_3d * sc.view(1, 1, phi.L)).view(N_rows, -1)
-        Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
-
-        # 2. SSM scan (PyTorch) — we need h for attention, Triton kernel doesn't expose it
-        h, cum_theta = kern(u, Bu_raw=Bu_raw)  # Pass pre-computed Bu_raw
-
-        # 3. SSM Path: C readout with gating (PyTorch)
-        c_proj_out = s6.c_proj(u)
-        c_gate = s6.c_norm(torch.nn.functional.silu(c_proj_out)) + s6.c_bias
-        from .s6 import apply_rotary_emb
-        c_gate = apply_rotary_emb(c_gate, cum_theta)
-        h_gated = h * c_gate
-
-        C = torch.view_as_complex(s6.C)
-        y_ssm = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
-
-        # 4. Attention Path (PyTorch): Q from u, K/V from h.real
-        h_real = h.real.float()
-        y_attn = s6.attn(u, h_real)
-
-        # 5. Mix SSM and Attention with learned gate
-        gate = torch.sigmoid(s6.mix_gate(u))
-        y = gate * y_ssm + (1 - gate) * y_attn
-
-        # 6. Skip connection + activation + norm
-        y = y + u * s6.D
-        y = s6.out_norm(torch.nn.functional.silu(y))
-
-        return y
+        """Simplified forward - scan directly in H dimensions, no bottleneck."""
+        # For now, use PyTorch implementation
+        # TODO: Add Triton-optimized scan kernel for H-dimensional scan
+        return self._pytorch_s6(u)
 
     def enable_cuda_graph(self, sample_input):
         """Capture fwd+bwd into a CUDA graph. Call once after warmup.
