@@ -807,12 +807,23 @@ class NorMuonAndAdam:
         """
         nGPT: Normalize weight matrix to unit L2 norm along specified dimension.
         This maintains the hypersphere constraint for representation learning.
-        Handles zero vectors by leaving them as zero (they'll get gradients and become non-zero).
+        Handles zero vectors and NaN/inf values robustly.
         """
-        # Replace any NaN/inf with zero before normalizing
-        p_clean = torch.where(torch.isfinite(p), p, torch.zeros_like(p))
-        p_norm = p_clean.float().norm(p=2, dim=dim, keepdim=True).clamp_min(1e-12)
-        p.copy_(p_clean / p_norm.type_as(p))
+        # Work in float32 for numerical stability
+        p_float = p.float()
+        
+        # Replace any NaN/inf with zero
+        p_clean = torch.where(torch.isfinite(p_float), p_float, torch.zeros_like(p_float))
+        
+        # Compute norms
+        p_norm = p_clean.norm(p=2, dim=dim, keepdim=True)
+        
+        # Only normalize vectors with non-negligible norm (leave near-zero vectors as-is)
+        # This prevents amplifying noise from near-zero vectors
+        mask = p_norm > 1e-8
+        p_normalized = torch.where(mask, p_clean / p_norm.clamp_min(1e-12), p_clean)
+        
+        p.copy_(p_normalized.type_as(p))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -823,6 +834,18 @@ def norm(x: Tensor):
 def unit_norm(x: Tensor):
     """Normalize to unit L2 norm along last dimension (for nGPT hypersphere)."""
     return F.normalize(x, p=2, dim=-1, eps=1e-12)
+
+# Debug flag for NaN detection - set via environment variable
+NGPT_DEBUG = os.environ.get("NGPT_DEBUG", "0") == "1"
+
+def check_nan(x: Tensor, name: str, step: int = -1):
+    """Check for NaN/Inf and print debug info if found. Only active when NGPT_DEBUG=1."""
+    if not NGPT_DEBUG:
+        return
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        nan_count = torch.isnan(x).sum().item()
+        inf_count = torch.isinf(x).sum().item()
+        print(f"[NaN DEBUG step={step}] {name}: NaN={nan_count}, Inf={inf_count}, shape={x.shape}, min={x[torch.isfinite(x)].min().item() if torch.isfinite(x).any() else 'N/A':.4f}, max={x[torch.isfinite(x)].max().item() if torch.isfinite(x).any() else 'N/A':.4f}")
 
 def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
     """
@@ -1203,16 +1226,16 @@ class Block(nn.Module):
                 alpha_A: Tensor = None, alpha_M: Tensor = None,
                 s_qk: Tensor = None):
         # nGPT: no norm before blocks, use LERP residual with eigen learning rates
-        # Clamp alpha to [0, 1] to prevent overshooting (paper shows typical values ~0.2-0.3)
+        # Alpha is already clamped to [0.001, 1.0] in GPT.forward(), but we do abs() here for safety
         if self.attn is not None:
             h_A = self.attn(x, attn_args, qkvo_w, s_qk)  # attention output (not normalized yet inside)
-            x = ngpt_lerp(x, h_A, alpha_A.abs().clamp(max=1.0))
+            x = ngpt_lerp(x, h_A, alpha_A.abs())
         if self.mlp is not None:
             if self.use_linear_attn_mlp:
                 h_M = self.mlp(x, w_qkv=w_qkv, w_out=w_out)
             else:
                 h_M = self.mlp(x, c_fc, c_proj)
-            x = ngpt_lerp(x, h_M, alpha_M.abs().clamp(max=1.0))
+            x = ngpt_lerp(x, h_M, alpha_M.abs())
         return x
 
 # -----------------------------------------------------------------------------
@@ -1537,10 +1560,17 @@ class GPT(nn.Module):
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x = x + skip_gate_out * skip_connections.pop()
                 x = unit_norm(x)  # nGPT: re-normalize after skip connection
+            # nGPT: Apply residual lambda combinations
+            # Clamp lambdas to prevent extreme values that could cause near-zero vectors
             if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
+                rl = (resid_lambdas[0] + x0_lambdas[0]).clamp(min=0.1)
+                bl = bigram_lambdas[0].clamp(min=-2.0, max=2.0)
+                x = rl * x + bl * x0_bigram
             else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+                rl = resid_lambdas[i].clamp(min=0.1)
+                x0l = x0_lambdas[i].clamp(min=-2.0, max=2.0)
+                bl = bigram_lambdas[i].clamp(min=-2.0, max=2.0)
+                x = rl * x + x0l * x0 + bl * x0_bigram
             x = unit_norm(x)  # nGPT: ensure x is on hypersphere before block
 
             # Get weights for this layer from banks
@@ -1553,9 +1583,11 @@ class GPT(nn.Module):
             
             # nGPT: get eigen learning rates and s_qk for this layer
             # Restore actual value: param_stored * (init / scale) 
-            alpha_A = alpha_As[i] * (self.alpha_A_bank.ngpt_init / self.alpha_A_bank.ngpt_scale)
-            alpha_M = alpha_Ms[i] * (self.alpha_M_bank.ngpt_init / self.alpha_M_bank.ngpt_scale)
-            s_qk = s_qks[self.layer_to_attn_idx[i]] * (self.s_qk_bank.ngpt_init / self.s_qk_bank.ngpt_scale) if i in self.layer_to_attn_idx else None
+            # Clamp values to reasonable ranges to prevent NaN from extreme values
+            alpha_A = (alpha_As[i] * (self.alpha_A_bank.ngpt_init / self.alpha_A_bank.ngpt_scale)).clamp(min=0.001, max=1.0)
+            alpha_M = (alpha_Ms[i] * (self.alpha_M_bank.ngpt_init / self.alpha_M_bank.ngpt_scale)).clamp(min=0.001, max=1.0)
+            # s_qk should stay close to 1.0; if it grows too large, attention scores explode
+            s_qk = (s_qks[self.layer_to_attn_idx[i]] * (self.s_qk_bank.ngpt_init / self.s_qk_bank.ngpt_scale)).clamp(min=0.1, max=3.0) if i in self.layer_to_attn_idx else None
 
             x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, w_qkv, w_out, alpha_A, alpha_M, s_qk)
             if i in skip_in:
@@ -1564,7 +1596,10 @@ class GPT(nn.Module):
                 x_backout = x
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda * x_backout
+        # nGPT safeguard: clamp backout_lambda to prevent creating near-zero vectors
+        # When backout_lambda ≈ 1 and x ≈ x_backout, the result would be near-zero causing NaN after normalization
+        backout_lambda_clamped = backout_lambda.clamp(max=0.9)  # Ensure we keep at least 10% of x
+        x = x - backout_lambda_clamped * x_backout
         x = unit_norm(x)  # nGPT: final unit norm before logits
         logits = self.lm_head(x)
         
@@ -2237,6 +2272,14 @@ for step in range(train_steps + 1):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale).backward()
     training_manager.step_optimizers(step)
+    
+    # NaN detection (when NGPT_DEBUG=1)
+    if NGPT_DEBUG and step % 10 == 0:  # Check every 10 steps
+        for name, param in model.named_parameters():
+            if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                nan_count = torch.isnan(param.data).sum().item()
+                inf_count = torch.isinf(param.data).sum().item()
+                print0(f"[NaN ALERT step={step}] {name}: NaN={nan_count}, Inf={inf_count}", console=True)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
