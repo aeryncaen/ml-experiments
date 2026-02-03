@@ -1205,15 +1205,16 @@ class Block(nn.Module):
                 alpha_A: Tensor = None, alpha_M: Tensor = None,
                 s_qk: Tensor = None):
         # nGPT: no norm before blocks, use LERP residual with eigen learning rates
+        # Clamp alpha to [0, 1] to prevent overshooting (paper shows typical values ~0.2-0.3)
         if self.attn is not None:
             h_A = self.attn(x, attn_args, qkvo_w, s_qk)  # attention output (not normalized yet inside)
-            x = ngpt_lerp(x, h_A, alpha_A.abs())  # α must be positive, use abs()
+            x = ngpt_lerp(x, h_A, alpha_A.abs().clamp(max=1.0))
         if self.mlp is not None:
             if self.use_linear_attn_mlp:
                 h_M = self.mlp(x, w_qkv=w_qkv, w_out=w_out)
             else:
                 h_M = self.mlp(x, c_fc, c_proj)
-            x = ngpt_lerp(x, h_M, alpha_M.abs())  # α must be positive, use abs()
+            x = ngpt_lerp(x, h_M, alpha_M.abs().clamp(max=1.0))
         return x
 
 # -----------------------------------------------------------------------------
@@ -1571,7 +1572,8 @@ class GPT(nn.Module):
         
         # nGPT: scale logits by s_z (compensates for bounded [-1,1] dot products)
         # Restore actual s_z value: stored * (init / scale)
-        s_z_actual = self.s_z * (self.s_z.ngpt_init / self.s_z.ngpt_scale)
+        # Clamp to reasonable range to prevent overflow (paper shows typical values ~60-100)
+        s_z_actual = (self.s_z * (self.s_z.ngpt_init / self.s_z.ngpt_scale)).clamp(min=0.1, max=200.0)
         logits = logits * s_z_actual
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
