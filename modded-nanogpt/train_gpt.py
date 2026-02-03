@@ -807,9 +807,14 @@ class NorMuonAndAdam:
         """
         nGPT: Normalize weight matrix to unit L2 norm along specified dimension.
         This maintains the hypersphere constraint for representation learning.
+        Handles zero vectors by leaving them as zero (they'll get gradients and become non-zero).
         """
-        p_norm = p.float().norm(p=2, dim=dim, keepdim=True).clamp_min(1e-12)
+        p_norm = p.float().norm(p=2, dim=dim, keepdim=True)
+        # Only normalize non-zero vectors; zero vectors stay zero
+        mask = p_norm > 1e-12
+        p_norm = p_norm.clamp_min(1e-12)  # Avoid div by zero
         p.div_(p_norm.type_as(p))
+        p.mul_(mask.type_as(p))  # Zero out vectors that were originally zero
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -831,8 +836,17 @@ def ngpt_lerp(h: Tensor, h_block: Tensor, alpha: Tensor) -> Tensor:
         alpha: eigen learning rate (D,) - learnable per-dimension
     Returns:
         Updated hidden state on hypersphere
+    
+    Note: If h_block is zero (e.g., from zero-init c_proj), we skip the update
+    and just return h (already on hypersphere).
     """
-    h_block_norm = unit_norm(h_block)
+    # Check if h_block is effectively zero (e.g., from zero-init weights)
+    h_block_norm_val = h_block.norm(p=2, dim=-1, keepdim=True)
+    is_zero = h_block_norm_val < 1e-12
+    
+    # Safe normalize: if zero, use h as fallback (no update)
+    h_block_norm = torch.where(is_zero, h, h_block / h_block_norm_val.clamp_min(1e-12))
+    
     # α * (h_block - h) is the update direction
     # alpha shape (D,) broadcasts with (B, T, D)
     h_new = h + alpha * (h_block_norm - h)
@@ -1414,36 +1428,40 @@ class GPT(nn.Module):
         
         Paper Section 2.6: "After each training step, normalize matrices Einput, Eoutput,
         Wq, Wk, Wv, Wo, Wu, Wv and WoMLP along their embedding dimension."
+        
+        Note: Zero-initialized weights (c_proj, bigram_embed) are left as-is since
+        normalizing zero vectors is undefined. They'll become non-zero via gradients.
         """
+        def safe_normalize(t, dim):
+            """Normalize non-zero vectors, leave zero vectors as zero."""
+            norms = t.norm(p=2, dim=dim, keepdim=True)
+            mask = norms > 1e-12
+            return torch.where(mask, t / norms.clamp_min(1e-12), t)
+        
         # Attention bank: (num_attn_layers, 4*model_dim, head_dim)
-        # Each row is a weight vector; normalize along last dim (head_dim)
-        self.attn_bank.data = F.normalize(self.attn_bank.data, p=2, dim=-1)
+        self.attn_bank.data = safe_normalize(self.attn_bank.data, dim=-1)
         
         # MLP bank (if using standard MLP): (num_layers+1, 2, mlp_hdim, model_dim)
-        # Each row is a weight vector; normalize along last dim (model_dim)
         if self.mlp_bank is not None:
-            self.mlp_bank.data = F.normalize(self.mlp_bank.data, p=2, dim=-1)
+            self.mlp_bank.data = safe_normalize(self.mlp_bank.data, dim=-1)
         
         # Linear attention MLP banks (if using linear attention MLP)
         if self.linear_attn_qkv_bank is not None:
-            # (num_layers+1, 3*hidden, model_dim) - normalize along model_dim
-            self.linear_attn_qkv_bank.data = F.normalize(self.linear_attn_qkv_bank.data, p=2, dim=-1)
+            self.linear_attn_qkv_bank.data = safe_normalize(self.linear_attn_qkv_bank.data, dim=-1)
         if self.linear_attn_out_bank is not None:
-            # (num_layers+1, model_dim, hidden) - normalize along model_dim (dim=-2)
-            self.linear_attn_out_bank.data = F.normalize(self.linear_attn_out_bank.data, p=2, dim=-2)
+            self.linear_attn_out_bank.data = safe_normalize(self.linear_attn_out_bank.data, dim=-2)
         
-        # Input embeddings: (vocab_size, model_dim) - normalize each embedding
-        self.embed.weight.data = F.normalize(self.embed.weight.data, p=2, dim=-1)
+        # Input embeddings: (vocab_size, model_dim)
+        self.embed.weight.data = safe_normalize(self.embed.weight.data, dim=-1)
         
         # Output embeddings (lm_head): (model_dim, vocab_size) - transposed storage
-        # Each column is a vocab embedding; normalize along dim=0
-        self.lm_head.weight.data = F.normalize(self.lm_head.weight.data, p=2, dim=0)
+        self.lm_head.weight.data = safe_normalize(self.lm_head.weight.data, dim=0)
         
-        # Value embeddings: (5, vocab_size, model_dim) - normalize each embedding
-        self.value_embeds.data = F.normalize(self.value_embeds.data, p=2, dim=-1)
+        # Value embeddings: (5, vocab_size, model_dim)
+        self.value_embeds.data = safe_normalize(self.value_embeds.data, dim=-1)
         
-        # Bigram embeddings: (bigram_vocab_size, model_dim) - normalize each embedding
-        self.bigram_embed.weight.data = F.normalize(self.bigram_embed.weight.data, p=2, dim=-1)
+        # Bigram embeddings: (bigram_vocab_size, model_dim) - may be zero-init
+        self.bigram_embed.weight.data = safe_normalize(self.bigram_embed.weight.data, dim=-1)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
