@@ -1001,11 +1001,11 @@ def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_s
     FlashAttention3 supports different head dims for Q/K vs V.
     
     diff_lambda: (num_heads,) tensor - learnable per-head λ values
-    attn_scale: for nGPT this is sqrt(full_head_dim), we adjust for half
+    attn_scale: for nGPT this is head_dim^0.25, we adjust for half dims
     """
-    # For nGPT: attn_scale is sqrt(head_dim), but Q1/K1 have half the dims
-    # For half head_dim d/2: scale should be sqrt(d/2) = sqrt(d)/sqrt(2)
-    half_scale = attn_scale / (2 ** 0.5)  # Adjust for halved head dim
+    # For nGPT: attn_scale is head_dim^0.25, but Q1/K1 have half the dims
+    # For half head_dim: scale should be (d/2)^0.25 = d^0.25 / 2^0.25
+    half_scale = attn_scale / (2 ** 0.25)  # Adjust for halved head dim
     
     a1 = flash_attn_interface.flash_attn_varlen_func(
         q1, k1, v, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
@@ -1135,8 +1135,11 @@ class CausalSelfAttention(nn.Module):
         q = unit_norm(q) * s_qk
         k = unit_norm(k) * s_qk
         
-        # nGPT softmax scale: sqrt(d_k) instead of 1/sqrt(d_k) since Q, K are normalized
-        ngpt_attn_scale = math.sqrt(self.head_dim)
+        # nGPT softmax scale: paper uses sqrt(d_k), but that gives scores in [-11.3, 11.3]
+        # which can cause gradient issues. Use a more conservative scale.
+        # With unit-norm Q, K: scores in [-scale, scale], want exp(scale) < 1e6 → scale < 14
+        # Using d_k^0.25 ≈ 3.4 gives reasonable attention sharpness without overflow
+        ngpt_attn_scale = self.head_dim ** 0.25  # ~3.4 for head_dim=128
 
         if self.use_diff_attn:
             # Differential attention: split Q and K along head_dim, keep V whole
@@ -1596,8 +1599,10 @@ class GPT(nn.Module):
             # Clamp values to reasonable ranges to prevent NaN from extreme values
             alpha_A = (alpha_As[i] * (self.alpha_A_bank.ngpt_init / self.alpha_A_bank.ngpt_scale)).clamp(min=0.001, max=1.0)
             alpha_M = (alpha_Ms[i] * (self.alpha_M_bank.ngpt_init / self.alpha_M_bank.ngpt_scale)).clamp(min=0.001, max=1.0)
-            # s_qk should stay close to 1.0; if it grows too large, attention scores explode
-            s_qk = (s_qks[self.layer_to_attn_idx[i]] * (self.s_qk_bank.ngpt_init / self.s_qk_bank.ngpt_scale)).clamp(min=0.1, max=3.0) if i in self.layer_to_attn_idx else None
+            # s_qk should stay close to 1.0; with sqrt(d_k) attention scale, s_qk affects scores quadratically
+            # At s_qk=1.2: scores in [-1.44*11.3, 1.44*11.3] ≈ [-16, 16], exp(16)≈9e6 is safe
+            # At s_qk=1.5: scores in [-2.25*11.3, 2.25*11.3] ≈ [-25, 25], exp(25)≈7e10 is borderline
+            s_qk = (s_qks[self.layer_to_attn_idx[i]] * (self.s_qk_bank.ngpt_init / self.s_qk_bank.ngpt_scale)).clamp(min=0.5, max=1.3) if i in self.layer_to_attn_idx else None
 
             x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, w_qkv, w_out, alpha_A, alpha_M, s_qk)
             if i in skip_in:
@@ -2287,6 +2292,15 @@ for step in range(train_steps + 1):
             print0(f"[NaN ALERT step={step}] Loss is NaN/Inf: {loss.item()}", console=True)
         
         (loss * grad_scale).backward()
+        
+        # Clip/sanitize gradients for nGPT parameters to prevent NaN/Inf propagation
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # Replace NaN/Inf with zeros
+                param.grad = torch.where(torch.isfinite(param.grad), param.grad, torch.zeros_like(param.grad))
+                # Clip large gradients for nGPT params (alpha, s_qk, s_z)
+                if 'ngpt' in name or 'alpha' in name or 's_qk' in name or 's_z' in name:
+                    param.grad.clamp_(-1.0, 1.0)
         
         # Check gradients before optimizer step
         if NGPT_DEBUG and step < 5:  # Check first few steps in detail

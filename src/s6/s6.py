@@ -146,10 +146,12 @@ class S6Kernel(nn.Module):
             nonneg=False, act="silu", ch_rms=True,
         )
 
-        # Fused input projection for dt, lam, theta (B is now separate via feature bank)
-        # Layout: [dt(P), lam(P), theta(P//2)]
-        self.x_proj = nn.Linear(H, P + P + P // 2)
-        self._split_sizes = [P, P, P // 2]
+        # Fused input projection for dt, lam, theta, alpha2 (B is now separate via feature bank)
+        # Layout: [dt(P), lam(P), theta(P//2), alpha2_real(P//2), alpha2_imag(P//2)]
+        # alpha2 is a separate learned decay for t-2 position in AB2 (only needed for g1, g2 = P//2 total)
+        # We project P//2 for each of real/imag since only half the state dims use AB2
+        self.x_proj = nn.Linear(H, P + P + P // 2 + P // 2 + P // 2)
+        self._split_sizes = [P, P, P // 2, P // 2, P // 2]
 
         # B norm + bias (Mamba-3 pattern)
         self.b_norm = RMSNorm(P)
@@ -165,8 +167,20 @@ class S6Kernel(nn.Module):
             # lam region starts at P, ends at 2P
             bias[P:2*P] = 2.0
             # theta region: zero weights and bias for init (starts from zero rotation)
-            self.x_proj.weight[2*P:] = 0.0
-            bias[2*P:] = 0.0
+            theta_start = 2*P
+            theta_end = 2*P + P//2
+            self.x_proj.weight[theta_start:theta_end] = 0.0
+            bias[theta_start:theta_end] = 0.0
+            # alpha2 region: init to produce decay ~0.9 (sigmoid(2.2) ≈ 0.9)
+            # alpha2_real: sigmoid activation, init bias for moderate decay
+            alpha2_real_start = theta_end
+            alpha2_real_end = alpha2_real_start + P//2
+            bias[alpha2_real_start:alpha2_real_end] = 2.2  # sigmoid(2.2) ≈ 0.9
+            # alpha2_imag: tanh activation scaled, init to zero (no rotation initially)
+            alpha2_imag_start = alpha2_real_end
+            alpha2_imag_end = alpha2_imag_start + P//2
+            self.x_proj.weight[alpha2_imag_start:alpha2_imag_end] = 0.0
+            bias[alpha2_imag_start:alpha2_imag_end] = 0.0
 
     def forward(self, u, Bu_raw=None):
         """
@@ -188,12 +202,20 @@ class S6Kernel(nn.Module):
         if Bu_raw is None:
             Bu_raw = self.phi_B(u.unsqueeze(1)).squeeze(1)  # (B, L, P)
 
-        # dt, lam, theta from fused linear projection
-        x_proj = self.x_proj(u)  # (B, L, P+P+P//2)
-        dt_raw, lam_raw, theta = x_proj.split(self._split_sizes, dim=-1)
+        # dt, lam, theta, alpha2 from fused linear projection
+        x_proj = self.x_proj(u)  # (B, L, P+P+P//2+P//2+P//2)
+        dt_raw, lam_raw, theta, alpha2_real_raw, alpha2_imag_raw = x_proj.split(self._split_sizes, dim=-1)
 
         dt = F.softplus(F.silu(dt_raw) + self.log_dt_bias)  # (B, L, P)
         lam = torch.sigmoid(lam_raw)  # (B, L, P)
+        
+        # alpha2: learned complex decay for t-2 position in AB2
+        # Magnitude from sigmoid (0 to 1), phase from tanh scaled to [-pi, pi]
+        alpha2_mag = torch.sigmoid(alpha2_real_raw)  # (B, L, P//2)
+        alpha2_phase = torch.tanh(alpha2_imag_raw) * math.pi  # (B, L, P//2)
+        alpha2_half = alpha2_mag * torch.exp(1j * alpha2_phase)  # (B, L, P//2) complex
+        # alpha2_half covers both g1 and g2 (each P//4 elements, total P//2)
+        # First P//4 elements for g1 (causal), second P//4 for g2 (retro)
 
         Bu = self.b_norm(Bu_raw) + self.b_bias  # (B, L, P)
 
@@ -209,8 +231,6 @@ class S6Kernel(nn.Module):
 
         # Trapezoidal discretization (complex)
         alpha = torch.exp(dt.to(torch.cfloat) * A)  # (B, L, P) complex decay
-        alpha_prev1 = F.pad(alpha[:, :-1], (0, 0, 1, 0))
-        alpha_next1 = F.pad(alpha[:, 1:], (0, 0, 0, 1))
 
         Bu_c = Bu.to(torch.cfloat)
         Bu_prev1_c = Bu_prev1.to(torch.cfloat)
@@ -224,24 +244,28 @@ class S6Kernel(nn.Module):
         g1 = slice(g, 2 * g)
         g2 = slice(2 * g, 3 * g)
         g3 = slice(3 * g, 4 * g)
+        
+        # Slice alpha2_half for g1 and g2 groups
+        alpha2_g1 = alpha2_half[:, :, :g]   # (B, L, P//4) for causal AB2
+        alpha2_g2 = alpha2_half[:, :, g:]   # (B, L, P//4) for retro AB2
 
         inject = torch.zeros_like(Bu_c)
         # pass-through: current only
         inject[:, :, g0] = lam[:, :, g0] * dt_c[:, :, g0] * Bu_c[:, :, g0]
-        # causal AB2: look behind 2 with stacked decay
+        # causal AB2: look behind 2 with learned decay for t-2
         inject[:, :, g1] = (
             lam[:, :, g1] * dt_c[:, :, g1] * Bu_c[:, :, g1]
             + (1 - lam[:, :, g1]) * dt_c[:, :, g1] * (
                 alpha[:, :, g1] * Bu_prev1_c[:, :, g1]
-                + (alpha[:, :, g1] * alpha_prev1[:, :, g1]) * Bu_prev2_c[:, :, g1]
+                + (alpha[:, :, g1] * alpha2_g1) * Bu_prev2_c[:, :, g1]
             )
         )
-        # retro AB2: look ahead 2 with stacked decay
+        # retro AB2: look ahead 2 with learned decay for t+2
         inject[:, :, g2] = (
             lam[:, :, g2] * dt_c[:, :, g2] * Bu_c[:, :, g2]
             + (1 - lam[:, :, g2]) * dt_c[:, :, g2] * (
                 alpha[:, :, g2] * Bu_next1_c[:, :, g2]
-                + (alpha[:, :, g2] * alpha_next1[:, :, g2]) * Bu_next2_c[:, :, g2]
+                + (alpha[:, :, g2] * alpha2_g2) * Bu_next2_c[:, :, g2]
             )
         )
         # center: one behind + one ahead, single decay both directions
@@ -271,81 +295,45 @@ class S6Kernel(nn.Module):
 
 
 class S6Attention(nn.Module):
-    """Causal attention with 80/20 weight sharing.
-
-    Q: 80% of rows shared with c_proj, 20% dedicated.
-    K: 80% of rows shared with phi_B.W, 20% dedicated.
-    V: standalone.
-    Separate forward ops — just shared Parameter storage.
+    """Cross-attention over shared SSM hidden state.
+    
+    Q: projected from input u
+    K, V: projected from scanned hidden state h (shared with SSM path)
     """
-    def __init__(self, d_model, d_state, M=4, num_heads=1,
-                 phi_B=None, c_proj=None):
+    def __init__(self, d_model, d_state, num_heads=1):
         super().__init__()
         H = d_model
         P = d_state
         self.H = H
         self.P = P
-        self.M = M
         self.num_heads = num_heads
         self.head_dim = P // num_heads
         assert P % num_heads == 0
 
-        # Q: 80% rows from c_proj, 20% dedicated
-        self.shared_q_rows = int(0.8 * P)
-        self.ded_q_rows = P - self.shared_q_rows
-        assert c_proj is not None
-        self._c_proj = c_proj
-        self.q_ded_weight = nn.Parameter(torch.randn(self.ded_q_rows, H) / math.sqrt(H))
-        self.q_ded_bias = nn.Parameter(torch.zeros(self.ded_q_rows))
-
-        # K: 80% W rows from phi_B, 20% dedicated
-        self.shared_k_dirs = int(0.8 * M)
-        self.ded_k_dirs = M - self.shared_k_dirs
-        assert phi_B is not None
-        self._phi_B = phi_B
-        self.k_ded_W = nn.Parameter(torch.randn(self.ded_k_dirs, H) / math.sqrt(H))
-        self.k_ded_b = nn.Parameter(torch.zeros(self.ded_k_dirs))
-
-        self.v_proj = nn.Linear(H, P, bias=False, dtype=torch.bfloat16)
+        # Q from input, K/V from hidden state
+        self.q_proj = nn.Linear(H, P, bias=False)
+        self.k_proj = nn.Linear(P, P, bias=False)  # P -> P since h is (B, L, P)
+        self.v_proj = nn.Linear(P, P, bias=False)
 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
-        self.q_norm.weight.data = self.q_norm.weight.data.bfloat16()
-        self.k_norm.weight.data = self.k_norm.weight.data.bfloat16()
 
-        self.out_proj = nn.Linear(P, H, bias=False, dtype=torch.bfloat16)
-        self.gate = nn.Parameter(torch.tensor(0.5))
+        self.out_proj = nn.Linear(P, H, bias=False)
 
-    def forward(self, u, y_ssm):
+    def forward(self, u, h):
         """
-        u: (B, L, H) — input for Q/K/V projections
-        y_ssm: (B, L, H) — SSM output (residual target)
+        u: (B, L, H) — input for Q projection
+        h: (B, L, P) — scanned hidden state (real part) for K/V
+        Returns: (B, L, H) attention output
         """
         B_batch, L, H = u.shape
         P = self.P
-        M = self.M
         nh = self.num_heads
         hd = self.head_dim
 
-        # Q: assemble shared c_proj rows + dedicated rows
-        q_w = torch.cat([self._c_proj.weight[:self.shared_q_rows],
-                         self.q_ded_weight], dim=0)
-        q_b = torch.cat([self._c_proj.bias[:self.shared_q_rows],
-                         self.q_ded_bias], dim=0)
-        Q = F.linear(u, q_w, q_b).bfloat16()  # (B, L, P)
-
-        # K: assemble shared phi_B rows + dedicated rows, run feature map
-        k_W = torch.cat([self._phi_B.W[:self.shared_k_dirs],
-                         self.k_ded_W], dim=0)  # (M, H)
-        k_b = torch.cat([self._phi_B.b[:self.shared_k_dirs],
-                         self.k_ded_b], dim=0)  # (M,)
-        k_proj = torch.einsum('mh,blh->blm', k_W, u) + k_b  # (B, L, M)
-        k_flat = k_proj.reshape(-1, 1).float()
-        k_feat = self._phi_B.channel_mlp(k_flat)
-        k_feat = k_feat.view(B_batch, L, M, self._phi_B.L)
-        K = (k_feat * self._phi_B.scale).reshape(B_batch, L, P).bfloat16()
-
-        V = self.v_proj(u.bfloat16())  # (B, L, P)
+        Q = self.q_proj(u)  # (B, L, P)
+        K = self.k_proj(h)  # (B, L, P)
+        V = self.v_proj(h)  # (B, L, P)
 
         Q = self.q_norm(Q.view(B_batch, L, nh, hd)).transpose(1, 2)
         K = self.k_norm(K.view(B_batch, L, nh, hd)).transpose(1, 2)
@@ -354,10 +342,18 @@ class S6Attention(nn.Module):
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         attn_out = attn_out.transpose(1, 2).reshape(B_batch, L, P)
 
-        return y_ssm + self.gate * self.out_proj(attn_out).float()
+        return self.out_proj(attn_out)
 
 
 class S6(nn.Module):
+    """S6: Shared-state SSM + Attention with learned mixing.
+    
+    Architecture:
+    1. Run SSM scan on input → hidden state h
+    2. SSM path: C readout from h → y_ssm  
+    3. Attention path: Q from input, K/V from h → y_attn
+    4. Learned gate mixes: gate * y_ssm + (1 - gate) * y_attn
+    """
     def __init__(self, d_model, d_state=64, M=4, layer_idx=None, num_heads=1, **kernel_args):
         super().__init__()
 
@@ -365,14 +361,10 @@ class S6(nn.Module):
         self.n = d_state
         self.d_output = self.h
 
-        # Multi-scale depthwise conv (before projections)
-        assert d_model % 4 == 0, f"d_model ({d_model}) must be divisible by 4 for msconv"
-        self.msconv = MultiScaleDepthwiseConv(d_model)
-
         # D skip connection
         self.D = nn.Parameter(torch.randn(self.h))
 
-        # SSM Kernel (parallel scan, not FFT conv)
+        # SSM Kernel (parallel scan)
         self.kernel = S6Kernel(self.h, N=self.n, M=M, **kernel_args)
 
         # C: static MIMO readout (H, P) complex — maps state back to output channels
@@ -382,39 +374,48 @@ class S6(nn.Module):
         self.c_norm = RMSNorm(self.n)
         self.c_bias = nn.Parameter(torch.ones(self.n))
 
-        # Post-readout norm (before attention residual)
-        self.readout_norm = RMSNorm(self.h)
+        # Attention over shared hidden state
+        self.attn = S6Attention(d_model, d_state, num_heads=num_heads)
 
-        # Attention (80/20 weight sharing with phi_B and c_proj)
-        self.attn = S6Attention(d_model, d_state, M=M, num_heads=num_heads,
-                                phi_B=self.kernel.phi_B, c_proj=self.c_proj)
+        # Learned gate to mix SSM and attention outputs
+        # Initialized to 0.5 for equal mixing, projects from input for data-dependent gating
+        self.mix_gate = nn.Linear(d_model, d_model, bias=True)
+        with torch.no_grad():
+            self.mix_gate.weight.zero_()
+            self.mix_gate.bias.fill_(0.0)  # sigmoid(0) = 0.5
+
+        # Output norm
+        self.out_norm = RMSNorm(d_model)
 
     def forward(self, u, **kwargs):
         """ Input and output shape (B, L, H) """
         B, L, H = u.shape
 
-        # msconv first
-        x = self.msconv(u)
+        # Run SSM scan directly on input (no conv preprocessing)
+        h, cum_theta = self.kernel(u)  # h: (B, L, P) complex
 
-        # Run SSM scan (phi_B computed internally by kernel)
-        h, cum_theta = self.kernel(x)
-
+        # === SSM Path ===
         # Input-dependent C gating + static C readout
-        c_proj_out = self.c_proj(x)  # (B, L, P)
+        c_proj_out = self.c_proj(u)  # (B, L, P)
         c_gate = self.c_norm(F.silu(c_proj_out)) + self.c_bias  # (B, L, P)
         c_gate = apply_rotary_emb(c_gate, cum_theta)  # rotate to match state
         h_gated = h * c_gate  # (B, L, P) — input-dependent selection of state dims
 
         # MIMO readout: (H, P) complex @ (B, L, P) complex -> (B, L, H), take real
         C = torch.view_as_complex(self.C)  # (H, P)
-        y = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
+        y_ssm = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
-        # Skip connection + activation
-        y = y + x * self.D
-        y = F.silu(y)
+        # === Attention Path ===
+        # Use real part of h for attention (Q from u, K/V from h)
+        h_real = h.real.float()  # (B, L, P)
+        y_attn = self.attn(u, h_real)  # (B, L, H)
 
-        # Post-readout norm + residual + attention
-        y_normed = self.readout_norm(y) + x
-        y = self.attn(x, y_normed)
+        # === Mix SSM and Attention with learned gate ===
+        gate = torch.sigmoid(self.mix_gate(u))  # (B, L, H) data-dependent gate
+        y = gate * y_ssm + (1 - gate) * y_attn
+
+        # Skip connection + activation + norm
+        y = y + u * self.D
+        y = self.out_norm(F.silu(y))
 
         return y
