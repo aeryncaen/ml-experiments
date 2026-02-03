@@ -2109,24 +2109,15 @@ class TritonS6(nn.Module):
         s6 = self._pytorch_s6
         kern = s6.kernel
 
-        # 1. Multi-scale conv (Triton fused) — before SSM
         B_size, L_size, H = u.shape
-        msconv = s6.msconv
-        x = _TritonMSConv.apply(
-            u,
-            msconv.convs[0].weight, msconv.convs[0].bias,
-            msconv.convs[1].weight, msconv.convs[1].bias,
-            msconv.convs[2].weight, msconv.convs[2].bias,
-            msconv.se.fc1.weight, msconv.se.fc2.weight,
-            msconv.group_size,
-        )  # (B, L, H)
+        P = self.P
 
-        # 2. phi_B projection (Triton)
+        # 1. phi_B projection (Triton) — directly on input u
         phi = kern.phi_B
         mlp = phi.channel_mlp
         N_rows = B_size * L_size
         raw = _TritonPhiB.apply(
-            x.reshape(N_rows, H),
+            u.reshape(N_rows, H),
             phi.W, phi.b,
             mlp.fc1.weight, mlp.fc1.bias,
             mlp.fc2.weight, mlp.fc2.bias,
@@ -2140,29 +2131,30 @@ class TritonS6(nn.Module):
             raw = (raw_3d * sc.view(1, 1, phi.L)).view(N_rows, -1)
         Bu_raw = (raw * phi.scale).view(B_size, L_size, -1)  # (B, L, P)
 
-        # 3. SSM core (Triton) — operates on x (post-msconv)
+        # 2. SSM scan (PyTorch) — we need h for attention, Triton kernel doesn't expose it
+        h, cum_theta = kern(u, Bu_raw=Bu_raw)  # Pass pre-computed Bu_raw
+
+        # 3. SSM Path: C readout with gating (PyTorch)
+        c_proj_out = s6.c_proj(u)
+        c_gate = s6.c_norm(torch.nn.functional.silu(c_proj_out)) + s6.c_bias
+        from .s6 import apply_rotary_emb
+        c_gate = apply_rotary_emb(c_gate, cum_theta)
+        h_gated = h * c_gate
+
         C = torch.view_as_complex(s6.C)
-        C_re = C.real.contiguous()
-        C_im = C.imag.contiguous()
+        y_ssm = torch.einsum('hp,blp->blh', C, h_gated.to(C.dtype)).real
 
-        y_ssm = _TritonS6.apply(
-            x,
-            Bu_raw,
-            kern.x_proj.weight, kern.x_proj.bias,
-            kern.b_norm.weight, kern.b_bias, kern.log_dt_bias,
-            kern.log_A_real, kern.A_imag,
-            s6.c_proj.weight, s6.c_proj.bias,
-            s6.c_norm.weight, s6.c_bias,
-            C_re, C_im,
-            s6.D,
-            self.P, self.chunk_size,
-        )
+        # 4. Attention Path (PyTorch): Q from u, K/V from h.real
+        h_real = h.real.float()
+        y_attn = s6.attn(u, h_real)
 
-        # 4. Post-readout norm + residual from x (post-msconv)
-        y_normed = s6.readout_norm(y_ssm) + x
+        # 5. Mix SSM and Attention with learned gate
+        gate = torch.sigmoid(s6.mix_gate(u))
+        y = gate * y_ssm + (1 - gate) * y_attn
 
-        # 5. Attention (PyTorch)
-        y = s6.attn(x, y_normed)
+        # 6. Skip connection + activation + norm
+        y = y + u * s6.D
+        y = s6.out_norm(torch.nn.functional.silu(y))
 
         return y
 
