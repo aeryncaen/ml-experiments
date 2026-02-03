@@ -936,6 +936,35 @@ def diff_attn(q1, k1, q2, k2, v, diff_lambda, seqlens, max_len, attn_scale, bm_s
     return a1 - diff_lambda * a2
 
 
+# -----------------------------------------------------------------------------
+# Linear Attention MLP - ReLU² serves as both activation and attention kernel
+# Allows token mixing inside MLP (like gMLP's spatial gating unit)
+
+def linear_attn_relu2(q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    Linear attention with ReLU² feature map.
+    Uses element-wise formulation for efficiency.
+    
+    Args:
+        q, k, v: (B, T, H, D) tensors
+    Returns:
+        o: (B, T, H, D) output
+    """
+    # Apply ReLU² feature map
+    q = F.relu(q) ** 2
+    k = F.relu(k) ** 2
+    
+    # Cumulative KV (element-wise linear attention)
+    kv = k * v  # (B, T, H, D)
+    kv_cumsum = kv.cumsum(dim=1)  # (B, T, H, D)
+    k_cumsum = k.cumsum(dim=1)  # (B, T, H, D)
+    
+    # Output with normalization
+    o = q * kv_cumsum
+    norm = (q * k_cumsum).sum(dim=-1, keepdim=True) + eps
+    return o / norm
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False, use_diff_attn: bool = False, layer_idx: int = 0):
         super().__init__()
@@ -1031,29 +1060,68 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self):
+    def __init__(self, use_linear_attn: bool = False, dim: int = 768, num_heads: int = 12):
         super().__init__()
+        self.use_linear_attn = use_linear_attn
         # Weights are stored in parameter banks and passed via forward()
+        
+        if use_linear_attn:
+            # Linear attention MLP config
+            self.dim = dim
+            self.hidden_dim = 2 * dim  # 1536 to match param count
+            self.num_heads = num_heads
+            self.head_dim = self.hidden_dim // num_heads  # 128
 
-    def forward(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
-        # relu(x)^2:
-        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+    def forward(self, x: Tensor, c_fc: Tensor = None, c_proj: Tensor = None,
+                w_qkv: Tensor = None, w_out: Tensor = None):
+        if self.use_linear_attn:
+            return self._forward_linear_attn(x, w_qkv, w_out)
+        else:
+            # relu(x)^2:
+            # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+            # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
+            return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+    
+    def _forward_linear_attn(self, x: Tensor, w_qkv: Tensor, w_out: Tensor) -> Tensor:
+        """Linear attention MLP: token mixing via ReLU² attention kernel."""
+        B, T, _ = x.shape
+        
+        # Project to Q, K, V
+        qkv = F.linear(x, w_qkv)  # (B, T, 3 * hidden_dim)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape to heads
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+        v = v.view(B, T, self.num_heads, self.head_dim)
+        
+        # Linear attention with ReLU² kernel
+        o = linear_attn_relu2(q, k, v)
+        
+        # Reshape and project output
+        o = o.view(B, T, self.hidden_dim)
+        return F.linear(o, w_out)
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool, use_diff_attn: bool = False, layer_idx: int = 0):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool, 
+                 use_diff_attn: bool = False, layer_idx: int = 0, use_linear_attn_mlp: bool = False):
         super().__init__()
+        self.use_linear_attn_mlp = use_linear_attn_mlp
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head, use_diff_attn=use_diff_attn, layer_idx=layer_idx) if has_attn else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP() if has_mlp else None
+        self.mlp = MLP(use_linear_attn=use_linear_attn_mlp, dim=dim, num_heads=num_heads) if has_mlp else None
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, 
+                c_fc: Tensor = None, c_proj: Tensor = None,
+                w_qkv: Tensor = None, w_out: Tensor = None):
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
+            if self.use_linear_attn_mlp:
+                x = x + self.mlp(norm(x), w_qkv=w_qkv, w_out=w_out)
+            else:
+                x = x + self.mlp(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1069,10 +1137,12 @@ class ForwardScheduleConfig:
     ws_long: int
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, use_diff_attn: bool = False):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, 
+                 use_diff_attn: bool = False, use_linear_attn_mlp: bool = False):
         super().__init__()
         self.num_layers = num_layers
         self.use_diff_attn = use_diff_attn
+        self.use_linear_attn_mlp = use_linear_attn_mlp
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -1125,17 +1195,36 @@ class GPT(nn.Module):
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         # Reshape for sharding: (24, 3072, 768)
         num_mlp_with_padding = len(self.mlp_layer_indices) + 1  # 11 + 1 = 12
-        self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
-        self.mlp_bank.label = 'mlp'
-        self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
+        
+        if use_linear_attn_mlp:
+            # Linear attention MLP banks: w_qkv and w_out per layer
+            # hidden_dim = 2 * model_dim = 1536 to match param count
+            # w_qkv: (3 * hidden_dim, model_dim) = (4608, 768) 
+            # w_out: (model_dim, hidden_dim) = (768, 1536)
+            linear_attn_hidden = 2 * model_dim  # 1536
+            self.linear_attn_qkv_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 3 * linear_attn_hidden, model_dim))
+            self.linear_attn_qkv_bank.label = 'linear_attn_qkv'
+            self.linear_attn_out_bank = nn.Parameter(torch.empty(num_mlp_with_padding, model_dim, linear_attn_hidden))
+            self.linear_attn_out_bank.label = 'linear_attn_out'
+            self.mlp_bank = None  # Not used in linear attention mode
+        else:
+            self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
+            self.mlp_bank.label = 'mlp'
+            self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
+            self.linear_attn_qkv_bank = None
+            self.linear_attn_out_bank = None
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
             self.attn_bank.uniform_(-bound, bound)
-            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
-            self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            if use_linear_attn_mlp:
+                self.linear_attn_qkv_bank.uniform_(-bound, bound)
+                self.linear_attn_out_bank.zero_()  # Zero init for residual
+            else:
+                self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
+                self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
         # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
@@ -1145,7 +1234,8 @@ class GPT(nn.Module):
                   has_mlp=(i in self.layer_to_mlp_idx),
                   use_paired_head=(i in self.paired_head_layers),
                   use_diff_attn=use_diff_attn,
-                  layer_idx=i)
+                  layer_idx=i,
+                  use_linear_attn_mlp=use_linear_attn_mlp)
             for i in range(num_layers)
         ])
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1240,8 +1330,14 @@ class GPT(nn.Module):
 
         # unbind weight banks to avoid select_backwards kernel
         attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
-        mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
-        mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+        if self.use_linear_attn_mlp:
+            mlp_qkvs = self.linear_attn_qkv_bank.unbind(0)  # tuple of [3*hidden, dim] tensors
+            mlp_outs = self.linear_attn_out_bank.unbind(0)  # tuple of [dim, hidden] tensors
+            mlp_fcs = mlp_projs = [None] * len(mlp_qkvs)  # Not used
+        else:
+            mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+            mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+            mlp_qkvs = mlp_outs = [None] * len(mlp_fcs)  # Not used
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
@@ -1265,10 +1361,13 @@ class GPT(nn.Module):
 
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
-            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
+            mlp_idx = self.layer_to_mlp_idx[i] if i in self.layer_to_mlp_idx else None
+            c_fc = mlp_fcs[mlp_idx] if mlp_idx is not None else None
+            c_proj = mlp_projs[mlp_idx] if mlp_idx is not None else None
+            w_qkv = mlp_qkvs[mlp_idx] if mlp_idx is not None else None
+            w_out = mlp_outs[mlp_idx] if mlp_idx is not None else None
 
-            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
+            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj, w_qkv, w_out)
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1491,6 +1590,9 @@ class Hyperparameters:
     bigram_vocab_size: int = 50304 * 5
     # differential attention (arXiv:2410.05258) - cancels attention noise via (softmax(Q1K1) - λ*softmax(Q2K2)) * V
     use_diff_attn: bool = False
+    # linear attention MLP - replaces relu²(x @ W1) @ W2 with linear attention using ReLU² as kernel
+    # allows token mixing inside MLP, similar to gMLP's spatial gating
+    use_linear_attn_mlp: bool = False
 
 args = Hyperparameters()
 
@@ -1760,17 +1862,24 @@ model: nn.Module = GPT(
     head_dim=128,
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-    use_diff_attn=args.use_diff_attn
+    use_diff_attn=args.use_diff_attn,
+    use_linear_attn_mlp=args.use_linear_attn_mlp
 ).cuda()
 if args.use_diff_attn:
     print0("Using Differential Attention (arXiv:2410.05258)", console=True)
+if args.use_linear_attn_mlp:
+    print0("Using Linear Attention MLP (ReLU² kernel)", console=True)
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
-model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+if args.use_linear_attn_mlp:
+    model.linear_attn_qkv_bank.data = model.linear_attn_qkv_bank.data.bfloat16()
+    model.linear_attn_out_bank.data = model.linear_attn_out_bank.data.bfloat16()
+else:
+    model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
