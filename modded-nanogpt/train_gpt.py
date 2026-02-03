@@ -1738,9 +1738,6 @@ class TrainingManager():
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "linear_attn_qkv": {"optim": "normuon", "comms": "sharded",   "adam_betas": None},  # Linear attn MLP
-            "linear_attn_out": {"optim": "normuon", "comms": "sharded",   "adam_betas": None},  # Linear attn MLP
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
@@ -1751,17 +1748,33 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "diff_attn_lambda": {"optim": "adam",  "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0},  # Diff attn learnable λ
         }
+        
+        # Conditionally add MLP params based on mode
+        if args.use_linear_attn_mlp:
+            self.param_table["linear_attn_qkv"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
+            self.param_table["linear_attn_out"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
+        else:
+            self.param_table["mlp"] = {"optim": "normuon", "comms": "sharded", "adam_betas": None}
+        
+        # Conditionally add diff attention lambda params
+        if args.use_diff_attn:
+            self.param_table["diff_attn_lambda"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0}
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas", "diff_attn_lambda",  # Small, fast
-            "value_embed", "bigram_embed",  # Medium
-            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp", "linear_attn_qkv", "linear_attn_out",  # Large, polar express - process last to maximize overlap
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
         ]
+        if args.use_diff_attn:
+            self.work_order.append("diff_attn_lambda")
+        self.work_order.extend(["value_embed", "bigram_embed"])  # Medium
+        self.work_order.extend(["lm_head", "embed"])  # lm_head must complete before embed sync (when tied)
+        self.work_order.append("attn")  # Large
+        if args.use_linear_attn_mlp:
+            self.work_order.extend(["linear_attn_qkv", "linear_attn_out"])
+        else:
+            self.work_order.append("mlp")
 
         adam_defaults = dict(
             lr=0.008,
