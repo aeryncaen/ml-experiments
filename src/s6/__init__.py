@@ -1,7 +1,10 @@
-from .s6 import S6
+"""
+S6: Unified Sequence Block (USB) Implementation
 
-try:
-    from .triton_s6 import TritonS6, HAS_TRITON
-except ImportError:
-    TritonS6 = None
-    HAS_TRITON = False
+A fused architecture combining SSM-style scans, attention, and MLP
+into a single expand-process-contract block.
+"""
+
+from .usb_block import USBBlock, USBConfig
+
+__all__ = ["USBBlock", "USBConfig"]

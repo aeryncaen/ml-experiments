@@ -1,96 +1,246 @@
-"""Parallel associative scan for S6.
+"""
+Sequential scan implementations for USB.
 
-Binary operator: (a_i, b_i) ⊕ (a_j, b_j) = (a_j * a_i, a_j * b_i + b_j)
-Where a = decay (complex diagonal), b = injection (complex).
-
-Chunked scan: within each chunk, build a (K,K) decay matrix and use cuBLAS matmul
-for the intra-chunk work. Carry state between chunks sequentially.
+These are reference implementations - will be optimized with parallel/associative
+scans later (e.g., via Triton kernels).
 """
 
 import torch
+from typing import Optional, List
 
 
-def sequential_scan(alpha: torch.Tensor, inject: torch.Tensor) -> torch.Tensor:
-    """Sequential scan fallback. O(L) with no parallelism.
-
-    Args:
-        alpha:  (B, L, P) — decay per position
-        inject: (B, L, P) — injection per position
-
-    Returns:
-        h: (B, L, P) — all hidden states
+def forward_scan(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    c2: torch.Tensor,
+    init_state: torch.Tensor,
+) -> torch.Tensor:
     """
-    B, L, P = alpha.shape
-    h = torch.zeros(B, P, dtype=alpha.dtype, device=alpha.device)
-    out = torch.empty_like(inject)
-    for t in range(L):
-        h = alpha[:, t] * h + inject[:, t]
-        out[:, t] = h
-    return out
-
-
-def chunked_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
-    """Chunked parallel scan. Intra-chunk via decay matrix matmul (cuBLAS), inter-chunk sequential.
-
-    Args:
-        alpha:  (B, L, P) — decay per position
-        inject: (B, L, P) — injection per position
-        chunk_size: K — positions per chunk
-
-    Returns:
-        h: (B, L, P) — all hidden states
-    """
-    B, L, P = alpha.shape
-    device = alpha.device
-    dtype = alpha.dtype
-    out = torch.empty_like(inject)
-    state = torch.zeros(B, P, dtype=dtype, device=device)
-
-    for chunk_start in range(0, L, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, L)
-        K = chunk_end - chunk_start
-
-        a_chunk = alpha[:, chunk_start:chunk_end]   # (B, K, P)
-        u_chunk = inject[:, chunk_start:chunk_end]   # (B, K, P)
-
-        # Build (K, K) causal decay matrix per batch per state dim
-        # decay[i,j] = prod_{t=j+1}^{i} alpha[t] for j < i, 1 for j == i, 0 for j > i
-        # Use cumulative log-sum trick (works for complex alpha too)
-        log_a = torch.log(a_chunk)  # (B, K, P)
-        log_a_cumsum = torch.cumsum(log_a, dim=1)     # (B, K, P)
-
-        # decay[i,j,p] = exp(cumsum[i,p] - cumsum[j,p]) for j <= i
-        # (B, K, 1, P) - (B, 1, K, P) -> (B, K, K, P)
-        log_decay = log_a_cumsum.unsqueeze(2) - log_a_cumsum.unsqueeze(1)  # (B, K, K, P)
-
-        # Causal mask: zero out j > i
-        causal = torch.tril(torch.ones(K, K, device=device, dtype=dtype))  # (K, K)
-        decay = torch.exp(log_decay) * causal.unsqueeze(0).unsqueeze(-1)  # (B, K, K, P)
-
-        # Intra-chunk: h_from_input[i] = sum_{j<=i} decay[i,j] * inject[j]
-        # (B, K, K, P) @ (B, K, P) -> need einsum
-        h_from_input = torch.einsum('bijk,bjk->bik', decay, u_chunk)  # (B, K, P)
-
-        # Carry from previous chunk: decay each position's state
-        # carry[i] = exp(cumsum[i]) * state = prod_{t=0}^{i} alpha[t] * state
-        carry_decay = torch.exp(log_a_cumsum)  # (B, K, P)
-        h_from_state = carry_decay * state.unsqueeze(1)  # (B, K, P)
-
-        h_chunk = h_from_input + h_from_state  # (B, K, P)
-        out[:, chunk_start:chunk_end] = h_chunk
-
-        # Update state for next chunk
-        state = h_chunk[:, -1]  # (B, P)
-
-    return out
-
-
-def parallel_scan(alpha: torch.Tensor, inject: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
-    """Parallel scan. Currently uses sequential due to numerical issues in chunked version.
+    Forward causal scan with AB-2 integration.
     
-    The chunked scan uses log-space computation which overflows when alpha is very small
-    (e.g., exp(-16) per step) and we compute cumulative products over many steps.
-    TODO: Implement numerically stable chunked scan or use Triton kernel.
+    Starts at t=0, moves forward. Integrates current position and two steps back.
+    
+    state_t = c0[t] * kv_t
+            + c1[t] * (α[t]   * state_{t-1} + kv_{t-1})
+            + c2[t] * (α[t]²  * state_{t-2} + kv_{t-2})
+    
+    Args:
+        kv: (batch, seq_len, nheads, headdim) - K·V product
+        alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
+        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        init_state: (batch, nheads, headdim) - learned initial state
+    
+    Returns:
+        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
     """
-    # Sequential is numerically stable, just slower
-    return sequential_scan(alpha, inject)
+    batch, seq_len, nheads, headdim = kv.shape
+    device = kv.device
+    dtype = kv.dtype
+    
+    # Collect states in a list to avoid inplace ops
+    state_list: List[torch.Tensor] = []
+    
+    # State history (need t-1 and t-2)
+    state_tm1 = init_state  # (batch, nheads, headdim)
+    state_tm2 = torch.zeros_like(init_state)
+    
+    # KV history
+    kv_tm1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    kv_tm2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    
+    for t in range(seq_len):
+        kv_t = kv[:, t]  # (batch, nheads, headdim)
+        alpha_t = alpha[:, t, :, None]  # (batch, nheads, 1)
+        c0_t = c0[:, t, :, None]  # (batch, nheads, 1)
+        c1_t = c1[:, t, :, None]
+        c2_t = c2[:, t, :, None]
+        
+        # AB-2 integration
+        state_t = (
+            c0_t * kv_t
+            + c1_t * (alpha_t * state_tm1 + kv_tm1)
+            + c2_t * (alpha_t.pow(2) * state_tm2 + kv_tm2)
+        )
+        
+        state_list.append(state_t)
+        
+        # Shift history
+        state_tm2 = state_tm1
+        state_tm1 = state_t
+        kv_tm2 = kv_tm1
+        kv_tm1 = kv_t
+    
+    # Stack along seq dimension
+    return torch.stack(state_list, dim=1)
+
+
+def backward_scan(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    c2: torch.Tensor,
+    init_state: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Backward causal scan with AB-2 integration.
+    
+    Starts at t=T-1 (end), moves backward. Integrates current position and two steps forward.
+    
+    state_t = c0[t] * kv_t
+            + c1[t] * (α[t]   * state_{t+1} + kv_{t+1})
+            + c2[t] * (α[t]²  * state_{t+2} + kv_{t+2})
+    
+    Args:
+        kv: (batch, seq_len, nheads, headdim) - K·V product
+        alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
+        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        init_state: (batch, nheads, headdim) - learned initial state
+    
+    Returns:
+        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
+    """
+    batch, seq_len, nheads, headdim = kv.shape
+    device = kv.device
+    dtype = kv.dtype
+    
+    # Collect states in a list (will be reversed)
+    state_list: List[torch.Tensor] = []
+    
+    # State history (need t+1 and t+2)
+    state_tp1 = init_state  # (batch, nheads, headdim)
+    state_tp2 = torch.zeros_like(init_state)
+    
+    # KV history
+    kv_tp1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    kv_tp2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    
+    for t in range(seq_len - 1, -1, -1):
+        kv_t = kv[:, t]  # (batch, nheads, headdim)
+        alpha_t = alpha[:, t, :, None]  # (batch, nheads, 1)
+        c0_t = c0[:, t, :, None]  # (batch, nheads, 1)
+        c1_t = c1[:, t, :, None]
+        c2_t = c2[:, t, :, None]
+        
+        # AB-2 integration (backward direction)
+        state_t = (
+            c0_t * kv_t
+            + c1_t * (alpha_t * state_tp1 + kv_tp1)
+            + c2_t * (alpha_t.pow(2) * state_tp2 + kv_tp2)
+        )
+        
+        state_list.append(state_t)
+        
+        # Shift history
+        state_tp2 = state_tp1
+        state_tp1 = state_t
+        kv_tp2 = kv_tp1
+        kv_tp1 = kv_t
+    
+    # Reverse and stack (we collected in reverse order)
+    state_list.reverse()
+    return torch.stack(state_list, dim=1)
+
+
+def centered_scan(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    c2: torch.Tensor,
+    init_state: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Centered scan with AB-2 integration.
+    
+    Starts at midpoint, propagates outward in both directions simultaneously.
+    Integrates current position, one step back, and one step forward.
+    
+    state_t = c0[t] * kv_t
+            + c1[t] * (α[t] * state_{t-1} + kv_{t-1})
+            + c2[t] * (α[t] * state_{t+1} + kv_{t+1})
+    
+    Note: Both directions use α[t] (not α[t]²) since it's one step each way.
+    
+    Args:
+        kv: (batch, seq_len, nheads, headdim) - K·V product
+        alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
+        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        init_state: (batch, nheads, headdim) - learned initial state
+    
+    Returns:
+        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
+    """
+    batch, seq_len, nheads, headdim = kv.shape
+    device = kv.device
+    dtype = kv.dtype
+    
+    # Use a dict to store states by position (avoids inplace ops)
+    state_dict = {}
+    
+    # Start from the middle
+    mid = seq_len // 2
+    
+    # Initialize the center position
+    kv_mid = kv[:, mid]
+    c0_mid = c0[:, mid, :, None]
+    state_dict[mid] = c0_mid * kv_mid
+    
+    # Expand outward from center
+    # We process positions in order of distance from center
+    for dist in range(1, max(mid + 1, seq_len - mid)):
+        # Left side: mid - dist
+        left_idx = mid - dist
+        if left_idx >= 0:
+            kv_t = kv[:, left_idx]
+            alpha_t = alpha[:, left_idx, :, None]
+            c0_t = c0[:, left_idx, :, None]
+            c1_t = c1[:, left_idx, :, None]
+            c2_t = c2[:, left_idx, :, None]
+            
+            # Get neighbors (inward = toward center)
+            # t-1 is further from center (may not exist yet or be at boundary)
+            # t+1 is toward center (already computed)
+            kv_tm1 = kv[:, left_idx - 1] if left_idx > 0 else torch.zeros_like(kv_t)
+            kv_tp1 = kv[:, left_idx + 1]
+            
+            state_tm1 = state_dict.get(left_idx - 1, init_state)
+            state_tp1 = state_dict[left_idx + 1]  # Already computed (closer to center)
+            
+            state_t = (
+                c0_t * kv_t
+                + c1_t * (alpha_t * state_tm1 + kv_tm1)
+                + c2_t * (alpha_t * state_tp1 + kv_tp1)
+            )
+            state_dict[left_idx] = state_t
+        
+        # Right side: mid + dist
+        right_idx = mid + dist
+        if right_idx < seq_len:
+            kv_t = kv[:, right_idx]
+            alpha_t = alpha[:, right_idx, :, None]
+            c0_t = c0[:, right_idx, :, None]
+            c1_t = c1[:, right_idx, :, None]
+            c2_t = c2[:, right_idx, :, None]
+            
+            # Get neighbors (inward = toward center)
+            # t+1 is further from center (may not exist yet or be at boundary)
+            # t-1 is toward center (already computed)
+            kv_tp1 = kv[:, right_idx + 1] if right_idx < seq_len - 1 else torch.zeros_like(kv_t)
+            kv_tm1 = kv[:, right_idx - 1]
+            
+            state_tp1 = state_dict.get(right_idx + 1, init_state)
+            state_tm1 = state_dict[right_idx - 1]  # Already computed (closer to center)
+            
+            state_t = (
+                c0_t * kv_t
+                + c1_t * (alpha_t * state_tm1 + kv_tm1)
+                + c2_t * (alpha_t * state_tp1 + kv_tp1)
+            )
+            state_dict[right_idx] = state_t
+    
+    # Collect in order and stack
+    state_list = [state_dict[i] for i in range(seq_len)]
+    return torch.stack(state_list, dim=1)
