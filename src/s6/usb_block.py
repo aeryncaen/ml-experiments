@@ -22,7 +22,7 @@ class USBConfig:
     d_model: int
     headdim: int = 64
     expansion_factor: int = 2
-    qkv_rank: int = 16  # Rank for per-group low-rank QKV deltas (0 = no sharing, use fused)
+    kv_heads: int = 0  # Number of KV heads. 0 = same as Q (full), 1 = MQA, in between = GQA
     paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
     
     # Derived dimensions
@@ -42,74 +42,11 @@ class USBConfig:
     @property
     def nheads_total(self) -> int:
         return self.nheads_per_group * 4
-
-
-class LowRankQKVProjection(nn.Module):
-    """
-    QKV projection with shared base + per-group low-rank deltas.
     
-    output_i = W_base @ x + (W_down_i @ W_up_i) @ x
-    
-    - W_base: shared across all groups (bulk of params/compute)
-    - W_down_i, W_up_i: per-group low-rank delta (allows specialization)
-    
-    Key difference from dimension-sharing: each group gets DIFFERENT outputs
-    while sharing the bulk of the weights. The delta starts at zero so
-    initially all groups behave the same, then specialize during training.
-    """
-    
-    def __init__(self, d_input: int, d_group: int, n_groups: int = 4, rank: int = 16):
-        super().__init__()
-        self.d_input = d_input
-        self.d_group = d_group
-        self.n_groups = n_groups
-        self.rank = rank
-        
-        # Shared base projection: d_input -> 3 * d_group (Q, K, V for one group)
-        # This is reused for all groups
-        self.qkv_base = nn.Linear(d_input, 3 * d_group, bias=False)
-        
-        # Per-group low-rank deltas: W_delta = W_down @ W_up
-        # W_down: (d_input, rank), W_up: (rank, 3 * d_group)
-        # Initialize W_down small, W_up to zero -> delta starts at zero
-        self.qkv_down = nn.ParameterList([
-            nn.Parameter(torch.randn(d_input, rank) * 0.01)
-            for _ in range(n_groups)
-        ])
-        self.qkv_up = nn.ParameterList([
-            nn.Parameter(torch.zeros(rank, 3 * d_group))
-            for _ in range(n_groups)
-        ])
-        
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (batch, seq_len, d_input)
-        
-        Returns:
-            Q, K, V: each (batch, seq_len, n_groups * d_group)
-        """
-        # Shared base (computed once, reused)
-        base = self.qkv_base(x)  # (batch, seq, 3 * d_group)
-        
-        q_groups, k_groups, v_groups = [], [], []
-        for i in range(self.n_groups):
-            # Low-rank delta for this group: x @ W_down @ W_up
-            delta = x @ self.qkv_down[i] @ self.qkv_up[i]  # (batch, seq, 3 * d_group)
-            
-            # Combine: base + delta (different output per group!)
-            qkv_i = base + delta
-            q_i, k_i, v_i = qkv_i.chunk(3, dim=-1)
-            
-            q_groups.append(q_i)
-            k_groups.append(k_i)
-            v_groups.append(v_i)
-        
-        Q = torch.cat(q_groups, dim=-1)  # (batch, seq_len, n_groups * d_group)
-        K = torch.cat(k_groups, dim=-1)
-        V = torch.cat(v_groups, dim=-1)
-        
-        return Q, K, V
+    @property
+    def nkv_heads(self) -> int:
+        """Actual number of KV heads (0 means same as Q heads)."""
+        return self.kv_heads if self.kv_heads > 0 else self.nheads_total
 
 
 class GatedRMSNorm(nn.Module):
@@ -234,29 +171,25 @@ class USBBlock(nn.Module):
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: QKV projection
-        if config.qkv_rank > 0:
-            # Low-rank sharing: shared base + per-group low-rank deltas
-            self.qkv_proj = LowRankQKVProjection(
-                d_input=d_expanded,
-                d_group=d_group,
-                n_groups=4,
-                rank=config.qkv_rank,
-            )
-        else:
-            # No sharing: simple fused QKV projection
-            self.qkv_proj = nn.Linear(d_expanded, 3 * d_expanded, bias=False)
-        self._use_fused_qkv = config.qkv_rank == 0
+        # Step 2: QKV projection with MQA/GQA support
+        # Q: always nheads_total heads
+        # K, V: nkv_heads (1 = MQA, nheads_total = full MHA, in between = GQA)
+        nkv_heads = config.nkv_heads
+        d_kv = nkv_heads * headdim
+        
+        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)  # -> nheads_total * headdim
+        self.k_proj = nn.Linear(d_expanded, d_kv, bias=False)  # -> nkv_heads * headdim
+        self.v_proj = nn.Linear(d_expanded, d_kv, bias=False)  # -> nkv_heads * headdim
+        self._nkv_heads = nkv_heads
         
         # Gated RMSNorm for Q, K, V
         self.q_norm = GatedRMSNorm(d_expanded)
-        self.k_norm = GatedRMSNorm(d_expanded)
-        self.v_norm = GatedRMSNorm(d_expanded)
+        self.k_norm = GatedRMSNorm(d_kv)
+        self.v_norm = GatedRMSNorm(d_kv)
         
         # QK bias (per-head, initialized to 1.0)
-        # 4 groups, each with nheads_per_group heads
         self.q_bias = nn.Parameter(torch.ones(config.nheads_total, headdim))
-        self.k_bias = nn.Parameter(torch.ones(config.nheads_total, headdim))
+        self.k_bias = nn.Parameter(torch.ones(nkv_heads, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
         # G4 is passthrough, no scan parameters needed
@@ -304,29 +237,31 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: QKV projection
-        if self._use_fused_qkv:
-            # Simple fused: split output into Q, K, V
-            qkv = self.qkv_proj(x_exp)  # (batch, seq_len, 3 * d_expanded)
-            qkv = rearrange(qkv, 'b t (three d) -> three b t d', three=3)
-            q_raw, k_raw, v_raw = qkv[0], qkv[1], qkv[2]
-        else:
-            # Low-rank: returns tuple directly
-            q_raw, k_raw, v_raw = self.qkv_proj(x_exp)  # each (batch, seq_len, d_expanded)
+        # Step 2: QKV projection (supports MQA/GQA via kv_heads)
+        q_raw = self.q_proj(x_exp)  # (batch, seq_len, d_expanded)
+        k_raw = self.k_proj(x_exp)  # (batch, seq_len, nkv_heads * headdim)
+        v_raw = self.v_proj(x_exp)  # (batch, seq_len, nkv_heads * headdim)
         
         # Apply SiLU and gated RMSNorm
         q = self.q_norm(F.silu(q_raw))
         k = self.k_norm(F.silu(k_raw))
         v = self.v_norm(F.silu(v_raw))
         
-        # Reshape to heads for bias application
+        # Reshape to heads
+        nkv_heads = self._nkv_heads
         q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
-        k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
-        v = rearrange(v, 'b t (h d) -> b t h d', h=config.nheads_total)
+        k = rearrange(k, 'b t (h d) -> b t h d', h=nkv_heads)
+        v = rearrange(v, 'b t (h d) -> b t h d', h=nkv_heads)
         
         # Apply QK bias (after norm)
         q = q + self.q_bias
         k = k + self.k_bias
+        
+        # Expand K, V heads for GQA/MQA (repeat to match Q heads)
+        if nkv_heads < config.nheads_total:
+            n_rep = config.nheads_total // nkv_heads
+            k = repeat(k, 'b t h d -> b t (h rep) d', rep=n_rep)
+            v = repeat(v, 'b t h d -> b t (h rep) d', rep=n_rep)
         
         # Step 3: Channel split into 4 groups
         # Each group gets nheads_per_group heads
