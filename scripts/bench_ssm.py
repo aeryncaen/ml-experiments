@@ -170,14 +170,17 @@ from s6.usb_block import USBBlock, USBConfig
 
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, kv_heads=0, **kwargs):
+    def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, 
+                 kv_groups=2, q_shared_frac=0.5, kv_shared_frac=0.8, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
             paired_heads=paired_heads,
-            kv_heads=kv_heads,
+            kv_groups=kv_groups,
+            q_shared_frac=q_shared_frac,
+            kv_shared_frac=kv_shared_frac,
         )
         self.usb = USBBlock(config)
 
@@ -658,18 +661,19 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB (Unified Sequence Block): fused SSM + full attention (kv_heads=0 means same as Q)
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=0))
+    # USB (Unified Sequence Block): hierarchical weight sharing (default kv_groups=2)
+    # Q: 50% global shared, K/V: 80% per-group shared (soft GQA)
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
     
-    # USB-MQA: Multi-Query Attention (all Q heads share 1 KV head)
-    try_add('USB-MQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=1))
+    # USB-MQA: All K/V heads share 80% weights (single group, like soft MQA)
+    try_add('USB-MQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_groups=1))
     
-    # USB-GQA: Grouped-Query Attention (Q heads grouped, each group shares KV)
-    # With dim=64, headdim=32, expansion=2: nheads=4, so kv_heads=2 means 2 groups of 2
-    try_add('USB-GQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=2))
+    # USB-MHA: No weight sharing (full MHA expressivity)
+    try_add('USB-MHA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, 
+                                          kv_groups=4, q_shared_frac=0.0, kv_shared_frac=0.0))
     
     # USB-P: USB with paired head attention (cross-head mixing via position interleaving)
-    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True, kv_heads=0))
+    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
@@ -698,6 +702,8 @@ if __name__ == '__main__':
                         help='Specific models to test (default: all)')
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
                         help='Specific tasks to test (default: all)')
+    parser.add_argument('--csv', type=str, default=None,
+                        help='Output CSV file path (optional)')
     args = parser.parse_args()
 
     print(f"Device: {DEVICE}")
@@ -740,6 +746,9 @@ if __name__ == '__main__':
     print(header)
     print('-' * 100)
 
+    # Collect all results for CSV and summary
+    all_results = []
+
     task_pbar = tqdm(tasks, desc="Tasks", position=0)
     for task in task_pbar:
         task_pbar.set_description(f"Task: {task}")
@@ -756,6 +765,7 @@ if __name__ == '__main__':
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim, n_layers=n_layers, requested_models=[name])[name]
+            param_count = count_params(model)
             
             # Optionally compile the model
             if args.compile:
@@ -765,6 +775,68 @@ if __name__ == '__main__':
                            preloaded_data=task_data, early_stop_acc=args.early_stop_acc)
             status = "CONVERGED" if r['converged'] else "MAX_EPOCH"
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f} {status:>10}")
+            
+            # Store result
+            all_results.append({
+                'model': name,
+                'task': task,
+                'params': param_count,
+                'initial_loss': r['initial'],
+                'final_loss': r['final'],
+                'val_acc': r['acc'],
+                'epochs': r['epochs'],
+                'wall_s': r['wall_s'],
+                'peak_mem_mb': r['peak_mem_mb'],
+                'converged': r['converged'],
+                'status': status
+            })
         del task_data
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # Write CSV if requested
+    if args.csv:
+        import csv
+        with open(args.csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'model', 'task', 'params', 'initial_loss', 'final_loss', 
+                'val_acc', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'status'
+            ])
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\nResults written to {args.csv}")
+
+    # Print markdown summary table
+    print("\n" + "=" * 100)
+    print("## Benchmark Summary (Markdown)\n")
+    
+    # Build pivot table: models as rows, tasks as columns, val_acc as values
+    result_map = {}
+    for r in all_results:
+        result_map[(r['model'], r['task'])] = r
+    
+    # Header row
+    md_header = "| Model | Params |"
+    md_sep = "|:------|-------:|"
+    for task in tasks:
+        md_header += f" {task} |"
+        md_sep += "-------:|"
+    print(md_header)
+    print(md_sep)
+    
+    # Data rows
+    for name in all_names:
+        param_count = result_map.get((name, tasks[0]), {}).get('params', 0)
+        row = f"| {name} | {param_count:,} |"
+        for task in tasks:
+            r = result_map.get((name, task))
+            if r:
+                acc_str = f"{r['val_acc']:.1%}"
+                if r['converged']:
+                    acc_str = f"**{acc_str}**"
+                row += f" {acc_str} |"
+            else:
+                row += " - |"
+        print(row)
+    
+    print("\n*Bold = converged (>{:.0%} accuracy)*".format(args.early_stop_acc))
