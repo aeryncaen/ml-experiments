@@ -23,7 +23,7 @@ class USBConfig:
     headdim: int = 64
     expansion_factor: int = 2
     kv_groups: int = 2  # Number of KV groups for hierarchical sharing (0 = full MHA, no sharing)
-    q_shared_frac: float = 0.5  # Fraction of Q weights shared globally
+    q_shared_frac: float = 0.0  # Fraction of Q weights shared globally (0 = independent Q per head)
     kv_shared_frac: float = 0.8  # Fraction of KV weights shared within each group
     paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
     
