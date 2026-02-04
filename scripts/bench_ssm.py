@@ -1,9 +1,9 @@
-"""Benchmark DS1 vs S4D vs Mamba on SSM litmus tests.
+"""Benchmark DS1 vs S4D vs Mamba vs USB on SSM litmus tests.
 
 Tasks: delay-1, selective copy, induction head
 Metrics: final loss, param count, peak memory, wall time
 
-Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box)
+Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box), tqdm
 """
 
 import sys, os, time, math, random, hashlib
@@ -20,6 +20,7 @@ try:
 except Exception:
     HAS_PROFILER = False
 from einops import rearrange, repeat
+from tqdm import tqdm
 
 DETERMINISTIC = os.getenv("BENCH_DETERMINISTIC", "0") == "1"
 if DETERMINISTIC:
@@ -112,13 +113,20 @@ class S4D(nn.Module):
 # ---------------------------------------------------------------------------
 # S5 (PyTorch port from s5-pytorch checkout)
 # ---------------------------------------------------------------------------
-from s5.s5_model import S5 as S5Module
+try:
+    from s5.s5_model import S5 as S5Module
+    HAS_S5 = True
+except ImportError:
+    HAS_S5 = False
+    S5Module = None
 
 
 class S5Wrapper(nn.Module):
     """Wraps S5 to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, width, state_width=256):
         super().__init__()
+        if not HAS_S5:
+            raise ImportError("S5 not available. Install s5-pytorch.")
         self.s5 = S5Module(width=width, state_width=state_width)
 
     def forward(self, x):
@@ -128,13 +136,20 @@ class S5Wrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Mamba (real implementation from mamba checkout)
 # ---------------------------------------------------------------------------
-from mamba_ssm.modules.mamba_simple import Mamba
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba
+    HAS_MAMBA = True
+except ImportError:
+    HAS_MAMBA = False
+    Mamba = None
 
 
 class MambaWrapper(nn.Module):
     """Wraps Mamba to accept (B, L, D) and return (B, L, D)."""
     def __init__(self, d_model, **kwargs):
         super().__init__()
+        if not HAS_MAMBA:
+            raise ImportError("Mamba not available. Install mamba_ssm.")
         self.mamba = Mamba(d_model=d_model, use_fast_path=True, **kwargs)
 
     def forward(self, x):
@@ -148,27 +163,28 @@ from ds_moe.model import DS1, RMSNorm
 from heuristic_secrets.models.backbone import SEBlock
 
 # ---------------------------------------------------------------------------
-# S6
+# S6 / USB (Unified Sequence Block)
 # ---------------------------------------------------------------------------
-from s6.s6 import S6 as S6Module
-try:
-    from s6.triton_s6 import TritonS6 as TritonS6Module
-    HAS_TRITON_S6 = True
-except ImportError:
-    HAS_TRITON_S6 = False
+from s6.usb_block import USBBlock, USBConfig
 
 
-class S6Wrapper(nn.Module):
-    """Wraps S6 to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, d_state=64, M=4, use_triton=True, **kwargs):
+class USBWrapper(nn.Module):
+    """Wraps USB to accept (B, L, H) and return (B, L, H)."""
+    def __init__(self, d_model, headdim=64, expansion_factor=2, **kwargs):
         super().__init__()
-        if use_triton and HAS_TRITON_S6 and torch.cuda.is_available():
-            self.s6 = TritonS6Module(d_model=d_model, d_state=d_state, M=M, **kwargs)
-        else:
-            self.s6 = S6Module(d_model=d_model, d_state=d_state, M=M, **kwargs)
+        config = USBConfig(
+            d_model=d_model,
+            headdim=headdim,
+            expansion_factor=expansion_factor,
+        )
+        self.usb = USBBlock(config)
 
     def forward(self, x):
-        return self.s6(x)
+        return self.usb(x)
+
+
+# Legacy S6 wrapper for backward compatibility (now uses USB)
+S6Wrapper = USBWrapper
 
 
 class SwiGLUMLP(nn.Module):
@@ -384,7 +400,7 @@ def pregen_task_data(task_name, n_steps, B, L, seed, device='cpu'):
         np.random.seed(seed)
         torch.manual_seed(seed)
         batches = []
-        for _ in range(n_steps + 3):  # +3 for warmup
+        for _ in tqdm(range(n_steps + 3), desc=f"Generating {task_name}", leave=False):  # +3 for warmup
             if task_name == 'delay':
                 batches.append(gen_delay(B, L, vocab_size=32, device='cpu'))
             elif task_name == 'selective_copy':
@@ -488,8 +504,8 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         _step(i)[0].backward()
         opt.zero_grad(set_to_none=True)
 
-    # Module-level memory profiling (CUDA only, S6 only)
-    if device == 'cuda' and isinstance(model, S6Wrapper):
+    # Module-level memory profiling (CUDA only, USB/S6 only)
+    if device == 'cuda' and isinstance(model, USBWrapper):
         mem_stats = defaultdict(int)
         mem_baseline = {}
         hooks = []
@@ -524,8 +540,8 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         # for name, peak in top:
         #     print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
 
-    # Optional profiling for S6 on CUDA (forward + backward on one batch)
-    if device == 'cuda' and isinstance(model, S6Wrapper) and HAS_PROFILER:
+    # Optional profiling for USB on CUDA (forward + backward on one batch)
+    if device == 'cuda' and isinstance(model, USBWrapper) and HAS_PROFILER:
         for i in range(50):
             loss, _ = _step(i % 3)
             opt.zero_grad(set_to_none=True)
@@ -552,7 +568,8 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     t0 = time.perf_counter()
 
     accs = []
-    for step in range(n_steps):
+    pbar = tqdm(range(n_steps), desc="Training", leave=False, ncols=80)
+    for step in pbar:
         loss, acc = _step(3 + step)  # offset past warmup batches
 
         opt.zero_grad(set_to_none=True)
@@ -560,6 +577,9 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         opt.step()
         losses.append(loss.item())
         accs.append(acc)
+        
+        if step % 100 == 0:
+            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
 
     if device == 'cuda':
         torch.cuda.synchronize()
@@ -631,9 +651,9 @@ def make_models(dim, n_layers=1):
     # Mamba: ~51K params/layer
     models['Mamba'] = _stack(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2), n_layers, dim)
 
-    # S6: ~50K params/layer
-    models['S6'] = _stack(
-        lambda: S6Wrapper(d_model=dim, d_state=64, M=4, num_heads=4),
+    # USB (Unified Sequence Block, formerly S6): fused SSM + attention
+    models['USB'] = _stack(
+        lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2),
         n_layers, dim)
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
@@ -671,11 +691,16 @@ if __name__ == '__main__':
     print('-' * 90)
 
     all_names = list(models_info.keys())
-    for task in tasks:
-        print(f"Pregenerating {task} data...")
+    task_pbar = tqdm(tasks, desc="Tasks", position=0)
+    for task in task_pbar:
+        task_pbar.set_description(f"Task: {task}")
+        print(f"\nPregenerating {task} data...")
         task_data = pregen_task_data(task, n_steps, B, L, SEED, device=DEVICE)
         print(f"  {len(task_data)} batches ready on {DEVICE}")
-        for name in all_names:
+        
+        model_pbar = tqdm(all_names, desc="Models", position=1, leave=False)
+        for name in model_pbar:
+            model_pbar.set_description(f"Model: {name}")
             random.seed(SEED)
             np.random.seed(SEED)
             torch.manual_seed(SEED)
@@ -684,8 +709,7 @@ if __name__ == '__main__':
             model = make_models(dim, n_layers=n_layers)[name]
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data)
-            print(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
+            tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
         del task_data
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print()
