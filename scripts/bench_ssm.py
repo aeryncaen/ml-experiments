@@ -387,43 +387,59 @@ def _cache_key(task_name, n_steps, B, L, seed):
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def pregen_task_data(task_name, n_steps, B, L, seed, device='cpu'):
-    """Generate all batches for a task, cache to disk, return list of GPU tensors."""
+def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, device='cpu'):
+    """Generate train and val batches for a task, cache to disk, return dict with train/val lists."""
     CACHE_DIR.mkdir(exist_ok=True)
-    key = _cache_key(task_name, n_steps, B, L, seed)
+    key = _cache_key(task_name, n_train_batches + n_val_batches, B, L, seed)
     cache_path = CACHE_DIR / f"{task_name}_{key}.pt"
 
     if cache_path.exists():
-        batches = torch.load(cache_path, weights_only=True)
+        cached = torch.load(cache_path, weights_only=True)
+        train_batches = cached['train']
+        val_batches = cached['val']
     else:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        batches = []
-        for _ in tqdm(range(n_steps + 3), desc=f"Generating {task_name}", leave=False):  # +3 for warmup
+        
+        def gen_batch(task_name):
             if task_name == 'delay':
-                batches.append(gen_delay(B, L, vocab_size=32, device='cpu'))
+                return gen_delay(B, L, vocab_size=32, device='cpu')
             elif task_name == 'selective_copy':
-                batches.append(gen_selective_copy(B, L, vocab_size=32, device='cpu'))
+                return gen_selective_copy(B, L, vocab_size=32, device='cpu')
             elif task_name == 'parity':
-                batches.append(gen_parity(B, L, device='cpu'))
+                return gen_parity(B, L, device='cpu')
             elif task_name == 'mod_arith':
-                batches.append(gen_mod_arith(B, L, device='cpu'))
+                return gen_mod_arith(B, L, device='cpu')
             elif task_name == 'induction':
-                batches.append(gen_induction(B, L, vocab_size=32, device='cpu'))
-        torch.save(batches, cache_path)
+                return gen_induction(B, L, vocab_size=32, device='cpu')
+        
+        train_batches = []
+        for _ in tqdm(range(n_train_batches), desc=f"Generating {task_name} train", leave=False):
+            train_batches.append(gen_batch(task_name))
+        
+        val_batches = []
+        for _ in tqdm(range(n_val_batches), desc=f"Generating {task_name} val", leave=False):
+            val_batches.append(gen_batch(task_name))
+        
+        torch.save({'train': train_batches, 'val': val_batches}, cache_path)
 
     # Preload everything to target device
     def _to(t):
         return t.to(device, non_blocking=True) if isinstance(t, torch.Tensor) else t
-    return [tuple(_to(t) for t in batch) for batch in batches]
+    
+    return {
+        'train': [tuple(_to(t) for t in batch) for batch in train_batches],
+        'val': [tuple(_to(t) for t in batch) for batch in val_batches],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device='cpu',
-               preloaded_data=None):
+def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, device='cpu',
+               preloaded_data=None, early_stop_acc=0.99):
+    """Train with epochs and early stopping when val accuracy exceeds threshold."""
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
 
@@ -455,11 +471,11 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
 
-    data = preloaded_data
-    assert data is not None, "preloaded_data required — use pregen_task_data()"
+    assert preloaded_data is not None, "preloaded_data required — use pregen_task_data()"
+    train_data = preloaded_data['train']
+    val_data = preloaded_data['val']
 
-    def _step(idx):
-        batch = data[idx]
+    def _forward(batch):
         if task_name == 'delay':
             inp, tgt = batch
             y = head(model(embed(inp)))
@@ -491,7 +507,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
-        else:
+        else:  # induction
             inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
@@ -499,64 +515,17 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
 
-    # warmup (first 3 batches)
-    for i in range(3):
-        _step(i)[0].backward()
-        opt.zero_grad(set_to_none=True)
-
-    # Module-level memory profiling (CUDA only, USB/S6 only)
-    if device == 'cuda' and isinstance(model, USBWrapper):
-        mem_stats = defaultdict(int)
-        mem_baseline = {}
-        hooks = []
-        module_names = {m: n for n, m in model.named_modules()}
-
-        def _pre_hook(module, _inputs):
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            mem_baseline[id(module)] = torch.cuda.memory_allocated()
-
-        def _post_hook(module, _inputs, _outputs):
-            torch.cuda.synchronize()
-            peak = torch.cuda.max_memory_allocated()
-            base = mem_baseline.get(id(module), 0)
-            delta = max(0, peak - base)
-            name = module_names.get(module, module.__class__.__name__)
-            mem_stats[name] = max(mem_stats[name], delta)
-
-        for m in model.modules():
-            if len(list(m.children())) == 0:
-                hooks.append(m.register_forward_pre_hook(_pre_hook))
-                hooks.append(m.register_forward_hook(_post_hook))
-
+    def _eval_val():
+        model.eval()
+        val_accs = []
+        val_losses = []
         with torch.no_grad():
-            _step(0)
-
-        for h in hooks:
-            h.remove()
-
-        # print("\n[Module Memory Peaks] (approx, per leaf module, delta)")
-        # top = sorted(mem_stats.items(), key=lambda kv: kv[1], reverse=True)[:20]
-        # for name, peak in top:
-        #     print(f"  {name:50s} {peak / (1024**2):8.2f} MB")
-
-    # Optional profiling for USB on CUDA (forward + backward on one batch)
-    if device == 'cuda' and isinstance(model, USBWrapper) and HAS_PROFILER:
-        for i in range(50):
-            loss, _ = _step(i % 3)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-        torch.cuda.synchronize()
-        opt.zero_grad(set_to_none=True)
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     record_shapes=True,
-                     profile_memory=True) as prof:
-            loss, _ = _step(0)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-        torch.cuda.synchronize()
-        # print("\n[S6 profile] Forward+Backward (1 batch)")
-        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
+            for batch in val_data:
+                loss, acc = _forward(batch)
+                val_losses.append(loss.item())
+                val_accs.append(acc)
+        model.train()
+        return sum(val_losses) / len(val_losses), sum(val_accs) / len(val_accs)
 
     mem_baseline = 0
     if device == 'cuda':
@@ -564,20 +533,53 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         torch.cuda.synchronize()
         mem_baseline = torch.cuda.memory_allocated()
 
-    losses = []
     t0 = time.perf_counter()
-
-    accs = []
-    pbar = tqdm(range(n_steps), desc="Training", leave=False, ncols=80)
-    for step in pbar:
-        loss, acc = _step(3 + step)  # offset past warmup batches
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        losses.append(loss.item())
-        accs.append(acc)
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
+    
+    n_train = len(train_data)
+    total_steps = 0
+    final_epoch = 0
+    final_val_acc = 0.0
+    final_val_loss = 0.0
+    initial_loss = None
+    
+    epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False, ncols=100)
+    for epoch in epoch_pbar:
+        # Shuffle train indices each epoch
+        train_indices = torch.randperm(n_train).tolist()
+        
+        epoch_losses = []
+        epoch_accs = []
+        
+        step_pbar = tqdm(train_indices, desc=f"Epoch {epoch+1}", leave=False, ncols=80)
+        for idx in step_pbar:
+            batch = train_data[idx]
+            loss, acc = _forward(batch)
+            
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            
+            epoch_losses.append(loss.item())
+            epoch_accs.append(acc)
+            total_steps += 1
+            
+            step_pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
+        
+        # Record initial loss from first epoch
+        if initial_loss is None:
+            initial_loss = sum(epoch_losses[:10]) / min(10, len(epoch_losses))
+        
+        # Evaluate on validation set
+        val_loss, val_acc = _eval_val()
+        final_epoch = epoch + 1
+        final_val_acc = val_acc
+        final_val_loss = val_loss
+        
+        epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
+        
+        # Early stopping
+        if val_acc >= early_stop_acc:
+            break
 
     if device == 'cuda':
         torch.cuda.synchronize()
@@ -587,16 +589,15 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
     if device == 'cuda':
         peak_mem = (torch.cuda.max_memory_allocated() - mem_baseline) / 1024 / 1024  # MB
 
-    initial = sum(losses[:10]) / 10
-    final = sum(losses[-10:]) / 10
-    final_acc = sum(accs[-10:]) / 10
     return {
-        'initial': initial,
-        'final': final,
-        'reduction': 1.0 - final / initial if initial > 0 else 0,
-        'acc': final_acc,
+        'initial': initial_loss if initial_loss else 0.0,
+        'final': final_val_loss,
+        'acc': final_val_acc,
+        'epochs': final_epoch,
+        'steps': total_steps,
         'wall_s': wall,
         'peak_mem_mb': peak_mem,
+        'converged': final_val_acc >= early_stop_acc,
     }
 
 
@@ -626,43 +627,43 @@ def _stack(make_layer, n_layers, dim):
     return StackedModel(make_layer, n_layers, dim)
 
 
-def make_models(dim, n_layers=1):
-    """Build models with configurable depth. Param counts are per-layer (~50-57K)."""
+def make_models(dim, n_layers=1, requested_models=None):
+    """Build models with configurable depth. Param counts are per-layer (~50-57K).
+    
+    If requested_models is provided, only build those models (skips unavailable ones with warning).
+    """
     models = {}
-
-    # DS1 base
-    # models['DS1'] = _stack(
-    #     lambda: DS1Wrapper(dim=dim, state_dim=64, mimo_rank=4, n_iters=2),
-    #     n_layers, dim)
+    
+    def try_add(name, make_fn):
+        if requested_models is not None and name not in requested_models:
+            return
+        try:
+            models[name] = _stack(make_fn, n_layers, dim)
+        except ImportError as e:
+            print(f"  Warning: {name} not available ({e})")
+        except Exception as e:
+            print(f"  Warning: {name} failed to initialize ({e})")
 
     # DS1++: DS1 + signed sparse attention
-    models['DS1++'] = _stack(
-        lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True),
-        n_layers, dim)
+    try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True))
 
     # S4D: ~50K params/layer
-    models['S4D'] = _stack(lambda: S4D(d_model=dim, d_state=320), n_layers, dim)
+    try_add('S4D', lambda: S4D(d_model=dim, d_state=320))
 
     # S5: ~50K params/layer
-    models['S5'] = _stack(lambda: S5Wrapper(width=dim, state_width=256), n_layers, dim)
+    try_add('S5', lambda: S5Wrapper(width=dim, state_width=256))
 
     # Mamba: ~51K params/layer
-    models['Mamba'] = _stack(lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2), n_layers, dim)
+    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
     # USB (Unified Sequence Block, formerly S6): fused SSM + attention
-    models['USB'] = _stack(
-        lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2),
-        n_layers, dim)
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
-    models['MHA'] = _stack(
-        lambda: MHABlock(d_model=dim, n_heads=4),
-        n_layers, dim)
+    try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
 
     # LearnedAttnAct MLP: SwiGLU with linear attention activation
-    models['AttnActMLP'] = _stack(
-        lambda: LearnedAttnActMLP(d_model=dim, ffn_mult=4, n_heads=4),
-        n_layers, dim)
+    try_add('AttnActMLP', lambda: LearnedAttnActMLP(d_model=dim, ffn_mult=4, n_heads=4))
 
     return models
 
@@ -675,7 +676,10 @@ if __name__ == '__main__':
                         help='torch.compile mode')
     parser.add_argument('--dim', type=int, default=64, help='Model dimension')
     parser.add_argument('--layers', type=int, default=1, help='Number of layers')
-    parser.add_argument('--steps', type=int, default=2000, help='Training steps')
+    parser.add_argument('--max-epochs', type=int, default=100, help='Maximum training epochs')
+    parser.add_argument('--train-batches', type=int, default=100, help='Number of training batches per epoch')
+    parser.add_argument('--val-batches', type=int, default=20, help='Number of validation batches')
+    parser.add_argument('--early-stop-acc', type=float, default=0.99, help='Early stop when val acc exceeds this')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--seq-len', type=int, default=32, help='Sequence length')
     parser.add_argument('--models', type=str, nargs='+', default=None,
@@ -692,17 +696,23 @@ if __name__ == '__main__':
     n_layers = args.layers
     all_tasks = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
     tasks = args.tasks if args.tasks else all_tasks
-    n_steps = args.steps
+    max_epochs = args.max_epochs
+    n_train = args.train_batches
+    n_val = args.val_batches
     B, L = args.batch_size, args.seq_len
 
-    models_info = make_models(dim, n_layers=n_layers)
-    all_names = args.models if args.models else list(models_info.keys())
+    requested = args.models  # None means all available
+    models_info = make_models(dim, n_layers=n_layers, requested_models=requested)
+    all_names = list(models_info.keys())
     
-    # Validate model names
-    for name in all_names:
-        if name not in models_info:
-            print(f"Unknown model: {name}. Available: {list(models_info.keys())}")
-            sys.exit(1)
+    if not all_names:
+        print("No models available to test!")
+        sys.exit(1)
+    
+    if requested:
+        missing = set(requested) - set(all_names)
+        if missing:
+            print(f"Warning: Requested models not available: {missing}")
     
     print(f"\n{'Model':<10} {'Params':>10} {'Layers':>8}")
     print('-' * 30)
@@ -710,19 +720,20 @@ if __name__ == '__main__':
         m = models_info[name]
         print(f"{name:<10} {count_params(m):>10,} {n_layers:>8}")
 
-    print(f"\nRunning {n_steps} steps, B={B}, L={L}, dim={dim}, layers={n_layers}")
-    print('=' * 90)
+    print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}")
+    print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
+    print('=' * 100)
 
-    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Acc':>8} {'Wall(s)':>8} {'Mem(MB)':>9}"
+    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Val Acc':>8} {'Epochs':>7} {'Wall(s)':>8} {'Mem(MB)':>9} {'Status':>10}"
     print(header)
-    print('-' * 90)
+    print('-' * 100)
 
     task_pbar = tqdm(tasks, desc="Tasks", position=0)
     for task in task_pbar:
         task_pbar.set_description(f"Task: {task}")
         print(f"\nPregenerating {task} data...")
-        task_data = pregen_task_data(task, n_steps, B, L, SEED, device=DEVICE)
-        print(f"  {len(task_data)} batches ready on {DEVICE}")
+        task_data = pregen_task_data(task, n_train, n_val, B, L, SEED, device=DEVICE)
+        print(f"  {len(task_data['train'])} train + {len(task_data['val'])} val batches ready on {DEVICE}")
         
         model_pbar = tqdm(all_names, desc="Models", position=1, leave=False)
         for name in model_pbar:
@@ -732,15 +743,16 @@ if __name__ == '__main__':
             torch.manual_seed(SEED)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
-            model = make_models(dim, n_layers=n_layers)[name]
+            model = make_models(dim, n_layers=n_layers, requested_models=[name])[name]
             
             # Optionally compile the model
             if args.compile:
                 model = torch.compile(model, mode=args.compile_mode)
             
-            r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
-                           preloaded_data=task_data)
-            tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
+            r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-3, B=B, L=L, device=DEVICE,
+                           preloaded_data=task_data, early_stop_acc=args.early_stop_acc)
+            status = "CONVERGED" if r['converged'] else "MAX_EPOCH"
+            tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f} {status:>10}")
         del task_data
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
