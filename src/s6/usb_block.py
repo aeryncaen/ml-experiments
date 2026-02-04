@@ -336,15 +336,14 @@ class USBBlock(nn.Module):
         # h_t = h_t + gate_t * state_t
         # Here "h_t" is the value representation
         if config.scan_state_mode == 'outer':
-            # For outer product mode, contract state with v to get back to headdim
-            # state: (batch, seq, nheads, headdim, headdim)
-            # v: (batch, seq, nheads, headdim)
-            # state @ v -> (batch, seq, nheads, headdim)
+            # For outer product mode, query with k to retrieve v
+            # state[i,j] = accumulated k[i] * v[j] (outer products)
+            # Query: out[j] = sum_i k_query[i] * state[i,j] -> retrieves v based on k match
             # Scale by 1/sqrt(headdim) like attention (sum over headdim terms)
             scale = config.headdim ** -0.5
-            state_g1_read = torch.einsum('bthjk,bthk->bthj', state_g1, v_g1) * scale
-            state_g2_read = torch.einsum('bthjk,bthk->bthj', state_g2, v_g2) * scale
-            state_g3_read = torch.einsum('bthjk,bthk->bthj', state_g3, v_g3) * scale
+            state_g1_read = torch.einsum('bthjk,bthj->bthk', state_g1, k_g1) * scale
+            state_g2_read = torch.einsum('bthjk,bthj->bthk', state_g2, k_g2) * scale
+            state_g3_read = torch.einsum('bthjk,bthj->bthk', state_g3, k_g3) * scale
             
             out_g1 = v_g1 + params_g1['gate'] * state_g1_read
             out_g2 = v_g2 + params_g2['gate'] * state_g2_read
