@@ -6,7 +6,7 @@ Metrics: final loss, param count, peak memory, wall time
 Requires: einops, mamba_ssm (for Mamba CUDA ops on CUDA box), tqdm
 """
 
-import sys, os, time, math, random, hashlib
+import sys, os, time, math, random, hashlib, argparse
 from pathlib import Path
 import numpy as np
 import torch
@@ -577,9 +577,7 @@ def train_task(model, task_name, dim, n_steps=2000, lr=1e-3, B=32, L=32, device=
         opt.step()
         losses.append(loss.item())
         accs.append(acc)
-        
-        if step % 100 == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
 
     if device == 'cuda':
         torch.cuda.synchronize()
@@ -670,17 +668,46 @@ def make_models(dim, n_layers=1):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Benchmark SSM models on litmus tests')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile on models')
+    parser.add_argument('--compile-mode', type=str, default='default', 
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode')
+    parser.add_argument('--dim', type=int, default=64, help='Model dimension')
+    parser.add_argument('--layers', type=int, default=1, help='Number of layers')
+    parser.add_argument('--steps', type=int, default=2000, help='Training steps')
+    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
+    parser.add_argument('--seq-len', type=int, default=32, help='Sequence length')
+    parser.add_argument('--models', type=str, nargs='+', default=None,
+                        help='Specific models to test (default: all)')
+    parser.add_argument('--tasks', type=str, nargs='+', default=None,
+                        help='Specific tasks to test (default: all)')
+    args = parser.parse_args()
+
     print(f"Device: {DEVICE}")
-    dim = 64
-    n_layers = 1
-    tasks = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
-    n_steps = 2000
-    B, L = 32, 32
+    if args.compile:
+        print(f"torch.compile enabled (mode={args.compile_mode})")
+    
+    dim = args.dim
+    n_layers = args.layers
+    all_tasks = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
+    tasks = args.tasks if args.tasks else all_tasks
+    n_steps = args.steps
+    B, L = args.batch_size, args.seq_len
 
     models_info = make_models(dim, n_layers=n_layers)
+    all_names = args.models if args.models else list(models_info.keys())
+    
+    # Validate model names
+    for name in all_names:
+        if name not in models_info:
+            print(f"Unknown model: {name}. Available: {list(models_info.keys())}")
+            sys.exit(1)
+    
     print(f"\n{'Model':<10} {'Params':>10} {'Layers':>8}")
     print('-' * 30)
-    for name, m in models_info.items():
+    for name in all_names:
+        m = models_info[name]
         print(f"{name:<10} {count_params(m):>10,} {n_layers:>8}")
 
     print(f"\nRunning {n_steps} steps, B={B}, L={L}, dim={dim}, layers={n_layers}")
@@ -690,7 +717,6 @@ if __name__ == '__main__':
     print(header)
     print('-' * 90)
 
-    all_names = list(models_info.keys())
     task_pbar = tqdm(tasks, desc="Tasks", position=0)
     for task in task_pbar:
         task_pbar.set_description(f"Task: {task}")
@@ -707,6 +733,11 @@ if __name__ == '__main__':
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim, n_layers=n_layers)[name]
+            
+            # Optionally compile the model
+            if args.compile:
+                model = torch.compile(model, mode=args.compile_mode)
+            
             r = train_task(model, task, dim, n_steps=n_steps, lr=1e-3, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data)
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f}")
