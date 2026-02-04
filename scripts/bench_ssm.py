@@ -170,14 +170,14 @@ from s6.usb_block import USBBlock, USBConfig
 
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, qkv_rank=16, **kwargs):
+    def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, kv_heads=0, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
             paired_heads=paired_heads,
-            qkv_rank=qkv_rank,
+            kv_heads=kv_heads,
         )
         self.usb = USBBlock(config)
 
@@ -658,14 +658,18 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB (Unified Sequence Block, formerly S6): fused SSM + attention with low-rank QKV sharing
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, qkv_rank=16))
+    # USB (Unified Sequence Block): fused SSM + full attention (kv_heads=0 means same as Q)
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=0))
     
-    # USB-Full: USB without QKV sharing (full independent projections)
-    try_add('USB-Full', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, qkv_rank=0))
+    # USB-MQA: Multi-Query Attention (all Q heads share 1 KV head)
+    try_add('USB-MQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=1))
+    
+    # USB-GQA: Grouped-Query Attention (Q heads grouped, each group shares KV)
+    # With dim=64, headdim=32, expansion=2: nheads=4, so kv_heads=2 means 2 groups of 2
+    try_add('USB-GQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_heads=2))
     
     # USB-P: USB with paired head attention (cross-head mixing via position interleaving)
-    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True, qkv_rank=16))
+    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True, kv_heads=0))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
