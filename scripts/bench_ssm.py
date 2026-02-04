@@ -171,14 +171,14 @@ from s6.usb_block import USBBlock, USBConfig
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, 
-                 scan_state_mode='elementwise', **kwargs):
+                 scan_state_modes=('elementwise', 'elementwise', 'elementwise'), **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
             layer_idx=layer_idx,
-            scan_state_mode=scan_state_mode,
+            scan_state_modes=scan_state_modes,
         )
         self.usb = USBBlock(config)
 
@@ -678,11 +678,17 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB: Full MHA with directional scans
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
+    # USB: Full MHA with directional scans (elementwise state - good for state tracking)
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
+                                       scan_state_modes=('elementwise', 'elementwise', 'elementwise')))
     
-    # USB_outer: USB with outer product state (more expressive, larger state)
-    try_add('USB_outer', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, scan_state_mode='outer'))
+    # USB_outer: USB with outer product state (all groups - good for retrieval)
+    try_add('USB_outer', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
+                                             scan_state_modes=('outer', 'outer', 'outer')))
+    
+    # USB_hybrid: G1/G2 outer (retrieval), G3 elementwise (state tracking)
+    try_add('USB_hybrid', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
+                                              scan_state_modes=('outer', 'outer', 'elementwise')))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))

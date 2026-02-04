@@ -24,10 +24,11 @@ class USBConfig:
     expansion_factor: int = 2
     layer_idx: int = 0  # For future use (e.g., layer-dependent params)
     
-    # Scan state mode: 'elementwise' (k*v) or 'outer' (k⊗v)
-    # - elementwise: state is (nheads, headdim), less memory
-    # - outer: state is (nheads, headdim, headdim), more expressive
-    scan_state_mode: str = 'elementwise'
+    # Scan state modes per group (G1, G2, G3): 'elementwise' (k*v) or 'outer' (k⊗v)
+    # - elementwise: state is (nheads, headdim), good for state-tracking (parity)
+    # - outer: state is (nheads, headdim, headdim), good for retrieval (induction)
+    # Default: G1/G2 outer (directional retrieval), G3 elementwise (global state)
+    scan_state_modes: tuple = ('outer', 'outer', 'elementwise')
     
     # Derived dimensions
     @property
@@ -192,17 +193,18 @@ class USBBlock(nn.Module):
         self.scan_proj_g3 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
         
         # Learnable initial states for scan heads (G1, G2, G3)
-        # Shape depends on scan_state_mode:
+        # Shape depends on per-group scan_state_modes:
         # - elementwise: (nheads_per_group, headdim)
         # - outer: (nheads_per_group, headdim, headdim)
-        if config.scan_state_mode == 'outer':
-            init_shape = (nheads_per_group, headdim, headdim)
-        else:
-            init_shape = (nheads_per_group, headdim)
+        def init_shape(mode):
+            if mode == 'outer':
+                return (nheads_per_group, headdim, headdim)
+            return (nheads_per_group, headdim)
         
-        self.init_state_g1 = nn.Parameter(torch.zeros(*init_shape))
-        self.init_state_g2 = nn.Parameter(torch.zeros(*init_shape))
-        self.init_state_g3 = nn.Parameter(torch.zeros(*init_shape))
+        modes = config.scan_state_modes
+        self.init_state_g1 = nn.Parameter(torch.zeros(*init_shape(modes[0])))
+        self.init_state_g2 = nn.Parameter(torch.zeros(*init_shape(modes[1])))
+        self.init_state_g3 = nn.Parameter(torch.zeros(*init_shape(modes[2])))
         
         # Mark initial states as no weight decay
         self.init_state_g1._no_weight_decay = True  # type: ignore[attr-defined]
@@ -276,29 +278,34 @@ class USBBlock(nn.Module):
         k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
         k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
         
-        # Compute K·V for each group
-        # Shape depends on scan_state_mode:
+        # Compute K·V for each group (mode-dependent)
+        # Shape depends on scan_state_modes[i]:
         # - elementwise: (batch, seq_len, nheads, headdim)
         # - outer: (batch, seq_len, nheads, headdim, headdim) = k ⊗ v
-        if config.scan_state_mode == 'outer':
-            # Outer product: k[..., :, None] * v[..., None, :] -> (b, t, h, d, d)
+        modes = config.scan_state_modes
+        
+        # G1: forward scan
+        if modes[0] == 'outer':
             kv_g1 = k_g1.unsqueeze(-1) * v_g1.unsqueeze(-2)
-            kv_g2 = k_g2.unsqueeze(-1) * v_g2.unsqueeze(-2)
-            kv_g3 = k_g3.unsqueeze(-1) * v_g3.unsqueeze(-2)
-            
-            # Get initial states (expand to batch dimension)
             init_g1 = repeat(self.init_state_g1, 'h d1 d2 -> b h d1 d2', b=batch)
+        else:
+            kv_g1 = k_g1 * v_g1
+            init_g1 = repeat(self.init_state_g1, 'h d -> b h d', b=batch)
+        
+        # G2: backward scan
+        if modes[1] == 'outer':
+            kv_g2 = k_g2.unsqueeze(-1) * v_g2.unsqueeze(-2)
             init_g2 = repeat(self.init_state_g2, 'h d1 d2 -> b h d1 d2', b=batch)
+        else:
+            kv_g2 = k_g2 * v_g2
+            init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
+        
+        # G3: centered scan
+        if modes[2] == 'outer':
+            kv_g3 = k_g3.unsqueeze(-1) * v_g3.unsqueeze(-2)
             init_g3 = repeat(self.init_state_g3, 'h d1 d2 -> b h d1 d2', b=batch)
         else:
-            # Element-wise: k * v -> (b, t, h, d)
-            kv_g1 = k_g1 * v_g1
-            kv_g2 = k_g2 * v_g2
             kv_g3 = k_g3 * v_g3
-            
-            # Get initial states (expand to batch dimension)
-            init_g1 = repeat(self.init_state_g1, 'h d -> b h d', b=batch)
-            init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
             init_g3 = repeat(self.init_state_g3, 'h d -> b h d', b=batch)
         
         # Run scans
@@ -332,25 +339,31 @@ class USBBlock(nn.Module):
             init_state=init_g3,
         )
         
-        # Gate state injection back into hiddens
-        # h_t = h_t + gate_t * state_t
-        # Here "h_t" is the value representation
-        if config.scan_state_mode == 'outer':
-            # For outer product mode, query with k to retrieve v
-            # state[i,j] = accumulated k[i] * v[j] (outer products)
-            # Query: out[j] = sum_i k_query[i] * state[i,j] -> retrieves v based on k match
-            # Scale by 1/sqrt(headdim) like attention (sum over headdim terms)
-            scale = config.headdim ** -0.5
+        # Gate state injection back into hiddens (mode-dependent readout)
+        # h_t = h_t + gate_t * state_read_t
+        # For outer mode: query with k to retrieve v (k-based readout)
+        # For elementwise mode: state is already the right shape
+        scale = config.headdim ** -0.5
+        
+        # G1 readout
+        if modes[0] == 'outer':
             state_g1_read = torch.einsum('bthjk,bthj->bthk', state_g1, k_g1) * scale
-            state_g2_read = torch.einsum('bthjk,bthj->bthk', state_g2, k_g2) * scale
-            state_g3_read = torch.einsum('bthjk,bthj->bthk', state_g3, k_g3) * scale
-            
             out_g1 = v_g1 + params_g1['gate'] * state_g1_read
-            out_g2 = v_g2 + params_g2['gate'] * state_g2_read
-            out_g3 = v_g3 + params_g3['gate'] * state_g3_read
         else:
             out_g1 = v_g1 + params_g1['gate'] * state_g1
+        
+        # G2 readout
+        if modes[1] == 'outer':
+            state_g2_read = torch.einsum('bthjk,bthj->bthk', state_g2, k_g2) * scale
+            out_g2 = v_g2 + params_g2['gate'] * state_g2_read
+        else:
             out_g2 = v_g2 + params_g2['gate'] * state_g2
+        
+        # G3 readout
+        if modes[2] == 'outer':
+            state_g3_read = torch.einsum('bthjk,bthj->bthk', state_g3, k_g3) * scale
+            out_g3 = v_g3 + params_g3['gate'] * state_g3_read
+        else:
             out_g3 = v_g3 + params_g3['gate'] * state_g3
         
         # Apply data-dependent RoPE to Q for attention
