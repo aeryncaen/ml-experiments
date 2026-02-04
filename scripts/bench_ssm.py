@@ -170,12 +170,14 @@ from s6.usb_block import USBBlock, USBConfig
 
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, headdim=64, expansion_factor=2, **kwargs):
+    def __init__(self, d_model, headdim=64, expansion_factor=2, attention_type="full", lowrank_factor=1.5, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
+            attention_type=attention_type,
+            lowrank_factor=lowrank_factor,
         )
         self.usb = USBBlock(config)
 
@@ -658,6 +660,10 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # USB (Unified Sequence Block, formerly S6): fused SSM + attention
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
+    
+    # USB-LR: USB with low-rank attention (O(L^1.5) instead of O(L^2))
+    try_add('USB-LR', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, 
+                                          attention_type="lowrank", lowrank_factor=1.5))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))

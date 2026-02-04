@@ -150,6 +150,52 @@ def test_rope_functions():
     print("  Data-dependent RoPE: PASSED")
 
 
+def test_usb_lowrank():
+    """Test USB with low-rank attention."""
+    config = USBConfig(
+        d_model=256,
+        headdim=64,
+        expansion_factor=2,
+        attention_type="lowrank",
+        lowrank_factor=1.5,
+    )
+    
+    print(f"\nLow-rank attention:")
+    print(f"  attention_type: {config.attention_type}")
+    print(f"  lowrank_factor: {config.lowrank_factor}")
+    
+    model = USBBlock(config)
+    
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  n_params: {n_params:,}")
+    
+    # Test with longer sequence to see compression
+    batch_size = 2
+    seq_len = 256
+    r = int((seq_len * config.lowrank_factor) ** 0.5)
+    print(f"  seq_len: {seq_len}, compressed to r={r}")
+    
+    x = torch.randn(batch_size, seq_len, config.d_model)
+    
+    with torch.no_grad():
+        out = model(x)
+    
+    assert out.shape == x.shape, f"Shape mismatch: {out.shape} vs {x.shape}"
+    assert not torch.isnan(out).any(), "Output contains NaN"
+    assert not torch.isinf(out).any(), "Output contains Inf"
+    print("  Forward pass: PASSED")
+    
+    # Test backward
+    x.requires_grad = True
+    out = model(x)
+    loss = out.sum()
+    loss.backward()
+    
+    assert x.grad is not None, "No gradient for input"
+    assert not torch.isnan(x.grad).any(), "Input gradient contains NaN"
+    print("  Backward pass: PASSED")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("USB Block Tests")
@@ -159,6 +205,7 @@ if __name__ == "__main__":
     test_rope_functions()
     test_usb_forward()
     test_usb_backward()
+    test_usb_lowrank()
     
     print("\n" + "=" * 60)
     print("All tests PASSED!")
