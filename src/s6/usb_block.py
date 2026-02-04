@@ -378,8 +378,12 @@ class USBBlock(nn.Module):
         k_sdpa = k_all.transpose(1, 2)
         v_sdpa = v_all.transpose(1, 2)
         
-        # Standard SDPA (full MHA)
-        attn_out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
+        # Full bidirectional attention (scans provide directionality)
+        attn_out = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa, 
+            attn_mask=attention_mask,
+            is_causal=False
+        )
         
         # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
         attn_out = attn_out.transpose(1, 2)

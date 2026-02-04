@@ -817,35 +817,33 @@ if __name__ == '__main__':
 
     # Print markdown summary table
     print("\n" + "=" * 100)
-    print("## Benchmark Summary (Markdown)\n")
+    print("## Benchmark Results\n")
     
-    # Build pivot table: models as rows, tasks as columns, val_acc as values
-    result_map = {}
-    for r in all_results:
-        result_map[(r['model'], r['task'])] = r
-    
-    # Header row
-    md_header = "| Model | Params |"
-    md_sep = "|:------|-------:|"
+    # Group by task for clearer presentation
     for task in tasks:
-        md_header += f" {task} |"
-        md_sep += "-------:|"
-    print(md_header)
-    print(md_sep)
+        print(f"### {task}\n")
+        print("| Model | Params | Val Acc | Best @ | Epochs | Stop Reason | Time |")
+        print("|:------|-------:|--------:|-------:|-------:|:------------|-----:|")
+        
+        task_results = [r for r in all_results if r['task'] == task]
+        # Sort by val_acc descending
+        task_results.sort(key=lambda x: x['val_acc'], reverse=True)
+        
+        for r in task_results:
+            acc_str = f"{r['val_acc']:.1%}"
+            if r['converged']:
+                acc_str = f"**{acc_str}**"
+            
+            best_epoch = r.get('best_epoch', r['epochs'])
+            stop = r.get('stop_reason', 'MAX_EPOCH')
+            wall_s = r.get('wall_s', 0)
+            
+            print(f"| {r['model']} | {r['params']:,} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
+        
+        print()
     
-    # Data rows
-    for name in all_names:
-        param_count = result_map.get((name, tasks[0]), {}).get('params', 0)
-        row = f"| {name} | {param_count:,} |"
-        for task in tasks:
-            r = result_map.get((name, task))
-            if r:
-                acc_str = f"{r['val_acc']:.1%}"
-                if r['converged']:
-                    acc_str = f"**{acc_str}**"
-                row += f" {acc_str} |"
-            else:
-                row += " - |"
-        print(row)
-    
-    print("\n*Bold = converged (>{:.0%} accuracy)*".format(args.early_stop_acc))
+    # Legend
+    print("**Legend:**")
+    print("- **Bold** = converged (>{:.0%} val acc)".format(args.early_stop_acc))
+    print("- Best @ = epoch with best val accuracy")
+    print("- Stop: CONVERGED (hit target) | PLATEAU (train stuck at 100%) | MAX_EPOCH")
