@@ -26,6 +26,8 @@ class USBConfig:
     q_shared_frac: float = 0.0  # Fraction of Q weights shared globally (0 = independent Q per head)
     kv_shared_frac: float = 0.8  # Fraction of KV weights shared within each group
     paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
+    diff_attn: bool = False  # Use differential attention (A1 - λ*A2)
+    layer_idx: int = 0  # Layer index for diff_attn λ_init calculation
     
     # Derived dimensions
     @property
@@ -315,6 +317,25 @@ class USBBlock(nn.Module):
         self.init_state_g2._no_weight_decay = True
         self.init_state_g3._no_weight_decay = True
         
+        # Differential attention parameters
+        # λ = exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
+        # λ_init = 0.8 - 0.6 * exp(-0.3 * (layer - 1))
+        if config.diff_attn:
+            import math
+            layer = config.layer_idx + 1  # 1-indexed
+            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer - 1))
+            
+            # Learnable λ parameters - vectors of size headdim//2 per head
+            # Initialized small so exp(q·k) ≈ 1, making λ ≈ λ_init initially
+            half_headdim = headdim // 2
+            self.lambda_q1 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
+            self.lambda_k1 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
+            self.lambda_q2 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
+            self.lambda_k2 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
+            
+            # Per-head RMSNorm for diff_attn output
+            self.diff_head_norm = nn.RMSNorm(headdim, eps=1e-6)
+        
         # Step 7: Down-projection
         self.down_proj = nn.Linear(d_expanded, d_model, bias=False)
         
@@ -493,6 +514,44 @@ class USBBlock(nn.Module):
             # Step 6e: Reshape back to original sequence length and head count
             # (batch, seq*2, nheads//2, headdim) -> (batch, seq, nheads, headdim)
             attn_out = rearrange(attn_out_interleaved, 'b (t two) h d -> b t (h two) d', two=2)
+            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+        elif config.diff_attn:
+            # Differential attention: A1 - λ*A2
+            # Split Q, K into halves
+            half_d = config.headdim // 2
+            q1, q2 = q_all[..., :half_d], q_all[..., half_d:]
+            k1, k2 = k_all[..., :half_d], k_all[..., half_d:]
+            
+            # Compute λ per head: exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
+            # lambda_q1, lambda_k1: (nheads, half_d)
+            lambda_val = (
+                torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1))
+                - torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1))
+                + self.lambda_init
+            )  # (nheads,)
+            
+            # Scale for half head dim
+            scale = half_d ** -0.5
+            
+            # Compute two attention patterns
+            attn1 = torch.einsum('bthd,bshd->bhts', q1, k1) * scale
+            attn2 = torch.einsum('bthd,bshd->bhts', q2, k2) * scale
+            
+            if attention_mask is not None:
+                attn1 = attn1.masked_fill(~attention_mask, float('-inf'))
+                attn2 = attn2.masked_fill(~attention_mask, float('-inf'))
+            
+            attn1 = F.softmax(attn1, dim=-1)
+            attn2 = F.softmax(attn2, dim=-1)
+            
+            # Differential: A1 - λ*A2, λ shape (nheads,) -> (1, nheads, 1, 1)
+            diff_weights = attn1 - lambda_val.view(1, -1, 1, 1) * attn2
+            
+            # Apply to V (full headdim)
+            attn_out = torch.einsum('bhts,bshd->bthd', diff_weights, v_all)
+            
+            # Per-head RMSNorm and scale by (1 - λ_init)
+            attn_out = self.diff_head_norm(attn_out) * (1 - self.lambda_init)
             attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
         else:
             # Standard full attention

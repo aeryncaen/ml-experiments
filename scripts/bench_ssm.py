@@ -171,7 +171,8 @@ from s6.usb_block import USBBlock, USBConfig
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, 
-                 kv_groups=2, q_shared_frac=0.0, kv_shared_frac=0.8, **kwargs):
+                 kv_groups=2, q_shared_frac=0.0, kv_shared_frac=0.8, 
+                 diff_attn=False, layer_idx=0, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
@@ -181,6 +182,8 @@ class USBWrapper(nn.Module):
             kv_groups=kv_groups,
             q_shared_frac=q_shared_frac,
             kv_shared_frac=kv_shared_frac,
+            diff_attn=diff_attn,
+            layer_idx=layer_idx,
         )
         self.usb = USBBlock(config)
 
@@ -661,9 +664,12 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB (Unified Sequence Block): hierarchical weight sharing (default kv_groups=2)
-    # Q: 50% global shared, K/V: 80% per-group shared (soft GQA)
+    # USB (Unified Sequence Block): hierarchical KV sharing (kv_groups=2)
+    # Q: independent per-head, K/V: 80% per-group shared + 20% per-head
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
+    
+    # USB-Diff: USB with differential attention (A1 - λ*A2)
+    try_add('USB-Diff', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, diff_attn=True))
     
     # USB-MQA: All K/V heads share 80% weights (single group, like soft MQA)
     try_add('USB-MQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_groups=1))
