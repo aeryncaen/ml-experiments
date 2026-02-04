@@ -340,9 +340,11 @@ class USBBlock(nn.Module):
             # state: (batch, seq, nheads, headdim, headdim)
             # v: (batch, seq, nheads, headdim)
             # state @ v -> (batch, seq, nheads, headdim)
-            state_g1_read = torch.einsum('bthjk,bthk->bthj', state_g1, v_g1)
-            state_g2_read = torch.einsum('bthjk,bthk->bthj', state_g2, v_g2)
-            state_g3_read = torch.einsum('bthjk,bthk->bthj', state_g3, v_g3)
+            # Scale by 1/sqrt(headdim) like attention (sum over headdim terms)
+            scale = config.headdim ** -0.5
+            state_g1_read = torch.einsum('bthjk,bthk->bthj', state_g1, v_g1) * scale
+            state_g2_read = torch.einsum('bthjk,bthk->bthj', state_g2, v_g2) * scale
+            state_g3_read = torch.einsum('bthjk,bthk->bthj', state_g3, v_g3) * scale
             
             out_g1 = v_g1 + params_g1['gate'] * state_g1_read
             out_g2 = v_g2 + params_g2['gate'] * state_g2_read
