@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .scan import forward_scan, backward_scan, centered_scan
-from .rope import apply_data_dependent_rope, apply_rope
+from .rope import apply_data_dependent_rope, apply_rope, apply_paired_rope
 
 
 @dataclass
@@ -23,6 +23,7 @@ class USBConfig:
     headdim: int = 64
     expansion_factor: int = 2
     qkv_share_ratio: float = 0.8  # 80% shared, 20% unique per group
+    paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
     
     # Derived dimensions
     @property
@@ -400,22 +401,62 @@ class USBBlock(nn.Module):
         # Note: k_g3 already has DD-RoPE, we apply standard RoPE on top
         k_g3_for_attn = apply_rope(k_g3, seq_len)
         
-        # Step 6: Full attention
+        # Step 6: Attention (standard or paired heads)
         # Concatenate all groups back together
         q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)  # (batch, seq_len, nheads_total, headdim)
         k_all = torch.cat([k_g1, k_g2, k_g3_for_attn, k_g4], dim=-2)
         v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         
-        # Scaled dot-product attention
-        scale = config.headdim ** -0.5
-        attn_weights = torch.einsum('bthd,bshd->bhts', q_all, k_all) * scale
-        
-        if attention_mask is not None:
-            attn_weights = attn_weights.masked_fill(~attention_mask, float('-inf'))
-        
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_out = torch.einsum('bhts,bshd->bthd', attn_weights, v_all)
-        attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+        if config.paired_heads:
+            # Paired head attention: adjacent heads' queries attend to each other's keys
+            # This enables cross-head information mixing through position interleaving
+            nheads = config.nheads_total
+            headdim = config.headdim
+            
+            # Step 6a: Merge adjacent head pairs - (batch, seq, nheads, headdim) -> (batch, seq, nheads//2, headdim*2)
+            q_paired = rearrange(q_all, 'b t (h2 two) d -> b t h2 (two d)', two=2)
+            k_paired = rearrange(k_all, 'b t (h2 two) d -> b t h2 (two d)', two=2)
+            
+            # Step 6b: Apply paired RoPE (even positions for first half, odd for second half)
+            q_paired = apply_paired_rope(q_paired, seq_len)
+            k_paired = apply_paired_rope(k_paired, seq_len)
+            
+            # Step 6c: Reshape to double sequence length, restore head_dim
+            # This interleaves adjacent heads along the sequence dimension
+            # (batch, seq, nheads//2, headdim*2) -> (batch, seq*2, nheads//2, headdim)
+            q_interleaved = rearrange(q_paired, 'b t h (two d) -> b (t two) h d', two=2)
+            k_interleaved = rearrange(k_paired, 'b t h (two d) -> b (t two) h d', two=2)
+            # V doesn't get RoPE, just interleave
+            v_interleaved = rearrange(v_all, 'b t (h2 two) d -> b (t two) h2 d', two=2)
+            
+            # Step 6d: Scaled dot-product attention on doubled sequence
+            scale = headdim ** -0.5
+            attn_weights = torch.einsum('bthd,bshd->bhts', q_interleaved, k_interleaved) * scale
+            
+            # Causal mask for interleaved sequence (position i can attend to positions <= i)
+            # Note: attention_mask from caller doesn't apply cleanly to interleaved positions
+            seq_doubled = seq_len * 2
+            causal_mask = torch.tril(torch.ones(seq_doubled, seq_doubled, device=x.device, dtype=torch.bool))
+            attn_weights = attn_weights.masked_fill(~causal_mask, float('-inf'))
+            
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_out_interleaved = torch.einsum('bhts,bshd->bthd', attn_weights, v_interleaved)
+            
+            # Step 6e: Reshape back to original sequence length and head count
+            # (batch, seq*2, nheads//2, headdim) -> (batch, seq, nheads, headdim)
+            attn_out = rearrange(attn_out_interleaved, 'b (t two) h d -> b t (h two) d', two=2)
+            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+        else:
+            # Standard full attention
+            scale = config.headdim ** -0.5
+            attn_weights = torch.einsum('bthd,bshd->bhts', q_all, k_all) * scale
+            
+            if attention_mask is not None:
+                attn_weights = attn_weights.masked_fill(~attention_mask, float('-inf'))
+            
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_out = torch.einsum('bhts,bshd->bthd', attn_weights, v_all)
+            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
         
         # Step 7: Down-projection
         out = self.down_proj(attn_out)

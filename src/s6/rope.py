@@ -87,6 +87,91 @@ def apply_rope(
     return x * cos + _rotate_half(x) * sin
 
 
+def _compute_paired_rope_freqs(
+    headdim: int,
+    seq_len: int,
+    base: float = 10000.0,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute paired RoPE frequencies for cross-head mixing.
+    
+    First half of headdim uses even positions (0, 2, 4, ...),
+    second half uses odd positions (1, 3, 5, ...).
+    
+    When combined with head pair reshaping, this allows adjacent heads
+    to attend to each other's keys through position interleaving.
+    
+    Returns:
+        cos, sin: (seq_len, headdim * 2) each - doubled for merged head pairs
+    """
+    # Frequency bands (same as standard RoPE)
+    inv_freq = 1.0 / (base ** (torch.arange(0, headdim, 2, device=device, dtype=torch.float32) / headdim))
+    inv_freq = torch.cat([inv_freq, inv_freq], dim=-1)  # (headdim,)
+    
+    # Position indices - even and odd interleaved
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    t_even = 2 * t  # 0, 2, 4, 6, ...
+    t_odd = 2 * t + 1  # 1, 3, 5, 7, ...
+    
+    # Compute frequencies for even and odd positions
+    freqs_even = torch.outer(t_even, inv_freq)  # (seq_len, headdim)
+    freqs_odd = torch.outer(t_odd, inv_freq)  # (seq_len, headdim)
+    
+    # Concatenate: first half even, second half odd -> (seq_len, headdim * 2)
+    freqs = torch.cat([freqs_even, freqs_odd], dim=-1)
+    
+    cos = freqs.cos().to(dtype)
+    sin = freqs.sin().to(dtype)
+    
+    return cos, sin
+
+
+# Cache for paired RoPE frequencies
+_paired_rope_cache = {}
+
+
+def apply_paired_rope(
+    x: torch.Tensor,
+    seq_len: int,
+    base: float = 10000.0,
+) -> torch.Tensor:
+    """
+    Apply paired RoPE for cross-head mixing.
+    
+    Used after merging adjacent head pairs (nheads/2, headdim*2).
+    First half of headdim gets even positions, second half gets odd positions.
+    
+    Args:
+        x: (batch, seq_len, nheads/2, headdim*2) - merged head pairs
+        seq_len: sequence length
+        base: RoPE base frequency
+    
+    Returns:
+        x with paired RoPE applied: (batch, seq_len, nheads/2, headdim*2)
+    """
+    headdim_doubled = x.shape[-1]
+    device = x.device
+    dtype = x.dtype
+    headdim = headdim_doubled // 2
+    
+    # Check cache
+    cache_key = (headdim, seq_len, base, device, dtype)
+    if cache_key not in _paired_rope_cache:
+        cos, sin = _compute_paired_rope_freqs(headdim, seq_len, base, device, dtype)
+        _paired_rope_cache[cache_key] = (cos, sin)
+    
+    cos, sin = _paired_rope_cache[cache_key]
+    
+    # Reshape for broadcasting: (1, seq_len, 1, headdim*2)
+    cos = cos.view(1, seq_len, 1, headdim_doubled)
+    sin = sin.view(1, seq_len, 1, headdim_doubled)
+    
+    # Apply rotation
+    return x * cos + _rotate_half(x) * sin
+
+
 def apply_data_dependent_rope(
     x: torch.Tensor,
     freqs: torch.Tensor,
