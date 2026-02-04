@@ -170,18 +170,14 @@ from s6.usb_block import USBBlock, USBConfig
 
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, 
-                 kv_groups=2, q_shared_frac=0.0, kv_shared_frac=0.8, 
+    def __init__(self, d_model, headdim=64, expansion_factor=2, n_kv_heads=2,
                  diff_attn=False, layer_idx=0, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
-            paired_heads=paired_heads,
-            kv_groups=kv_groups,
-            q_shared_frac=q_shared_frac,
-            kv_shared_frac=kv_shared_frac,
+            n_kv_heads=n_kv_heads,
             diff_attn=diff_attn,
             layer_idx=layer_idx,
         )
@@ -545,10 +541,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     
     n_train = len(train_data)
     total_steps = 0
-    final_epoch = 0
-    final_val_acc = 0.0
-    final_val_loss = 0.0
     initial_loss = None
+    
+    # Track best result
+    best_epoch = 0
+    best_val_acc = 0.0
+    best_val_loss = float('inf')
+    final_epoch = 0
+    stop_reason = "MAX_EPOCH"
     
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False, ncols=100)
     for epoch in epoch_pbar:
@@ -577,16 +577,29 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
         if initial_loss is None:
             initial_loss = sum(epoch_losses[:10]) / min(10, len(epoch_losses))
         
+        # Check for train accuracy plateau (memorization)
+        train_acc = sum(epoch_accs) / len(epoch_accs)
+        
         # Evaluate on validation set
         val_loss, val_acc = _eval_val()
         final_epoch = epoch + 1
-        final_val_acc = val_acc
-        final_val_loss = val_loss
+        
+        # Track best
+        if val_acc > best_val_acc:
+            best_epoch = final_epoch
+            best_val_acc = val_acc
+            best_val_loss = val_loss
         
         epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
-        # Early stopping
+        # Early stopping: converged
         if val_acc >= early_stop_acc:
+            stop_reason = "CONVERGED"
+            break
+        
+        # Early stopping: train plateau (100% train acc but val not improving)
+        if train_acc >= 0.9999 and val_acc < early_stop_acc:
+            stop_reason = "PLATEAU"
             break
 
     if device == 'cuda':
@@ -599,13 +612,15 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
 
     return {
         'initial': initial_loss if initial_loss else 0.0,
-        'final': final_val_loss,
-        'acc': final_val_acc,
+        'final': best_val_loss,
+        'acc': best_val_acc,
+        'best_epoch': best_epoch,
         'epochs': final_epoch,
         'steps': total_steps,
         'wall_s': wall,
         'peak_mem_mb': peak_mem,
-        'converged': final_val_acc >= early_stop_acc,
+        'converged': best_val_acc >= early_stop_acc,
+        'stop_reason': stop_reason,
     }
 
 
@@ -664,22 +679,14 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB (Unified Sequence Block): hierarchical KV sharing (kv_groups=2)
-    # Q: independent per-head, K/V: 80% per-group shared + 20% per-head
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
+    # USB: GQA with 2 KV heads (default)
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=2))
     
-    # USB-Diff: USB with differential attention (A1 - λ*A2)
-    try_add('USB-Diff', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, diff_attn=True))
+    # USB-Diff: USB + differential attention (A1 - λ*A2)
+    try_add('USB-Diff', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=2, diff_attn=True))
     
-    # USB-MQA: All K/V heads share 80% weights (single group, like soft MQA)
-    try_add('USB-MQA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, kv_groups=1))
-    
-    # USB-MHA: No weight sharing (full MHA expressivity)
-    try_add('USB-MHA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, 
-                                          kv_groups=4, q_shared_frac=0.0, kv_shared_frac=0.0))
-    
-    # USB-P: USB with paired head attention (cross-head mixing via position interleaving)
-    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True))
+    # USB-MHA: Full MHA (n_kv_heads=0 means same as Q heads)
+    try_add('USB-MHA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=0))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
@@ -748,7 +755,7 @@ if __name__ == '__main__':
     print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
     print('=' * 100)
 
-    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Final':>8} {'Val Acc':>8} {'Epochs':>7} {'Wall(s)':>8} {'Mem(MB)':>9} {'Status':>10}"
+    header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Best':>8} {'Val Acc':>8} {'Best@':>6} {'Epochs':>7} {'Wall(s)':>8} {'Status':>10}"
     print(header)
     print('-' * 100)
 
@@ -779,8 +786,7 @@ if __name__ == '__main__':
             
             r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-3, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data, early_stop_acc=args.early_stop_acc)
-            status = "CONVERGED" if r['converged'] else "MAX_EPOCH"
-            tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['peak_mem_mb']:>8.1f} {status:>10}")
+            tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['best_epoch']:>6} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['stop_reason']:>10}")
             
             # Store result
             all_results.append({
@@ -790,11 +796,12 @@ if __name__ == '__main__':
                 'initial_loss': r['initial'],
                 'final_loss': r['final'],
                 'val_acc': r['acc'],
+                'best_epoch': r['best_epoch'],
                 'epochs': r['epochs'],
                 'wall_s': r['wall_s'],
                 'peak_mem_mb': r['peak_mem_mb'],
                 'converged': r['converged'],
-                'status': status
+                'stop_reason': r['stop_reason'],
             })
         del task_data
         if torch.cuda.is_available():
@@ -806,7 +813,7 @@ if __name__ == '__main__':
         with open(args.csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'model', 'task', 'params', 'initial_loss', 'final_loss', 
-                'val_acc', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'status'
+                'val_acc', 'best_epoch', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'stop_reason'
             ])
             writer.writeheader()
             writer.writerows(all_results)

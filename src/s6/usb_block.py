@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .scan import forward_scan, backward_scan, centered_scan
-from .rope import apply_data_dependent_rope, apply_rope, apply_paired_rope
+from .rope import apply_data_dependent_rope, apply_rope
 
 
 @dataclass
@@ -22,10 +22,7 @@ class USBConfig:
     d_model: int
     headdim: int = 64
     expansion_factor: int = 2
-    kv_groups: int = 2  # Number of KV groups for hierarchical sharing (0 = full MHA, no sharing)
-    q_shared_frac: float = 0.0  # Fraction of Q weights shared globally (0 = independent Q per head)
-    kv_shared_frac: float = 0.8  # Fraction of KV weights shared within each group
-    paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
+    n_kv_heads: int = 2  # Number of KV heads (GQA). 0 = same as Q heads (MHA)
     diff_attn: bool = False  # Use differential attention (A1 - λ*A2)
     layer_idx: int = 0  # Layer index for diff_attn λ_init calculation
     
@@ -48,11 +45,9 @@ class USBConfig:
         return self.nheads_per_group * 4
     
     @property
-    def heads_per_kv_group(self) -> int:
-        """Number of heads per KV group."""
-        if self.kv_groups == 0:
-            return 1  # No grouping, each head is its own group
-        return self.nheads_total // self.kv_groups
+    def nkv_heads(self) -> int:
+        """Actual number of KV heads."""
+        return self.n_kv_heads if self.n_kv_heads > 0 else self.nheads_total
 
 
 class GatedRMSNorm(nn.Module):
@@ -156,106 +151,6 @@ class PerHeadProjections(nn.Module):
         }
 
 
-class HierarchicalQKV(nn.Module):
-    """
-    Hierarchical weight sharing for Q, K, V projections.
-    
-    Blends MHA expressivity with GQA parameter efficiency:
-    - Q: global shared base (q_shared_frac) + per-head unique (1-q_shared_frac)
-    - K, V: per-group shared base (kv_shared_frac) + per-head unique (1-kv_shared_frac)
-    
-    Each Q head gets its own K, V (like MHA), but weights are shared hierarchically.
-    """
-    
-    def __init__(
-        self, 
-        d_in: int, 
-        d_head: int, 
-        n_heads: int, 
-        n_groups: int,
-        q_shared_frac: float = 0.5,
-        kv_shared_frac: float = 0.8,
-    ):
-        super().__init__()
-        assert n_heads % n_groups == 0, f"n_heads ({n_heads}) must be divisible by n_groups ({n_groups})"
-        
-        self.d_in = d_in
-        self.d_head = d_head
-        self.n_heads = n_heads
-        self.n_groups = n_groups
-        self.heads_per_group = n_heads // n_groups
-        
-        # Q dimensions: global shared + per-head unique
-        self.q_shared_dim = int(d_head * q_shared_frac)
-        self.q_unique_dim = d_head - self.q_shared_dim
-        
-        # KV dimensions: per-group shared + per-head unique
-        self.kv_shared_dim = int(d_head * kv_shared_frac)
-        self.kv_unique_dim = d_head - self.kv_shared_dim
-        
-        # Q projections (only create if needed)
-        self.q_base = nn.Linear(d_in, self.q_shared_dim, bias=False) if self.q_shared_dim > 0 else None
-        self.q_delta = nn.Linear(d_in, self.q_unique_dim * n_heads, bias=False) if self.q_unique_dim > 0 else None
-        
-        # K projections  
-        self.k_base = nn.Linear(d_in, self.kv_shared_dim * n_groups, bias=False) if self.kv_shared_dim > 0 else None
-        self.k_delta = nn.Linear(d_in, self.kv_unique_dim * n_heads, bias=False) if self.kv_unique_dim > 0 else None
-        
-        # V projections
-        self.v_base = nn.Linear(d_in, self.kv_shared_dim * n_groups, bias=False) if self.kv_shared_dim > 0 else None
-        self.v_delta = nn.Linear(d_in, self.kv_unique_dim * n_heads, bias=False) if self.kv_unique_dim > 0 else None
-    
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (batch, seq_len, d_in)
-        
-        Returns:
-            q, k, v: each (batch, seq_len, n_heads, d_head)
-        """
-        batch, seq_len, _ = x.shape
-        
-        # Q: broadcast shared base to all heads, concat with per-head delta
-        parts_q = []
-        if self.q_base is not None:
-            q_base = self.q_base(x)  # (batch, seq, q_shared_dim)
-            q_base = q_base.unsqueeze(2).expand(-1, -1, self.n_heads, -1)  # broadcast
-            parts_q.append(q_base)
-        if self.q_delta is not None:
-            q_delta = self.q_delta(x)  # (batch, seq, q_unique_dim * n_heads)
-            q_delta = rearrange(q_delta, 'b t (h d) -> b t h d', h=self.n_heads)
-            parts_q.append(q_delta)
-        q = torch.cat(parts_q, dim=-1)  # (batch, seq, n_heads, d_head)
-        
-        # K: expand per-group base to heads in group, concat with per-head delta
-        parts_k = []
-        if self.k_base is not None:
-            k_base = self.k_base(x)  # (batch, seq, kv_shared_dim * n_groups)
-            k_base = rearrange(k_base, 'b t (g d) -> b t g d', g=self.n_groups)
-            k_base = repeat(k_base, 'b t g d -> b t (g hpg) d', hpg=self.heads_per_group)
-            parts_k.append(k_base)
-        if self.k_delta is not None:
-            k_delta = self.k_delta(x)  # (batch, seq, kv_unique_dim * n_heads)
-            k_delta = rearrange(k_delta, 'b t (h d) -> b t h d', h=self.n_heads)
-            parts_k.append(k_delta)
-        k = torch.cat(parts_k, dim=-1)  # (batch, seq, n_heads, d_head)
-        
-        # V: same pattern as K
-        parts_v = []
-        if self.v_base is not None:
-            v_base = self.v_base(x)
-            v_base = rearrange(v_base, 'b t (g d) -> b t g d', g=self.n_groups)
-            v_base = repeat(v_base, 'b t g d -> b t (g hpg) d', hpg=self.heads_per_group)
-            parts_v.append(v_base)
-        if self.v_delta is not None:
-            v_delta = self.v_delta(x)
-            v_delta = rearrange(v_delta, 'b t (h d) -> b t h d', h=self.n_heads)
-            parts_v.append(v_delta)
-        v = torch.cat(parts_v, dim=-1)  # (batch, seq, n_heads, d_head)
-        
-        return q, k, v
-
-
 class USBBlock(nn.Module):
     """
     Unified Sequence Block.
@@ -273,32 +168,26 @@ class USBBlock(nn.Module):
         d_group = config.d_group
         nheads_per_group = config.nheads_per_group
         nheads_total = config.nheads_total
+        nkv_heads = config.nkv_heads
         headdim = config.headdim
         
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: Hierarchical QKV projection
-        # Q: 50% global shared, 50% per-head unique
-        # K, V: 80% per-group shared, 20% per-head unique
-        n_groups = config.kv_groups if config.kv_groups > 0 else nheads_total
-        self.qkv = HierarchicalQKV(
-            d_in=d_expanded,
-            d_head=headdim,
-            n_heads=nheads_total,
-            n_groups=n_groups,
-            q_shared_frac=config.q_shared_frac,
-            kv_shared_frac=config.kv_shared_frac,
-        )
+        # Step 2: QKV projections (GQA: fewer KV heads than Q heads)
+        d_kv = nkv_heads * headdim
+        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)  # nheads_total * headdim
+        self.k_proj = nn.Linear(d_expanded, d_kv, bias=False)  # nkv_heads * headdim
+        self.v_proj = nn.Linear(d_expanded, d_kv, bias=False)  # nkv_heads * headdim
         
-        # Gated RMSNorm for Q, K, V (all same size now - full n_heads)
+        # Gated RMSNorm for Q, K, V
         self.q_norm = GatedRMSNorm(d_expanded)
-        self.k_norm = GatedRMSNorm(d_expanded)
-        self.v_norm = GatedRMSNorm(d_expanded)
+        self.k_norm = GatedRMSNorm(d_kv)
+        self.v_norm = GatedRMSNorm(d_kv)
         
         # QK bias (per-head, initialized to 1.0)
         self.q_bias = nn.Parameter(torch.ones(nheads_total, headdim))
-        self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
+        self.k_bias = nn.Parameter(torch.ones(nkv_heads, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
         # G4 is passthrough, no scan parameters needed
@@ -365,26 +254,31 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: Hierarchical QKV projection
-        # Returns (batch, seq, n_heads, headdim) for each
-        q, k, v = self.qkv(x_exp)
+        # Step 2: QKV projection (GQA)
+        q = self.q_proj(x_exp)  # (batch, seq, nheads_total * headdim)
+        k = self.k_proj(x_exp)  # (batch, seq, nkv_heads * headdim)
+        v = self.v_proj(x_exp)  # (batch, seq, nkv_heads * headdim)
         
-        # Flatten, apply SiLU + RMSNorm, reshape back
-        q = rearrange(q, 'b t h d -> b t (h d)')
-        k = rearrange(k, 'b t h d -> b t (h d)')
-        v = rearrange(v, 'b t h d -> b t (h d)')
-        
+        # Apply SiLU + RMSNorm
         q = self.q_norm(F.silu(q))
         k = self.k_norm(F.silu(k))
         v = self.v_norm(F.silu(v))
         
+        # Reshape to heads
+        nkv_heads = config.nkv_heads
         q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
-        k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
-        v = rearrange(v, 'b t (h d) -> b t h d', h=config.nheads_total)
+        k = rearrange(k, 'b t (h d) -> b t h d', h=nkv_heads)
+        v = rearrange(v, 'b t (h d) -> b t h d', h=nkv_heads)
         
         # Apply QK bias (after norm)
         q = q + self.q_bias
         k = k + self.k_bias
+        
+        # Expand K, V for GQA (repeat KV heads to match Q heads)
+        if nkv_heads < config.nheads_total:
+            n_rep = config.nheads_total // nkv_heads
+            k = repeat(k, 'b t h d -> b t (h rep) d', rep=n_rep)
+            v = repeat(v, 'b t h d -> b t (h rep) d', rep=n_rep)
         
         # Step 3: Channel split into 4 groups
         # Each group gets nheads_per_group heads
@@ -470,99 +364,49 @@ class USBBlock(nn.Module):
         # Note: k_g3 already has DD-RoPE, we apply standard RoPE on top
         k_g3_for_attn = apply_rope(k_g3, seq_len)
         
-        # Step 6: Attention (standard or paired heads)
+        # Step 6: Attention using SDPA
         # Concatenate all groups back together
         q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)  # (batch, seq_len, nheads_total, headdim)
         k_all = torch.cat([k_g1, k_g2, k_g3_for_attn, k_g4], dim=-2)
         v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         
-        if config.paired_heads:
-            # Paired head attention: adjacent heads' queries attend to each other's keys
-            # This enables cross-head information mixing through position interleaving
-            nheads = config.nheads_total
-            headdim = config.headdim
-            
-            # Step 6a: Merge adjacent head pairs - (batch, seq, nheads, headdim) -> (batch, seq, nheads//2, headdim*2)
-            q_paired = rearrange(q_all, 'b t (h2 two) d -> b t h2 (two d)', two=2)
-            k_paired = rearrange(k_all, 'b t (h2 two) d -> b t h2 (two d)', two=2)
-            
-            # Step 6b: Apply paired RoPE (even positions for first half, odd for second half)
-            q_paired = apply_paired_rope(q_paired, seq_len)
-            k_paired = apply_paired_rope(k_paired, seq_len)
-            
-            # Step 6c: Reshape to double sequence length, restore head_dim
-            # This interleaves adjacent heads along the sequence dimension
-            # (batch, seq, nheads//2, headdim*2) -> (batch, seq*2, nheads//2, headdim)
-            q_interleaved = rearrange(q_paired, 'b t h (two d) -> b (t two) h d', two=2)
-            k_interleaved = rearrange(k_paired, 'b t h (two d) -> b (t two) h d', two=2)
-            # V doesn't get RoPE, just interleave
-            v_interleaved = rearrange(v_all, 'b t (h2 two) d -> b (t two) h2 d', two=2)
-            
-            # Step 6d: Scaled dot-product attention on doubled sequence
-            scale = headdim ** -0.5
-            attn_weights = torch.einsum('bthd,bshd->bhts', q_interleaved, k_interleaved) * scale
-            
-            # Causal mask for interleaved sequence (position i can attend to positions <= i)
-            # Note: attention_mask from caller doesn't apply cleanly to interleaved positions
-            seq_doubled = seq_len * 2
-            causal_mask = torch.tril(torch.ones(seq_doubled, seq_doubled, device=x.device, dtype=torch.bool))
-            attn_weights = attn_weights.masked_fill(~causal_mask, float('-inf'))
-            
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_out_interleaved = torch.einsum('bhts,bshd->bthd', attn_weights, v_interleaved)
-            
-            # Step 6e: Reshape back to original sequence length and head count
-            # (batch, seq*2, nheads//2, headdim) -> (batch, seq, nheads, headdim)
-            attn_out = rearrange(attn_out_interleaved, 'b (t two) h d -> b t (h two) d', two=2)
-            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
-        elif config.diff_attn:
-            # Differential attention: A1 - λ*A2
-            # Split Q, K into halves
+        # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
+        q_sdpa = q_all.transpose(1, 2)
+        k_sdpa = k_all.transpose(1, 2)
+        v_sdpa = v_all.transpose(1, 2)
+        
+        if config.diff_attn:
+            # Differential attention: out1 - λ*out2 using SDPA
             half_d = config.headdim // 2
-            q1, q2 = q_all[..., :half_d], q_all[..., half_d:]
-            k1, k2 = k_all[..., :half_d], k_all[..., half_d:]
+            q1, q2 = q_sdpa[..., :half_d], q_sdpa[..., half_d:]
+            k1, k2 = k_sdpa[..., :half_d], k_sdpa[..., half_d:]
             
             # Compute λ per head: exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
-            # lambda_q1, lambda_k1: (nheads, half_d)
             lambda_val = (
                 torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1))
                 - torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1))
                 + self.lambda_init
             )  # (nheads,)
             
-            # Scale for half head dim
-            scale = half_d ** -0.5
+            # Two SDPA calls with half Q, K dims but full V
+            out1 = F.scaled_dot_product_attention(q1, k1, v_sdpa, is_causal=True)
+            out2 = F.scaled_dot_product_attention(q2, k2, v_sdpa, is_causal=True)
             
-            # Compute two attention patterns
-            attn1 = torch.einsum('bthd,bshd->bhts', q1, k1) * scale
-            attn2 = torch.einsum('bthd,bshd->bhts', q2, k2) * scale
+            # Differential: out1 - λ*out2, λ shape (nheads,) -> (1, nheads, 1, 1)
+            attn_out = out1 - lambda_val.view(1, -1, 1, 1) * out2
             
-            if attention_mask is not None:
-                attn1 = attn1.masked_fill(~attention_mask, float('-inf'))
-                attn2 = attn2.masked_fill(~attention_mask, float('-inf'))
-            
-            attn1 = F.softmax(attn1, dim=-1)
-            attn2 = F.softmax(attn2, dim=-1)
-            
-            # Differential: A1 - λ*A2, λ shape (nheads,) -> (1, nheads, 1, 1)
-            diff_weights = attn1 - lambda_val.view(1, -1, 1, 1) * attn2
-            
-            # Apply to V (full headdim)
-            attn_out = torch.einsum('bhts,bshd->bthd', diff_weights, v_all)
+            # Transpose back: (B, H, T, D) -> (B, T, H, D)
+            attn_out = attn_out.transpose(1, 2)
             
             # Per-head RMSNorm and scale by (1 - λ_init)
             attn_out = self.diff_head_norm(attn_out) * (1 - self.lambda_init)
             attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
         else:
-            # Standard full attention
-            scale = config.headdim ** -0.5
-            attn_weights = torch.einsum('bthd,bshd->bhts', q_all, k_all) * scale
+            # Standard SDPA
+            attn_out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
             
-            if attention_mask is not None:
-                attn_weights = attn_weights.masked_fill(~attention_mask, float('-inf'))
-            
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_out = torch.einsum('bhts,bshd->bthd', attn_weights, v_all)
+            # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
+            attn_out = attn_out.transpose(1, 2)
             attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
         
         # Step 7: Down-projection
