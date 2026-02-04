@@ -24,6 +24,11 @@ class USBConfig:
     expansion_factor: int = 2
     layer_idx: int = 0  # For future use (e.g., layer-dependent params)
     
+    # Scan state mode: 'elementwise' (k*v) or 'outer' (k⊗v)
+    # - elementwise: state is (nheads, headdim), less memory
+    # - outer: state is (nheads, headdim, headdim), more expressive
+    scan_state_mode: str = 'elementwise'
+    
     # Derived dimensions
     @property
     def d_expanded(self) -> int:
@@ -187,15 +192,22 @@ class USBBlock(nn.Module):
         self.scan_proj_g3 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
         
         # Learnable initial states for scan heads (G1, G2, G3)
-        # Shape: (nheads_per_group, headdim) per group
-        self.init_state_g1 = nn.Parameter(torch.zeros(nheads_per_group, headdim))
-        self.init_state_g2 = nn.Parameter(torch.zeros(nheads_per_group, headdim))
-        self.init_state_g3 = nn.Parameter(torch.zeros(nheads_per_group, headdim))
+        # Shape depends on scan_state_mode:
+        # - elementwise: (nheads_per_group, headdim)
+        # - outer: (nheads_per_group, headdim, headdim)
+        if config.scan_state_mode == 'outer':
+            init_shape = (nheads_per_group, headdim, headdim)
+        else:
+            init_shape = (nheads_per_group, headdim)
+        
+        self.init_state_g1 = nn.Parameter(torch.zeros(*init_shape))
+        self.init_state_g2 = nn.Parameter(torch.zeros(*init_shape))
+        self.init_state_g3 = nn.Parameter(torch.zeros(*init_shape))
         
         # Mark initial states as no weight decay
-        self.init_state_g1._no_weight_decay = True
-        self.init_state_g2._no_weight_decay = True
-        self.init_state_g3._no_weight_decay = True
+        self.init_state_g1._no_weight_decay = True  # type: ignore[attr-defined]
+        self.init_state_g2._no_weight_decay = True  # type: ignore[attr-defined]
+        self.init_state_g3._no_weight_decay = True  # type: ignore[attr-defined]
         
         # Step 7: Down-projection
         self.down_proj = nn.Linear(d_expanded, d_model, bias=False)
@@ -265,16 +277,29 @@ class USBBlock(nn.Module):
         k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
         
         # Compute K·V for each group
-        # For efficiency, we can think of this as the "input" to the scan
-        # Shape: (batch, seq_len, nheads, headdim)
-        kv_g1 = k_g1 * v_g1
-        kv_g2 = k_g2 * v_g2
-        kv_g3 = k_g3 * v_g3
-        
-        # Get initial states (expand to batch dimension)
-        init_g1 = repeat(self.init_state_g1, 'h d -> b h d', b=batch)
-        init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
-        init_g3 = repeat(self.init_state_g3, 'h d -> b h d', b=batch)
+        # Shape depends on scan_state_mode:
+        # - elementwise: (batch, seq_len, nheads, headdim)
+        # - outer: (batch, seq_len, nheads, headdim, headdim) = k ⊗ v
+        if config.scan_state_mode == 'outer':
+            # Outer product: k[..., :, None] * v[..., None, :] -> (b, t, h, d, d)
+            kv_g1 = k_g1.unsqueeze(-1) * v_g1.unsqueeze(-2)
+            kv_g2 = k_g2.unsqueeze(-1) * v_g2.unsqueeze(-2)
+            kv_g3 = k_g3.unsqueeze(-1) * v_g3.unsqueeze(-2)
+            
+            # Get initial states (expand to batch dimension)
+            init_g1 = repeat(self.init_state_g1, 'h d1 d2 -> b h d1 d2', b=batch)
+            init_g2 = repeat(self.init_state_g2, 'h d1 d2 -> b h d1 d2', b=batch)
+            init_g3 = repeat(self.init_state_g3, 'h d1 d2 -> b h d1 d2', b=batch)
+        else:
+            # Element-wise: k * v -> (b, t, h, d)
+            kv_g1 = k_g1 * v_g1
+            kv_g2 = k_g2 * v_g2
+            kv_g3 = k_g3 * v_g3
+            
+            # Get initial states (expand to batch dimension)
+            init_g1 = repeat(self.init_state_g1, 'h d -> b h d', b=batch)
+            init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
+            init_g3 = repeat(self.init_state_g3, 'h d -> b h d', b=batch)
         
         # Run scans
         # Forward scan (G1): starts at t=0, moves forward
@@ -310,9 +335,22 @@ class USBBlock(nn.Module):
         # Gate state injection back into hiddens
         # h_t = h_t + gate_t * state_t
         # Here "h_t" is the value representation
-        out_g1 = v_g1 + params_g1['gate'] * state_g1
-        out_g2 = v_g2 + params_g2['gate'] * state_g2
-        out_g3 = v_g3 + params_g3['gate'] * state_g3
+        if config.scan_state_mode == 'outer':
+            # For outer product mode, contract state with v to get back to headdim
+            # state: (batch, seq, nheads, headdim, headdim)
+            # v: (batch, seq, nheads, headdim)
+            # state @ v -> (batch, seq, nheads, headdim)
+            state_g1_read = torch.einsum('bthjk,bthk->bthj', state_g1, v_g1)
+            state_g2_read = torch.einsum('bthjk,bthk->bthj', state_g2, v_g2)
+            state_g3_read = torch.einsum('bthjk,bthk->bthj', state_g3, v_g3)
+            
+            out_g1 = v_g1 + params_g1['gate'] * state_g1_read
+            out_g2 = v_g2 + params_g2['gate'] * state_g2_read
+            out_g3 = v_g3 + params_g3['gate'] * state_g3_read
+        else:
+            out_g1 = v_g1 + params_g1['gate'] * state_g1
+            out_g2 = v_g2 + params_g2['gate'] * state_g2
+            out_g3 = v_g3 + params_g3['gate'] * state_g3
         
         # Apply data-dependent RoPE to Q for attention
         q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])

@@ -3,6 +3,10 @@ Sequential scan implementations for USB.
 
 These are reference implementations - will be optimized with parallel/associative
 scans later (e.g., via Triton kernels).
+
+Supports two modes:
+- elementwise: kv = k * v, state is (nheads, headdim)
+- outer: kv = k ⊗ v, state is (nheads, headdim, headdim)
 """
 
 import torch
@@ -27,15 +31,22 @@ def forward_scan(
             + c2[t] * (α[t]²  * state_{t-2} + kv_{t-2})
     
     Args:
-        kv: (batch, seq_len, nheads, headdim) - K·V product
+        kv: (batch, seq_len, nheads, headdim) for elementwise mode
+            (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
         c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
-        init_state: (batch, nheads, headdim) - learned initial state
+        init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
-        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
+        states: same shape as kv - accumulated states at each position
     """
-    batch, seq_len, nheads, headdim = kv.shape
+    outer_mode = kv.ndim == 5
+    
+    if outer_mode:
+        batch, seq_len, nheads, headdim, _ = kv.shape
+    else:
+        batch, seq_len, nheads, headdim = kv.shape
+    
     device = kv.device
     dtype = kv.dtype
     
@@ -43,19 +54,26 @@ def forward_scan(
     state_list: List[torch.Tensor] = []
     
     # State history (need t-1 and t-2)
-    state_tm1 = init_state  # (batch, nheads, headdim)
+    state_tm1 = init_state
     state_tm2 = torch.zeros_like(init_state)
     
-    # KV history
-    kv_tm1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-    kv_tm2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    # KV history - same shape as state
+    if outer_mode:
+        kv_tm1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
+        kv_tm2 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
+        # Coefficients need extra dims for broadcasting
+        coef_dims = (slice(None), slice(None), None, None)  # (batch, nheads, 1, 1)
+    else:
+        kv_tm1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+        kv_tm2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+        coef_dims = (slice(None), slice(None), None)  # (batch, nheads, 1)
     
     for t in range(seq_len):
-        kv_t = kv[:, t]  # (batch, nheads, headdim)
-        alpha_t = alpha[:, t, :, None]  # (batch, nheads, 1)
-        c0_t = c0[:, t, :, None]  # (batch, nheads, 1)
-        c1_t = c1[:, t, :, None]
-        c2_t = c2[:, t, :, None]
+        kv_t = kv[:, t]
+        alpha_t = alpha[:, t][coef_dims]
+        c0_t = c0[:, t][coef_dims]
+        c1_t = c1[:, t][coef_dims]
+        c2_t = c2[:, t][coef_dims]
         
         # AB-2 integration
         state_t = (
@@ -94,15 +112,22 @@ def backward_scan(
             + c2[t] * (α[t]²  * state_{t+2} + kv_{t+2})
     
     Args:
-        kv: (batch, seq_len, nheads, headdim) - K·V product
+        kv: (batch, seq_len, nheads, headdim) for elementwise mode
+            (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
         c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
-        init_state: (batch, nheads, headdim) - learned initial state
+        init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
-        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
+        states: same shape as kv - accumulated states at each position
     """
-    batch, seq_len, nheads, headdim = kv.shape
+    outer_mode = kv.ndim == 5
+    
+    if outer_mode:
+        batch, seq_len, nheads, headdim, _ = kv.shape
+    else:
+        batch, seq_len, nheads, headdim = kv.shape
+    
     device = kv.device
     dtype = kv.dtype
     
@@ -110,19 +135,25 @@ def backward_scan(
     state_list: List[torch.Tensor] = []
     
     # State history (need t+1 and t+2)
-    state_tp1 = init_state  # (batch, nheads, headdim)
+    state_tp1 = init_state
     state_tp2 = torch.zeros_like(init_state)
     
     # KV history
-    kv_tp1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-    kv_tp2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+    if outer_mode:
+        kv_tp1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
+        kv_tp2 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
+        coef_dims = (slice(None), slice(None), None, None)
+    else:
+        kv_tp1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+        kv_tp2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
+        coef_dims = (slice(None), slice(None), None)
     
     for t in range(seq_len - 1, -1, -1):
-        kv_t = kv[:, t]  # (batch, nheads, headdim)
-        alpha_t = alpha[:, t, :, None]  # (batch, nheads, 1)
-        c0_t = c0[:, t, :, None]  # (batch, nheads, 1)
-        c1_t = c1[:, t, :, None]
-        c2_t = c2[:, t, :, None]
+        kv_t = kv[:, t]
+        alpha_t = alpha[:, t][coef_dims]
+        c0_t = c0[:, t][coef_dims]
+        c1_t = c1[:, t][coef_dims]
+        c2_t = c2[:, t][coef_dims]
         
         # AB-2 integration (backward direction)
         state_t = (
@@ -165,15 +196,24 @@ def centered_scan(
     Note: Both directions use α[t] (not α[t]²) since it's one step each way.
     
     Args:
-        kv: (batch, seq_len, nheads, headdim) - K·V product
+        kv: (batch, seq_len, nheads, headdim) for elementwise mode
+            (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
         c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
-        init_state: (batch, nheads, headdim) - learned initial state
+        init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
-        states: (batch, seq_len, nheads, headdim) - accumulated states at each position
+        states: same shape as kv - accumulated states at each position
     """
-    batch, seq_len, nheads, headdim = kv.shape
+    outer_mode = kv.ndim == 5
+    
+    if outer_mode:
+        batch, seq_len, nheads, headdim, _ = kv.shape
+        coef_dims = (slice(None), slice(None), None, None)
+    else:
+        batch, seq_len, nheads, headdim = kv.shape
+        coef_dims = (slice(None), slice(None), None)
+    
     device = kv.device
     dtype = kv.dtype
     
@@ -185,8 +225,14 @@ def centered_scan(
     
     # Initialize the center position
     kv_mid = kv[:, mid]
-    c0_mid = c0[:, mid, :, None]
+    c0_mid = c0[:, mid][coef_dims]
     state_dict[mid] = c0_mid * kv_mid
+    
+    # Zero tensor for boundary conditions
+    if outer_mode:
+        zeros = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
+    else:
+        zeros = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
     
     # Expand outward from center
     # We process positions in order of distance from center
@@ -195,15 +241,15 @@ def centered_scan(
         left_idx = mid - dist
         if left_idx >= 0:
             kv_t = kv[:, left_idx]
-            alpha_t = alpha[:, left_idx, :, None]
-            c0_t = c0[:, left_idx, :, None]
-            c1_t = c1[:, left_idx, :, None]
-            c2_t = c2[:, left_idx, :, None]
+            alpha_t = alpha[:, left_idx][coef_dims]
+            c0_t = c0[:, left_idx][coef_dims]
+            c1_t = c1[:, left_idx][coef_dims]
+            c2_t = c2[:, left_idx][coef_dims]
             
             # Get neighbors (inward = toward center)
             # t-1 is further from center (may not exist yet or be at boundary)
             # t+1 is toward center (already computed)
-            kv_tm1 = kv[:, left_idx - 1] if left_idx > 0 else torch.zeros_like(kv_t)
+            kv_tm1 = kv[:, left_idx - 1] if left_idx > 0 else zeros
             kv_tp1 = kv[:, left_idx + 1]
             
             state_tm1 = state_dict.get(left_idx - 1, init_state)
@@ -220,15 +266,15 @@ def centered_scan(
         right_idx = mid + dist
         if right_idx < seq_len:
             kv_t = kv[:, right_idx]
-            alpha_t = alpha[:, right_idx, :, None]
-            c0_t = c0[:, right_idx, :, None]
-            c1_t = c1[:, right_idx, :, None]
-            c2_t = c2[:, right_idx, :, None]
+            alpha_t = alpha[:, right_idx][coef_dims]
+            c0_t = c0[:, right_idx][coef_dims]
+            c1_t = c1[:, right_idx][coef_dims]
+            c2_t = c2[:, right_idx][coef_dims]
             
             # Get neighbors (inward = toward center)
             # t+1 is further from center (may not exist yet or be at boundary)
             # t-1 is toward center (already computed)
-            kv_tp1 = kv[:, right_idx + 1] if right_idx < seq_len - 1 else torch.zeros_like(kv_t)
+            kv_tp1 = kv[:, right_idx + 1] if right_idx < seq_len - 1 else zeros
             kv_tm1 = kv[:, right_idx - 1]
             
             state_tp1 = state_dict.get(right_idx + 1, init_state)
