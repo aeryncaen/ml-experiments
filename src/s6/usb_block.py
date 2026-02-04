@@ -104,10 +104,12 @@ class USBConfig:
     expansion_factor: int = 2
     qkv_share_ratio: float = 0.8  # 80% shared, 20% unique per group
     
-    # Attention type: "full" for O(L²), "lowrank" for O(L^1.5)
-    attention_type: Literal["full", "lowrank"] = "full"
+    # Attention type: "full" for O(L²), "lowrank" for O(L^1.5), "linear" for O(L·d)
+    attention_type: Literal["full", "lowrank", "linear"] = "full"
     # For lowrank: r = sqrt(L * reduction_factor)
     lowrank_factor: float = 1.5
+    # For linear: feature map type
+    linear_feature_map: Literal["elu", "relu", "softmax"] = "elu"
     
     # Derived dimensions
     @property
@@ -498,7 +500,45 @@ class USBBlock(nn.Module):
         
         scale = config.headdim ** -0.5
         
-        if config.attention_type == "lowrank":
+        if config.attention_type == "linear":
+            # Linear attention: φ(Q) @ (φ(K)^T @ V) - O(L·d²) instead of O(L²·d)
+            # Feature map φ makes Q, K non-negative for stable association
+            if config.linear_feature_map == "elu":
+                phi = lambda x: F.elu(x) + 1
+            elif config.linear_feature_map == "relu":
+                phi = lambda x: F.relu(x)
+            else:  # softmax on feature dim
+                phi = lambda x: F.softmax(x, dim=-1)
+            
+            # Apply feature map: (batch, seq_len, nheads, headdim)
+            q_phi = phi(q_all)
+            k_phi = phi(k_all)
+            
+            # Compute K^T @ V first: (batch, nheads, headdim, headdim)
+            # k_phi: (b, t, h, d) -> (b, h, t, d)
+            # v_all: (b, t, h, d) -> (b, h, t, d)
+            k_t = k_phi.permute(0, 2, 1, 3)  # (b, h, t, d)
+            v_t = v_all.permute(0, 2, 1, 3)  # (b, h, t, d)
+            
+            # KV = K^T @ V: (b, h, d, d)
+            kv = torch.einsum('bhtd,bhte->bhde', k_t, v_t)
+            
+            # Normalization: sum of K features per head
+            k_sum = k_t.sum(dim=2)  # (b, h, d)
+            
+            # Q @ KV: (b, h, t, d) @ (b, h, d, d) -> (b, h, t, d)
+            q_t = q_phi.permute(0, 2, 1, 3)  # (b, h, t, d)
+            attn_out_t = torch.einsum('bhtd,bhde->bhte', q_t, kv)
+            
+            # Normalize by Q @ K_sum to approximate softmax denominator
+            q_k_sum = torch.einsum('bhtd,bhd->bht', q_t, k_sum).unsqueeze(-1)  # (b, h, t, 1)
+            attn_out_t = attn_out_t / (q_k_sum + 1e-6)
+            
+            # Back to (batch, seq_len, nheads, headdim) -> (batch, seq_len, d_expanded)
+            attn_out = attn_out_t.permute(0, 2, 1, 3)  # (b, t, h, d)
+            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+            
+        elif config.attention_type == "lowrank":
             # Low-rank attention: downsample to r = sqrt(L * factor), attend, upsample
             r = max(1, int((seq_len * config.lowrank_factor) ** 0.5))
             
