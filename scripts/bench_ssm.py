@@ -171,7 +171,7 @@ from s6.usb_block import USBBlock, USBConfig
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, paired_heads=False, 
-                 kv_groups=2, q_shared_frac=0.5, kv_shared_frac=0.8, **kwargs):
+                 kv_groups=2, q_shared_frac=0.0, kv_shared_frac=0.8, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
