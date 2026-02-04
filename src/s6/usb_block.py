@@ -22,7 +22,7 @@ class USBConfig:
     d_model: int
     headdim: int = 64
     expansion_factor: int = 2
-    qkv_share_ratio: float = 0.8  # 80% shared, 20% unique per group
+    qkv_rank: int = 16  # Rank for per-group low-rank QKV deltas (0 = no sharing, use fused)
     paired_heads: bool = False  # Pair adjacent heads for cross-head mixing
     
     # Derived dimensions
@@ -44,34 +44,40 @@ class USBConfig:
         return self.nheads_per_group * 4
 
 
-class SharedQKVProjection(nn.Module):
+class LowRankQKVProjection(nn.Module):
     """
-    QKV projection with 80/20 weight sharing across groups.
+    QKV projection with shared base + per-group low-rank deltas.
     
-    80% of each group's output dimensions come from shared weights.
-    20% of each group's output dimensions come from group-specific weights.
+    output_i = W_base @ x + (W_down_i @ W_up_i) @ x
     
-    This reduces parameters while allowing groups to specialize.
+    - W_base: shared across all groups (bulk of params/compute)
+    - W_down_i, W_up_i: per-group low-rank delta (allows specialization)
+    
+    Key difference from dimension-sharing: each group gets DIFFERENT outputs
+    while sharing the bulk of the weights. The delta starts at zero so
+    initially all groups behave the same, then specialize during training.
     """
     
-    def __init__(self, d_input: int, d_group: int, n_groups: int = 4, share_ratio: float = 0.8):
+    def __init__(self, d_input: int, d_group: int, n_groups: int = 4, rank: int = 16):
         super().__init__()
         self.d_input = d_input
         self.d_group = d_group
         self.n_groups = n_groups
-        self.share_ratio = share_ratio
+        self.rank = rank
         
-        # Dimensions
-        self.shared_dim = int(share_ratio * d_group)
-        self.unique_dim = d_group - self.shared_dim
+        # Shared base projection: d_input -> 3 * d_group (Q, K, V for one group)
+        # This is reused for all groups
+        self.qkv_base = nn.Linear(d_input, 3 * d_group, bias=False)
         
-        # Shared projection: produces shared_dim outputs for Q, K, V
-        # These dims are replicated across all groups
-        self.qkv_shared = nn.Linear(d_input, 3 * self.shared_dim, bias=False)
-        
-        # Per-group unique projections: each group gets unique_dim outputs for Q, K, V
-        self.qkv_unique = nn.ModuleList([
-            nn.Linear(d_input, 3 * self.unique_dim, bias=False)
+        # Per-group low-rank deltas: W_delta = W_down @ W_up
+        # W_down: (d_input, rank), W_up: (rank, 3 * d_group)
+        # Initialize W_down small, W_up to zero -> delta starts at zero
+        self.qkv_down = nn.ParameterList([
+            nn.Parameter(torch.randn(d_input, rank) * 0.01)
+            for _ in range(n_groups)
+        ])
+        self.qkv_up = nn.ParameterList([
+            nn.Parameter(torch.zeros(rank, 3 * d_group))
             for _ in range(n_groups)
         ])
         
@@ -83,29 +89,22 @@ class SharedQKVProjection(nn.Module):
         Returns:
             Q, K, V: each (batch, seq_len, n_groups * d_group)
         """
-        batch, seq_len, _ = x.shape
+        # Shared base (computed once, reused)
+        base = self.qkv_base(x)  # (batch, seq, 3 * d_group)
         
-        # Shared projection
-        shared = self.qkv_shared(x)  # (batch, seq_len, 3 * shared_dim)
-        shared_q, shared_k, shared_v = shared.chunk(3, dim=-1)  # each (batch, seq_len, shared_dim)
-        
-        # Per-group unique projections
-        unique_qs, unique_ks, unique_vs = [], [], []
-        for proj in self.qkv_unique:
-            unique = proj(x)  # (batch, seq_len, 3 * unique_dim)
-            uq, uk, uv = unique.chunk(3, dim=-1)
-            unique_qs.append(uq)
-            unique_ks.append(uk)
-            unique_vs.append(uv)
-        
-        # Combine: for each group, concat [shared, unique]
         q_groups, k_groups, v_groups = [], [], []
         for i in range(self.n_groups):
-            q_groups.append(torch.cat([shared_q, unique_qs[i]], dim=-1))
-            k_groups.append(torch.cat([shared_k, unique_ks[i]], dim=-1))
-            v_groups.append(torch.cat([shared_v, unique_vs[i]], dim=-1))
+            # Low-rank delta for this group: x @ W_down @ W_up
+            delta = x @ self.qkv_down[i] @ self.qkv_up[i]  # (batch, seq, 3 * d_group)
+            
+            # Combine: base + delta (different output per group!)
+            qkv_i = base + delta
+            q_i, k_i, v_i = qkv_i.chunk(3, dim=-1)
+            
+            q_groups.append(q_i)
+            k_groups.append(k_i)
+            v_groups.append(v_i)
         
-        # Concatenate all groups
         Q = torch.cat(q_groups, dim=-1)  # (batch, seq_len, n_groups * d_group)
         K = torch.cat(k_groups, dim=-1)
         V = torch.cat(v_groups, dim=-1)
@@ -235,14 +234,19 @@ class USBBlock(nn.Module):
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: QKV projection with 80/20 sharing
-        # 80% of dims shared across groups, 20% unique per group
-        self.qkv_proj = SharedQKVProjection(
-            d_input=d_expanded,
-            d_group=d_group,
-            n_groups=4,
-            share_ratio=config.qkv_share_ratio,
-        )
+        # Step 2: QKV projection
+        if config.qkv_rank > 0:
+            # Low-rank sharing: shared base + per-group low-rank deltas
+            self.qkv_proj = LowRankQKVProjection(
+                d_input=d_expanded,
+                d_group=d_group,
+                n_groups=4,
+                rank=config.qkv_rank,
+            )
+        else:
+            # No sharing: simple fused QKV projection
+            self.qkv_proj = nn.Linear(d_expanded, 3 * d_expanded, bias=False)
+        self._use_fused_qkv = config.qkv_rank == 0
         
         # Gated RMSNorm for Q, K, V
         self.q_norm = GatedRMSNorm(d_expanded)
@@ -300,8 +304,15 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: QKV projection (80/20 shared)
-        q_raw, k_raw, v_raw = self.qkv_proj(x_exp)  # each (batch, seq_len, d_expanded)
+        # Step 2: QKV projection
+        if self._use_fused_qkv:
+            # Simple fused: split output into Q, K, V
+            qkv = self.qkv_proj(x_exp)  # (batch, seq_len, 3 * d_expanded)
+            qkv = rearrange(qkv, 'b t (three d) -> three b t d', three=3)
+            q_raw, k_raw, v_raw = qkv[0], qkv[1], qkv[2]
+        else:
+            # Low-rank: returns tuple directly
+            q_raw, k_raw, v_raw = self.qkv_proj(x_exp)  # each (batch, seq_len, d_expanded)
         
         # Apply SiLU and gated RMSNorm
         q = self.q_norm(F.silu(q_raw))
