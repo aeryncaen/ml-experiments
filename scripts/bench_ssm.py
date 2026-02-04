@@ -658,11 +658,14 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB (Unified Sequence Block, formerly S6): fused SSM + attention
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
+    # USB (Unified Sequence Block, formerly S6): fused SSM + attention with low-rank QKV sharing
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, qkv_rank=16))
+    
+    # USB-Full: USB without QKV sharing (full independent projections)
+    try_add('USB-Full', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, qkv_rank=0))
     
     # USB-P: USB with paired head attention (cross-head mixing via position interleaving)
-    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True))
+    try_add('USB-P', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, paired_heads=True, qkv_rank=16))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
