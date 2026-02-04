@@ -22,9 +22,7 @@ class USBConfig:
     d_model: int
     headdim: int = 64
     expansion_factor: int = 2
-    n_kv_heads: int = 2  # Number of KV heads (GQA). 0 = same as Q heads (MHA)
-    diff_attn: bool = False  # Use differential attention (A1 - λ*A2)
-    layer_idx: int = 0  # Layer index for diff_attn λ_init calculation
+    layer_idx: int = 0  # For future use (e.g., layer-dependent params)
     
     # Derived dimensions
     @property
@@ -43,11 +41,6 @@ class USBConfig:
     @property
     def nheads_total(self) -> int:
         return self.nheads_per_group * 4
-    
-    @property
-    def nkv_heads(self) -> int:
-        """Actual number of KV heads."""
-        return self.n_kv_heads if self.n_kv_heads > 0 else self.nheads_total
 
 
 class GatedRMSNorm(nn.Module):
@@ -168,26 +161,24 @@ class USBBlock(nn.Module):
         d_group = config.d_group
         nheads_per_group = config.nheads_per_group
         nheads_total = config.nheads_total
-        nkv_heads = config.nkv_heads
         headdim = config.headdim
         
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: QKV projections (GQA: fewer KV heads than Q heads)
-        d_kv = nkv_heads * headdim
-        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)  # nheads_total * headdim
-        self.k_proj = nn.Linear(d_expanded, d_kv, bias=False)  # nkv_heads * headdim
-        self.v_proj = nn.Linear(d_expanded, d_kv, bias=False)  # nkv_heads * headdim
+        # Step 2: QKV projections (full MHA - all heads independent)
+        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)
+        self.k_proj = nn.Linear(d_expanded, d_expanded, bias=False)
+        self.v_proj = nn.Linear(d_expanded, d_expanded, bias=False)
         
         # Gated RMSNorm for Q, K, V
         self.q_norm = GatedRMSNorm(d_expanded)
-        self.k_norm = GatedRMSNorm(d_kv)
-        self.v_norm = GatedRMSNorm(d_kv)
+        self.k_norm = GatedRMSNorm(d_expanded)
+        self.v_norm = GatedRMSNorm(d_expanded)
         
         # QK bias (per-head, initialized to 1.0)
         self.q_bias = nn.Parameter(torch.ones(nheads_total, headdim))
-        self.k_bias = nn.Parameter(torch.ones(nkv_heads, headdim))
+        self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
         # G4 is passthrough, no scan parameters needed
@@ -205,25 +196,6 @@ class USBBlock(nn.Module):
         self.init_state_g1._no_weight_decay = True
         self.init_state_g2._no_weight_decay = True
         self.init_state_g3._no_weight_decay = True
-        
-        # Differential attention parameters
-        # λ = exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
-        # λ_init = 0.8 - 0.6 * exp(-0.3 * (layer - 1))
-        if config.diff_attn:
-            import math
-            layer = config.layer_idx + 1  # 1-indexed
-            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer - 1))
-            
-            # Learnable λ parameters - vectors of size headdim//2 per head
-            # Initialized small so exp(q·k) ≈ 1, making λ ≈ λ_init initially
-            half_headdim = headdim // 2
-            self.lambda_q1 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
-            self.lambda_k1 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
-            self.lambda_q2 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
-            self.lambda_k2 = nn.Parameter(torch.randn(nheads_total, half_headdim) * 0.1)
-            
-            # Per-head RMSNorm for diff_attn output
-            self.diff_head_norm = nn.RMSNorm(headdim, eps=1e-6)
         
         # Step 7: Down-projection
         self.down_proj = nn.Linear(d_expanded, d_model, bias=False)
@@ -254,10 +226,10 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: QKV projection (GQA)
+        # Step 2: QKV projection (full MHA)
         q = self.q_proj(x_exp)  # (batch, seq, nheads_total * headdim)
-        k = self.k_proj(x_exp)  # (batch, seq, nkv_heads * headdim)
-        v = self.v_proj(x_exp)  # (batch, seq, nkv_heads * headdim)
+        k = self.k_proj(x_exp)
+        v = self.v_proj(x_exp)
         
         # Apply SiLU + RMSNorm
         q = self.q_norm(F.silu(q))
@@ -265,20 +237,13 @@ class USBBlock(nn.Module):
         v = self.v_norm(F.silu(v))
         
         # Reshape to heads
-        nkv_heads = config.nkv_heads
         q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
-        k = rearrange(k, 'b t (h d) -> b t h d', h=nkv_heads)
-        v = rearrange(v, 'b t (h d) -> b t h d', h=nkv_heads)
+        k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
+        v = rearrange(v, 'b t (h d) -> b t h d', h=config.nheads_total)
         
         # Apply QK bias (after norm)
         q = q + self.q_bias
         k = k + self.k_bias
-        
-        # Expand K, V for GQA (repeat KV heads to match Q heads)
-        if nkv_heads < config.nheads_total:
-            n_rep = config.nheads_total // nkv_heads
-            k = repeat(k, 'b t h d -> b t (h rep) d', rep=n_rep)
-            v = repeat(v, 'b t h d -> b t (h rep) d', rep=n_rep)
         
         # Step 3: Channel split into 4 groups
         # Each group gets nheads_per_group heads
@@ -375,39 +340,12 @@ class USBBlock(nn.Module):
         k_sdpa = k_all.transpose(1, 2)
         v_sdpa = v_all.transpose(1, 2)
         
-        if config.diff_attn:
-            # Differential attention: out1 - λ*out2 using SDPA
-            half_d = config.headdim // 2
-            q1, q2 = q_sdpa[..., :half_d], q_sdpa[..., half_d:]
-            k1, k2 = k_sdpa[..., :half_d], k_sdpa[..., half_d:]
-            
-            # Compute λ per head: exp(λ_q1 · λ_k1) - exp(λ_q2 · λ_k2) + λ_init
-            lambda_val = (
-                torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1))
-                - torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1))
-                + self.lambda_init
-            )  # (nheads,)
-            
-            # Two SDPA calls with half Q, K dims but full V
-            out1 = F.scaled_dot_product_attention(q1, k1, v_sdpa, is_causal=True)
-            out2 = F.scaled_dot_product_attention(q2, k2, v_sdpa, is_causal=True)
-            
-            # Differential: out1 - λ*out2, λ shape (nheads,) -> (1, nheads, 1, 1)
-            attn_out = out1 - lambda_val.view(1, -1, 1, 1) * out2
-            
-            # Transpose back: (B, H, T, D) -> (B, T, H, D)
-            attn_out = attn_out.transpose(1, 2)
-            
-            # Per-head RMSNorm and scale by (1 - λ_init)
-            attn_out = self.diff_head_norm(attn_out) * (1 - self.lambda_init)
-            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
-        else:
-            # Standard SDPA
-            attn_out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
-            
-            # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
-            attn_out = attn_out.transpose(1, 2)
-            attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+        # Standard SDPA (full MHA)
+        attn_out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
+        
+        # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
+        attn_out = attn_out.transpose(1, 2)
+        attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
         
         # Step 7: Down-projection
         out = self.down_proj(attn_out)

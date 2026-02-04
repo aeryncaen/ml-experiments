@@ -170,15 +170,12 @@ from s6.usb_block import USBBlock, USBConfig
 
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
-    def __init__(self, d_model, headdim=64, expansion_factor=2, n_kv_heads=2,
-                 diff_attn=False, layer_idx=0, **kwargs):
+    def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, **kwargs):
         super().__init__()
         config = USBConfig(
             d_model=d_model,
             headdim=headdim,
             expansion_factor=expansion_factor,
-            n_kv_heads=n_kv_heads,
-            diff_attn=diff_attn,
             layer_idx=layer_idx,
         )
         self.usb = USBBlock(config)
@@ -679,14 +676,8 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Mamba: ~51K params/layer
     try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
 
-    # USB: GQA with 2 KV heads (default)
-    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=2))
-    
-    # USB-Diff: USB + differential attention (A1 - λ*A2)
-    try_add('USB-Diff', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=2, diff_attn=True))
-    
-    # USB-MHA: Full MHA (n_kv_heads=0 means same as Q heads)
-    try_add('USB-MHA', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2, n_kv_heads=0))
+    # USB: Full MHA with directional scans
+    try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2))
 
     # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
