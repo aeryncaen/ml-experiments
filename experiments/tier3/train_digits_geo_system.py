@@ -175,6 +175,8 @@ class RunConfig:
     chi2_forget_shrink: float = 0.7
     eval_best_val: bool = True
     hybrid_chi2_scale: float = 0.3
+    loss_type: str = "ce"
+    loss_eps: float = 1e-8
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -193,7 +195,25 @@ def accuracy(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.devic
     return float((pred == y).mean())
 
 
-def eval_loss_acc(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.device, batch_size: int = 1024) -> tuple[float, float]:
+def classification_loss(logits: torch.Tensor, y: torch.Tensor, loss_type: str, eps: float) -> torch.Tensor:
+    if loss_type == "ce":
+        return F.cross_entropy(logits, y)
+    if loss_type == "chi2":
+        p = torch.softmax(logits, dim=1)
+        py = p.gather(1, y.view(-1, 1)).squeeze(1)
+        return torch.mean(1.0 / torch.clamp(py, min=eps) - 1.0)
+    raise ValueError(f"Unknown loss_type: {loss_type}")
+
+
+def eval_loss_acc(
+    model: nn.Module,
+    X: np.ndarray,
+    y: np.ndarray,
+    device: torch.device,
+    loss_type: str,
+    loss_eps: float,
+    batch_size: int = 1024,
+) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total = 0
@@ -203,8 +223,12 @@ def eval_loss_acc(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.
             xb = torch.from_numpy(X[i : i + batch_size].astype(np.float32)).to(device)
             yb = torch.from_numpy(y[i : i + batch_size].astype(np.int64)).to(device)
             logits = model(xb)
-            loss = F.cross_entropy(logits, yb, reduction="sum")
-            total_loss += float(loss.item())
+            if loss_type == "ce":
+                loss = F.cross_entropy(logits, yb, reduction="sum")
+                total_loss += float(loss.item())
+            else:
+                loss = classification_loss(logits, yb, loss_type=loss_type, eps=loss_eps)
+                total_loss += float(loss.item()) * float(yb.shape[0])
             pred = logits.argmax(dim=1)
             correct += int((pred == yb).sum().item())
             total += int(yb.shape[0])
@@ -345,7 +369,7 @@ def train_one(
             yb = yb.to(device)
 
             logits = model(xb)
-            loss = F.cross_entropy(logits, yb)
+            loss = classification_loss(logits, yb, loss_type=cfg.loss_type, eps=cfg.loss_eps)
 
             if mode == "geo_system" and epoch < cfg.reg_warmup_epochs:
                 # Spectral shaping regularizer:
@@ -384,7 +408,7 @@ def train_one(
                     adam_opt.step()
                     with torch.no_grad():
                         logits_adam = model(xb)
-                        loss_adam = F.cross_entropy(logits_adam, yb)
+                        loss_adam = classification_loss(logits_adam, yb, loss_type=cfg.loss_type, eps=cfg.loss_eps)
                         if mode == "geo_system" and epoch < cfg.reg_warmup_epochs:
                             Wa = model.fc1.weight
                             Wa_proj = Wa @ P_top_t
@@ -399,7 +423,7 @@ def train_one(
 
                 with torch.no_grad():
                     logits_new = model(xb)
-                    new_loss = F.cross_entropy(logits_new, yb)
+                    new_loss = classification_loss(logits_new, yb, loss_type=cfg.loss_type, eps=cfg.loss_eps)
                     if mode == "geo_system" and epoch < cfg.reg_warmup_epochs:
                         Wn = model.fc1.weight
                         Wn_proj = Wn @ P_top_t
@@ -518,7 +542,7 @@ def train_one(
 
         train_loss = total_loss / max(n_seen, 1)
         train_acc = n_correct / max(n_seen, 1)
-        val_loss, val_acc = eval_loss_acc(model, X_val, y_val, device)
+        val_loss, val_acc = eval_loss_acc(model, X_val, y_val, device, loss_type=cfg.loss_type, loss_eps=cfg.loss_eps)
         print(
             f"epoch {epoch + 1:02d}/{cfg.epochs:02d} "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
@@ -680,6 +704,8 @@ def main() -> None:
     parser.add_argument("--eval-best-val", action="store_true", default=True)
     parser.add_argument("--eval-last", action="store_false", dest="eval_best_val")
     parser.add_argument("--hybrid-chi2-scale", type=float, default=0.3)
+    parser.add_argument("--loss-type", type=str, choices=["ce", "chi2"], default="ce")
+    parser.add_argument("--loss-eps", type=float, default=1e-8)
     parser.add_argument("--out", type=str, default="tier3_digits_results.json")
     args = parser.parse_args()
 
@@ -715,6 +741,8 @@ def main() -> None:
         chi2_forget_shrink=args.chi2_forget_shrink,
         eval_best_val=args.eval_best_val,
         hybrid_chi2_scale=args.hybrid_chi2_scale,
+        loss_type=args.loss_type,
+        loss_eps=args.loss_eps,
     )
 
     device = get_device()
