@@ -151,6 +151,9 @@ class RunConfig:
     chi2_q_high: float = 0.5
     chi2_q_beta: float = 0.9
     chi2_per_layer: bool = True
+    chi2_eta_shape: bool = True
+    chi2_eta_proj_scale: float = 1.2
+    chi2_eta_resid_scale: float = 0.8
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -239,6 +242,8 @@ def train_one(
         denom_sum = 0.0
         scale_sum = 0.0
         diag_count = 0
+        eta_grad_sum = 0.0
+        eta_grad_count = 0
         tr_start_by_group = {
             str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
             for i, g in enumerate(opt.param_groups)
@@ -262,6 +267,18 @@ def train_one(
 
                 opt.zero_grad()
                 loss.backward()
+
+                if cfg.optimizer == "chi2" and cfg.chi2_eta_shape and mode == "geo_system":
+                    g = model.fc1.weight.grad
+                    if g is not None:
+                        g_proj = g @ P_top_t
+                        g_res = g - g_proj
+                        total = float(torch.sum(g * g).item())
+                        proj = float(torch.sum(g_proj * g_proj).item())
+                        eta_grad_sum += proj / max(total, 1e-12)
+                        eta_grad_count += 1
+                        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
+
                 opt.step()
 
                 with torch.no_grad():
@@ -356,6 +373,16 @@ def train_one(
             else:
                 opt.zero_grad()
                 loss.backward()
+                if cfg.optimizer == "chi2" and cfg.chi2_eta_shape and mode == "geo_system":
+                    g = model.fc1.weight.grad
+                    if g is not None:
+                        g_proj = g @ P_top_t
+                        g_res = g - g_proj
+                        total = float(torch.sum(g * g).item())
+                        proj = float(torch.sum(g_proj * g_proj).item())
+                        eta_grad_sum += proj / max(total, 1e-12)
+                        eta_grad_count += 1
+                        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
                 opt.step()
 
             bs = xb.shape[0]
@@ -392,6 +419,7 @@ def train_one(
                     "chi2_delta_std": float(np.sqrt(max(chi2_ctrl["m2_delta"] / max(chi2_ctrl["count"] - 1, 1), 0.0))),
                     "chi2_q_ema": float(chi2_ctrl["q_ema"]),
                     "chi2_q_ema_by_group": {k: float(v["q_ema"]) for k, v in chi2_group_ctrl.items()},
+                    "chi2_eta_grad_mean": float(eta_grad_sum / max(eta_grad_count, 1)),
                 }
             )
         history.append(epoch_rec)
@@ -495,6 +523,10 @@ def main() -> None:
     parser.add_argument("--chi2-q-beta", type=float, default=0.9)
     parser.add_argument("--chi2-per-layer", action="store_true", default=True)
     parser.add_argument("--no-chi2-per-layer", action="store_false", dest="chi2_per_layer")
+    parser.add_argument("--chi2-eta-shape", action="store_true", default=True)
+    parser.add_argument("--no-chi2-eta-shape", action="store_false", dest="chi2_eta_shape")
+    parser.add_argument("--chi2-eta-proj-scale", type=float, default=1.2)
+    parser.add_argument("--chi2-eta-resid-scale", type=float, default=0.8)
     parser.add_argument("--out", type=str, default="tier3_fashion_results.json")
     args = parser.parse_args()
 
@@ -521,6 +553,9 @@ def main() -> None:
         chi2_q_high=args.chi2_q_high,
         chi2_q_beta=args.chi2_q_beta,
         chi2_per_layer=args.chi2_per_layer,
+        chi2_eta_shape=args.chi2_eta_shape,
+        chi2_eta_proj_scale=args.chi2_eta_proj_scale,
+        chi2_eta_resid_scale=args.chi2_eta_resid_scale,
     )
 
     device = get_device()
