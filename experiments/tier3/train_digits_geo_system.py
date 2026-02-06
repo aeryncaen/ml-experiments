@@ -168,6 +168,10 @@ class RunConfig:
     chi2_eta_shape: bool = True
     chi2_eta_proj_scale: float = 1.2
     chi2_eta_resid_scale: float = 0.8
+    chi2_forget_guard: bool = True
+    chi2_forget_tol: float = 0.01
+    chi2_forget_shrink: float = 0.7
+    eval_best_val: bool = True
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -249,6 +253,9 @@ def train_one(
         "q_ema": 0.0,
     }
     chi2_group_ctrl = {}
+    best_val_acc = -1.0
+    best_epoch = 0
+    best_state = None
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -408,6 +415,23 @@ def train_one(
         train_loss = total_loss / max(n_seen, 1)
         val_acc = accuracy(model, X_val, y_val, device)
         epoch_rec = {"epoch": epoch + 1, "train_loss": train_loss, "val_acc": val_acc}
+        if val_acc > best_val_acc:
+            best_val_acc = float(val_acc)
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        guard_triggered = False
+        if (
+            cfg.optimizer == "chi2"
+            and cfg.chi2_forget_guard
+            and (epoch + 1) >= 3
+            and best_epoch > 0
+            and val_acc < (best_val_acc - cfg.chi2_forget_tol)
+        ):
+            for group in opt.param_groups:
+                tr = float(group.get("trust_radius", cfg.trust_radius))
+                group["trust_radius"] = max(cfg.chi2_min_radius, tr * cfg.chi2_forget_shrink)
+            guard_triggered = True
         if cfg.optimizer == "chi2":
             tr_end_by_group = {
                 str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
@@ -433,11 +457,16 @@ def train_one(
                     "chi2_q_ema": float(chi2_ctrl["q_ema"]),
                     "chi2_q_ema_by_group": {k: float(v["q_ema"]) for k, v in chi2_group_ctrl.items()},
                     "chi2_eta_grad_mean": float(eta_grad_sum / max(eta_grad_count, 1)),
+                    "chi2_forget_guard_triggered": bool(guard_triggered),
                 }
             )
         history.append(epoch_rec)
 
     # Final evaluations on clean + shifts
+    clean_acc_last = accuracy(model, X_test, y_test, device)
+    if cfg.eval_best_val and best_state is not None:
+        model.load_state_dict(best_state)
+
     clean_acc = accuracy(model, X_test, y_test, device)
 
     X_border = scaler.transform(apply_shift(scaler.inverse_transform(X_test), "border_erase", 0.85))
@@ -452,6 +481,10 @@ def train_one(
     return {
         "mode": mode,
         "seed": seed,
+        "best_epoch": int(best_epoch),
+        "best_val_acc": float(best_val_acc),
+        "selected_eval": "best_val" if cfg.eval_best_val else "last",
+        "clean_acc_last": clean_acc_last,
         "clean_acc": clean_acc,
         "acc_border": acc_border,
         "acc_center": acc_center,
@@ -473,10 +506,13 @@ def summarize(runs: list[dict], mode: str) -> dict:
         vals = []
         for r in sub:
             h = r["history"]
-            idx = min(ep - 1, len(h) - 1)
-            vals.append(h[idx]["val_acc"])
-        vals = np.array(vals, dtype=float)
-        out[f"val_acc_ep{ep}"] = {"mean": float(vals.mean()), "std": float(vals.std(ddof=0))}
+            if len(h) >= ep:
+                vals.append(h[ep - 1]["val_acc"])
+        if len(vals) == 0:
+            out[f"val_acc_ep{ep}"] = {"mean": float("nan"), "std": float("nan")}
+        else:
+            arr = np.array(vals, dtype=float)
+            out[f"val_acc_ep{ep}"] = {"mean": float(arr.mean()), "std": float(arr.std(ddof=0))}
     return out
 
 
@@ -509,6 +545,12 @@ def main() -> None:
     parser.add_argument("--no-chi2-eta-shape", action="store_false", dest="chi2_eta_shape")
     parser.add_argument("--chi2-eta-proj-scale", type=float, default=1.2)
     parser.add_argument("--chi2-eta-resid-scale", type=float, default=0.8)
+    parser.add_argument("--chi2-forget-guard", action="store_true", default=True)
+    parser.add_argument("--no-chi2-forget-guard", action="store_false", dest="chi2_forget_guard")
+    parser.add_argument("--chi2-forget-tol", type=float, default=0.01)
+    parser.add_argument("--chi2-forget-shrink", type=float, default=0.7)
+    parser.add_argument("--eval-best-val", action="store_true", default=True)
+    parser.add_argument("--eval-last", action="store_false", dest="eval_best_val")
     parser.add_argument("--out", type=str, default="tier3_digits_results.json")
     args = parser.parse_args()
 
@@ -537,6 +579,10 @@ def main() -> None:
         chi2_eta_shape=args.chi2_eta_shape,
         chi2_eta_proj_scale=args.chi2_eta_proj_scale,
         chi2_eta_resid_scale=args.chi2_eta_resid_scale,
+        chi2_forget_guard=args.chi2_forget_guard,
+        chi2_forget_tol=args.chi2_forget_tol,
+        chi2_forget_shrink=args.chi2_forget_shrink,
+        eval_best_val=args.eval_best_val,
     )
 
     device = get_device()
