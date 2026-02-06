@@ -1011,27 +1011,62 @@ def main():
                 f"rho={cfg['geo_embed_reanchor_rho']}"
             )
 
-    # ---- Iterative binary search ----
+    # ---- Iterative binary search (resumable) ----
+    out_path = Path(args.out)
     all_results: list[dict] = []
-
-    # Level 1: 3^6 = 729 configs
-    print("\n" + "=" * 80, flush=True)
-    print("BINARY SEARCH LEVEL 1", flush=True)
-    print("=" * 80, flush=True)
-    level1_configs, axis_vals = generate_binary_level1()
-    print(f"Level 1: {len(level1_configs)} configs", flush=True)
-    level1_results = run_config_batch(level1_configs)
-    all_results.extend(level1_results)
-    all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
-    print_leaderboard(all_results, "LEVEL 1")
-
-    # Track intervals per axis for refinement
+    completed_levels = 0
     intervals: dict[str, tuple[float, float]] = {
         k: (lo, hi) for k, (lo, hi, _) in BINARY_SEARCH_AXES.items()
     }
 
+    # Resume from previous run if output file exists
+    if out_path.exists():
+        prev = json.loads(out_path.read_text(encoding="utf-8"))
+        completed_levels = prev.get("completed_levels", 0)
+        all_results = prev.get("all", [])
+        if "intervals" in prev:
+            intervals = {k: tuple(v) for k, v in prev["intervals"].items()}
+        print(f"Resuming: {completed_levels} levels completed, {len(all_results)} results loaded", flush=True)
+        all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+        if all_results:
+            print_leaderboard(all_results, f"RESUMED (level {completed_levels})")
+
+    def save_results(level: int):
+        best = all_results[0]
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        output = {
+            "n_configs": len(all_results),
+            "strategy": "iterative_binary_search",
+            "completed_levels": level,
+            "binary_levels": args.binary_levels,
+            "intervals": {k: list(v) for k, v in intervals.items()},
+            "steps": args.steps,
+            "eval_iters": args.eval_iters,
+            "batch_size": args.batch_size,
+            "device": str(device),
+            "best": best,
+            "top": all_results[:args.top_k],
+            "all": all_results,
+        }
+        out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        print(f"Saved results to {out_path}", flush=True)
+
+    # Level 1
+    if completed_levels < 1:
+        print("\n" + "=" * 80, flush=True)
+        print("BINARY SEARCH LEVEL 1", flush=True)
+        print("=" * 80, flush=True)
+        level1_configs, axis_vals = generate_binary_level1()
+        print(f"Level 1: {len(level1_configs)} configs", flush=True)
+        level1_results = run_config_batch(level1_configs)
+        all_results.extend(level1_results)
+        all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+        completed_levels = 1
+        print_leaderboard(all_results, "LEVEL 1")
+        save_results(1)
+
     # Levels 2+: narrow and refine
-    for level in range(2, args.binary_levels + 1):
+    for level in range(max(2, completed_levels + 1), args.binary_levels + 1):
         print(f"\n{'='*80}", flush=True)
         print(f"BINARY SEARCH LEVEL {level}", flush=True)
         print(f"{'='*80}", flush=True)
@@ -1045,30 +1080,14 @@ def main():
         new_results = run_config_batch(new_configs)
         all_results.extend(new_results)
         all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+        completed_levels = level
         print_leaderboard(all_results, f"LEVEL {level} (cumulative)")
+        save_results(level)
 
     # Final summary
     best = all_results[0]
     print(f"\nFINAL BEST: val_acc={best['val_acc']:.6f} val_loss={best['val_loss']:.4f}")
     print(f"BEST CONFIG: {json.dumps(best['config'], indent=2)}")
-
-    # Save
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    output = {
-        "n_configs": len(all_results),
-        "strategy": "iterative_binary_search",
-        "binary_levels": args.binary_levels,
-        "steps": args.steps,
-        "eval_iters": args.eval_iters,
-        "batch_size": args.batch_size,
-        "device": str(device),
-        "best": best,
-        "top": all_results[:args.top_k],
-        "all": all_results,
-    }
-    out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
-    print(f"\nWrote results to {out_path}")
 
 
 if __name__ == "__main__":
