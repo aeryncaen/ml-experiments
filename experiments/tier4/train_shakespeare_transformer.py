@@ -151,6 +151,10 @@ def token_loss(logits: torch.Tensor, y: torch.Tensor, loss_type: str, eps: float
         p = torch.softmax(lflat, dim=1)
         py = p.gather(1, yflat.view(-1, 1)).squeeze(1)
         return torch.mean(1.0 / torch.clamp(py, min=eps) - 1.0)
+    if loss_type == "chi2_log2":
+        p = torch.softmax(lflat, dim=1)
+        py = p.gather(1, yflat.view(-1, 1)).squeeze(1)
+        return torch.mean(torch.log2(1.0 / torch.clamp(py, min=eps)))
     raise ValueError(loss_type)
 
 
@@ -174,7 +178,7 @@ def eval_stats(
             losses.append(float(token_loss(logits, yb, cfg.loss_type, cfg.loss_eps).item()))
             pred = logits.argmax(dim=-1)
             accs.append(float((pred == yb).float().mean().item()))
-            if cfg.loss_type == "chi2":
+            if cfg.loss_type in ("chi2", "chi2_log2"):
                 lflat = logits.reshape(-1, logits.size(-1))
                 yflat = yb.reshape(-1)
                 p = torch.softmax(lflat, dim=1)
@@ -189,7 +193,7 @@ def eval_stats(
         "acc": float(np.mean(accs)),
         "ppl": float(math.exp(min(np.mean(losses), 20.0))) if cfg.loss_type == "ce" else float("nan"),
     }
-    if cfg.loss_type == "chi2":
+    if cfg.loss_type in ("chi2", "chi2_log2"):
         out.update(
             {
                 "inv_py_mean": inv_py_sum / max(n_tok, 1),
@@ -244,6 +248,8 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, op_to
                     proj = float(torch.sum(g_proj * g_proj).item())
                     g.copy_(g_proj + w * g_res)
                     g2 = model.token_emb.weight.grad
+                    if g2 is None:
+                        g2 = g
                     g2_proj = P_top_t @ g2
                     total2 = float(torch.sum(g2 * g2).item())
                     proj2 = float(torch.sum(g2_proj * g2_proj).item())
@@ -269,7 +275,7 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, op_to
             "val_acc": val["acc"],
             "val_ppl": val["ppl"],
         }
-        if cfg.loss_type == "chi2":
+        if cfg.loss_type in ("chi2", "chi2_log2"):
             rec.update(
                 {
                     "chi2_val_inv_py_mean": val["inv_py_mean"],
@@ -290,7 +296,7 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, op_to
             f"epoch {ep + 1:02d}/{cfg.epochs:02d} train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
             f"val_loss={val['loss']:.4f} val_acc={val['acc']:.4f}"
         )
-        if cfg.loss_type == "chi2":
+        if cfg.loss_type in ("chi2", "chi2_log2"):
             print(
                 f"  chi2_tail val_inv_py_mean={val['inv_py_mean']:.3f} val_inv_py_max={val['inv_py_max']:.3f} "
                 f"val_py_low_frac={val['py_low_frac']:.4f}"
@@ -355,7 +361,7 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--optimizer", type=str, choices=["adam", "adam_eta_follow"], default="adam")
-    p.add_argument("--loss-type", type=str, choices=["ce", "chi2"], default="ce")
+    p.add_argument("--loss-type", type=str, choices=["ce", "chi2", "chi2_log2"], default="ce")
     p.add_argument("--loss-eps", type=float, default=1e-6)
     p.add_argument("--chi2-tail-threshold", type=float, default=1e-4)
     p.add_argument("--eta-shape", action="store_true", default=True)
