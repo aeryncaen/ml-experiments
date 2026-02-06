@@ -216,6 +216,8 @@ class USBBlock(nn.Module):
         self.router_temp = nn.Parameter(torch.tensor(1.0))
         self.local_gate = nn.Parameter(torch.tensor(-2.0))
         self.kv_blend = nn.Parameter(torch.tensor(-2.0))
+        self.router_smooth = 5
+        self.router_prev_idx = None
         nn.init.zeros_(self.router.weight)
         
         # Learnable initial states for scan heads (G1, G2, G3)
@@ -486,8 +488,16 @@ class USBBlock(nn.Module):
 
         router_in = self.router_norm(attn_out)
         router_scores = self.router(router_in).squeeze(-1)
+        router_scores_raw = router_scores
         router_temp = F.softplus(self.router_temp) + 1e-4
         router_scores = router_scores / router_temp
+        if self.router_smooth > 1:
+            kernel = self.router_smooth
+            if kernel % 2 == 0:
+                kernel += 1
+            router_scores = F.avg_pool1d(
+                router_scores.unsqueeze(1), kernel_size=kernel, stride=1, padding=kernel // 2
+            ).squeeze(1)
         num_centers = max(1, int(round(seq_len ** (1.0 / 3.0))))
         window = max(1, int(round(math.sqrt(seq_len))))
         half = window // 2
@@ -605,10 +615,43 @@ class USBBlock(nn.Module):
                     'gate': _gate_stats(params['gate']),
                 }
 
+            topk_overlap = None
+            if self.router_prev_idx is not None and self.router_prev_idx.shape == topk_idx.shape:
+                inter = torch.isin(topk_idx, self.router_prev_idx).sum(dim=1).float()
+                union = 2 * topk_idx.shape[1] - inter
+                topk_overlap = (inter / union.clamp_min(1.0)).mean().item()
+            self.router_prev_idx = topk_idx.detach()
+
+            topk_entropy = 0.0
+            if topk_w.numel() > 0 and topk_w.shape[1] > 1:
+                topk_entropy = (
+                    -(topk_w * (topk_w + eps).log()).sum(dim=1)
+                    / math.log(topk_w.shape[1])
+                ).mean().item()
+
             debug = {
                 'g1': _param_block(params_g1),
                 'g2': _param_block(params_g2),
                 'g3': _param_block(params_g3),
+                'router': {
+                    'temp': router_temp.item(),
+                    'smooth': float(self.router_smooth),
+                    'centers': float(num_centers),
+                    'window': float(window),
+                    'topk_entropy': topk_entropy,
+                    'topk_overlap': topk_overlap,
+                    'topk_weight_mean': topk_w.mean().item(),
+                    'topk_weight_min': topk_w.min().item(),
+                    'topk_weight_max': topk_w.max().item(),
+                    'scores_mean': router_scores.mean().item(),
+                    'scores_min': router_scores.min().item(),
+                    'scores_max': router_scores.max().item(),
+                    'scores_raw_mean': router_scores_raw.mean().item(),
+                    'scores_raw_min': router_scores_raw.min().item(),
+                    'scores_raw_max': router_scores_raw.max().item(),
+                    'local_gate': local_gate.item(),
+                    'kv_blend': kv_blend.item(),
+                },
                 'rms': {
                     'k_g1': _rms(k_g1),
                     'v_g1': _rms(v_g1),

@@ -507,6 +507,21 @@ def _format_usb_debug(step: int, layer_idx: int, dbg: dict) -> list[str]:
     seq = dbg['seq_rms']
     lines.append(f"[usb] step={step} layer={layer_idx} seq g1 {fmt_seq(seq['g1'])}")
     lines.append(f"[usb] step={step} layer={layer_idx} seq g2 {fmt_seq(seq['g2'])}")
+
+    router = dbg.get('router')
+    if router is not None:
+        overlap = router['topk_overlap']
+        overlap_str = f"{overlap:.2e}" if overlap is not None else "n/a"
+        lines.append(
+            f"[usb] step={step} layer={layer_idx} router "
+            f"temp={router['temp']:.2e} smooth={router['smooth']:.0f} "
+            f"K={router['centers']:.0f} W={router['window']:.0f} "
+            f"entropy={router['topk_entropy']:.2e} overlap={overlap_str} "
+            f"w={router['topk_weight_min']:.2e}/{router['topk_weight_mean']:.2e}/{router['topk_weight_max']:.2e} "
+            f"score={router['scores_min']:.2e}/{router['scores_mean']:.2e}/{router['scores_max']:.2e} "
+            f"raw={router['scores_raw_min']:.2e}/{router['scores_raw_mean']:.2e}/{router['scores_raw_max']:.2e} "
+            f"lg={router['local_gate']:.2e} kvb={router['kv_blend']:.2e}"
+        )
     return lines
 def _grad_stats(named_params):
     total_sq = 0.0
