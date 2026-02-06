@@ -287,6 +287,15 @@ class BatchedModels:
         # Causal mask
         self.causal_mask = torch.triu(torch.ones(block_size, block_size, device=device, dtype=torch.bool), diagonal=1)
 
+        # Compile the forward pass
+        self._compiled_forward = None
+        if hasattr(torch, "compile"):
+            try:
+                self._compiled_forward = torch.compile(self._raw_forward, fullgraph=False)
+                print(f"  torch.compile enabled for batched forward", flush=True)
+            except Exception as e:
+                print(f"  torch.compile failed, using eager: {e}", flush=True)
+
         del ref
 
     def _make_ref(self):
@@ -319,6 +328,11 @@ class BatchedModels:
         return _GPT()
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        if self._compiled_forward is not None:
+            return self._compiled_forward(idx)
+        return self._raw_forward(idx)
+
+    def _raw_forward(self, idx: torch.Tensor) -> torch.Tensor:
         """
         idx: (B, T) shared input batch
         Returns: (N, B, T, V) logits for each config
