@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib.util
 import itertools
 import json
 import random
@@ -196,6 +197,115 @@ def run_inprocess(
         sys.argv = old_argv
 
 
+def load_runner_module(runner_path: str):
+    p = Path(runner_path)
+    spec = importlib.util.spec_from_file_location("tier4_runner", p)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load runner module from {runner_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_native_trial(
+    mod,
+    common: dict,
+    cfg: dict,
+    result_json: Path,
+    stdout_log: Path,
+    stderr_log: Path,
+    stream_child: bool,
+    ctx: dict,
+) -> int:
+    def _execute() -> None:
+        merged = dict(common)
+        merged.update(cfg)
+        run_cfg_kwargs = {k: v for k, v in merged.items() if k in mod.RunConfig.__dataclass_fields__}
+        run_cfg = mod.RunConfig(**run_cfg_kwargs)
+
+        geo_key = (
+            run_cfg.geo_init_method,
+            run_cfg.geo_init_mtp_weights,
+            run_cfg.d_model,
+        )
+        if geo_key not in ctx["geo_basis_cache"]:
+            if run_cfg.geo_init_method == "eig":
+                _, eigvecs = mod.np.linalg.eigh(ctx["op"])
+                geo_basis = eigvecs[:, -run_cfg.d_model :].astype(mod.np.float32)
+            elif run_cfg.geo_init_method == "kl_bucket_mtp":
+                mtp_w = mod.parse_float_list_csv(run_cfg.geo_init_mtp_weights)
+                if not mtp_w:
+                    mtp_w = [1.0, 0.5, 0.25]
+                geo_basis = mod.compute_kl_bucket_mtp_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model, mtp_w)
+            elif run_cfg.geo_init_method == "kl_bucket":
+                geo_basis = mod.compute_kl_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+            else:
+                geo_basis = mod.compute_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+            ctx["geo_basis_cache"][geo_key] = geo_basis
+        geo_basis = ctx["geo_basis_cache"][geo_key]
+
+        attn_key = (
+            bool(run_cfg.geo_attn_corr_bias),
+            run_cfg.geo_attn_corr_rank,
+            run_cfg.geo_attn_corr_layers,
+            run_cfg.geo_attn_corr_horizons,
+            run_cfg.geo_attn_corr_horizon_weights,
+            geo_key,
+        )
+        if attn_key not in ctx["attn_corr_cache"]:
+            attn_corr = None
+            if run_cfg.geo_attn_corr_bias:
+                attn_corr = mod.compute_attn_corr_projector(
+                    ctx["train_ids"],
+                    ctx["vocab_size"],
+                    geo_basis,
+                    run_cfg.d_model,
+                    run_cfg.geo_attn_corr_rank,
+                    list(run_cfg.geo_attn_corr_horizons),
+                    list(run_cfg.geo_attn_corr_horizon_weights),
+                )
+            ctx["attn_corr_cache"][attn_key] = attn_corr
+        attn_corr_projector = ctx["attn_corr_cache"][attn_key]
+
+        runs = []
+        for seed in range(run_cfg.seeds):
+            print(f"Running mode=geo_system, seed={seed}")
+            res = mod.train_one(
+                ctx["train_ids"],
+                ctx["val_ids"],
+                ctx["vocab_size"],
+                geo_basis,
+                attn_corr_projector,
+                "geo_system",
+                run_cfg,
+                seed,
+                ctx["device"],
+            )
+            runs.append(res)
+
+        out = {
+            "config": merged,
+            "device": str(ctx["device"]),
+            "baseline": None,
+            "geo_system": mod.summarize(runs, "geo_system"),
+            "runs": runs,
+        }
+        result_json.write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+    try:
+        if stream_child:
+            _execute()
+        else:
+            with stdout_log.open("w", encoding="utf-8") as so, stderr_log.open("w", encoding="utf-8") as se:
+                with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+                    _execute()
+        return 0
+    except Exception:
+        with stderr_log.open("a", encoding="utf-8") as se:
+            traceback.print_exc(file=se)
+        return 1
+
+
 def short_cfg(cfg: dict) -> str:
     keys = [
         "geo_init_method",
@@ -263,6 +373,7 @@ def main() -> None:
     p.add_argument("--quick", action="store_true", default=False)
     p.add_argument("--torch-compile", action="store_true", default=False)
     p.add_argument("--subprocess", action="store_true", default=False)
+    p.add_argument("--runpy", action="store_true", default=False)
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -294,6 +405,35 @@ def main() -> None:
         common["eval_iters"] = 20
         common["seeds"] = 1
 
+    mode = "subprocess" if args.subprocess else ("runpy" if args.runpy else "native")
+    runner_mod = None
+    runner_ctx = None
+    if mode == "native":
+        print(f"Loading runner module once: {args.runner}", flush=True)
+        runner_mod = load_runner_module(args.runner)
+        text = runner_mod.ensure_data(Path(common.get("data_path", "./data/tinyshakespeare/input.txt")))
+        stoi, _ = runner_mod.build_vocab(text)
+        ids = runner_mod.encode(text, stoi)
+        n = len(ids)
+        n_train = int(0.9 * n)
+        train_ids = ids[:n_train]
+        val_ids = ids[n_train:]
+        vocab_size = len(stoi)
+        op = runner_mod.compute_token_operator(train_ids, vocab_size)
+        runner_ctx = {
+            "device": runner_mod.get_device(),
+            "train_ids": train_ids,
+            "val_ids": val_ids,
+            "vocab_size": vocab_size,
+            "op": op,
+            "geo_basis_cache": {},
+            "attn_corr_cache": {},
+        }
+        print(
+            f"Native context ready: device={runner_ctx['device']} train={len(train_ids)} val={len(val_ids)} vocab={vocab_size}",
+            flush=True,
+        )
+
     space = candidate_space()
     rng = random.Random(args.seed)
     print("Generating candidate configs...", flush=True)
@@ -322,7 +462,7 @@ def main() -> None:
 
     total_pending = len(pending)
     print(
-        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={'subprocess' if args.subprocess else 'inprocess'}",
+        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={mode}",
         flush=True,
     )
 
@@ -356,7 +496,7 @@ def main() -> None:
         if args.dry_run:
             rec["status"] = "dry_run"
         else:
-            if args.subprocess:
+            if mode == "subprocess":
                 rc = run_with_heartbeat(
                     cmd,
                     stdout_log=stdout_log,
@@ -364,13 +504,24 @@ def main() -> None:
                     heartbeat_sec=max(0, args.heartbeat_sec),
                     stream_child=args.stream_child,
                 )
-            else:
+            elif mode == "runpy":
                 rc = run_inprocess(
                     args.runner,
                     runner_args,
                     stdout_log=stdout_log,
                     stderr_log=stderr_log,
                     stream_child=args.stream_child,
+                )
+            else:
+                rc = run_native_trial(
+                    runner_mod,
+                    common,
+                    cfg,
+                    result_json,
+                    stdout_log=stdout_log,
+                    stderr_log=stderr_log,
+                    stream_child=args.stream_child,
+                    ctx=runner_ctx,
                 )
             if rc != 0:
                 rec["status"] = "failed"
