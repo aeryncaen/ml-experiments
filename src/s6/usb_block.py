@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .scan import forward_scan, backward_scan, centered_scan
+from .scan import forward_scan, backward_scan
 from .rope import apply_data_dependent_rope, apply_rope
 
 
@@ -191,6 +191,11 @@ class USBBlock(nn.Module):
         self.scan_proj_g1 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
         self.scan_proj_g2 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
         self.scan_proj_g3 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
+
+        # G3 depthwise conv (k=3) replacing centered scan
+        self.conv_g3 = nn.Conv1d(
+            d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
+        )
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -266,7 +271,7 @@ class USBBlock(nn.Module):
         k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
         v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
         
-        # Step 4: Directional scans for G1, G2, G3
+        # Step 4: Directional scans for G1, G2; G3 uses a 3-wide conv
         
         # Get per-head parameters for each scan group
         params_g1 = self.scan_proj_g1(x_exp)
@@ -300,13 +305,6 @@ class USBBlock(nn.Module):
             kv_g2 = k_g2 * v_g2
             init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
         
-        # G3: centered scan
-        if modes[2] == 'outer':
-            kv_g3 = k_g3.unsqueeze(-1) * v_g3.unsqueeze(-2)
-            init_g3 = repeat(self.init_state_g3, 'h d1 d2 -> b h d1 d2', b=batch)
-        else:
-            kv_g3 = k_g3 * v_g3
-            init_g3 = repeat(self.init_state_g3, 'h d -> b h d', b=batch)
         
         # Run scans
         # Forward scan (G1): starts at t=0, moves forward
@@ -329,15 +327,6 @@ class USBBlock(nn.Module):
             init_state=init_g2,
         )
         
-        # Centered scan (G3): starts at midpoint, expands outward
-        state_g3 = centered_scan(
-            kv=kv_g3,
-            alpha=params_g3['alpha'],
-            c0=params_g3['c0'],
-            c1=params_g3['c1'],
-            c2=params_g3['c2'],
-            init_state=init_g3,
-        )
         
         # Gate state injection back into hiddens (mode-dependent readout)
         # h_t = h_t + gate_t * state_read_t
@@ -359,12 +348,14 @@ class USBBlock(nn.Module):
         else:
             out_g2 = v_g2 + params_g2['gate'] * state_g2
         
-        # G3 readout
-        if modes[2] == 'outer':
-            state_g3_read = torch.einsum('bthjk,bthj->bthk', state_g3, k_g3) * scale
-            out_g3 = v_g3 + params_g3['gate'] * state_g3_read
-        else:
-            out_g3 = v_g3 + params_g3['gate'] * state_g3
+        # G3 readout: depthwise conv over sequence
+        def conv_g3(x_heads: torch.Tensor) -> torch.Tensor:
+            b_, t_, h_, d_ = x_heads.shape
+            x_flat = rearrange(x_heads, 'b t h d -> b (h d) t')
+            y = self.conv_g3(x_flat)
+            return rearrange(y, 'b (h d) t -> b t h d', h=h_)
+
+        out_g3 = v_g3 + params_g3['gate'] * conv_g3(v_g3)
         
         # Apply data-dependent RoPE to Q for attention
         q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
