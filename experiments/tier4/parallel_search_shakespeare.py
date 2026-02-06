@@ -797,12 +797,16 @@ def _fmt_val(v, as_int: bool):
 
 
 # Numeric axes: (lo, hi, is_int)
-BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = {
-    "geo_attn_bias_blend":  (0.0, 1.0, False),
-    "geo_attn_corr_blend":  (0.0, 1.0, False),
-    "geo_attn_corr_rank":   (1, 64, True),
-    "geo_attn_corr_layers": (1, 4, True),
-}
+def make_search_axes(n_layer: int) -> dict[str, tuple[float, float, bool]]:
+    return {
+        "geo_attn_bias_blend":  (0.0, 1.0, False),
+        "geo_attn_corr_blend":  (0.0, 1.0, False),
+        "geo_attn_corr_rank":   (1, 64, True),
+        "geo_attn_corr_layers": (1, n_layer, True),
+    }
+
+# Default; overwritten in main() after args are parsed
+BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = make_search_axes(4)
 
 BINARY_SEARCH_FIXED: dict[str, object] = {
     "geo_init_method": "kl_bucket",
@@ -961,6 +965,9 @@ def main():
     p.add_argument("--top-k", type=int, default=25)
     p.add_argument("--out", type=str, default="experiments/tier4/parallel_search_results.json")
     args = p.parse_args()
+
+    global BINARY_SEARCH_AXES
+    BINARY_SEARCH_AXES = make_search_axes(args.n_layer)
 
     device = torch.device("cuda") if torch.cuda.is_available() else (
         torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
