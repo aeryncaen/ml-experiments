@@ -218,7 +218,7 @@ class USBBlock(nn.Module):
         self.kv_blend = nn.Parameter(torch.tensor(-2.0))
         self.router_smooth = 5
         self.router_prev_idx = None
-        nn.init.zeros_(self.router.weight)
+        nn.init.normal_(self.router.weight, std=1e-3)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
