@@ -21,6 +21,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+torch.set_float32_matmul_precision("high")
+
 
 # ---------------------------------------------------------------------------
 # Data helpers (same as train script)
@@ -413,9 +415,9 @@ class BatchedModels:
         q, k, v = qkv.split(D, dim=-1)  # each (N, B, T, D)
 
         # Reshape to heads and merge N*B for SDPA: (N*B, H, T, head_dim)
-        q = q.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
-        k = k.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
-        v = v.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
+        q = q.view(N * B, T, H, head_dim).permute(0, 2, 1, 3).contiguous()
+        k = k.view(N * B, T, H, head_dim).permute(0, 2, 1, 3).contiguous()
+        v = v.view(N * B, T, H, head_dim).permute(0, 2, 1, 3).contiguous()
 
         # SDPA with causal mask
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (N*B, H, T, head_dim)
