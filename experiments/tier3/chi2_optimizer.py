@@ -25,6 +25,7 @@ class Chi2TrustRegion(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         lr_scale: float = 1.0,
+        max_step_l2: float = 1.0,
     ):
         if trust_radius <= 0:
             raise ValueError("trust_radius must be > 0")
@@ -41,8 +42,20 @@ class Chi2TrustRegion(Optimizer):
             eps=eps,
             weight_decay=weight_decay,
             lr_scale=lr_scale,
+            max_step_l2=max_step_l2,
         )
         super().__init__(params, defaults)
+        self.last_stats = {
+            "denom_mean": 0.0,
+            "scale": 0.0,
+            "n_tensors": 0,
+            "n_params": 0,
+            "step_l2": 0.0,
+            "step_linf": 0.0,
+            "grad_l2": 0.0,
+            "precond_grad_l2": 0.0,
+            "pred_linear": 0.0,
+        }
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -58,11 +71,14 @@ class Chi2TrustRegion(Optimizer):
             eps = group["eps"]
             weight_decay = group["weight_decay"]
             lr_scale = group["lr_scale"]
+            max_step_l2 = group["max_step_l2"]
 
             # First pass: update metric states and compute denom = g^T G^{-1} g
             denom_sum = 0.0
             denom_count = 0
             tensors = []
+            grad_sq_sum = 0.0
+            pre_sq_sum = 0.0
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -96,16 +112,43 @@ class Chi2TrustRegion(Optimizer):
                 inv_metric_grad = m_hat / (torch.sqrt(v_hat) + eps)
                 denom_sum += torch.sum(m_hat * inv_metric_grad).item()
                 denom_count += g.numel()
+                grad_sq_sum += torch.sum(g * g).item()
+                pre_sq_sum += torch.sum(inv_metric_grad * inv_metric_grad).item()
                 tensors.append((p, inv_metric_grad))
 
             if denom_sum <= 0.0 or denom_count == 0 or len(tensors) == 0:
                 continue
 
-            denom_mean = denom_sum / float(denom_count)
-            scale = lr_scale * math.sqrt(trust_radius) / math.sqrt(denom_mean)
+            scale = lr_scale * math.sqrt(trust_radius) / math.sqrt(denom_sum)
+
+            # Optional global step-norm clipping for stability.
+            pre_l2 = math.sqrt(max(pre_sq_sum, 0.0))
+            if pre_l2 > 0:
+                step_l2_est = scale * pre_l2
+                if step_l2_est > max_step_l2:
+                    scale = scale * (max_step_l2 / step_l2_est)
 
             # Second pass: apply normalized trust-region step
+            step_sq_sum = 0.0
+            step_linf = 0.0
             for p, inv_metric_grad in tensors:
-                p.add_(inv_metric_grad, alpha=-scale)
+                delta = -scale * inv_metric_grad
+                p.add_(delta)
+                step_sq_sum += torch.sum(delta * delta).item()
+                step_linf = max(step_linf, torch.max(torch.abs(delta)).item())
+
+            self.last_stats = {
+                "denom_mean": float(denom_sum),
+                "scale": float(scale),
+                "n_tensors": int(len(tensors)),
+                "n_params": int(denom_count),
+                "step_l2": float(math.sqrt(max(step_sq_sum, 0.0))),
+                "step_linf": float(step_linf),
+                "grad_l2": float(math.sqrt(max(grad_sq_sum, 0.0))),
+                "precond_grad_l2": float(math.sqrt(max(pre_sq_sum, 0.0))),
+                # First-order predicted reduction proxy:
+                # pred = -g^T delta = scale * <m_hat, inv_metric_grad>
+                "pred_linear": float(max(scale * denom_sum, 0.0)),
+            }
 
         return loss

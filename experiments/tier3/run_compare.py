@@ -80,6 +80,17 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=7e-4)
     p.add_argument("--trust-radius", type=float, default=0.05)
+    p.add_argument("--chi2-adaptive", action="store_true", default=True)
+    p.add_argument("--no-chi2-adaptive", action="store_false", dest="chi2_adaptive")
+    p.add_argument("--chi2-reject-tol", type=float, default=0.02)
+    p.add_argument("--chi2-shrink", type=float, default=0.5)
+    p.add_argument("--chi2-grow", type=float, default=1.01)
+    p.add_argument("--chi2-min-radius", type=float, default=1e-4)
+    p.add_argument("--chi2-max-radius", type=float, default=1.0)
+    p.add_argument("--chi2-sigma", type=float, default=3.0)
+    p.add_argument("--chi2-q-low", type=float, default=0.05)
+    p.add_argument("--chi2-q-high", type=float, default=0.5)
+    p.add_argument("--chi2-q-beta", type=float, default=0.9)
     p.add_argument("--reg-lambda", type=float, default=1e-3)
     p.add_argument("--reg-warmup-epochs", type=int, default=8)
     p.add_argument("--max-train", type=int, default=60000)
@@ -153,9 +164,31 @@ def main() -> None:
             "chi2",
             "--trust-radius",
             str(args.trust_radius),
+            "--chi2-reject-tol",
+            str(args.chi2_reject_tol),
+            "--chi2-shrink",
+            str(args.chi2_shrink),
+            "--chi2-grow",
+            str(args.chi2_grow),
+            "--chi2-min-radius",
+            str(args.chi2_min_radius),
+            "--chi2-max-radius",
+            str(args.chi2_max_radius),
+            "--chi2-sigma",
+            str(args.chi2_sigma),
+            "--chi2-q-low",
+            str(args.chi2_q_low),
+            "--chi2-q-high",
+            str(args.chi2_q_high),
+            "--chi2-q-beta",
+            str(args.chi2_q_beta),
             "--out",
             str(chi2_out),
         ]
+        if args.chi2_adaptive:
+            chi2_cmd.append("--chi2-adaptive")
+        else:
+            chi2_cmd.append("--no-chi2-adaptive")
 
         print("\n" + "#" * 80)
         print(f"Running dataset={ds}")
