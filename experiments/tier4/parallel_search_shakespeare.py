@@ -22,6 +22,16 @@ import torch
 import torch.nn.functional as F
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# Use flash attention backend if available
+try:
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)  # prefer flash/mem-efficient over math fallback
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +262,7 @@ class BatchedModels:
         lr: float,
         device: torch.device,
         seed: int,
+        dtype: torch.dtype | None = None,
     ):
         self.N = n_configs
         self.V = vocab_size
@@ -262,6 +273,15 @@ class BatchedModels:
         self.device = device
         self.lr = lr
         self.dropout = dropout
+
+        # Pick dtype: prefer bf16 on cuda for flash attention, else float32
+        if dtype is not None:
+            self.dtype = dtype
+        elif device.type == "cuda" and torch.cuda.is_bf16_supported():
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+        print(f"  BatchedModels dtype={self.dtype}", flush=True)
 
         # We'll create one reference model to get the architecture right,
         # then clone its state_dict N times into stacked tensors.
@@ -276,7 +296,7 @@ class BatchedModels:
             if name == "lm_head.weight":
                 continue  # tied
             stacked = p.unsqueeze(0).expand(n_configs, *p.shape).clone().contiguous()
-            stacked = stacked.to(device)
+            stacked = stacked.to(device=device, dtype=self.dtype)
             stacked.requires_grad_(True)
             self.params[name] = stacked
             self.param_names.append(name)
@@ -666,7 +686,7 @@ def run_parallel_search(
             e_norm = np.linalg.norm(E0, axis=1, keepdims=True)
             geo_target_np = geo_target_np / np.maximum(t_norm, 1e-8) * e_norm
 
-        geo_target_t = torch.from_numpy(geo_target_np).to(device)
+        geo_target_t = torch.from_numpy(geo_target_np).to(device=device, dtype=bm.dtype)
         geo_targets.append(geo_target_t)
 
         # Blend embedding
@@ -676,7 +696,7 @@ def run_parallel_search(
         if cfg.geo_attn_bias:
             mk = (gk, 16)
             P_np = artifacts["model_proj_cache"][mk]
-            P_t = torch.from_numpy(P_np).to(device)
+            P_t = torch.from_numpy(P_np).to(device=device, dtype=bm.dtype)
             bm.apply_attn_bias(i, P_t, cfg.geo_attn_bias_blend, n_layer)
 
         # Attention correlation bias
@@ -684,13 +704,13 @@ def run_parallel_search(
             horizons = parse_int_csv(cfg.geo_attn_corr_horizons)
             h_weights = parse_float_csv(cfg.geo_attn_corr_horizon_weights)
             ak = (gk, cfg.geo_attn_corr_rank, tuple(horizons), tuple(h_weights))
-            P_corr = torch.from_numpy(artifacts["attn_corr_cache"][ak]).to(device)
+            P_corr = torch.from_numpy(artifacts["attn_corr_cache"][ak]).to(device=device, dtype=bm.dtype)
             bm.apply_attn_corr_bias(i, P_corr, cfg.geo_attn_corr_blend, cfg.geo_attn_corr_layers)
 
         # Embed grad projector
         if cfg.geo_embed_grad_shape:
             P_np = compute_embed_projector_from_target(geo_target_np, cfg.geo_embed_grad_rank)
-            embed_proj_ts.append(torch.from_numpy(P_np).to(device))
+            embed_proj_ts.append(torch.from_numpy(P_np).to(device=device, dtype=bm.dtype))
         else:
             embed_proj_ts.append(None)
 
