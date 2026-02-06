@@ -209,6 +209,10 @@ class USBBlock(nn.Module):
         # Low-rank attention downsamplers (SIREN)
         self.attn_downsample = SIRENDownsampleND(d_expanded, ndim=1)
         self.attn_rope_downsample = SIRENDownsampleND(d_group // 2, ndim=1)
+
+        # Router head for multifocal attention centers
+        self.router = nn.Linear(d_expanded, 1, bias=False)
+        nn.init.zeros_(self.router.weight)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -385,20 +389,18 @@ class USBBlock(nn.Module):
         out_g4 = v_g4  # No scan, just passthrough
 
         # Step 6: Low-rank attention (full Q against downsampled KV)
-        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
-        k_all = torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2)
         v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
 
         target_len = max(1, int(math.sqrt(seq_len)))
 
-        k_flat = rearrange(k_all, 'b t h d -> b t (h d)')
+        k_flat = rearrange(torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2), 'b t h d -> b t (h d)')
         v_flat = rearrange(v_all, 'b t h d -> b t (h d)')
         k_down_flat = self.attn_downsample(k_flat, (target_len,))
         v_down_flat = self.attn_downsample(v_flat, (target_len,))
         k_down = rearrange(k_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
         v_down = rearrange(v_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
 
-        # Apply data-dependent RoPE to Q after downsampling
+        # Apply data-dependent RoPE to Q
         q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
         q_g2 = apply_data_dependent_rope(q_g2, params_g2['rope_freq'])
         q_g3 = apply_data_dependent_rope(q_g3, params_g3['rope_freq'])
@@ -453,10 +455,61 @@ class USBBlock(nn.Module):
             attn_mask=None,
             is_causal=False,
         )
-        
-        # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
+
+        # Step 7: Multifocal attention over routed windows
+        k_full_g1 = apply_data_dependent_rope(k_g1_attn, params_g1['rope_freq'])
+        k_full_g2 = apply_data_dependent_rope(k_g2_attn, params_g2['rope_freq'])
+        k_full_g3 = apply_data_dependent_rope(k_g3_attn, params_g3['rope_freq'])
+        k_full_g3 = apply_rope(k_full_g3, seq_len)
+        k_full_g4 = apply_rope(k_g4_attn, seq_len)
+
+        q_full = q_all
+        k_full = torch.cat([k_full_g1, k_full_g2, k_full_g3, k_full_g4], dim=-2)
+
+        q_full = q_full.transpose(1, 2)
+        k_full = k_full.transpose(1, 2)
+        v_full = v_all.transpose(1, 2)
+
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+
+        router_scores = self.router(attn_out).squeeze(-1)
+        num_centers = max(1, int(round(seq_len ** (1.0 / 3.0))))
+        window = max(1, int(round(math.sqrt(seq_len))))
+        half = window // 2
+
+        local_out = torch.zeros_like(attn_out)
+        local_counts = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
+
+        topk_idx = torch.topk(router_scores, k=num_centers, dim=1).indices
+
+        for b in range(batch):
+            for idx in topk_idx[b]:
+                center = int(idx.item())
+                start = max(0, center - half)
+                end = min(seq_len, center + half + 1)
+                win_idx = torch.arange(start, end, device=attn_out.device)
+
+                q_win = q_full[b, :, win_idx, :].unsqueeze(0)
+                k_win = k_full[b, :, win_idx, :].unsqueeze(0)
+                v_win = v_full[b, :, win_idx, :].unsqueeze(0)
+
+                win_out = F.scaled_dot_product_attention(
+                    q_win, k_win, v_win,
+                    attn_mask=None,
+                    is_causal=False,
+                ).squeeze(0)
+                win_out = win_out.transpose(0, 1)
+                win_out = rearrange(win_out, 't h d -> t (h d)')
+
+                local_out[b, win_idx] += win_out
+                local_counts[b, win_idx] += 1
+
+        local_counts = local_counts.clamp_min(1.0).unsqueeze(-1)
+        local_out = local_out / local_counts
+
+        attn_out = attn_out + local_out
+        # attn_out already (B, T, H*D)
 
         if do_debug:
             eps = 1e-6
