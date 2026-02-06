@@ -492,13 +492,18 @@ class USBBlock(nn.Module):
         idx = topk_idx.unsqueeze(-1) + offsets
         idx = idx.clamp(0, seq_len - 1)
 
-        idx_exp = idx[:, None, :, :, None].expand(
-            batch, config.nheads_total, num_centers, offsets.numel(), config.headdim
+        idx_flat = idx.reshape(batch, -1)
+        idx_exp = idx_flat[:, None, :, None].expand(
+            batch, config.nheads_total, idx_flat.shape[1], config.headdim
         )
 
-        q_win = torch.gather(q_full, dim=2, index=idx_exp)
-        k_win = torch.gather(k_full, dim=2, index=idx_exp)
-        v_win = torch.gather(v_full, dim=2, index=idx_exp)
+        q_flat = torch.gather(q_full, dim=2, index=idx_exp)
+        k_flat = torch.gather(k_full, dim=2, index=idx_exp)
+        v_flat = torch.gather(v_full, dim=2, index=idx_exp)
+
+        q_win = q_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
+        k_win = k_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
+        v_win = v_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
 
         q_win = q_win.permute(0, 2, 1, 3, 4).contiguous()
         k_win = k_win.permute(0, 2, 1, 3, 4).contiguous()
@@ -516,16 +521,18 @@ class USBBlock(nn.Module):
 
         win_out = win_out.view(batch, num_centers, config.nheads_total, offsets.numel(), config.headdim)
         win_out = win_out.permute(0, 1, 3, 2, 4).contiguous()
-        win_out = win_out.view(batch, num_centers, offsets.numel(), config.d_expanded)
+        win_out = win_out.view(batch, num_centers * offsets.numel(), config.d_expanded)
 
         local_sum = torch.zeros(batch, seq_len, config.d_expanded, device=attn_out.device, dtype=attn_out.dtype)
         local_weight = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
 
-        idx_out = idx.unsqueeze(-1).expand(batch, num_centers, offsets.numel(), config.d_expanded)
-        win_weight = topk_w.unsqueeze(-1).unsqueeze(-1)
-        local_sum.scatter_add_(1, idx_out, win_out * win_weight)
+        idx_out = idx.reshape(batch, -1)
+        idx_out_exp = idx_out.unsqueeze(-1).expand(batch, idx_out.shape[1], config.d_expanded)
+        win_weight = topk_w.unsqueeze(-1).expand(batch, num_centers, offsets.numel()).reshape(batch, -1)
+        win_weight_exp = win_weight.unsqueeze(-1).expand(batch, win_weight.shape[1], config.d_expanded)
 
-        local_weight.scatter_add_(1, idx, topk_w.unsqueeze(-1).expand(batch, num_centers, offsets.numel()))
+        local_sum.scatter_add_(1, idx_out_exp, win_out * win_weight_exp)
+        local_weight.scatter_add_(1, idx_out, win_weight)
 
         local_out = local_sum / local_weight.clamp_min(1e-6).unsqueeze(-1)
 
