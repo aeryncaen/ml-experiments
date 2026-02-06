@@ -798,12 +798,12 @@ def _fmt_val(v, as_int: bool):
 
 # Numeric axes: (lo, hi, is_int)
 BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = {
-    "geo_init_blend":            (0.4, 0.95, False),
-    "geo_embed_grad_rank":       (4, 32, True),
-    "geo_embed_grad_perp_init":  (0.05, 0.4, False),
-    "geo_embed_grad_hold_steps": (10, 150, True),
-    "geo_embed_grad_ramp_steps": (10, 150, True),
-    "geo_embed_reanchor_rho":    (0.0, 0.04, False),
+    "geo_init_blend":            (0.0, 1.0, False),
+    "geo_embed_grad_rank":       (1, 64, True),
+    "geo_embed_grad_perp_init":  (0.0, 1.0, False),
+    "geo_embed_grad_hold_steps": (0, 300, True),
+    "geo_embed_grad_ramp_steps": (0, 300, True),
+    "geo_embed_reanchor_rho":    (0.0, 1.0, False),
 }
 
 BINARY_SEARCH_FIXED: dict[str, object] = {
@@ -862,6 +862,7 @@ def generate_binary_level1() -> tuple[list[TrialConfig], dict[str, list]]:
 def generate_binary_refinement(
     best_config: dict,
     intervals: dict[str, tuple[float, float]],
+    all_results: list[dict],
 ) -> tuple[list[TrialConfig], dict[str, tuple[float, float]]]:
     """
     Narrow each axis to the half-interval containing the best value.
@@ -883,12 +884,28 @@ def generate_binary_refinement(
         as_int = BINARY_SEARCH_AXES[k][2]
         mid = (lo + hi) / 2.0
         best_val = best_config[k]
+        lo_f = _fmt_val(lo, as_int)
+        mid_f = _fmt_val(mid, as_int)
+        hi_f = _fmt_val(hi, as_int)
 
-        # Narrow to the half containing best
-        if best_val <= _fmt_val(mid, as_int):
+        # Which half to narrow into: bisect between best and its better neighbor
+        if best_val == lo_f:
+            # Best is at low end — bisect between lo and mid
             new_lo, new_hi = lo, mid
-        else:
+        elif best_val == hi_f:
+            # Best is at high end — bisect between mid and hi
             new_lo, new_hi = mid, hi
+        else:
+            # Best is the midpoint — look at which neighbor performed better
+            # by checking all results for configs matching lo vs hi on this axis
+            lo_scores = [r["val_acc"] for r in all_results if r["config"][k] == lo_f]
+            hi_scores = [r["val_acc"] for r in all_results if r["config"][k] == hi_f]
+            lo_best = max(lo_scores) if lo_scores else -1
+            hi_best = max(hi_scores) if hi_scores else -1
+            if hi_best > lo_best:
+                new_lo, new_hi = mid, hi
+            else:
+                new_lo, new_hi = lo, mid
 
         new_mid = (new_lo + new_hi) / 2.0
         new_lo_f = _fmt_val(new_lo, as_int)
@@ -1072,7 +1089,7 @@ def main():
         print(f"{'='*80}", flush=True)
 
         best_cfg = all_results[0]["config"]
-        new_configs, intervals = generate_binary_refinement(best_cfg, intervals)
+        new_configs, intervals = generate_binary_refinement(best_cfg, intervals, all_results)
         if not new_configs:
             print("No new configs to evaluate, stopping.", flush=True)
             break
