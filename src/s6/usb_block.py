@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .scan import forward_scan
-from .rope import apply_data_dependent_rope
+from .rope import apply_rope, apply_data_dependent_rope
 
 
 @dataclass
@@ -25,12 +25,8 @@ class USBConfig:
     expansion_factor: int = 2
     layer_idx: int = 0  # For future use (e.g., layer-dependent params)
 
-    # Post-scan polarity-aware sparse attention
-    polarity_attention: bool = True
-    sparse_keys: int = 64
-    num_hash: int = 8
-    use_lsh: bool = True
-    use_key_selection: bool = True
+    # Post-scan full causal attention
+    post_scan_attention: bool = True
     
     # Scan state modes per group (G1, G2, G3): 'elementwise' (k*v) or 'outer' (k⊗v)
     # - elementwise: state is (nheads, headdim), good for state-tracking (parity)
@@ -163,127 +159,24 @@ class PerHeadProjections(nn.Module):
         }
 
 
-class SparseAttention(nn.Module):
+class PostScanAttention(nn.Module):
     """
-    HAX-style sparse causal attention.
-    
-    Sign-bin LSH + learned key selection to build a sparse mask,
-    then standard scaled dot-product softmax over selected keys.
-    
-    Q is projected from post-scan enhanced states.
-    K/V come from pre-scan projections.
+    Full causal attention applied post-scan over all heads.
+    Q projected from post-scan enhanced states, K/V from pre-scan projections.
+    Standard RoPE applied to Q and K on the G3+G4 head dimensions only
+    (G1/G2 already have positional info from dd-rope in the scan path).
     """
 
-    def __init__(
-        self,
-        d_input: int,
-        nheads: int,
-        headdim: int,
-        sparse_keys: int = 64,
-        num_hash: int = 8,
-        use_lsh: bool = True,
-        use_key_selection: bool = True,
-    ):
+    def __init__(self, d_input: int, nheads: int, headdim: int, nheads_rope: int):
         super().__init__()
         self.nheads = nheads
         self.headdim = headdim
-        self.sparse_keys = sparse_keys
-        self.num_hash = num_hash
-        self.use_lsh = use_lsh
-        self.use_key_selection = use_key_selection
+        self.nheads_rope = nheads_rope  # number of G3+G4 heads that need RoPE
 
-        # Q projection from post-scan enhanced hidden states
         self.q_proj = nn.Linear(d_input, nheads * headdim, bias=False)
         self.q_norm = GatedRMSNorm(nheads * headdim)
-
-        # HAX key selection MLP (operates on per-head K/cumQ concatenation)
-        if self.use_key_selection:
-            self.dx_proj_1 = nn.Linear(headdim * 2, headdim * 2)
-            self.dx_proj_2 = nn.Linear(headdim * 2, headdim * 2)
-            self.dx_proj_3 = nn.Linear(headdim * 2, 1)
-
-        # Output projection back to d_input
         self.out_proj = nn.Linear(nheads * headdim, d_input, bias=False)
-
-        # Learnable gate (initialized near zero so attention starts small)
         self.attn_gate = nn.Parameter(torch.zeros(1))
-
-    @staticmethod
-    def _cumtopk(x: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Cumulative top-k per position along last dim."""
-        *batch_shape, size = x.shape
-        x_flat = x.reshape(-1, size)
-        mask = torch.tril(torch.ones(size, size, dtype=torch.bool, device=x.device))
-        x_cumulative = x_flat.unsqueeze(1).expand(-1, size, -1)
-        x_cumulative = x_cumulative.masked_fill(~mask.unsqueeze(0), float("-inf"))
-        topk_values, topk_indices = x_cumulative.topk(k, dim=2)
-        out_shape = batch_shape + [size, k]
-        return topk_values.reshape(*out_shape), topk_indices.reshape(*out_shape)
-
-    @staticmethod
-    def _lsh_sliding_window(mask: torch.Tensor, budget: int) -> torch.Tensor:
-        """Keep up to budget matches per query from the right."""
-        reversed_mask = mask.flip(dims=[-1])
-        cumsum = torch.cumsum(reversed_mask.int(), dim=-1)
-        keep = cumsum <= budget
-        return (reversed_mask & keep).flip(dims=[-1])
-
-    def _build_sparse_mask(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        valid: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Build causal sparse mask via sign-bin LSH + key selection (HAX)."""
-        bsz, nheads, seq_len, hdim = q.shape
-        device = q.device
-        budget = max(1, min(self.sparse_keys, seq_len))
-
-        causal = torch.arange(seq_len, device=device)
-        causal_mask = (causal[None, None, :] <= causal[None, :, None]).unsqueeze(0)
-        diag = torch.eye(seq_len, device=device, dtype=torch.bool).view(1, 1, seq_len, seq_len)
-
-        # Sign-bin LSH
-        lsh_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
-        if self.use_lsh:
-            assert self.num_hash < 64
-            nq = F.normalize(q - q.mean(dim=2, keepdim=True), dim=-1)
-            nk = F.normalize(k - k.mean(dim=2, keepdim=True), dim=-1)
-            proj = torch.randn((hdim, self.num_hash), device=device, dtype=q.dtype)
-            hq_bits = (torch.matmul(nq, proj) > 0).to(torch.long)
-            hk_bits = (torch.matmul(nk, proj) > 0).to(torch.long)
-            weights = (1 << torch.arange(self.num_hash, device=device, dtype=torch.long)).view(1, 1, 1, self.num_hash)
-            hq_idx = (hq_bits * weights).sum(-1)
-            hk_idx = (hk_bits * weights).sum(-1)
-            lsh_mask = hq_idx.unsqueeze(-1) == hk_idx.unsqueeze(-2)
-            lsh_mask = self._lsh_sliding_window(lsh_mask & causal_mask, budget=budget)
-
-        # Key selection MLP
-        ks_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
-        if self.use_key_selection:
-            # HAX recipe: concat(K_detached, normalize(cumsum(Q_detached))) -> MLP -> score
-            tq = F.normalize(q.detach().cumsum(dim=2), dim=-1)
-            tk = k.detach()
-            t2 = torch.cat([tk, tq], dim=-1)  # (b, h, t, hdim*2)
-            t2 = F.relu(self.dx_proj_1(t2))
-            t2 = F.relu(self.dx_proj_2(t2))
-            key_score = self.dx_proj_3(t2).squeeze(-1)  # (b, h, t)
-            if valid is not None:
-                key_score = key_score.masked_fill(~valid[:, None, :], float("-inf"))
-            _, key_idx = self._cumtopk(key_score, k=budget)
-
-            bh = bsz * nheads
-            key_idx_flat = key_idx.reshape(bh, seq_len, budget)
-            flat_mask = torch.zeros(bh, seq_len, seq_len, device=device, dtype=torch.bool)
-            bid = torch.arange(bh, device=device).view(-1, 1, 1).expand(bh, seq_len, budget)
-            sid = torch.arange(seq_len, device=device).view(1, -1, 1).expand(bh, seq_len, budget)
-            flat_mask[bid, sid, key_idx_flat] = True
-            ks_mask = flat_mask.view(bsz, nheads, seq_len, seq_len)
-
-        sparse_mask = (lsh_mask | ks_mask | diag) & causal_mask
-        if valid is not None:
-            sparse_mask = sparse_mask & valid[:, None, None, :]
-        return sparse_mask
 
     def forward(
         self,
@@ -294,38 +187,35 @@ class SparseAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            post_scan_states: (batch, seq_len, d_input) - enhanced states after all scans
+            post_scan_states: (batch, seq_len, d_input)
             k: (batch, seq_len, nheads, headdim) - pre-scan keys
             v: (batch, seq_len, nheads, headdim) - pre-scan values
-            attention_mask: (batch, seq_len) or None
         Returns:
             (batch, seq_len, d_input)
         """
-        bsz, seq_len, _ = post_scan_states.shape
+        seq_len = post_scan_states.shape[1]
+        nh = self.nheads
+        nr = self.nheads_rope  # G3+G4 heads at the end
 
-        # Project Q from post-scan states
         q = self.q_norm(self.q_proj(post_scan_states))
-        q = rearrange(q, 'b t (h d) -> b h t d', h=self.nheads)
+        q = rearrange(q, 'b t (h d) -> b t h d', h=nh)
 
-        # Reshape K, V to (b, h, t, d)
+        # Apply standard RoPE to G3+G4 heads only (last nr heads)
+        q_scan = q[..., :nh - nr, :]          # G1+G2: already have dd-rope
+        q_rope = apply_rope(q[..., nh - nr:, :], seq_len)  # G3+G4: need RoPE
+        q = torch.cat([q_scan, q_rope], dim=-2)
+
+        k_scan = k[..., :nh - nr, :]
+        k_rope = apply_rope(k[..., nh - nr:, :], seq_len)
+        k = torch.cat([k_scan, k_rope], dim=-2)
+
+        q = q.transpose(1, 2)  # (b, h, t, d)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        valid = attention_mask.to(torch.bool) if attention_mask is not None else None
-
-        # Build sparse mask
-        sparse_mask = self._build_sparse_mask(q, k, valid)
-
-        # Standard scaled dot-product attention over sparse mask
-        scale = self.headdim ** -0.5
-        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * scale
-        attn_logits = attn_logits + (1.0 - sparse_mask.to(attn_logits.dtype)) * torch.finfo(attn_logits.dtype).min
-        attn = F.softmax(attn_logits, dim=-1)
-        out = torch.matmul(attn, v)
-
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = rearrange(out, 'b h t d -> b t (h d)')
 
-        # Gate + project
         gate = torch.sigmoid(self.attn_gate)
         return gate * self.out_proj(out)
 
@@ -380,19 +270,16 @@ class USBBlock(nn.Module):
             d_group, d_group, kernel_size=3, padding=0, groups=d_group, bias=False
         )
 
-        # Post-scan sparse attention (over ALL heads)
-        if config.polarity_attention:
-            self.sparse_attn = SparseAttention(
+        # Post-scan full causal attention (over ALL heads)
+        if config.post_scan_attention:
+            self.post_attn = PostScanAttention(
                 d_input=d_expanded,
                 nheads=nheads_total,
                 headdim=headdim,
-                sparse_keys=config.sparse_keys,
-                num_hash=config.num_hash,
-                use_lsh=config.use_lsh,
-                use_key_selection=config.use_key_selection,
+                nheads_rope=nheads_per_group * 2,  # G3 + G4
             )
         else:
-            self.sparse_attn = None
+            self.post_attn = None
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -584,10 +471,11 @@ class USBBlock(nn.Module):
         scan_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         scan_out_flat = rearrange(scan_out, 'b t h d -> b t (h d)')
 
-        # Step 6b: Post-scan sparse attention (HAX-style)
+        # Step 6b: Post-scan full causal attention
         # Q from post-scan enhanced states; K/V from pre-scan projections (all heads)
-        if self.sparse_attn is not None:
-            attn_out = scan_out_flat + self.sparse_attn(
+        # Standard RoPE on G3+G4 heads; G1+G2 already have dd-rope from scan
+        if self.post_attn is not None:
+            attn_out = scan_out_flat + self.post_attn(
                 post_scan_states=scan_out_flat,
                 k=k,  # pre-scan K, all heads: (b, t, nheads_total, headdim)
                 v=v,  # pre-scan V, all heads: (b, t, nheads_total, headdim)
