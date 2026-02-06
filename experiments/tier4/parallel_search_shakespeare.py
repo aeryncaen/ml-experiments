@@ -792,85 +792,135 @@ def run_parallel_search(
 # ---------------------------------------------------------------------------
 # Config generation
 # ---------------------------------------------------------------------------
-def _binary_space(lo: float, hi: float, levels: int, as_int: bool) -> list:
-    """Generate 2*levels+1 binary-spaced values between lo and hi."""
-    mid = (lo + hi) / 2.0
-    vals = {lo, mid, hi}
-    queue = [(lo, hi)]
-    for _ in range(levels):
-        next_q = []
-        for a, b in queue:
-            m = (a + b) / 2.0
-            vals.add(m)
-            next_q.append((a, m))
-            next_q.append((m, b))
-        queue = next_q
-    if as_int:
-        return sorted({int(round(v)) for v in vals})
-    return sorted({round(v, 6) for v in vals})
+def _fmt_val(v, as_int: bool):
+    return int(round(v)) if as_int else round(v, 6)
 
 
-def generate_full_binary_grid(levels: int) -> list[TrialConfig]:
+# Numeric axes: (lo, hi, is_int)
+BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = {
+    "geo_init_blend":            (0.4, 0.95, False),
+    "geo_embed_grad_rank":       (4, 32, True),
+    "geo_embed_grad_perp_init":  (0.05, 0.4, False),
+    "geo_embed_grad_hold_steps": (50, 400, True),
+    "geo_embed_grad_ramp_steps": (50, 400, True),
+    "geo_embed_reanchor_rho":    (0.0, 0.04, False),
+}
+
+BINARY_SEARCH_FIXED: dict[str, object] = {
+    "geo_init_method": "kl_bucket",
+    "geo_init_mtp_weights": "1.0,0.5,0.25",
+    "geo_init_fullspace": False,
+    "geo_init_ridge": 1e-3,
+    "geo_init_match_row_norm": True,
+    "geo_attn_bias": False,
+    "geo_attn_bias_blend": 0.2,
+    "geo_attn_corr_bias": False,
+    "geo_attn_corr_blend": 0.1,
+    "geo_attn_corr_rank": 8,
+    "geo_attn_corr_layers": 2,
+    "geo_attn_corr_horizons": "1,2,3",
+    "geo_attn_corr_horizon_weights": "1.0,0.5,0.25",
+    "geo_embed_grad_shape": True,
+    "geo_embed_reanchor_every": 50,
+    "geo_embed_reanchor_until_step": 0,
+}
+
+
+def generate_binary_level1() -> tuple[list[TrialConfig], dict[str, list]]:
     """
-    Full cartesian product of binary-spaced values for embed-focused params.
-    geo_init_method locked to kl_bucket. Attention bias disabled (separate search).
+    Level 1: 3 values per axis (lo, mid, hi) → 3^6 = 729 configs.
+    Returns (configs, axis_values) where axis_values maps key → [lo, mid, hi].
     """
     import itertools
 
-    # Numeric axes: (lo, hi, is_int)
-    num_axes: dict[str, tuple[float, float, bool]] = {
-        "geo_init_blend":            (0.4, 0.95, False),
-        "geo_embed_grad_rank":       (4, 32, True),
-        "geo_embed_grad_perp_init":  (0.05, 0.4, False),
-        "geo_embed_grad_hold_steps": (50, 400, True),
-        "geo_embed_grad_ramp_steps": (50, 400, True),
-        "geo_embed_reanchor_rho":    (0.0, 0.04, False),
-    }
+    axis_vals: dict[str, list] = {}
+    for k, (lo, hi, as_int) in BINARY_SEARCH_AXES.items():
+        mid = (lo + hi) / 2.0
+        axis_vals[k] = sorted({_fmt_val(lo, as_int), _fmt_val(mid, as_int), _fmt_val(hi, as_int)})
 
-    # Everything else fixed
-    fixed = {
-        "geo_init_method": "kl_bucket",
-        "geo_init_mtp_weights": "1.0,0.5,0.25",
-        "geo_init_fullspace": False,
-        "geo_init_ridge": 1e-3,
-        "geo_init_match_row_norm": True,
-        "geo_attn_bias": False,
-        "geo_attn_bias_blend": 0.2,
-        "geo_attn_corr_bias": False,
-        "geo_attn_corr_blend": 0.1,
-        "geo_attn_corr_rank": 8,
-        "geo_attn_corr_layers": 2,
-        "geo_attn_corr_horizons": "1,2,3",
-        "geo_attn_corr_horizon_weights": "1.0,0.5,0.25",
-        "geo_embed_grad_shape": True,
-        "geo_embed_reanchor_every": 50,
-        "geo_embed_reanchor_until_step": 0,
-    }
-
-    # Build value lists per axis
-    all_axes: list[tuple[str, list]] = []
-    for k, (lo, hi, as_int) in num_axes.items():
-        all_axes.append((k, _binary_space(lo, hi, levels, as_int)))
-
-    keys = [k for k, _ in all_axes]
-    val_lists = [v for _, v in all_axes]
+    keys = list(axis_vals.keys())
+    val_lists = [axis_vals[k] for k in keys]
 
     total = 1
     for v in val_lists:
         total *= len(v)
 
-    print(f"Binary grid: {len(keys)} axes, {total} total configs", flush=True)
-    for k, vs in zip(keys, val_lists):
-        print(f"  {k}: {len(vs)} values = {vs}", flush=True)
+    print(f"Binary search level 1: {len(keys)} axes, {total} configs", flush=True)
+    for k in keys:
+        print(f"  {k}: {axis_vals[k]}", flush=True)
 
     configs = []
     for combo in itertools.product(*val_lists):
-        d = dict(fixed)
+        d = dict(BINARY_SEARCH_FIXED)
         for k, v in zip(keys, combo):
             d[k] = v
         configs.append(TrialConfig(**d))
 
-    return configs
+    return configs, axis_vals
+
+
+def generate_binary_refinement(
+    best_config: dict,
+    intervals: dict[str, tuple[float, float]],
+) -> tuple[list[TrialConfig], dict[str, tuple[float, float]]]:
+    """
+    Narrow each axis to the half-interval containing the best value.
+    The winning half keeps 2 old endpoints + 1 new midpoint = 3 values per axis.
+    We already ran 2^6 = 64 combos of the 2 old values, so we run 3^6 - 2^6 = 665 new.
+
+    Returns (new_configs, new_intervals).
+    """
+    import itertools
+
+    new_intervals: dict[str, tuple[float, float]] = {}
+    old_vals_per_axis: dict[str, list] = {}  # 2 surviving old values
+    all_vals_per_axis: dict[str, list] = {}  # 3 values (2 old + 1 new mid)
+
+    keys = list(BINARY_SEARCH_AXES.keys())
+
+    for k in keys:
+        lo, hi = intervals[k]
+        as_int = BINARY_SEARCH_AXES[k][2]
+        mid = (lo + hi) / 2.0
+        best_val = best_config[k]
+
+        # Narrow to the half containing best
+        if best_val <= _fmt_val(mid, as_int):
+            new_lo, new_hi = lo, mid
+        else:
+            new_lo, new_hi = mid, hi
+
+        new_mid = (new_lo + new_hi) / 2.0
+        new_lo_f = _fmt_val(new_lo, as_int)
+        new_hi_f = _fmt_val(new_hi, as_int)
+        new_mid_f = _fmt_val(new_mid, as_int)
+
+        new_intervals[k] = (new_lo, new_hi)
+        old_vals_per_axis[k] = sorted({new_lo_f, new_hi_f})
+        all_vals_per_axis[k] = sorted({new_lo_f, new_mid_f, new_hi_f})
+
+    # Already-run combos: cartesian product of just the 2 old values per axis
+    already_run = set()
+    old_lists = [old_vals_per_axis[k] for k in keys]
+    for combo in itertools.product(*old_lists):
+        already_run.add(combo)
+
+    # New configs: full 3-value grid minus already-run
+    val_lists = [all_vals_per_axis[k] for k in keys]
+    new_configs = []
+    for combo in itertools.product(*val_lists):
+        if combo in already_run:
+            continue
+        d = dict(BINARY_SEARCH_FIXED)
+        for k, v in zip(keys, combo):
+            d[k] = v
+        new_configs.append(TrialConfig(**d))
+
+    print(f"Binary refinement: {len(new_configs)} new configs", flush=True)
+    for k in keys:
+        print(f"  {k}: vals={all_vals_per_axis[k]} interval=({intervals[k][0]:.6f}, {intervals[k][1]:.6f}) -> ({new_intervals[k][0]:.6f}, {new_intervals[k][1]:.6f})", flush=True)
+
+    return new_configs, new_intervals
 
 
 # ---------------------------------------------------------------------------
@@ -912,79 +962,110 @@ def main():
     vocab_size = len(stoi)
     print(f"Vocab={vocab_size} Train={len(train_ids)} Val={len(val_ids)}", flush=True)
 
-    # Generate configs
-    print("Generating binary grid configs...", flush=True)
-    all_configs = generate_full_binary_grid(args.binary_levels)
-    print(f"Generated {len(all_configs)} configs, config_batch={args.config_batch}", flush=True)
+    def run_config_batch(cfgs: list[TrialConfig]) -> list[dict]:
+        """Run a list of configs through parallel search in config-batch chunks."""
+        res: list[dict] = []
+        n_batches = (len(cfgs) + args.config_batch - 1) // args.config_batch
+        for bi in range(n_batches):
+            start = bi * args.config_batch
+            end = min(start + args.config_batch, len(cfgs))
+            chunk = cfgs[start:end]
+            print(f"\n--- Config batch {bi+1}/{n_batches} ({len(chunk)} configs, {start}-{end-1}) ---", flush=True)
+            batch_results = run_parallel_search(
+                configs=chunk,
+                train_ids=train_ids,
+                val_ids=val_ids,
+                vocab_size=vocab_size,
+                d_model=args.d_model,
+                n_head=args.n_head,
+                n_layer=args.n_layer,
+                block_size=args.block_size,
+                dropout=args.dropout,
+                lr=args.lr,
+                steps=args.steps,
+                eval_iters=args.eval_iters,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                device=device,
+            )
+            res.extend(batch_results)
+        return res
 
-    # Run in config batches
-    results: list[dict] = []
-    n_batches = (len(all_configs) + args.config_batch - 1) // args.config_batch
-    for bi in range(n_batches):
-        start = bi * args.config_batch
-        end = min(start + args.config_batch, len(all_configs))
-        configs = all_configs[start:end]
-        print(f"\n--- Config batch {bi+1}/{n_batches} ({len(configs)} configs, {start}-{end-1}) ---", flush=True)
-        batch_results = run_parallel_search(
-            configs=configs,
-            train_ids=train_ids,
-            val_ids=val_ids,
-            vocab_size=vocab_size,
-            d_model=args.d_model,
-            n_head=args.n_head,
-            n_layer=args.n_layer,
-            block_size=args.block_size,
-            dropout=args.dropout,
-            lr=args.lr,
-            steps=args.steps,
-            eval_iters=args.eval_iters,
-            batch_size=args.batch_size,
-            seed=args.seed,
-            device=device,
-        )
-        results.extend(batch_results)
+    def print_leaderboard(results: list[dict], label: str):
+        results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+        top_k = min(args.top_k, len(results))
+        print(f"\n{'='*80}")
+        print(f"{label}: TOP {top_k} (of {len(results)} tested)")
+        print(f"{'='*80}")
+        for i, r in enumerate(results[:top_k]):
+            print(
+                f"#{i+1:3d} val_acc={r['val_acc']:.6f} val_loss={r['val_loss']:.4f} "
+                f"train_acc={r['train_acc']:.6f} train_loss={r['train_loss']:.4f} "
+                f"id={r['config_id']}"
+            )
+            cfg = r["config"]
+            print(
+                f"     blend={cfg['geo_init_blend']} "
+                f"rank={cfg['geo_embed_grad_rank']} perp={cfg['geo_embed_grad_perp_init']} "
+                f"hold={cfg['geo_embed_grad_hold_steps']} ramp={cfg['geo_embed_grad_ramp_steps']} "
+                f"rho={cfg['geo_embed_reanchor_rho']}"
+            )
 
-    results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+    # ---- Iterative binary search ----
+    all_results: list[dict] = []
 
-    # Print top results
-    top_k = min(args.top_k, len(results))
-    print(f"\n{'='*80}")
-    print(f"TOP {top_k} CONFIGS (of {len(results)} tested)")
-    print(f"{'='*80}")
-    for i, r in enumerate(results[:top_k]):
-        print(
-            f"#{i+1:3d} val_acc={r['val_acc']:.6f} val_loss={r['val_loss']:.4f} "
-            f"train_acc={r['train_acc']:.6f} train_loss={r['train_loss']:.4f} "
-            f"id={r['config_id']}"
-        )
-        cfg = r["config"]
-        print(
-            f"     method={cfg['geo_init_method']} blend={cfg['geo_init_blend']} "
-            f"attn={cfg['geo_attn_bias']}/{cfg['geo_attn_bias_blend']} "
-            f"corr={cfg['geo_attn_corr_bias']}/{cfg['geo_attn_corr_blend']}/r{cfg['geo_attn_corr_rank']}/L{cfg['geo_attn_corr_layers']} "
-            f"grad={cfg['geo_embed_grad_shape']}/perp{cfg['geo_embed_grad_perp_init']}/hold{cfg['geo_embed_grad_hold_steps']}/ramp{cfg['geo_embed_grad_ramp_steps']} "
-            f"reanchor={cfg['geo_embed_reanchor_rho']}"
-        )
+    # Level 1: 3^6 = 729 configs
+    print("\n" + "=" * 80, flush=True)
+    print("BINARY SEARCH LEVEL 1", flush=True)
+    print("=" * 80, flush=True)
+    level1_configs, axis_vals = generate_binary_level1()
+    print(f"Level 1: {len(level1_configs)} configs", flush=True)
+    level1_results = run_config_batch(level1_configs)
+    all_results.extend(level1_results)
+    all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+    print_leaderboard(all_results, "LEVEL 1")
 
-    # Best
-    best = results[0]
-    print(f"\nBEST: val_acc={best['val_acc']:.6f} val_loss={best['val_loss']:.4f}")
+    # Track intervals per axis for refinement
+    intervals: dict[str, tuple[float, float]] = {
+        k: (lo, hi) for k, (lo, hi, _) in BINARY_SEARCH_AXES.items()
+    }
+
+    # Levels 2+: narrow and refine
+    for level in range(2, args.binary_levels + 1):
+        print(f"\n{'='*80}", flush=True)
+        print(f"BINARY SEARCH LEVEL {level}", flush=True)
+        print(f"{'='*80}", flush=True)
+
+        best_cfg = all_results[0]["config"]
+        new_configs, intervals = generate_binary_refinement(best_cfg, intervals)
+        if not new_configs:
+            print("No new configs to evaluate, stopping.", flush=True)
+            break
+        print(f"Level {level}: {len(new_configs)} new configs", flush=True)
+        new_results = run_config_batch(new_configs)
+        all_results.extend(new_results)
+        all_results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
+        print_leaderboard(all_results, f"LEVEL {level} (cumulative)")
+
+    # Final summary
+    best = all_results[0]
+    print(f"\nFINAL BEST: val_acc={best['val_acc']:.6f} val_loss={best['val_loss']:.4f}")
     print(f"BEST CONFIG: {json.dumps(best['config'], indent=2)}")
 
     # Save
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = {
-        "n_configs": len(all_configs),
-        "strategy": "binary_grid",
+        "n_configs": len(all_results),
+        "strategy": "iterative_binary_search",
         "binary_levels": args.binary_levels,
         "steps": args.steps,
         "eval_iters": args.eval_iters,
         "batch_size": args.batch_size,
         "device": str(device),
         "best": best,
-        "top": results[:top_k],
-        "all": results,
+        "top": all_results[:args.top_k],
+        "all": all_results,
     }
     out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(f"\nWrote results to {out_path}")
