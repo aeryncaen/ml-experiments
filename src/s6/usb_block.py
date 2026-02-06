@@ -180,8 +180,9 @@ class USBBlock(nn.Module):
         self.k_norm = GatedRMSNorm(d_expanded)
         self.v_norm = GatedRMSNorm(d_expanded)
 
-        # K bias (per-head, initialized to 1.0)
+        # KV bias (per-head, initialized to 1.0)
         self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
+        self.v_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
         # G4 is passthrough, no scan parameters needed
@@ -258,8 +259,9 @@ class USBBlock(nn.Module):
         k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
         v = rearrange(v, 'b t (h d) -> b t h d', h=config.nheads_total)
 
-        # Apply K bias (after norm)
+        # Apply KV bias (after norm)
         k = k + self.k_bias
+        v = v + self.v_bias
         
         # Step 3: Channel split into 4 groups
         # Each group gets nheads_per_group heads
