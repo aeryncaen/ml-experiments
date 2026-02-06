@@ -65,12 +65,14 @@ def candidate_grids():
         {"lr": 2e-3},
     ]
     chi2 = []
-    for trust_radius, reject_tol, sigma, q_low, q_high in itertools.product(
+    for trust_radius, reject_tol, sigma, q_low, q_high, eta_proj_scale, eta_resid_scale in itertools.product(
         [0.01, 0.03, 0.05, 0.08],
         [0.02, 0.05],
         [2.5, 3.0, 4.0],
         [-0.5, -0.2, 0.0],
         [0.2, 0.4],
+        [1.1, 1.2],
+        [0.8, 0.9],
     ):
         chi2.append(
             {
@@ -84,6 +86,8 @@ def candidate_grids():
                 "chi2_grow": 1.01,
                 "chi2_min_radius": 1e-4,
                 "chi2_max_radius": 1.0,
+                "chi2_eta_proj_scale": eta_proj_scale,
+                "chi2_eta_resid_scale": eta_resid_scale,
             }
         )
     return adam, chi2
@@ -135,8 +139,16 @@ def sweep(dataset: str, mode: str, metric: str, root: Path, out_dir: Path, args)
             "--chi2-q-low", str(cfg["chi2_q_low"]),
             "--chi2-q-high", str(cfg["chi2_q_high"]),
             "--chi2-q-beta", str(cfg["chi2_q_beta"]),
+            "--chi2-eta-proj-scale", str(cfg["chi2_eta_proj_scale"]),
+            "--chi2-eta-resid-scale", str(cfg["chi2_eta_resid_scale"]),
+            "--chi2-forget-tol", str(args.chi2_forget_tol),
+            "--chi2-forget-shrink", str(args.chi2_forget_shrink),
             "--out", str(out),
         ]
+        cmd += ["--chi2-per-layer" if args.chi2_per_layer else "--no-chi2-per-layer"]
+        cmd += ["--chi2-eta-shape" if args.chi2_eta_shape else "--no-chi2-eta-shape"]
+        cmd += ["--chi2-forget-guard" if args.chi2_forget_guard else "--no-chi2-forget-guard"]
+        cmd += ["--eval-best-val" if args.eval_best_val else "--eval-last"]
         run_cmd(cmd)
         res = load_json(out)
         score = get_score(res, mode, metric)
@@ -188,8 +200,16 @@ def final_compare(dataset: str, best: dict, root: Path, out_dir: Path, args):
         "--chi2-q-low", str(chi2_cfg["chi2_q_low"]),
         "--chi2-q-high", str(chi2_cfg["chi2_q_high"]),
         "--chi2-q-beta", str(chi2_cfg["chi2_q_beta"]),
+        "--chi2-eta-proj-scale", str(chi2_cfg.get("chi2_eta_proj_scale", args.chi2_eta_proj_scale)),
+        "--chi2-eta-resid-scale", str(chi2_cfg.get("chi2_eta_resid_scale", args.chi2_eta_resid_scale)),
+        "--chi2-forget-tol", str(args.chi2_forget_tol),
+        "--chi2-forget-shrink", str(args.chi2_forget_shrink),
         "--out", str(chi2_out),
     ]
+    cmd_chi2 += ["--chi2-per-layer" if args.chi2_per_layer else "--no-chi2-per-layer"]
+    cmd_chi2 += ["--chi2-eta-shape" if args.chi2_eta_shape else "--no-chi2-eta-shape"]
+    cmd_chi2 += ["--chi2-forget-guard" if args.chi2_forget_guard else "--no-chi2-forget-guard"]
+    cmd_chi2 += ["--eval-best-val" if args.eval_best_val else "--eval-last"]
     run_cmd(cmd_chi2)
 
     return adam_out, chi2_out
@@ -222,6 +242,18 @@ def main():
     p.add_argument("--data-dir", type=str, default="./data")
     p.add_argument("--lr-chi2", type=float, default=7e-4)
     p.add_argument("--max-chi2-trials", type=int, default=16)
+    p.add_argument("--chi2-per-layer", action="store_true", default=True)
+    p.add_argument("--no-chi2-per-layer", action="store_false", dest="chi2_per_layer")
+    p.add_argument("--chi2-eta-shape", action="store_true", default=True)
+    p.add_argument("--no-chi2-eta-shape", action="store_false", dest="chi2_eta_shape")
+    p.add_argument("--chi2-eta-proj-scale", type=float, default=1.2)
+    p.add_argument("--chi2-eta-resid-scale", type=float, default=0.8)
+    p.add_argument("--chi2-forget-guard", action="store_true", default=True)
+    p.add_argument("--no-chi2-forget-guard", action="store_false", dest="chi2_forget_guard")
+    p.add_argument("--chi2-forget-tol", type=float, default=0.01)
+    p.add_argument("--chi2-forget-shrink", type=float, default=0.7)
+    p.add_argument("--eval-best-val", action="store_true", default=True)
+    p.add_argument("--eval-last", action="store_false", dest="eval_best_val")
     p.add_argument("--out-dir", type=str, default="./results_tune")
     args = p.parse_args()
 
