@@ -760,111 +760,83 @@ def run_parallel_search(
 # ---------------------------------------------------------------------------
 # Config generation
 # ---------------------------------------------------------------------------
-def generate_configs_random(n: int, seed: int) -> list[TrialConfig]:
-    rng = random.Random(seed)
-    space = {
-        "geo_init_method": ["bucket", "kl_bucket", "kl_bucket_mtp"],
-        "geo_init_mtp_weights": ["1.0,0.5,0.25", "1.0,0.7,0.4"],
-        "geo_init_blend": [0.6, 0.7, 0.8, 0.9],
-        "geo_attn_bias": [False, True],
-        "geo_attn_bias_blend": [0.1, 0.2, 0.5],
-        "geo_attn_corr_bias": [False, True],
-        "geo_attn_corr_blend": [0.05, 0.1, 0.2],
-        "geo_attn_corr_rank": [8, 16, 32],
-        "geo_attn_corr_layers": [1, 2, 4],
-        "geo_attn_corr_horizons": ["1", "1,2", "1,2,3"],
-        "geo_attn_corr_horizon_weights": ["1.0", "1.0,0.5", "1.0,0.5,0.25"],
-        "geo_embed_grad_shape": [False, True],
-        "geo_embed_grad_rank": [8, 16, 32],
-        "geo_embed_grad_perp_init": [0.05, 0.1, 0.2, 0.3],
-        "geo_embed_grad_hold_steps": [50, 100, 250],
-        "geo_embed_grad_ramp_steps": [100, 250, 400],
-        "geo_embed_reanchor_every": [0, 50],
-        "geo_embed_reanchor_rho": [0.0, 0.01, 0.02],
-        "geo_embed_reanchor_until_step": [0, 300],
+def _binary_space(lo: float, hi: float, levels: int, as_int: bool) -> list:
+    """Generate 2*levels+1 binary-spaced values between lo and hi."""
+    mid = (lo + hi) / 2.0
+    vals = {lo, mid, hi}
+    queue = [(lo, hi)]
+    for _ in range(levels):
+        next_q = []
+        for a, b in queue:
+            m = (a + b) / 2.0
+            vals.add(m)
+            next_q.append((a, m))
+            next_q.append((m, b))
+        queue = next_q
+    if as_int:
+        return sorted({int(round(v)) for v in vals})
+    return sorted({round(v, 6) for v in vals})
+
+
+def generate_full_binary_grid(levels: int) -> list[TrialConfig]:
+    """
+    Full cartesian product of binary-spaced values for embed-focused params.
+    geo_init_method locked to kl_bucket. Attention bias disabled (separate search).
+    """
+    import itertools
+
+    # Numeric axes: (lo, hi, is_int)
+    num_axes: dict[str, tuple[float, float, bool]] = {
+        "geo_init_blend":            (0.4, 0.95, False),
+        "geo_embed_grad_rank":       (4, 32, True),
+        "geo_embed_grad_perp_init":  (0.05, 0.4, False),
+        "geo_embed_grad_hold_steps": (50, 400, True),
+        "geo_embed_grad_ramp_steps": (50, 400, True),
+        "geo_embed_reanchor_rho":    (0.0, 0.04, False),
     }
+
+    # Everything else fixed
+    fixed = {
+        "geo_init_method": "kl_bucket",
+        "geo_init_mtp_weights": "1.0,0.5,0.25",
+        "geo_init_fullspace": False,
+        "geo_init_ridge": 1e-3,
+        "geo_init_match_row_norm": True,
+        "geo_attn_bias": False,
+        "geo_attn_bias_blend": 0.2,
+        "geo_attn_corr_bias": False,
+        "geo_attn_corr_blend": 0.1,
+        "geo_attn_corr_rank": 8,
+        "geo_attn_corr_layers": 2,
+        "geo_attn_corr_horizons": "1,2,3",
+        "geo_attn_corr_horizon_weights": "1.0,0.5,0.25",
+        "geo_embed_grad_shape": True,
+        "geo_embed_reanchor_every": 50,
+        "geo_embed_reanchor_until_step": 0,
+    }
+
+    # Build value lists per axis
+    all_axes: list[tuple[str, list]] = []
+    for k, (lo, hi, as_int) in num_axes.items():
+        all_axes.append((k, _binary_space(lo, hi, levels, as_int)))
+
+    keys = [k for k, _ in all_axes]
+    val_lists = [v for _, v in all_axes]
+
+    total = 1
+    for v in val_lists:
+        total *= len(v)
+
+    print(f"Binary grid: {len(keys)} axes, {total} total configs", flush=True)
+    for k, vs in zip(keys, val_lists):
+        print(f"  {k}: {len(vs)} values = {vs}", flush=True)
+
     configs = []
-    seen = set()
-    while len(configs) < n:
-        d = {}
-        for k, vs in space.items():
-            d[k] = rng.choice(vs)
-        # Validity
-        hz = parse_int_csv(d["geo_attn_corr_horizons"])
-        hw = parse_float_csv(d["geo_attn_corr_horizon_weights"])
-        if len(hz) != len(hw):
-            continue
-        if not d["geo_attn_bias"]:
-            d["geo_attn_bias_blend"] = 0.2
-        if not d["geo_attn_corr_bias"]:
-            d["geo_attn_corr_horizons"] = "1,2"
-            d["geo_attn_corr_horizon_weights"] = "1.0,0.5"
-        if d["geo_init_method"] != "kl_bucket_mtp":
-            d["geo_init_mtp_weights"] = "1.0,0.5,0.25"
-        if not d["geo_embed_grad_shape"]:
-            d["geo_embed_grad_rank"] = 8
-            d["geo_embed_grad_perp_init"] = 0.1
-            d["geo_embed_grad_hold_steps"] = 100
-            d["geo_embed_grad_ramp_steps"] = 250
-        if d["geo_embed_reanchor_every"] == 0:
-            d["geo_embed_reanchor_rho"] = 0.0
-            d["geo_embed_reanchor_until_step"] = 0
-        sig = json.dumps(d, sort_keys=True)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        configs.append(TrialConfig(**d))
-    return configs
-
-
-def generate_configs_from_leaderboard(path: str, levels: int, seed: int) -> list[TrialConfig]:
-    """Binary-refine around leaderboard best."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    top = data.get("top", [])
-    if not top:
-        raise ValueError("No top entries")
-    base = dict(top[0]["config"])
-    # Only keep TrialConfig fields
-    valid_fields = {f.name for f in fields(TrialConfig)}
-    base = {k: v for k, v in base.items() if k in valid_fields}
-
-    bounds = {
-        "geo_init_blend": (0.3, 0.95, False),
-        "geo_attn_corr_blend": (0.02, 0.5, False),
-        "geo_attn_corr_rank": (4, 32, True),
-        "geo_attn_corr_layers": (1, 4, True),
-        "geo_embed_grad_perp_init": (0.01, 0.4, False),
-        "geo_embed_grad_hold_steps": (25, 500, True),
-        "geo_embed_grad_ramp_steps": (50, 500, True),
-        "geo_embed_grad_rank": (4, 32, True),
-        "geo_embed_reanchor_rho": (0.0, 0.05, False),
-        "geo_attn_bias_blend": (0.05, 0.95, False),
-    }
-
-    def binary_vals(base_val, lo, hi, as_int):
-        vals = [float(base_val)]
-        span = hi - lo
-        for i in range(1, levels + 1):
-            step = span / (2 ** i)
-            vals.append(max(lo, min(hi, float(base_val) - step)))
-            vals.append(max(lo, min(hi, float(base_val) + step)))
-        if as_int:
-            return sorted({int(round(v)) for v in vals})
-        return sorted({round(v, 6) for v in vals})
-
-    configs = [TrialConfig(**base)]
-    seen = {json.dumps(base, sort_keys=True)}
-
-    for k, (lo, hi, as_int) in bounds.items():
-        if k not in base:
-            continue
-        for v in binary_vals(base[k], lo, hi, as_int):
-            d = dict(base)
+    for combo in itertools.product(*val_lists):
+        d = dict(fixed)
+        for k, v in zip(keys, combo):
             d[k] = v
-            sig = json.dumps(d, sort_keys=True)
-            if sig not in seen:
-                seen.add(sig)
-                configs.append(TrialConfig(**d))
+        configs.append(TrialConfig(**d))
 
     return configs
 
@@ -874,8 +846,6 @@ def generate_configs_from_leaderboard(path: str, levels: int, seed: int) -> list
 # ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Parallel batched Shakespeare geo-bias search")
-    p.add_argument("--strategy", choices=["random", "binary"], default="random")
-    p.add_argument("--n-configs", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--eval-iters", type=int, default=50)
@@ -887,8 +857,7 @@ def main():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--data-path", type=str, default="./data/tinyshakespeare/input.txt")
-    p.add_argument("--binary-base", type=str, default="leaderboard_ep1.json")
-    p.add_argument("--binary-levels", type=int, default=3)
+    p.add_argument("--binary-levels", type=int, default=2)
     p.add_argument("--top-k", type=int, default=25)
     p.add_argument("--out", type=str, default="experiments/tier4/parallel_search_results.json")
     args = p.parse_args()
@@ -911,11 +880,8 @@ def main():
     print(f"Vocab={vocab_size} Train={len(train_ids)} Val={len(val_ids)}", flush=True)
 
     # Generate configs
-    print(f"Generating configs (strategy={args.strategy})...", flush=True)
-    if args.strategy == "binary":
-        configs = generate_configs_from_leaderboard(args.binary_base, args.binary_levels, args.seed)
-    else:
-        configs = generate_configs_random(args.n_configs, args.seed)
+    print("Generating binary grid configs...", flush=True)
+    configs = generate_full_binary_grid(args.binary_levels)
     print(f"Generated {len(configs)} configs", flush=True)
 
     # Run
@@ -967,7 +933,8 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = {
         "n_configs": len(configs),
-        "strategy": args.strategy,
+        "strategy": "binary_grid",
+        "binary_levels": args.binary_levels,
         "steps": args.steps,
         "eval_iters": args.eval_iters,
         "batch_size": args.batch_size,
