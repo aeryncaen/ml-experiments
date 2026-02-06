@@ -798,10 +798,10 @@ def _fmt_val(v, as_int: bool):
 
 # Numeric axes: (lo, hi, is_int)
 BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = {
-    "geo_embed_grad_rank":       (1, 64, True),
-    "geo_embed_grad_perp_init":  (0.0, 1.0, False),
-    "geo_embed_grad_hold_steps": (0, 300, True),
-    "geo_embed_grad_ramp_steps": (0, 300, True),
+    "geo_attn_bias_blend":  (0.0, 1.0, False),
+    "geo_attn_corr_blend":  (0.0, 1.0, False),
+    "geo_attn_corr_rank":   (1, 64, True),
+    "geo_attn_corr_layers": (1, 4, True),
 }
 
 BINARY_SEARCH_FIXED: dict[str, object] = {
@@ -811,15 +811,15 @@ BINARY_SEARCH_FIXED: dict[str, object] = {
     "geo_init_fullspace": False,
     "geo_init_ridge": 1e-3,
     "geo_init_match_row_norm": True,
-    "geo_attn_bias": False,
-    "geo_attn_bias_blend": 0.2,
-    "geo_attn_corr_bias": False,
-    "geo_attn_corr_blend": 0.1,
-    "geo_attn_corr_rank": 8,
-    "geo_attn_corr_layers": 2,
+    "geo_attn_bias": True,
+    "geo_attn_corr_bias": True,
     "geo_attn_corr_horizons": "1,2,3",
     "geo_attn_corr_horizon_weights": "1.0,0.5,0.25",
     "geo_embed_grad_shape": True,
+    "geo_embed_grad_rank": 1,
+    "geo_embed_grad_perp_init": 0.0,
+    "geo_embed_grad_hold_steps": 225,
+    "geo_embed_grad_ramp_steps": 75,
     "geo_embed_reanchor_every": 0,
     "geo_embed_reanchor_rho": 0.0,
     "geo_embed_reanchor_until_step": 0,
@@ -1022,8 +1022,8 @@ def main():
             )
             cfg = r["config"]
             print(
-                f"     rank={cfg['geo_embed_grad_rank']} perp={cfg['geo_embed_grad_perp_init']} "
-                f"hold={cfg['geo_embed_grad_hold_steps']} ramp={cfg['geo_embed_grad_ramp_steps']}"
+                f"     attn_blend={cfg['geo_attn_bias_blend']} corr_blend={cfg['geo_attn_corr_blend']} "
+                f"corr_rank={cfg['geo_attn_corr_rank']} corr_layers={cfg['geo_attn_corr_layers']}"
             )
 
     # ---- Iterative binary search (resumable) ----
