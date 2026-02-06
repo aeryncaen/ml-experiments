@@ -412,20 +412,16 @@ class BatchedModels:
         qkv = torch.einsum("nbti,noi->nbto", x, in_proj_w) + in_proj_b[:, None, None, :]
         q, k, v = qkv.split(D, dim=-1)  # each (N, B, T, D)
 
-        # Reshape to heads: (N, B, H, T, head_dim)
-        q = q.view(N, B, T, H, head_dim).permute(0, 1, 3, 2, 4)
-        k = k.view(N, B, T, H, head_dim).permute(0, 1, 3, 2, 4)
-        v = v.view(N, B, T, H, head_dim).permute(0, 1, 3, 2, 4)
+        # Reshape to heads and merge N*B for SDPA: (N*B, H, T, head_dim)
+        q = q.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
+        k = k.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
+        v = v.view(N * B, T, H, head_dim).permute(0, 2, 1, 3)
 
-        # Attention scores: (N, B, H, T, T)
-        scale = 1.0 / math.sqrt(head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = attn.masked_fill(mask[None, None, None, :T, :T], float("-inf"))
-        attn = F.softmax(attn, dim=-1)
+        # SDPA with causal mask
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (N*B, H, T, head_dim)
 
-        # Attend: (N, B, H, T, head_dim) -> (N, B, T, D)
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2, 4).reshape(N, B, T, D)
+        # Reshape back: (N, B, T, D)
+        out = out.permute(0, 2, 1, 3).reshape(N, B, T, D)
 
         # Output projection
         out = torch.einsum("nbti,noi->nbto", out, out_proj_w) + out_proj_b[:, None, None, :]
