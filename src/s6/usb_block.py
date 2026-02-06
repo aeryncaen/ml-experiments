@@ -5,7 +5,6 @@ Fuses SSM-style scans, attention, and MLP into a single expand-process-contract 
 """
 
 from dataclasses import dataclass
-import math
 from typing import Optional
 
 import torch
@@ -14,8 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .scan import forward_scan, backward_scan
-from .rope import apply_data_dependent_rope, apply_rope
-from heuristic_secrets.models.scatter_attention import SIRENDownsampleND
+from .rope import apply_data_dependent_rope
 
 
 @dataclass
@@ -181,18 +179,15 @@ class USBBlock(nn.Module):
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: QKV projections (full MHA - all heads independent)
-        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)
+        # Step 2: KV projections
         self.k_proj = nn.Linear(d_expanded, d_expanded, bias=False)
         self.v_proj = nn.Linear(d_expanded, d_expanded, bias=False)
-        
-        # Gated RMSNorm for Q, K, V
-        self.q_norm = GatedRMSNorm(d_expanded)
+
+        # Gated RMSNorm for K, V
         self.k_norm = GatedRMSNorm(d_expanded)
         self.v_norm = GatedRMSNorm(d_expanded)
-        
-        # QK bias (per-head, initialized to 1.0)
-        self.q_bias = nn.Parameter(torch.ones(nheads_total, headdim))
+
+        # K bias (per-head, initialized to 1.0)
         self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
@@ -205,21 +200,6 @@ class USBBlock(nn.Module):
         self.conv_g3 = nn.Conv1d(
             d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
         )
-
-        # Low-rank attention downsamplers (SIREN)
-        self.attn_downsample = SIRENDownsampleND(d_expanded, ndim=1)
-        self.attn_rope_downsample = SIRENDownsampleND(d_group // 2, ndim=1)
-
-        # Router head for multifocal attention centers
-        self.router_norm = GatedRMSNorm(d_expanded)
-        self.router = nn.Linear(d_expanded, 1, bias=False)
-        self.router_temp = nn.Parameter(torch.tensor(1.0))
-        self.local_gate = nn.Parameter(torch.tensor(-2.0))
-        self.kv_blend = nn.Parameter(torch.tensor(-2.0))
-        self.lowrank_gate = nn.Parameter(torch.tensor(-2.0))
-        self.router_smooth = 5
-        self.router_prev_idx = None
-        nn.init.normal_(self.router.weight, std=1e-3)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -273,29 +253,24 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: QKV projection (full MHA)
-        q = self.q_proj(x_exp)  # (batch, seq, nheads_total * headdim)
+        # Step 2: KV projection
         k = self.k_proj(x_exp)
         v = self.v_proj(x_exp)
-        
-        # Apply RMSNorm (no activation on Q/K/V)
-        q = self.q_norm(q)
+
+        # Apply RMSNorm (no activation on K/V)
         k = self.k_norm(k)
         v = self.v_norm(v)
-        
+
         # Reshape to heads
-        q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
         k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
         v = rearrange(v, 'b t (h d) -> b t h d', h=config.nheads_total)
-        
-        # Apply QK bias (after norm)
-        q = q + self.q_bias
+
+        # Apply K bias (after norm)
         k = k + self.k_bias
         
         # Step 3: Channel split into 4 groups
         # Each group gets nheads_per_group heads
         nph = config.nheads_per_group
-        q_g1, q_g2, q_g3, q_g4 = q[..., :nph, :], q[..., nph:2*nph, :], q[..., 2*nph:3*nph, :], q[..., 3*nph:, :]
         k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
         v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
         
@@ -395,86 +370,8 @@ class USBBlock(nn.Module):
         # Step 5: Passthrough for G4 (standard RoPE only)
         out_g4 = v_g4  # No scan, just passthrough
 
-        # Step 6: Low-rank attention (full Q against downsampled KV)
-        kv_blend = torch.sigmoid(self.kv_blend)
-        k_pre = torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2)
-        k_post = torch.cat([k_g1, k_g2, k_g3, k_g4], dim=-2)
-        v_pre = torch.cat([v_g1, v_g2, v_g3, v_g4], dim=-2)
-        v_post = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
-
-        k_all_blend = (1.0 - kv_blend) * k_pre + kv_blend * k_post
-        v_all_blend = (1.0 - kv_blend) * v_pre + kv_blend * v_post
-
-        target_len = max(1, int(math.sqrt(seq_len * 1.5)))
-
-        k_flat = rearrange(k_all_blend, 'b t h d -> b t (h d)')
-        v_flat = rearrange(v_all_blend, 'b t h d -> b t (h d)')
-        k_down_flat = self.attn_downsample(k_flat, (target_len,))
-        v_down_flat = self.attn_downsample(v_flat, (target_len,))
-        k_down = rearrange(k_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
-        v_down = rearrange(v_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
-
-        # Apply data-dependent RoPE to Q
-        q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
-        q_g2 = apply_data_dependent_rope(q_g2, params_g2['rope_freq'])
-        q_g3 = apply_data_dependent_rope(q_g3, params_g3['rope_freq'])
-
-        # Standard RoPE for G3/G4 on Q (after DD-RoPE for G3)
-        q_g3 = apply_rope(q_g3, seq_len)
-        q_g4 = apply_rope(q_g4, seq_len)
-
-        # Downsample rope_freq for K (apply RoPE after downsampling)
-        if target_len == seq_len:
-            rope_g1 = params_g1['rope_freq']
-            rope_g2 = params_g2['rope_freq']
-            rope_g3 = params_g3['rope_freq']
-        else:
-            rope_g1_flat = rearrange(params_g1['rope_freq'], 'b t h d -> b t (h d)')
-            rope_g2_flat = rearrange(params_g2['rope_freq'], 'b t h d -> b t (h d)')
-            rope_g3_flat = rearrange(params_g3['rope_freq'], 'b t h d -> b t (h d)')
-            rope_g1_flat = self.attn_rope_downsample(rope_g1_flat, (target_len,))
-            rope_g2_flat = self.attn_rope_downsample(rope_g2_flat, (target_len,))
-            rope_g3_flat = self.attn_rope_downsample(rope_g3_flat, (target_len,))
-            rope_g1 = rearrange(rope_g1_flat, 'b t (h d) -> b t h d', h=nph)
-            rope_g2 = rearrange(rope_g2_flat, 'b t (h d) -> b t h d', h=nph)
-            rope_g3 = rearrange(rope_g3_flat, 'b t (h d) -> b t h d', h=nph)
-
-        k_g1_d, k_g2_d, k_g3_d, k_g4_d = (
-            k_down[..., :nph, :],
-            k_down[..., nph:2*nph, :],
-            k_down[..., 2*nph:3*nph, :],
-            k_down[..., 3*nph:, :],
-        )
-
-        k_g1_d = apply_data_dependent_rope(k_g1_d, rope_g1)
-        k_g2_d = apply_data_dependent_rope(k_g2_d, rope_g2)
-        k_g3_d = apply_data_dependent_rope(k_g3_d, rope_g3)
-
-        # Standard RoPE for G3/G4 on K (after DD-RoPE for G3)
-        k_g3_d = apply_rope(k_g3_d, target_len)
-        k_g4_d = apply_rope(k_g4_d, target_len)
-
-        # Concatenate for SDPA
-        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
-        k_all = torch.cat([k_g1_d, k_g2_d, k_g3_d, k_g4_d], dim=-2)
-
-        # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
-        q_sdpa = q_all.transpose(1, 2)
-        k_sdpa = k_all.transpose(1, 2)
-        v_sdpa = v_down.transpose(1, 2)
-
-        # Acausal attention (mask ignored for low-rank)
-        attn_out = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=None,
-            is_causal=False,
-        )
-        lowrank_gate = torch.sigmoid(self.lowrank_gate)
-        attn_out = attn_out * lowrank_gate
-
-        # Step 7: Multifocal attention over routed windows (disabled)
-        # Skip multifocal attention and return low-rank output
-        attn_out = attn_out.transpose(1, 2)
+        # Step 6: No attention - concatenate scan outputs
+        attn_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
 
         if do_debug:
@@ -534,23 +431,10 @@ class USBBlock(nn.Module):
                     'gate': _gate_stats(params['gate']),
                 }
 
-            self.router_prev_idx = None
-            router_temp = F.softplus(self.router_temp) + 1e-4
-            local_gate = torch.sigmoid(self.local_gate)
-            lowrank_gate = torch.sigmoid(self.lowrank_gate)
-
             debug = {
                 'g1': _param_block(params_g1),
                 'g2': _param_block(params_g2),
                 'g3': _param_block(params_g3),
-                'router': {
-                    'enabled': False,
-                    'temp': router_temp.item(),
-                    'smooth': float(self.router_smooth),
-                    'local_gate': local_gate.item(),
-                    'kv_blend': kv_blend.item(),
-                    'lowrank_gate': lowrank_gate.item(),
-                },
                 'rms': {
                     'k_g1': _rms(k_g1),
                     'v_g1': _rms(v_g1),
