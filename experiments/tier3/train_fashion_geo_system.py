@@ -179,6 +179,24 @@ def accuracy(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.devic
     return float((pred == y).mean())
 
 
+def eval_loss_acc(model: nn.Module, X: np.ndarray, y: np.ndarray, device: torch.device, batch_size: int = 1024) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total = 0
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            xb = torch.from_numpy(X[i : i + batch_size].astype(np.float32)).to(device)
+            yb = torch.from_numpy(y[i : i + batch_size].astype(np.int64)).to(device)
+            logits = model(xb)
+            loss = F.cross_entropy(logits, yb, reduction="sum")
+            total_loss += float(loss.item())
+            pred = logits.argmax(dim=1)
+            correct += int((pred == yb).sum().item())
+            total += int(yb.shape[0])
+    return total_loss / max(total, 1), correct / max(total, 1)
+
+
 def train_one(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -272,6 +290,7 @@ def train_one(
         model.train()
         total_loss = 0.0
         n_seen = 0
+        n_correct = 0
         n_accept = 0
         n_reject = 0
         old_loss_sum = 0.0
@@ -452,11 +471,23 @@ def train_one(
             bs = xb.shape[0]
             total_loss += float(loss.item()) * bs
             n_seen += bs
+            with torch.no_grad():
+                pred_tr = logits.argmax(dim=1)
+                n_correct += int((pred_tr == yb).sum().item())
 
-        val_acc = accuracy(model, X_val, y_val, device)
+        train_loss = total_loss / max(n_seen, 1)
+        train_acc = n_correct / max(n_seen, 1)
+        val_loss, val_acc = eval_loss_acc(model, X_val, y_val, device)
+        print(
+            f"epoch {epoch + 1:02d}/{cfg.epochs:02d} "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+        )
         epoch_rec = {
             "epoch": epoch + 1,
-            "train_loss": total_loss / max(n_seen, 1),
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
             "val_acc": val_acc,
         }
         if val_acc > best_val_acc:
