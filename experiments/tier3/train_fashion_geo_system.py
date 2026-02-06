@@ -268,12 +268,15 @@ def train_one(
     best_epoch = 0
     best_state = None
 
-    def apply_eta_shaping() -> float | None:
-        if (not cfg.chi2_eta_shape) or mode != "geo_system":
-            return None
+    def apply_eta_shaping(enable: bool) -> tuple[float | None, float | None]:
+        # Returns (raw_eta, shaped_eta)
+        if not cfg.chi2_eta_shape:
+            return None, None
+        if not enable:
+            return None, None
         g = model.fc1.weight.grad
         if g is None:
-            return None
+            return None, None
         g_proj = g @ P_top_t
         g_res = g - g_proj
         row_dist = torch.norm(g_res, dim=1, keepdim=True)
@@ -283,8 +286,13 @@ def train_one(
         resid_weight = torch.clamp(resid_weight, min=cfg.chi2_eta_min_resid_weight, max=1.0)
         total = float(torch.sum(g * g).item())
         proj = float(torch.sum(g_proj * g_proj).item())
+        raw_eta = proj / max(total, 1e-12)
         g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * resid_weight * g_res)
-        return proj / max(total, 1e-12)
+        total_after = float(torch.sum(g * g).item())
+        g_after_proj = g @ P_top_t
+        proj_after = float(torch.sum(g_after_proj * g_after_proj).item())
+        shaped_eta = proj_after / max(total_after, 1e-12)
+        return raw_eta, shaped_eta
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -302,6 +310,8 @@ def train_one(
         diag_count = 0
         eta_grad_sum = 0.0
         eta_grad_count = 0
+        eta_grad_raw_sum = 0.0
+        eta_grad_raw_count = 0
         tr_start_by_group = {
             str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
             for i, g in enumerate(opt.param_groups)
@@ -333,9 +343,12 @@ def train_one(
                 loss.backward()
 
                 if is_chi2_family:
-                    eta_ratio = apply_eta_shaping()
-                    if eta_ratio is not None:
-                        eta_grad_sum += eta_ratio
+                    raw_eta, shaped_eta = apply_eta_shaping(enable=True)
+                    if raw_eta is not None:
+                        eta_grad_raw_sum += raw_eta
+                        eta_grad_raw_count += 1
+                    if shaped_eta is not None:
+                        eta_grad_sum += shaped_eta
                         eta_grad_count += 1
 
                 if is_hybrid:
@@ -456,9 +469,12 @@ def train_one(
                     opt.zero_grad()
                 loss.backward()
                 if is_chi2_family or is_eta_follow:
-                    eta_ratio = apply_eta_shaping()
-                    if eta_ratio is not None:
-                        eta_grad_sum += eta_ratio
+                    raw_eta, shaped_eta = apply_eta_shaping(enable=(is_chi2_family or is_eta_follow))
+                    if raw_eta is not None:
+                        eta_grad_raw_sum += raw_eta
+                        eta_grad_raw_count += 1
+                    if shaped_eta is not None:
+                        eta_grad_sum += shaped_eta
                         eta_grad_count += 1
                 if is_hybrid:
                     if adam_opt is None or chi2_opt is None:
@@ -538,7 +554,12 @@ def train_one(
                 }
             )
         elif is_eta_follow:
-            epoch_rec.update({"eta_grad_mean": float(eta_grad_sum / max(eta_grad_count, 1))})
+            epoch_rec.update(
+                {
+                    "eta_grad_raw_mean": float(eta_grad_raw_sum / max(eta_grad_raw_count, 1)),
+                    "eta_grad_shaped_mean": float(eta_grad_sum / max(eta_grad_count, 1)),
+                }
+            )
         history.append(epoch_rec)
 
     clean_acc_last = accuracy(model, X_test, y_test, device)
