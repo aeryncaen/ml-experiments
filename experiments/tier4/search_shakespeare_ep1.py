@@ -9,7 +9,13 @@ import random
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 def bool_flag_args(k: str, v: bool) -> list[str]:
@@ -37,7 +43,8 @@ def config_to_args(cfg: dict) -> list[str]:
 
 def candidate_space() -> dict[str, list]:
     return {
-        "geo_init_method": ["bucket", "kl_bucket", "eig"],
+        "geo_init_method": ["bucket", "kl_bucket", "kl_bucket_mtp", "eig"],
+        "geo_init_mtp_weights": ["1.0,0.5,0.25", "1.0,0.7,0.4", "1.0,0.5,0.25,0.125"],
         "geo_init_blend": [0.6, 0.8, 0.9],
         "geo_init_fullspace": [False, True],
         "geo_init_ridge": [1e-4, 1e-3, 1e-2],
@@ -72,6 +79,8 @@ def is_valid(cfg: dict) -> bool:
     ):
         return False
     if (not cfg["geo_attn_bias"]) and cfg["geo_attn_bias_blend"] != 0.2:
+        return False
+    if cfg["geo_init_method"] != "kl_bucket_mtp" and cfg["geo_init_mtp_weights"] != "1.0,0.5,0.25":
         return False
     if not cfg["geo_embed_grad_shape"]:
         defaults = {
@@ -201,10 +210,22 @@ def main() -> None:
             trials.append(rec)
             done_ids.add(rec["id"])
 
+    pending = []
     for i, cfg in enumerate(candidates, start=1):
         cid = stable_id(cfg)
         if cid in done_ids:
             continue
+        pending.append((i, cfg, cid))
+
+    total_pending = len(pending)
+    print(
+        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume}",
+        flush=True,
+    )
+
+    progress = tqdm(total=total_pending, desc="search_ep1", unit="run") if (tqdm is not None and total_pending > 0) else None
+
+    for i, cfg, cid in pending:
         run_dir = out_dir / f"run_{i:04d}_{cid}"
         run_dir.mkdir(parents=True, exist_ok=True)
         result_json = run_dir / "result.json"
@@ -224,6 +245,9 @@ def main() -> None:
             "status": "pending",
         }
 
+        start_t = time.perf_counter()
+        print(f"[{i}/{args.max_runs}] run_id={cid} started", flush=True)
+
         if args.dry_run:
             rec["status"] = "dry_run"
         else:
@@ -242,10 +266,26 @@ def main() -> None:
                     rec["status"] = "parse_error"
                     rec["error"] = str(e)
 
+        elapsed = time.perf_counter() - start_t
+
         with trials_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
         trials.append(rec)
         done_ids.add(cid)
+        if progress is not None:
+            progress.update(1)
+        status = rec.get("status", "unknown")
+        if status == "ok":
+            m = rec["metrics"]
+            print(
+                f"[{i}/{args.max_runs}] run_id={cid} done status=ok ep1_acc={m['ep1_val_acc_mean']:.5f} ep1_loss={m['ep1_val_loss_mean']:.5f} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+        else:
+            print(f"[{i}/{args.max_runs}] run_id={cid} done status={status} elapsed={elapsed:.1f}s", flush=True)
+
+    if progress is not None:
+        progress.close()
 
     ok = [t for t in trials if t.get("status") == "ok"]
     ok_sorted = sorted(
