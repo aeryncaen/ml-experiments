@@ -1,0 +1,179 @@
+{
+  "config": {
+    "data_dir": "./data",
+    "epochs": 3,
+    "seeds": 1,
+    "batch_size": 256,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 12000,
+    "optimizer": "adam_eta_follow",
+    "trust_radius": 0.05,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "chi2_adaptive": true,
+    "chi2_reject_tol": 0.02,
+    "chi2_shrink": 0.5,
+    "chi2_grow": 1.01,
+    "chi2_min_radius": 0.0001,
+    "chi2_max_radius": 1.0,
+    "chi2_sigma": 3.0,
+    "chi2_q_low": 0.05,
+    "chi2_q_high": 0.5,
+    "chi2_q_beta": 0.9,
+    "chi2_per_layer": true,
+    "chi2_eta_shape": true,
+    "chi2_eta_proj_scale": 1.2,
+    "chi2_eta_resid_scale": 0.8,
+    "chi2_eta_dist_tau": 2.0,
+    "chi2_eta_min_resid_weight": 0.05,
+    "chi2_forget_guard": true,
+    "chi2_forget_tol": 0.01,
+    "chi2_forget_shrink": 0.7,
+    "eval_best_val": true,
+    "hybrid_chi2_scale": 0.3,
+    "out": "experiments/tier3/check_eta_follow.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.8336,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.7904,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.8037,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.8335,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.8092,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.8444,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": NaN,
+      "std": NaN
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.8185,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.7723,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.7663,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.8185,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.7857,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.8264,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": NaN,
+      "std": NaN
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "best_epoch": 3,
+      "best_val_acc": 0.8444,
+      "selected_eval": "best_val",
+      "clean_acc_last": 0.8336,
+      "clean_acc": 0.8336,
+      "acc_border": 0.7904,
+      "acc_center": 0.8037,
+      "acc_contrast": 0.8335,
+      "robust_avg": 0.8092,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 0.8215188872132982,
+          "train_acc": 0.7254285714285714,
+          "val_loss": 0.5145643676757813,
+          "val_acc": 0.8232,
+          "eta_grad_mean": 0.0
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.39218531707354953,
+          "train_acc": 0.864,
+          "val_loss": 0.4478150329589844,
+          "val_acc": 0.839,
+          "eta_grad_mean": 0.0
+        },
+        {
+          "epoch": 3,
+          "train_loss": 0.3049900621005467,
+          "train_acc": 0.8967142857142857,
+          "val_loss": 0.4443051086425781,
+          "val_acc": 0.8444,
+          "eta_grad_mean": 0.0
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "best_epoch": 3,
+      "best_val_acc": 0.8264,
+      "selected_eval": "best_val",
+      "clean_acc_last": 0.8185,
+      "clean_acc": 0.8185,
+      "acc_border": 0.7723,
+      "acc_center": 0.7663,
+      "acc_contrast": 0.8185,
+      "robust_avg": 0.7857,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 0.8164179852349418,
+          "train_acc": 0.7225714285714285,
+          "val_loss": 0.58487412109375,
+          "val_acc": 0.7938,
+          "eta_grad_mean": 0.7159110620866743
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.504951213155474,
+          "train_acc": 0.8135714285714286,
+          "val_loss": 0.5144720825195312,
+          "val_acc": 0.8156,
+          "eta_grad_mean": 0.7195550630436583
+        },
+        {
+          "epoch": 3,
+          "train_loss": 0.44567751080649237,
+          "train_acc": 0.8384285714285714,
+          "val_loss": 0.4846110595703125,
+          "val_acc": 0.8264,
+          "eta_grad_mean": 0.7286352883585533
+        }
+      ]
+    }
+  ]
+}
