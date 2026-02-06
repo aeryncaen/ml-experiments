@@ -207,6 +207,20 @@ def load_runner_module(runner_path: str):
     return mod
 
 
+def normalize_runner_cfg(mod, merged: dict) -> dict:
+    cfg = dict(merged)
+    if "geo_attn_corr_horizons" in cfg and isinstance(cfg["geo_attn_corr_horizons"], str):
+        cfg["geo_attn_corr_horizons"] = tuple(mod.parse_int_list_csv(cfg["geo_attn_corr_horizons"]))
+    if "geo_attn_corr_horizon_weights" in cfg and isinstance(cfg["geo_attn_corr_horizon_weights"], str):
+        cfg["geo_attn_corr_horizon_weights"] = tuple(mod.parse_float_list_csv(cfg["geo_attn_corr_horizon_weights"]))
+    return cfg
+
+
+def key_hash(obj) -> str:
+    s = json.dumps(obj, sort_keys=True, default=str)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
 def run_native_trial(
     mod,
     common: dict,
@@ -220,6 +234,7 @@ def run_native_trial(
     def _execute() -> None:
         merged = dict(common)
         merged.update(cfg)
+        merged = normalize_runner_cfg(mod, merged)
         run_cfg_kwargs = {k: v for k, v in merged.items() if k in mod.RunConfig.__dataclass_fields__}
         run_cfg = mod.RunConfig(**run_cfg_kwargs)
 
@@ -229,18 +244,32 @@ def run_native_trial(
             run_cfg.d_model,
         )
         if geo_key not in ctx["geo_basis_cache"]:
-            if run_cfg.geo_init_method == "eig":
-                _, eigvecs = mod.np.linalg.eigh(ctx["op"])
-                geo_basis = eigvecs[:, -run_cfg.d_model :].astype(mod.np.float32)
-            elif run_cfg.geo_init_method == "kl_bucket_mtp":
-                mtp_w = mod.parse_float_list_csv(run_cfg.geo_init_mtp_weights)
-                if not mtp_w:
-                    mtp_w = [1.0, 0.5, 0.25]
-                geo_basis = mod.compute_kl_bucket_mtp_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model, mtp_w)
-            elif run_cfg.geo_init_method == "kl_bucket":
-                geo_basis = mod.compute_kl_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+            geo_disk_key = {
+                "method": run_cfg.geo_init_method,
+                "mtp": run_cfg.geo_init_mtp_weights,
+                "d_model": run_cfg.d_model,
+                "vocab_size": int(ctx["vocab_size"]),
+                "train_len": int(len(ctx["train_ids"])),
+            }
+            geo_cache_file = ctx["cache_dir"] / f"geo_basis_{key_hash(geo_disk_key)}.npy"
+            if geo_cache_file.exists():
+                print(f"cache hit: geo_basis {geo_cache_file.name}")
+                geo_basis = mod.np.load(geo_cache_file)
             else:
-                geo_basis = mod.compute_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+                print(f"cache miss: geo_basis {geo_cache_file.name}")
+                if run_cfg.geo_init_method == "eig":
+                    _, eigvecs = mod.np.linalg.eigh(ctx["op"])
+                    geo_basis = eigvecs[:, -run_cfg.d_model :].astype(mod.np.float32)
+                elif run_cfg.geo_init_method == "kl_bucket_mtp":
+                    mtp_w = mod.parse_float_list_csv(run_cfg.geo_init_mtp_weights)
+                    if not mtp_w:
+                        mtp_w = [1.0, 0.5, 0.25]
+                    geo_basis = mod.compute_kl_bucket_mtp_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model, mtp_w)
+                elif run_cfg.geo_init_method == "kl_bucket":
+                    geo_basis = mod.compute_kl_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+                else:
+                    geo_basis = mod.compute_bucket_basis(ctx["train_ids"], ctx["vocab_size"], run_cfg.d_model)
+                mod.np.save(geo_cache_file, geo_basis)
             ctx["geo_basis_cache"][geo_key] = geo_basis
         geo_basis = ctx["geo_basis_cache"][geo_key]
 
@@ -255,15 +284,29 @@ def run_native_trial(
         if attn_key not in ctx["attn_corr_cache"]:
             attn_corr = None
             if run_cfg.geo_attn_corr_bias:
-                attn_corr = mod.compute_attn_corr_projector(
-                    ctx["train_ids"],
-                    ctx["vocab_size"],
-                    geo_basis,
-                    run_cfg.d_model,
-                    run_cfg.geo_attn_corr_rank,
-                    list(run_cfg.geo_attn_corr_horizons),
-                    list(run_cfg.geo_attn_corr_horizon_weights),
-                )
+                attn_disk_key = {
+                    "geo_key": geo_key,
+                    "rank": run_cfg.geo_attn_corr_rank,
+                    "layers": run_cfg.geo_attn_corr_layers,
+                    "h": list(run_cfg.geo_attn_corr_horizons),
+                    "w": list(run_cfg.geo_attn_corr_horizon_weights),
+                }
+                attn_cache_file = ctx["cache_dir"] / f"attn_corr_{key_hash(attn_disk_key)}.npy"
+                if attn_cache_file.exists():
+                    print(f"cache hit: attn_corr {attn_cache_file.name}")
+                    attn_corr = mod.np.load(attn_cache_file)
+                else:
+                    print(f"cache miss: attn_corr {attn_cache_file.name}")
+                    attn_corr = mod.compute_attn_corr_projector(
+                        ctx["train_ids"],
+                        ctx["vocab_size"],
+                        geo_basis,
+                        run_cfg.d_model,
+                        run_cfg.geo_attn_corr_rank,
+                        list(run_cfg.geo_attn_corr_horizons),
+                        list(run_cfg.geo_attn_corr_horizon_weights),
+                    )
+                    mod.np.save(attn_cache_file, attn_corr)
             ctx["attn_corr_cache"][attn_key] = attn_corr
         attn_corr_projector = ctx["attn_corr_cache"][attn_key]
 
@@ -378,6 +421,8 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = out_dir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     trials_path = out_dir / "trials.jsonl"
     leaderboard_path = out_dir / "leaderboard_ep1.json"
     best_path = out_dir / "best_ep1.json"
@@ -428,6 +473,7 @@ def main() -> None:
             "op": op,
             "geo_basis_cache": {},
             "attn_corr_cache": {},
+            "cache_dir": cache_dir,
         }
         print(
             f"Native context ready: device={runner_ctx['device']} train={len(train_ids)} val={len(val_ids)} vocab={vocab_size}",
@@ -513,6 +559,7 @@ def main() -> None:
                     stream_child=args.stream_child,
                 )
             else:
+                assert runner_mod is not None and runner_ctx is not None
                 rc = run_native_trial(
                     runner_mod,
                     common,
