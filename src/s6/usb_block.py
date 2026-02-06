@@ -5,7 +5,7 @@ Unified Sequence Block (USB) Implementation
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 import math
 
 import torch
@@ -24,6 +24,13 @@ class USBConfig:
     headdim: int = 64
     expansion_factor: int = 2
     layer_idx: int = 0  # For future use (e.g., layer-dependent params)
+
+    # G4 attention mode: "polarity_sparse" or "none"
+    g4_attention: str = "polarity_sparse"
+    g4_sparse_keys: int = 64
+    g4_num_hash: int = 8
+    g4_use_lsh: bool = True
+    g4_use_key_selection: bool = True
     
     # Scan state modes per group (G1, G2, G3): 'elementwise' (k*v) or 'outer' (k⊗v)
     # - elementwise: state is (nheads, headdim), good for state-tracking (parity)
@@ -156,6 +163,170 @@ class PerHeadProjections(nn.Module):
         }
 
 
+class PolaritySparseAttention(nn.Module):
+    """Polarity-aware sparse attention (HAX-style masks)."""
+
+    def __init__(
+        self,
+        nheads: int,
+        headdim: int,
+        sparse_keys: int = 64,
+        num_hash: int = 8,
+        use_lsh: bool = True,
+        use_key_selection: bool = True,
+    ):
+        super().__init__()
+        self.nheads = nheads
+        self.headdim = headdim
+        self.feat_dim = headdim * 2
+        self.sparse_keys = sparse_keys
+        self.num_hash = num_hash
+        self.use_lsh = use_lsh
+        self.use_key_selection = use_key_selection
+
+        self.s1 = nn.Parameter(torch.zeros(1, 1, nheads, self.feat_dim))
+        self.s2 = nn.Parameter(torch.zeros(1, 1, nheads, self.feat_dim))
+
+        if self.use_key_selection:
+            self.dx_proj_1 = nn.Linear(self.feat_dim * 2, self.feat_dim * 2)
+            self.dx_proj_2 = nn.Linear(self.feat_dim * 2, self.feat_dim * 2)
+            self.dx_proj_3 = nn.Linear(self.feat_dim * 2, 1)
+
+        self.attn_gate = nn.Parameter(torch.zeros(nheads, 1))
+
+    @staticmethod
+    def _cumtopk(x: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cumulative top-k per position along last dim."""
+        *batch_shape, size = x.shape
+        x_flat = x.reshape(-1, size)
+        mask = torch.tril(torch.ones(size, size, dtype=torch.bool, device=x.device))
+        x_cumulative = x_flat.unsqueeze(1).expand(-1, size, -1)
+        x_cumulative = x_cumulative.masked_fill(~mask.unsqueeze(0), float("-inf"))
+        topk_values, topk_indices = x_cumulative.topk(k, dim=2)
+        out_shape = batch_shape + [size, k]
+        values_out = topk_values.reshape(*out_shape)
+        indices_out = topk_indices.reshape(*out_shape)
+        return values_out, indices_out
+
+    @staticmethod
+    def _lsh_sliding_window(mask: torch.Tensor, budget: int) -> torch.Tensor:
+        """Keep up to budget matches per query from the right."""
+        reversed_mask = mask.flip(dims=[-1])
+        cumsum = torch.cumsum(reversed_mask.int(), dim=-1)
+        keep = cumsum <= budget
+        return (reversed_mask & keep).flip(dims=[-1])
+
+    def _polarity_map(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_pos = F.relu(q)
+        q_neg = F.relu(-q)
+        k_pos = F.relu(k)
+        k_neg = F.relu(-k)
+
+        s1 = torch.sigmoid(self.s1)
+        s2 = torch.sigmoid(self.s2)
+
+        q_sim = torch.expm1(torch.cat([q_pos, q_neg], dim=-1) * s1)
+        q_opp = torch.expm1(torch.cat([q_neg, q_pos], dim=-1) * s2)
+        q_map = 0.5 * (q_sim + q_opp)
+
+        k_map = torch.expm1(torch.cat([k_pos, k_neg], dim=-1))
+        return q_map, k_map
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            q, k, v: (batch, seq_len, nheads, headdim)
+            attention_mask: (batch, seq_len) or None
+        Returns:
+            (batch, seq_len, nheads, headdim)
+        """
+        bsz, seq_len, nheads, _ = q.shape
+        device = q.device
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q_map, k_map = self._polarity_map(q, k)
+
+        if attention_mask is not None:
+            valid = attention_mask.to(torch.bool)
+            q_map = q_map * valid[:, None, :, None]
+            k_map = k_map * valid[:, None, :, None]
+        else:
+            valid = None
+
+        causal = torch.arange(seq_len, device=device)
+        causal_mask = causal[None, None, :] <= causal[None, :, None]
+        causal_mask = causal_mask.unsqueeze(0)
+
+        diag = torch.eye(seq_len, device=device, dtype=torch.bool).view(1, 1, seq_len, seq_len)
+
+        budget = max(1, min(self.sparse_keys, seq_len))
+
+        lsh_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
+        if self.use_lsh:
+            assert self.num_hash < 64
+            nq = q_map - q_map.mean(dim=2, keepdim=True)
+            nk = k_map - k_map.mean(dim=2, keepdim=True)
+            nq = F.normalize(nq, dim=-1)
+            nk = F.normalize(nk, dim=-1)
+            proj = torch.randn((self.feat_dim, self.num_hash), device=device, dtype=q.dtype)
+            hq = torch.matmul(nq, proj)
+            hk = torch.matmul(nk, proj)
+            hq_bits = (hq > 0).to(torch.long)
+            hk_bits = (hk > 0).to(torch.long)
+            weights = (1 << torch.arange(self.num_hash, device=device, dtype=torch.long)).view(1, 1, 1, self.num_hash)
+            hq_idx = (hq_bits * weights).sum(-1)
+            hk_idx = (hk_bits * weights).sum(-1)
+            lsh_mask = hq_idx.unsqueeze(-1) == hk_idx.unsqueeze(-2)
+            lsh_mask = self._lsh_sliding_window(lsh_mask & causal_mask, budget=budget)
+
+        key_selection_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
+        if self.use_key_selection:
+            tq = q_map.detach().cumsum(dim=2)
+            tq = F.normalize(tq, dim=-1)
+            tk = k_map.detach()
+            t2 = torch.cat([tk, tq], dim=-1)
+            t2 = F.relu(self.dx_proj_1(t2))
+            t2 = F.relu(self.dx_proj_2(t2))
+            key_score = self.dx_proj_3(t2).squeeze(-1)
+            if valid is not None:
+                key_score = key_score.masked_fill(~valid[:, None, :], float("-inf"))
+            _, key_idx = self._cumtopk(key_score, k=budget)
+
+            bh = bsz * nheads
+            key_idx = key_idx.reshape(bh, seq_len, budget)
+            mask = torch.zeros(bh, seq_len, seq_len, device=device, dtype=torch.bool)
+            bid = torch.arange(bh, device=device).view(-1, 1, 1).expand(bh, seq_len, budget)
+            sid = torch.arange(seq_len, device=device).view(1, -1, 1).expand(bh, seq_len, budget)
+            mask[bid, sid, key_idx] = True
+            key_selection_mask = mask.view(bsz, nheads, seq_len, seq_len)
+
+        sparse_mask = (lsh_mask | key_selection_mask | diag) & causal_mask
+        if valid is not None:
+            sparse_mask = sparse_mask & valid[:, None, None, :]
+
+        scale = (self.feat_dim ** -0.5)
+        attn_score = torch.matmul(q_map, k_map.transpose(-1, -2)) * scale
+        attn_score = attn_score + (1.0 - sparse_mask.to(attn_score.dtype)) * torch.finfo(attn_score.dtype).min
+        attn = F.softmax(attn_score, dim=-1)
+        attn_out = torch.matmul(attn, v)
+        attn_out = attn_out.transpose(1, 2)
+
+        if valid is not None:
+            attn_out = attn_out * valid[:, :, None, None]
+
+        gate = torch.sigmoid(self.attn_gate).view(1, 1, nheads, 1)
+        return v.transpose(1, 2) + gate * attn_out
+
+
 class USBBlock(nn.Module):
     """
     Unified Sequence Block.
@@ -205,6 +376,19 @@ class USBBlock(nn.Module):
         self.conv_g3 = nn.Conv1d(
             d_group, d_group, kernel_size=3, padding=0, groups=d_group, bias=False
         )
+
+        # G4 polarity-aware sparse attention
+        if config.g4_attention == "polarity_sparse":
+            self.g4_attn = PolaritySparseAttention(
+                nheads=nheads_per_group,
+                headdim=headdim,
+                sparse_keys=config.g4_sparse_keys,
+                num_hash=config.g4_num_hash,
+                use_lsh=config.g4_use_lsh,
+                use_key_selection=config.g4_use_key_selection,
+            )
+        else:
+            self.g4_attn = None
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -390,7 +574,10 @@ class USBBlock(nn.Module):
         out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
         # Step 5: Passthrough for G4
-        out_g4 = v_g4  # No scan, just passthrough
+        if self.g4_attn is not None:
+            out_g4 = self.g4_attn(k_g4, k_g4, v_g4, attention_mask=attention_mask)
+        else:
+            out_g4 = v_g4  # No scan, just passthrough
 
         # Step 6: No attention - concatenate scan outputs
         attn_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
@@ -469,6 +656,7 @@ class USBBlock(nn.Module):
                     'v_g3': _rms(v_g3),
                     'conv_g3': _rms(conv_g3_out),
                     'out_g3': _rms(out_g3),
+                    'out_g4': _rms(out_g4),
                     'attn_out': _rms(attn_out),
                 },
                 'seq_rms': {
