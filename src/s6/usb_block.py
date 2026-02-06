@@ -203,6 +203,11 @@ class USBBlock(nn.Module):
         self.conv_g3 = nn.Conv1d(
             d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
         )
+
+        # Content-dependent attention gate
+        self.attn_gate = nn.Linear(d_expanded, 1, bias=True)
+        nn.init.zeros_(self.attn_gate.weight)
+        nn.init.constant_(self.attn_gate.bias, -2.0)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -373,13 +378,8 @@ class USBBlock(nn.Module):
         # Step 5: Passthrough for G4
         out_g4 = v_g4  # No scan, just passthrough
 
-        # Step 6: Full attention over unscanned groups (G3/G4)
-        attn_in = torch.cat([
-            torch.zeros_like(out_g1),
-            torch.zeros_like(out_g2),
-            out_g3,
-            out_g4,
-        ], dim=-2)
+        # Step 6: Full attention with Q from enhanced dims
+        attn_in = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         attn_in_flat = rearrange(attn_in, 'b t h d -> b t (h d)')
 
         q = self.q_proj(attn_in_flat)
@@ -387,9 +387,16 @@ class USBBlock(nn.Module):
         q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
         q = q + self.q_bias
 
-        # Apply data-dependent RoPE to Q for attention (G3 only)
-        q_g3 = q[..., 2*nph:3*nph, :]
-        q_g4 = q[..., 3*nph:, :]
+        # Apply data-dependent RoPE to Q for attention
+        q_g1, q_g2, q_g3, q_g4 = (
+            q[..., :nph, :],
+            q[..., nph:2*nph, :],
+            q[..., 2*nph:3*nph, :],
+            q[..., 3*nph:, :],
+        )
+
+        q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
+        q_g2 = apply_data_dependent_rope(q_g2, params_g2['rope_freq'])
         q_g3 = apply_data_dependent_rope(q_g3, params_g3['rope_freq'])
 
         # Standard RoPE for G3/G4 on Q (after DD-RoPE for G3)
@@ -400,10 +407,10 @@ class USBBlock(nn.Module):
         k_g3_for_attn = apply_rope(k_g3, seq_len)
         k_g4_for_attn = apply_rope(k_g4, seq_len)
 
-        # Concatenate for SDPA (G3/G4 only)
-        q_all = torch.cat([q_g3, q_g4], dim=-2)
-        k_all = torch.cat([k_g3_for_attn, k_g4_for_attn], dim=-2)
-        v_all = torch.cat([out_g3, out_g4], dim=-2)
+        # Concatenate for SDPA
+        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
+        k_all = torch.cat([k_g1, k_g2, k_g3_for_attn, k_g4_for_attn], dim=-2)
+        v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
 
         # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
         q_sdpa = q_all.transpose(1, 2)
@@ -417,10 +424,13 @@ class USBBlock(nn.Module):
             is_causal=False,
         )
 
-        # Transpose back and reassemble full heads
+        # Transpose back and flatten
         attn_out = attn_out.transpose(1, 2)
-        attn_out = torch.cat([out_g1, out_g2, attn_out], dim=-2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+
+        # Content-dependent gating
+        attn_gate = torch.sigmoid(self.attn_gate(attn_in_flat))
+        attn_out = attn_out * attn_gate
 
         if do_debug:
             eps = 1e-6
