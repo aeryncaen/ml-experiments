@@ -225,6 +225,7 @@ def main() -> None:
     p.add_argument("--heartbeat-sec", type=int, default=10)
     p.add_argument("--stream-child", action="store_true", default=False)
     p.add_argument("--quick", action="store_true", default=False)
+    p.add_argument("--torch-compile", action="store_true", default=False)
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -249,6 +250,7 @@ def main() -> None:
         "eta_dist_tau": 2.0,
         "eta_min_resid_weight": 0.05,
         "geo_only": True,
+        "torch_compile": args.torch_compile,
     }
     if args.quick:
         common["steps_per_epoch"] = 120
