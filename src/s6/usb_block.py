@@ -211,7 +211,10 @@ class USBBlock(nn.Module):
         self.attn_rope_downsample = SIRENDownsampleND(d_group // 2, ndim=1)
 
         # Router head for multifocal attention centers
+        self.router_norm = GatedRMSNorm(d_expanded)
         self.router = nn.Linear(d_expanded, 1, bias=False)
+        self.router_temp = nn.Parameter(torch.tensor(1.0))
+        self.local_gate = nn.Parameter(torch.tensor(-2.0))
         nn.init.zeros_(self.router.weight)
         
         # Learnable initial states for scan heads (G1, G2, G3)
@@ -473,45 +476,61 @@ class USBBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
 
-        router_scores = self.router(attn_out).squeeze(-1)
+        router_in = self.router_norm(attn_out)
+        router_scores = self.router(router_in).squeeze(-1)
+        router_temp = F.softplus(self.router_temp) + 1e-4
+        router_scores = router_scores / router_temp
         num_centers = max(1, int(round(seq_len ** (1.0 / 3.0))))
         window = max(1, int(round(math.sqrt(seq_len))))
         half = window // 2
-
-        local_out = torch.zeros_like(attn_out)
-        local_weight = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
 
         topk = torch.topk(router_scores, k=num_centers, dim=1)
         topk_idx = topk.indices
         topk_w = torch.softmax(topk.values, dim=1)
 
-        for b in range(batch):
-            for i, idx in enumerate(topk_idx[b]):
-                center = int(idx.item())
-                weight = topk_w[b, i]
-                start = max(0, center - half)
-                end = min(seq_len, center + half + 1)
-                win_idx = torch.arange(start, end, device=attn_out.device)
+        offsets = torch.arange(-half, half + 1, device=attn_out.device)
+        idx = topk_idx.unsqueeze(-1) + offsets
+        idx = idx.clamp(0, seq_len - 1)
 
-                q_win = q_full[b, :, win_idx, :].unsqueeze(0)
-                k_win = k_full[b, :, win_idx, :].unsqueeze(0)
-                v_win = v_full[b, :, win_idx, :].unsqueeze(0)
+        idx_exp = idx[:, None, :, :, None].expand(
+            batch, config.nheads_total, num_centers, offsets.numel(), config.headdim
+        )
 
-                win_out = F.scaled_dot_product_attention(
-                    q_win, k_win, v_win,
-                    attn_mask=None,
-                    is_causal=False,
-                ).squeeze(0)
-                win_out = win_out.transpose(0, 1)
-                win_out = rearrange(win_out, 't h d -> t (h d)')
+        q_win = torch.gather(q_full, dim=2, index=idx_exp)
+        k_win = torch.gather(k_full, dim=2, index=idx_exp)
+        v_win = torch.gather(v_full, dim=2, index=idx_exp)
 
-                w_old = local_weight[b, win_idx]
-                w_new = w_old + weight
-                alpha = weight / w_new
-                local_out[b, win_idx] = (1.0 - alpha).unsqueeze(-1) * local_out[b, win_idx] + alpha.unsqueeze(-1) * win_out
-                local_weight[b, win_idx] = w_new
+        q_win = q_win.permute(0, 2, 1, 3, 4).contiguous()
+        k_win = k_win.permute(0, 2, 1, 3, 4).contiguous()
+        v_win = v_win.permute(0, 2, 1, 3, 4).contiguous()
 
-        attn_out = attn_out + local_out
+        q_win = q_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
+        k_win = k_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
+        v_win = v_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
+
+        win_out = F.scaled_dot_product_attention(
+            q_win, k_win, v_win,
+            attn_mask=None,
+            is_causal=False,
+        )
+
+        win_out = win_out.view(batch, num_centers, config.nheads_total, offsets.numel(), config.headdim)
+        win_out = win_out.permute(0, 1, 3, 2, 4).contiguous()
+        win_out = win_out.view(batch, num_centers, offsets.numel(), config.d_expanded)
+
+        local_sum = torch.zeros(batch, seq_len, config.d_expanded, device=attn_out.device, dtype=attn_out.dtype)
+        local_weight = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
+
+        idx_out = idx.unsqueeze(-1).expand(batch, num_centers, offsets.numel(), config.d_expanded)
+        win_weight = topk_w.unsqueeze(-1).unsqueeze(-1)
+        local_sum.scatter_add_(1, idx_out, win_out * win_weight)
+
+        local_weight.scatter_add_(1, idx, topk_w.unsqueeze(-1).expand(batch, num_centers, offsets.numel()))
+
+        local_out = local_sum / local_weight.clamp_min(1e-6).unsqueeze(-1)
+
+        local_gate = torch.sigmoid(self.local_gate)
+        attn_out = attn_out + local_gate * local_out
         # attn_out already (B, T, H*D)
 
         if do_debug:
