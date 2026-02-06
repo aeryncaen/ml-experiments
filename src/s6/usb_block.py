@@ -396,11 +396,11 @@ class USBBlock(nn.Module):
         k_sdpa = k_all.transpose(1, 2)
         v_sdpa = v_all.transpose(1, 2)
         
-        # Full bidirectional attention (scans provide directionality)
+        # Causal attention
         attn_out = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa, 
             attn_mask=attention_mask,
-            is_causal=False
+            is_causal=True
         )
         
         # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
