@@ -90,6 +90,35 @@ def compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int) -> np.
     return basis.astype(np.float32)
 
 
+def compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps: float = 1e-8) -> np.ndarray:
+    # KL-aligned bucket basis: log-ratio features over deterministic context buckets.
+    # basis[t, b] ~= log P(token=t | bucket=b) - log P(token=t)
+    if len(tokens) < 2:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+
+    counts = np.zeros((vocab_size, width), dtype=np.float64)
+    cur = tokens[2:]
+    prev1 = tokens[1:-1]
+    prev2 = tokens[:-2]
+    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
+    buckets = context_id % width
+    np.add.at(counts, (cur, buckets), 1.0)
+
+    # P(token | bucket)
+    col_sum = counts.sum(axis=0, keepdims=True)
+    p_t_given_b = counts / np.maximum(col_sum, 1.0)
+
+    # P(token)
+    token_sum = counts.sum(axis=1, keepdims=True)
+    p_t = token_sum / np.maximum(np.sum(counts), 1.0)
+
+    basis = np.log(p_t_given_b + eps) - np.log(p_t + eps)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
@@ -400,7 +429,7 @@ def main() -> None:
     p.add_argument("--eta-dist-tau", type=float, default=2.0)
     p.add_argument("--eta-min-resid-weight", type=float, default=0.05)
     p.add_argument("--eta-topk", type=int, default=16)
-    p.add_argument("--geo-init-method", type=str, choices=["bucket", "eig"], default="bucket")
+    p.add_argument("--geo-init-method", type=str, choices=["bucket", "kl_bucket", "eig"], default="bucket")
     p.add_argument("--geo-init-blend", type=float, default=0.3)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
@@ -447,6 +476,8 @@ def main() -> None:
     if cfg.geo_init_method == "eig":
         _, eigvecs = np.linalg.eigh(op)
         geo_basis = eigvecs[:, -cfg.d_model :].astype(np.float32)
+    elif cfg.geo_init_method == "kl_bucket":
+        geo_basis = compute_kl_bucket_basis(train_ids, vocab_size, cfg.d_model)
     else:
         geo_basis = compute_bucket_basis(train_ids, vocab_size, cfg.d_model)
 
