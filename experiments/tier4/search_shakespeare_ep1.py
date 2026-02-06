@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
 import random
+import runpy
 import shlex
 import statistics
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 try:
@@ -160,6 +163,39 @@ def run_with_heartbeat(
             time.sleep(0.5)
 
 
+def run_inprocess(
+    runner: str,
+    runner_args: list[str],
+    stdout_log: Path,
+    stderr_log: Path,
+    stream_child: bool,
+) -> int:
+    old_argv = sys.argv[:]
+    sys.argv = [runner, *runner_args]
+    try:
+        if stream_child:
+            print("inprocess:", runner, shlex.join(runner_args), flush=True)
+            runpy.run_path(runner, run_name="__main__")
+            return 0
+        with stdout_log.open("w", encoding="utf-8") as so, stderr_log.open("w", encoding="utf-8") as se:
+            with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+                runpy.run_path(runner, run_name="__main__")
+        return 0
+    except SystemExit as e:
+        code = e.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        return 1
+    except Exception:
+        with stderr_log.open("a", encoding="utf-8") as se:
+            traceback.print_exc(file=se)
+        return 1
+    finally:
+        sys.argv = old_argv
+
+
 def short_cfg(cfg: dict) -> str:
     keys = [
         "geo_init_method",
@@ -226,6 +262,7 @@ def main() -> None:
     p.add_argument("--stream-child", action="store_true", default=False)
     p.add_argument("--quick", action="store_true", default=False)
     p.add_argument("--torch-compile", action="store_true", default=False)
+    p.add_argument("--subprocess", action="store_true", default=False)
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -285,7 +322,7 @@ def main() -> None:
 
     total_pending = len(pending)
     print(
-        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume}",
+        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={'subprocess' if args.subprocess else 'inprocess'}",
         flush=True,
     )
 
@@ -298,16 +335,17 @@ def main() -> None:
         stdout_log = run_dir / "stdout.log"
         stderr_log = run_dir / "stderr.log"
 
-        cmd = [args.python, args.runner]
-        cmd.extend(config_to_args(common))
-        cmd.extend(config_to_args(cfg))
-        cmd.extend(["--out", str(result_json)])
+        runner_args = []
+        runner_args.extend(config_to_args(common))
+        runner_args.extend(config_to_args(cfg))
+        runner_args.extend(["--out", str(result_json)])
+        cmd = [args.python, args.runner, *runner_args]
 
         rec = {
             "id": cid,
             "run_index": i,
             "config": cfg,
-            "command": cmd,
+            "command": cmd if args.subprocess else ["inprocess", args.runner, *runner_args],
             "status": "pending",
         }
 
@@ -318,13 +356,22 @@ def main() -> None:
         if args.dry_run:
             rec["status"] = "dry_run"
         else:
-            rc = run_with_heartbeat(
-                cmd,
-                stdout_log=stdout_log,
-                stderr_log=stderr_log,
-                heartbeat_sec=max(0, args.heartbeat_sec),
-                stream_child=args.stream_child,
-            )
+            if args.subprocess:
+                rc = run_with_heartbeat(
+                    cmd,
+                    stdout_log=stdout_log,
+                    stderr_log=stderr_log,
+                    heartbeat_sec=max(0, args.heartbeat_sec),
+                    stream_child=args.stream_child,
+                )
+            else:
+                rc = run_inprocess(
+                    args.runner,
+                    runner_args,
+                    stdout_log=stdout_log,
+                    stderr_log=stderr_log,
+                    stream_child=args.stream_child,
+                )
             if rc != 0:
                 rec["status"] = "failed"
                 rec["returncode"] = rc
