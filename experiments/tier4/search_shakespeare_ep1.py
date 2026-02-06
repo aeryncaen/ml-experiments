@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections import Counter, defaultdict
 from pathlib import Path
 
 try:
@@ -212,6 +213,69 @@ def build_binary_candidates(base_cfg: dict, keys: list[str], levels: int, max_ru
         return uniq
     rng.shuffle(uniq)
     return uniq[:max_runs]
+
+
+def load_value_counts(trials_path: Path) -> dict[str, Counter]:
+    out: dict[str, Counter] = defaultdict(Counter)
+    if not trials_path.exists():
+        return out
+    for line in trials_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("status") != "ok":
+            continue
+        cfg = rec.get("config", {})
+        for k, v in cfg.items():
+            out[k][json.dumps(v, sort_keys=True)] += 1
+    return out
+
+
+def build_binary_candidates_adaptive(
+    base_cfg: dict,
+    keys: list[str],
+    levels: int,
+    max_runs: int,
+    rng: random.Random,
+    space: dict[str, list],
+    value_counts: dict[str, Counter],
+    min_count: int,
+) -> list[dict]:
+    cands = build_binary_candidates(base_cfg, keys, levels, max_runs=10_000_000, rng=rng)
+
+    # Add one-factor categorical/boolean coverage points for under-sampled values.
+    for k in keys:
+        if k not in space or k not in base_cfg:
+            continue
+        vals = space[k]
+        if not vals:
+            continue
+        if all(isinstance(v, (int, float)) for v in vals):
+            continue
+        for v in vals:
+            if v == base_cfg[k]:
+                continue
+            cnt = value_counts.get(k, Counter()).get(json.dumps(v, sort_keys=True), 0)
+            if cnt <= min_count:
+                cfg = dict(base_cfg)
+                cfg[k] = v
+                if is_valid(cfg):
+                    cands.append(cfg)
+
+    # De-duplicate.
+    uniq = []
+    seen = set()
+    for cfg in cands:
+        s = json.dumps(cfg, sort_keys=True)
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(cfg)
+
+    if max_runs > 0 and len(uniq) > max_runs:
+        rng.shuffle(uniq)
+        return uniq[:max_runs]
+    return uniq
 
 
 def stable_id(cfg: dict) -> str:
@@ -485,7 +549,7 @@ def load_ep1_metrics(result_json: Path) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description="Hyperparameter/config search for best Shakespeare epoch-1 geo results")
     p.add_argument("--strategy", choices=["random", "grid", "binary"], default="random")
-    p.add_argument("--max-runs", type=int, default=64)
+    p.add_argument("--max-runs", type=int, default=0)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--binary-base", type=str, default="leaderboard_ep1.json")
     p.add_argument(
@@ -494,6 +558,7 @@ def main() -> None:
         default="geo_init_blend,geo_init_ridge,geo_attn_corr_blend,geo_attn_corr_rank,geo_attn_corr_layers,geo_embed_grad_perp_init,geo_embed_grad_hold_steps,geo_embed_grad_ramp_steps,geo_embed_grad_rank,geo_embed_reanchor_rho",
     )
     p.add_argument("--binary-levels", type=int, default=3)
+    p.add_argument("--binary-min-count", type=int, default=2)
     p.add_argument("--seeds", type=int, default=1)
     p.add_argument("--steps-per-epoch", type=int, default=300)
     p.add_argument("--eval-iters", type=int, default=50)
@@ -578,21 +643,29 @@ def main() -> None:
     space = candidate_space()
     rng = random.Random(args.seed)
     print("Generating candidate configs...", flush=True)
+    trials_path_for_counts = out_dir / "trials.jsonl"
+    value_counts = load_value_counts(trials_path_for_counts)
     if args.strategy == "grid":
-        candidates = list(itertools.islice(iter_grid(space), args.max_runs))
+        candidates = list(iter_grid(space))
+        if args.max_runs > 0:
+            candidates = candidates[: args.max_runs]
     elif args.strategy == "binary":
         base_cfg = load_best_config(args.binary_base)
         binary_keys = [k.strip() for k in args.binary_keys.split(",") if k.strip()]
-        candidates = build_binary_candidates(
+        candidates = build_binary_candidates_adaptive(
             base_cfg,
             keys=binary_keys,
             levels=max(1, int(args.binary_levels)),
             max_runs=args.max_runs,
             rng=rng,
+            space=space,
+            value_counts=value_counts,
+            min_count=max(0, int(args.binary_min_count)),
         )
         print(f"Binary base from {args.binary_base}: {base_cfg}", flush=True)
     else:
-        candidates = sample_random(space, args.max_runs, rng)
+        n = args.max_runs if args.max_runs > 0 else 64
+        candidates = sample_random(space, n, rng)
     print(f"Generated candidates: {len(candidates)}", flush=True)
 
     done_ids = set()
@@ -614,7 +687,7 @@ def main() -> None:
 
     total_pending = len(pending)
     print(
-        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={mode} seeds={common['seeds']} steps={common['steps_per_epoch']} eval_iters={common['eval_iters']}",
+        f"Starting search: strategy={args.strategy} max_runs={args.max_runs} pending={total_pending} resume={args.resume} mode={mode} seeds={common['seeds']} steps={common['steps_per_epoch']} eval_iters={common['eval_iters']}",
         flush=True,
     )
 
@@ -642,8 +715,8 @@ def main() -> None:
         }
 
         start_t = time.perf_counter()
-        print(f"[{i}/{args.max_runs}] run_id={cid} started", flush=True)
-        print(f"[{i}/{args.max_runs}] config: {short_cfg(cfg)}", flush=True)
+        print(f"[{i}/{len(candidates)}] run_id={cid} started", flush=True)
+        print(f"[{i}/{len(candidates)}] config: {short_cfg(cfg)}", flush=True)
 
         if args.dry_run:
             rec["status"] = "dry_run"
@@ -701,11 +774,11 @@ def main() -> None:
         if status == "ok":
             m = rec["metrics"]
             print(
-                f"[{i}/{args.max_runs}] run_id={cid} done status=ok ep1_acc={m['ep1_val_acc_mean']:.5f} ep1_loss={m['ep1_val_loss_mean']:.5f} elapsed={elapsed:.1f}s",
+                f"[{i}/{len(candidates)}] run_id={cid} done status=ok ep1_acc={m['ep1_val_acc_mean']:.5f} ep1_loss={m['ep1_val_loss_mean']:.5f} elapsed={elapsed:.1f}s",
                 flush=True,
             )
         else:
-            print(f"[{i}/{args.max_runs}] run_id={cid} done status={status} elapsed={elapsed:.1f}s", flush=True)
+            print(f"[{i}/{len(candidates)}] run_id={cid} done status={status} elapsed={elapsed:.1f}s", flush=True)
 
     if progress is not None:
         progress.close()
