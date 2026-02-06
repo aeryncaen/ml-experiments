@@ -1,0 +1,126 @@
+{
+  "config": {
+    "epochs": 2,
+    "seeds": 1,
+    "batch_size": 128,
+    "lr": 0.001,
+    "reg_lambda": 0.002,
+    "reg_warmup_epochs": 6,
+    "optimizer": "chi2",
+    "trust_radius": 0.05,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "chi2_adaptive": true,
+    "chi2_reject_tol": 0.02,
+    "chi2_shrink": 0.5,
+    "chi2_grow": 1.01,
+    "chi2_min_radius": 0.0001,
+    "chi2_max_radius": 1.0,
+    "out": "quick_tier3_digits_chi2_adapt.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.19722222222222222,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.18611111111111112,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.15555555555555556,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.17777777777777778,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.17314814814814816,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.1615598885793872,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.1615598885793872,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.11388888888888889,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.10555555555555556,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.12222222222222222,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.10925925925925926,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.10584958217270195,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.10584958217270195,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.19722222222222222,
+      "acc_border": 0.18611111111111112,
+      "acc_center": 0.15555555555555556,
+      "acc_contrast": 0.17777777777777778,
+      "robust_avg": 0.17314814814814816,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 2.720247458880819,
+          "val_acc": 0.1615598885793872
+        },
+        {
+          "epoch": 2,
+          "train_loss": 2.720247456669144,
+          "val_acc": 0.1615598885793872
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.11388888888888889,
+      "acc_border": 0.1,
+      "acc_center": 0.10555555555555556,
+      "acc_contrast": 0.12222222222222222,
+      "robust_avg": 0.10925925925925926,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 2.3179399303691066,
+          "val_acc": 0.10584958217270195
+        },
+        {
+          "epoch": 2,
+          "train_loss": 2.317939971063929,
+          "val_acc": 0.10584958217270195
+        }
+      ]
+    }
+  ]
+}

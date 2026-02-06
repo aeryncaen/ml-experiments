@@ -1,0 +1,46 @@
+{
+  "args": {
+    "dataset": "digits",
+    "mode": "geo_system",
+    "metric": "robust_avg",
+    "epochs": 2,
+    "seeds": 1,
+    "final_epochs": 2,
+    "final_seeds": 1,
+    "batch_size": 128,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 12000,
+    "data_dir": "./data",
+    "lr_chi2": 0.0007,
+    "max_chi2_trials": 2,
+    "out_dir": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke"
+  },
+  "best": {
+    "adam": {
+      "score": 0.6555555555555556,
+      "cfg": {
+        "lr": 0.002
+      },
+      "path": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke/tune_digits_adam_20260206_044808_4.json"
+    },
+    "chi2": {
+      "score": 0.6342592592592592,
+      "cfg": {
+        "trust_radius": 0.01,
+        "chi2_reject_tol": 0.02,
+        "chi2_sigma": 2.5,
+        "chi2_q_low": -0.5,
+        "chi2_q_high": 0.2,
+        "chi2_q_beta": 0.9,
+        "chi2_shrink": 0.5,
+        "chi2_grow": 1.01,
+        "chi2_min_radius": 0.0001,
+        "chi2_max_radius": 1.0
+      },
+      "path": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke/tune_digits_chi2_20260206_044808_1.json"
+    }
+  },
+  "final_adam": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke/best_digits_adam_final_20260206_044830.json",
+  "final_chi2": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke/best_digits_chi2_final_20260206_044830.json"
+}

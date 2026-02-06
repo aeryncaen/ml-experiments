@@ -1,0 +1,362 @@
+{
+  "config": {
+    "epochs": 8,
+    "seeds": 1,
+    "batch_size": 128,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "optimizer": "chi2",
+    "trust_radius": 0.05,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "chi2_adaptive": true,
+    "chi2_reject_tol": 0.02,
+    "chi2_shrink": 0.5,
+    "chi2_grow": 1.01,
+    "chi2_min_radius": 0.0001,
+    "chi2_max_radius": 1.0,
+    "out": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_diag/tier3_digits_chi2_20260206_043805.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.19722222222222222,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.18611111111111112,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.15555555555555556,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.17777777777777778,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.17314814814814816,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.1615598885793872,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.1615598885793872,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.11388888888888889,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.10555555555555556,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.12222222222222222,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.10925925925925926,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.10584958217270195,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.10584958217270195,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.19722222222222222,
+      "acc_border": 0.18611111111111112,
+      "acc_center": 0.15555555555555556,
+      "acc_contrast": 0.17777777777777778,
+      "robust_avg": 0.17314814814814816,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 2.720247458880819,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.05,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.714894427193536,
+          "chi2_new_loss_mean": 6964.382768101163,
+          "chi2_step_l2_mean": 84.73957199414568,
+          "chi2_step_linf_max": 2.0297043323516846,
+          "chi2_denom_mean": 0.010488864961591888,
+          "chi2_scale_mean": 0.7707619975387362
+        },
+        {
+          "epoch": 2,
+          "train_loss": 2.720247456669144,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.7203064229753284,
+          "chi2_new_loss_mean": 6.018494235144721,
+          "chi2_step_l2_mean": 9.279761020816405,
+          "chi2_step_linf_max": 0.10547623783349991,
+          "chi2_denom_mean": 0.009613152288928596,
+          "chi2_scale_mean": 0.10200356609072651
+        },
+        {
+          "epoch": 3,
+          "train_loss": 2.72024738943422,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.7096930079989963,
+          "chi2_new_loss_mean": 5.702156119876438,
+          "chi2_step_l2_mean": 9.204200996794604,
+          "chi2_step_linf_max": 0.10684506595134735,
+          "chi2_denom_mean": 0.009625406555650449,
+          "chi2_scale_mean": 0.10194378872414865
+        },
+        {
+          "epoch": 4,
+          "train_loss": 2.720247426148027,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.735544549094306,
+          "chi2_new_loss_mean": 5.35975440343221,
+          "chi2_step_l2_mean": 9.243704125153876,
+          "chi2_step_linf_max": 0.11005744338035583,
+          "chi2_denom_mean": 0.009309009888799685,
+          "chi2_scale_mean": 0.10365195202402235
+        },
+        {
+          "epoch": 5,
+          "train_loss": 2.7202474367640677,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.712410820855035,
+          "chi2_new_loss_mean": 5.723766962687175,
+          "chi2_step_l2_mean": 9.15983207362289,
+          "chi2_step_linf_max": 0.10772759467363358,
+          "chi2_denom_mean": 0.009610731388577175,
+          "chi2_scale_mean": 0.10200931258244446
+        },
+        {
+          "epoch": 6,
+          "train_loss": 2.720247452245794,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.7178962230682373,
+          "chi2_new_loss_mean": 5.66086302863227,
+          "chi2_step_l2_mean": 9.173929017545403,
+          "chi2_step_linf_max": 0.11018981039524078,
+          "chi2_denom_mean": 0.009588580615137522,
+          "chi2_scale_mean": 0.10212921115360045
+        },
+        {
+          "epoch": 7,
+          "train_loss": 2.720247453572799,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.719448698891534,
+          "chi2_new_loss_mean": 5.379942735036214,
+          "chi2_step_l2_mean": 9.203828633359187,
+          "chi2_step_linf_max": 0.11107084900140762,
+          "chi2_denom_mean": 0.009485056382590763,
+          "chi2_scale_mean": 0.10267958551681901
+        },
+        {
+          "epoch": 8,
+          "train_loss": 2.720247456226809,
+          "val_acc": 0.1615598885793872,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.735117408964369,
+          "chi2_new_loss_mean": 5.259731928507487,
+          "chi2_step_l2_mean": 9.221350522444773,
+          "chi2_step_linf_max": 0.11057821661233902,
+          "chi2_denom_mean": 0.009423616711437953,
+          "chi2_scale_mean": 0.10302636784256464
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.11388888888888889,
+      "acc_border": 0.1,
+      "acc_center": 0.10555555555555556,
+      "acc_contrast": 0.12222222222222222,
+      "robust_avg": 0.10925925925925926,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 2.3179399303691066,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.05,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.318677478366428,
+          "chi2_new_loss_mean": 13861.580770068698,
+          "chi2_step_l2_mean": 139.02649383863763,
+          "chi2_step_linf_max": 3.4062225818634033,
+          "chi2_denom_mean": 0.0036583344904918993,
+          "chi2_scale_mean": 1.2981500659097254
+        },
+        {
+          "epoch": 2,
+          "train_loss": 2.317939971063929,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.3183475070529513,
+          "chi2_new_loss_mean": 6.299234920077854,
+          "chi2_step_l2_mean": 15.067146490775453,
+          "chi2_step_linf_max": 0.18257485330104828,
+          "chi2_denom_mean": 0.0033084179003944596,
+          "chi2_scale_mean": 0.17387302025417573
+        },
+        {
+          "epoch": 3,
+          "train_loss": 2.317939902944335,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.3167716132269964,
+          "chi2_new_loss_mean": 11.273900243971083,
+          "chi2_step_l2_mean": 15.038041901579781,
+          "chi2_step_linf_max": 0.1827370673418045,
+          "chi2_denom_mean": 0.0033030049690812935,
+          "chi2_scale_mean": 0.17400209697410454
+        },
+        {
+          "epoch": 4,
+          "train_loss": 2.3179400152974314,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.31875303056505,
+          "chi2_new_loss_mean": 7.9989633030361595,
+          "chi2_step_l2_mean": 14.96318172328878,
+          "chi2_step_linf_max": 0.18219755589962006,
+          "chi2_denom_mean": 0.0032938733530573747,
+          "chi2_scale_mean": 0.17424284034295662
+        },
+        {
+          "epoch": 5,
+          "train_loss": 2.317939941427482,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.3173144923316107,
+          "chi2_new_loss_mean": 9.114056004418266,
+          "chi2_step_l2_mean": 14.889607353874757,
+          "chi2_step_linf_max": 0.18377377092838287,
+          "chi2_denom_mean": 0.0033050461596903966,
+          "chi2_scale_mean": 0.17395624406129906
+        },
+        {
+          "epoch": 6,
+          "train_loss": 2.317939922407076,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.318481100930108,
+          "chi2_new_loss_mean": 8.689659860399034,
+          "chi2_step_l2_mean": 14.887222590308669,
+          "chi2_step_linf_max": 0.1845342218875885,
+          "chi2_denom_mean": 0.0033109444491079367,
+          "chi2_scale_mean": 0.17379486347023942
+        },
+        {
+          "epoch": 7,
+          "train_loss": 2.317939971506264,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.317860656314426,
+          "chi2_new_loss_mean": 7.544367578294542,
+          "chi2_step_l2_mean": 14.911176265397078,
+          "chi2_step_linf_max": 0.18955549597740173,
+          "chi2_denom_mean": 0.0032764337001758175,
+          "chi2_scale_mean": 0.1747067429981558
+        },
+        {
+          "epoch": 8,
+          "train_loss": 2.3179399020596647,
+          "val_acc": 0.10584958217270195,
+          "chi2_accept": 0,
+          "chi2_reject": 9,
+          "chi2_accept_rate": 0.0,
+          "chi2_trust_radius_start": 0.0001,
+          "chi2_trust_radius_end": 0.0001,
+          "chi2_old_loss_mean": 2.3180903328789606,
+          "chi2_new_loss_mean": 8.793185181087917,
+          "chi2_step_l2_mean": 14.894527175622166,
+          "chi2_step_linf_max": 0.18755227327346802,
+          "chi2_denom_mean": 0.003302903155629193,
+          "chi2_scale_mean": 0.17400773669067096
+        }
+      ]
+    }
+  ]
+}

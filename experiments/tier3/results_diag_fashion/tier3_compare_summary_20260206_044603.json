@@ -1,0 +1,107 @@
+{
+  "config": {
+    "dataset": "fashion",
+    "epochs": 5,
+    "seeds": 1,
+    "batch_size": 256,
+    "lr": 0.0007,
+    "trust_radius": 0.05,
+    "chi2_adaptive": true,
+    "chi2_reject_tol": 0.05,
+    "chi2_shrink": 0.5,
+    "chi2_grow": 1.01,
+    "chi2_min_radius": 0.0001,
+    "chi2_max_radius": 1.0,
+    "chi2_sigma": 3.0,
+    "chi2_q_low": -0.5,
+    "chi2_q_high": 0.2,
+    "chi2_q_beta": 0.9,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 12000,
+    "data_dir": "./data",
+    "out_dir": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_diag_fashion",
+    "dry_run": false
+  },
+  "summaries": [
+    {
+      "dataset": "fashion",
+      "modes": {
+        "baseline": {
+          "val_acc_ep3": {
+            "adam": 0.8444,
+            "chi2": 0.8238,
+            "delta": -0.020600000000000063
+          },
+          "val_acc_ep5": {
+            "adam": 0.846,
+            "chi2": 0.8194,
+            "delta": -0.026599999999999957
+          },
+          "clean_acc": {
+            "adam": 0.8378,
+            "chi2": 0.8088,
+            "delta": -0.029000000000000026
+          },
+          "robust_avg": {
+            "adam": 0.8051666666666666,
+            "chi2": 0.7787999999999999,
+            "delta": -0.02636666666666665
+          },
+          "acc_border": {
+            "adam": 0.7515,
+            "chi2": 0.7392,
+            "delta": -0.012299999999999978
+          },
+          "acc_center": {
+            "adam": 0.8263,
+            "chi2": 0.7877,
+            "delta": -0.03860000000000008
+          },
+          "acc_contrast": {
+            "adam": 0.8377,
+            "chi2": 0.8095,
+            "delta": -0.028200000000000003
+          }
+        },
+        "geo_system": {
+          "val_acc_ep3": {
+            "adam": 0.8426,
+            "chi2": 0.8062,
+            "delta": -0.03639999999999999
+          },
+          "val_acc_ep5": {
+            "adam": 0.848,
+            "chi2": 0.809,
+            "delta": -0.038999999999999924
+          },
+          "clean_acc": {
+            "adam": 0.8392,
+            "chi2": 0.7983,
+            "delta": -0.040899999999999936
+          },
+          "robust_avg": {
+            "adam": 0.8107666666666665,
+            "chi2": 0.7630333333333333,
+            "delta": -0.04773333333333318
+          },
+          "acc_border": {
+            "adam": 0.7704,
+            "chi2": 0.6999,
+            "delta": -0.07050000000000001
+          },
+          "acc_center": {
+            "adam": 0.8229,
+            "chi2": 0.7904,
+            "delta": -0.03249999999999997
+          },
+          "acc_contrast": {
+            "adam": 0.839,
+            "chi2": 0.7988,
+            "delta": -0.040200000000000014
+          }
+        }
+      }
+    }
+  ]
+}

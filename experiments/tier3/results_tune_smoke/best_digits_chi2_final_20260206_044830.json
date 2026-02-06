@@ -1,0 +1,186 @@
+{
+  "config": {
+    "epochs": 2,
+    "seeds": 1,
+    "batch_size": 128,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "optimizer": "chi2",
+    "trust_radius": 0.01,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "chi2_adaptive": true,
+    "chi2_reject_tol": 0.02,
+    "chi2_shrink": 0.5,
+    "chi2_grow": 1.01,
+    "chi2_min_radius": 0.0001,
+    "chi2_max_radius": 1.0,
+    "chi2_sigma": 2.5,
+    "chi2_q_low": -0.5,
+    "chi2_q_high": 0.2,
+    "chi2_q_beta": 0.9,
+    "out": "/Users/bzoidberg/heuristic-secrets/experiments/tier3/results_tune_smoke/best_digits_chi2_final_20260206_044830.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.9083333333333333,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.6555555555555556,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.5527777777777778,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.9027777777777778,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.7037037037037037,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.9303621169916435,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.9303621169916435,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.9166666666666666,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.5666666666666667,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.4305555555555556,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.9055555555555556,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.6342592592592592,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.9052924791086351,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.9052924791086351,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.9083333333333333,
+      "acc_border": 0.6555555555555556,
+      "acc_center": 0.5527777777777778,
+      "acc_contrast": 0.9027777777777778,
+      "robust_avg": 0.7037037037037037,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 1.0244380975753788,
+          "val_acc": 0.8997214484679665,
+          "chi2_accept": 9,
+          "chi2_reject": 0,
+          "chi2_accept_rate": 1.0,
+          "chi2_trust_radius_start": 0.01,
+          "chi2_trust_radius_end": 0.0120751691431336,
+          "chi2_old_loss_mean": 0.9670960191223357,
+          "chi2_new_loss_mean": 0.5845117829740047,
+          "chi2_step_l2_mean": 0.9527330317021124,
+          "chi2_step_linf_max": 0.02076689712703228,
+          "chi2_denom_mean": 75.69303687661886,
+          "chi2_scale_mean": 0.013951236601138641,
+          "chi2_delta_mean": -0.3825842361483309,
+          "chi2_delta_std": 0.3171960215628325,
+          "chi2_q_ema": 0.22932631940589265
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.2623368422595822,
+          "val_acc": 0.9303621169916435,
+          "chi2_accept": 9,
+          "chi2_reject": 0,
+          "chi2_accept_rate": 1.0,
+          "chi2_trust_radius_start": 0.0120751691431336,
+          "chi2_trust_radius_end": 0.015782911916598173,
+          "chi2_old_loss_mean": 0.2726358125607173,
+          "chi2_new_loss_mean": 0.12130400331483947,
+          "chi2_step_l2_mean": 1.0000000047932387,
+          "chi2_step_linf_max": 0.02872077189385891,
+          "chi2_denom_mean": 9.146189624961051,
+          "chi2_scale_mean": 0.029805882886636454,
+          "chi2_delta_mean": -0.26695802269710434,
+          "chi2_delta_std": 0.25725598208009154,
+          "chi2_q_ema": 0.48203288489341456
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.9166666666666666,
+      "acc_border": 0.5666666666666667,
+      "acc_center": 0.4305555555555556,
+      "acc_contrast": 0.9055555555555556,
+      "robust_avg": 0.6342592592592592,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 1.1132303604057856,
+          "val_acc": 0.8969359331476323,
+          "chi2_accept": 9,
+          "chi2_reject": 0,
+          "chi2_accept_rate": 1.0,
+          "chi2_trust_radius_start": 0.01,
+          "chi2_trust_radius_end": 0.012563005976516202,
+          "chi2_old_loss_mean": 1.0515379707018535,
+          "chi2_new_loss_mean": 0.7405251848200957,
+          "chi2_step_l2_mean": 0.9999999821868385,
+          "chi2_step_linf_max": 0.018444079905748367,
+          "chi2_denom_mean": 39.76432939949963,
+          "chi2_scale_mean": 0.013243035879075386,
+          "chi2_delta_mean": -0.3110127858817577,
+          "chi2_delta_std": 0.15797357904628767,
+          "chi2_q_ema": 0.35251507287362677
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.2728132372220947,
+          "val_acc": 0.9052924791086351,
+          "chi2_accept": 9,
+          "chi2_reject": 0,
+          "chi2_accept_rate": 1.0,
+          "chi2_trust_radius_start": 0.012563005976516202,
+          "chi2_trust_radius_end": 0.01642054155802875,
+          "chi2_old_loss_mean": 0.2854432463645935,
+          "chi2_new_loss_mean": 0.12371694462166892,
+          "chi2_step_l2_mean": 1.0000000067140915,
+          "chi2_step_linf_max": 0.03024403564631939,
+          "chi2_denom_mean": 8.923989072286835,
+          "chi2_scale_mean": 0.026565545543788295,
+          "chi2_delta_mean": -0.23636954381234118,
+          "chi2_delta_std": 0.16042392096690505,
+          "chi2_q_ema": 0.5973690975688575
+        }
+      ]
+    }
+  ]
+}
