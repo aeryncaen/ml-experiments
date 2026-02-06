@@ -8,6 +8,7 @@ import random
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import torch
@@ -370,6 +371,7 @@ class RunConfig:
     geo_embed_reanchor_every: int = 0
     geo_embed_reanchor_rho: float = 0.0
     geo_embed_reanchor_until_step: int = 0
+    use_torch_compile: bool = False
 
 
 def get_batch(data: np.ndarray, batch_size: int, block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -516,6 +518,13 @@ def train_one(
                     W = attn.in_proj_weight
                     for s0, s1 in ((0, d), (d, 2 * d)):
                         W[s0:s1, :].copy_((1.0 - b_corr) * W[s0:s1, :] + b_corr * (W[s0:s1, :] @ P_corr_t))
+    run_model: nn.Module = model
+    if cfg.use_torch_compile and hasattr(torch, "compile"):
+        try:
+            run_model = cast(nn.Module, torch.compile(model))
+        except Exception as e:
+            print(f"torch.compile unavailable/failing, falling back to eager: {e}")
+
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
     if geo_basis.shape[1] >= cfg.d_model:
@@ -540,7 +549,7 @@ def train_one(
         for it in range(cfg.steps_per_epoch):
             global_step = ep * cfg.steps_per_epoch + it
             xb, yb = get_batch(train_ids, cfg.batch_size, cfg.block_size, device)
-            logits = model(xb)
+            logits = run_model(xb)
             loss = token_loss(logits, yb, cfg.loss_type, cfg.loss_eps)
             opt.zero_grad()
             loss.backward()
@@ -597,7 +606,7 @@ def train_one(
 
         train_loss = train_loss_sum / cfg.steps_per_epoch
         train_acc = train_acc_sum / cfg.steps_per_epoch
-        val = eval_stats(model, val_ids, cfg, device)
+        val = eval_stats(run_model, val_ids, cfg, device)
         rec = {
             "epoch": ep + 1,
             "train_loss": train_loss,
@@ -639,7 +648,7 @@ def train_one(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    final = eval_stats(model, val_ids, cfg, device)
+    final = eval_stats(run_model, val_ids, cfg, device)
     return {
         "mode": mode,
         "seed": seed,
@@ -724,6 +733,7 @@ def main() -> None:
     p.add_argument("--geo-embed-reanchor-every", type=int, default=0)
     p.add_argument("--geo-embed-reanchor-rho", type=float, default=0.0)
     p.add_argument("--geo-embed-reanchor-until-step", type=int, default=0)
+    p.add_argument("--torch-compile", action="store_true", default=False)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
 
@@ -775,6 +785,7 @@ def main() -> None:
         geo_embed_reanchor_every=args.geo_embed_reanchor_every,
         geo_embed_reanchor_rho=args.geo_embed_reanchor_rho,
         geo_embed_reanchor_until_step=args.geo_embed_reanchor_until_step,
+        use_torch_compile=args.torch_compile,
     )
 
     device = get_device()

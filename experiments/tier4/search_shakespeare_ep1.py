@@ -160,6 +160,31 @@ def run_with_heartbeat(
             time.sleep(0.5)
 
 
+def short_cfg(cfg: dict) -> str:
+    keys = [
+        "geo_init_method",
+        "geo_init_mtp_weights",
+        "geo_init_blend",
+        "geo_init_fullspace",
+        "geo_attn_bias",
+        "geo_attn_bias_blend",
+        "geo_attn_corr_bias",
+        "geo_attn_corr_blend",
+        "geo_attn_corr_rank",
+        "geo_attn_corr_layers",
+        "geo_embed_grad_shape",
+        "geo_embed_grad_rank",
+        "geo_embed_grad_perp_init",
+        "geo_embed_reanchor_every",
+        "geo_embed_reanchor_rho",
+    ]
+    parts = []
+    for k in keys:
+        if k in cfg:
+            parts.append(f"{k}={cfg[k]}")
+    return " ".join(parts)
+
+
 def load_ep1_metrics(result_json: Path) -> dict:
     data = json.loads(result_json.read_text(encoding="utf-8"))
     runs = [r for r in data.get("runs", []) if r.get("mode") == "geo_system"]
@@ -286,6 +311,7 @@ def main() -> None:
 
         start_t = time.perf_counter()
         print(f"[{i}/{args.max_runs}] run_id={cid} started", flush=True)
+        print(f"[{i}/{args.max_runs}] config: {short_cfg(cfg)}", flush=True)
 
         if args.dry_run:
             rec["status"] = "dry_run"
