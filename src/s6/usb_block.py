@@ -163,21 +163,15 @@ class PerHeadProjections(nn.Module):
         }
 
 
-class PolaritySparseAttention(nn.Module):
+class SparseAttention(nn.Module):
     """
-    Polarity-aware sparse attention combining PolaFormer++ dual-flow
-    with HAX-style sparse masking (sign-bin LSH + key selection).
+    HAX-style sparse causal attention.
     
-    PolaFormer++ specifics preserved:
-    - Q split into sim-polarity (q_sim) and opp-polarity (q_opp) via learnable s1/s2
-    - K mapped to polarity feature space via expm1([k_pos, k_neg])
-    - V split into v1/v2; sim-flow attends v1, opp-flow attends v2
-    - z normalization per flow: z = q @ mean(k0)
+    Sign-bin LSH + learned key selection to build a sparse mask,
+    then standard scaled dot-product softmax over selected keys.
     
-    HAX specifics preserved:
-    - Sign-bin LSH with budget-capped sliding window
-    - Key selection MLP with cumulative top-k
-    - Causal masking throughout
+    Q is projected from post-scan enhanced states.
+    K/V come from pre-scan projections.
     """
 
     def __init__(
@@ -193,7 +187,6 @@ class PolaritySparseAttention(nn.Module):
         super().__init__()
         self.nheads = nheads
         self.headdim = headdim
-        self.feat_dim = headdim * 2  # polarity doubles the feature dim
         self.sparse_keys = sparse_keys
         self.num_hash = num_hash
         self.use_lsh = use_lsh
@@ -203,19 +196,15 @@ class PolaritySparseAttention(nn.Module):
         self.q_proj = nn.Linear(d_input, nheads * headdim, bias=False)
         self.q_norm = GatedRMSNorm(nheads * headdim)
 
-        # Per-head learnable polarity spikiness (PolaFormer++)
-        self.s1 = nn.Parameter(torch.zeros(1, nheads, 1, self.feat_dim))
-        self.s2 = nn.Parameter(torch.zeros(1, nheads, 1, self.feat_dim))
-
-        # HAX key selection MLP
+        # HAX key selection MLP (operates on per-head K/cumQ concatenation)
         if self.use_key_selection:
-            self.dx_proj_1 = nn.Linear(self.feat_dim * 2, self.feat_dim * 2)
-            self.dx_proj_2 = nn.Linear(self.feat_dim * 2, self.feat_dim * 2)
-            self.dx_proj_3 = nn.Linear(self.feat_dim * 2, 1)
+            self.dx_proj_1 = nn.Linear(headdim * 2, headdim * 2)
+            self.dx_proj_2 = nn.Linear(headdim * 2, headdim * 2)
+            self.dx_proj_3 = nn.Linear(headdim * 2, 1)
 
         # Output projection back to d_input
         self.out_proj = nn.Linear(nheads * headdim, d_input, bias=False)
-        
+
         # Learnable gate (initialized near zero so attention starts small)
         self.attn_gate = nn.Parameter(torch.zeros(1))
 
@@ -241,26 +230,26 @@ class PolaritySparseAttention(nn.Module):
 
     def _build_sparse_mask(
         self,
-        q_map: torch.Tensor,
-        k_map: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         valid: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Build causal sparse mask via LSH + key selection (HAX recipe)."""
-        bsz, nheads, seq_len, _ = q_map.shape
-        device = q_map.device
+        """Build causal sparse mask via sign-bin LSH + key selection (HAX)."""
+        bsz, nheads, seq_len, hdim = q.shape
+        device = q.device
         budget = max(1, min(self.sparse_keys, seq_len))
 
         causal = torch.arange(seq_len, device=device)
         causal_mask = (causal[None, None, :] <= causal[None, :, None]).unsqueeze(0)
         diag = torch.eye(seq_len, device=device, dtype=torch.bool).view(1, 1, seq_len, seq_len)
 
-        # LSH mask
+        # Sign-bin LSH
         lsh_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
         if self.use_lsh:
             assert self.num_hash < 64
-            nq = F.normalize(q_map - q_map.mean(dim=2, keepdim=True), dim=-1)
-            nk = F.normalize(k_map - k_map.mean(dim=2, keepdim=True), dim=-1)
-            proj = torch.randn((self.feat_dim, self.num_hash), device=device, dtype=q_map.dtype)
+            nq = F.normalize(q - q.mean(dim=2, keepdim=True), dim=-1)
+            nk = F.normalize(k - k.mean(dim=2, keepdim=True), dim=-1)
+            proj = torch.randn((hdim, self.num_hash), device=device, dtype=q.dtype)
             hq_bits = (torch.matmul(nq, proj) > 0).to(torch.long)
             hk_bits = (torch.matmul(nk, proj) > 0).to(torch.long)
             weights = (1 << torch.arange(self.num_hash, device=device, dtype=torch.long)).view(1, 1, 1, self.num_hash)
@@ -269,15 +258,16 @@ class PolaritySparseAttention(nn.Module):
             lsh_mask = hq_idx.unsqueeze(-1) == hk_idx.unsqueeze(-2)
             lsh_mask = self._lsh_sliding_window(lsh_mask & causal_mask, budget=budget)
 
-        # Key selection mask
+        # Key selection MLP
         ks_mask = torch.zeros(bsz, nheads, seq_len, seq_len, device=device, dtype=torch.bool)
         if self.use_key_selection:
-            tq = F.normalize(q_map.detach().cumsum(dim=2), dim=-1)
-            tk = k_map.detach()
-            t2 = torch.cat([tk, tq], dim=-1)
+            # HAX recipe: concat(K_detached, normalize(cumsum(Q_detached))) -> MLP -> score
+            tq = F.normalize(q.detach().cumsum(dim=2), dim=-1)
+            tk = k.detach()
+            t2 = torch.cat([tk, tq], dim=-1)  # (b, h, t, hdim*2)
             t2 = F.relu(self.dx_proj_1(t2))
             t2 = F.relu(self.dx_proj_2(t2))
-            key_score = self.dx_proj_3(t2).squeeze(-1)
+            key_score = self.dx_proj_3(t2).squeeze(-1)  # (b, h, t)
             if valid is not None:
                 key_score = key_score.masked_fill(~valid[:, None, :], float("-inf"))
             _, key_idx = self._cumtopk(key_score, k=budget)
@@ -312,66 +302,32 @@ class PolaritySparseAttention(nn.Module):
             (batch, seq_len, d_input)
         """
         bsz, seq_len, _ = post_scan_states.shape
-        nheads = self.nheads
-        headdim = self.headdim
 
         # Project Q from post-scan states
         q = self.q_norm(self.q_proj(post_scan_states))
-        q = rearrange(q, 'b t (h d) -> b h t d', h=nheads)
+        q = rearrange(q, 'b t (h d) -> b h t d', h=self.nheads)
 
         # Reshape K, V to (b, h, t, d)
-        k = k.transpose(1, 2)  # (b, h, t, d)
-        v = v.transpose(1, 2)  # (b, h, t, d)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         valid = attention_mask.to(torch.bool) if attention_mask is not None else None
 
-        # --- PolaFormer++ polarity feature maps ---
-        s1 = torch.sigmoid(self.s1)
-        s2 = torch.sigmoid(self.s2)
+        # Build sparse mask
+        sparse_mask = self._build_sparse_mask(q, k, valid)
 
-        q_pos, q_neg = F.relu(q), F.relu(-q)
-        k_pos, k_neg = F.relu(k), F.relu(-k)
-
-        # Q: two flows with learnable spikiness
-        q_sim = torch.expm1(torch.cat([q_pos, q_neg], dim=-1) * s1)  # same-polarity
-        q_opp = torch.expm1(torch.cat([q_neg, q_pos], dim=-1) * s2)  # opposite-polarity
-
-        # K: single feature map (shared by both flows)
-        k0 = torch.expm1(torch.cat([k_pos, k_neg], dim=-1))
-
-        # V: split into two halves for dual flow
-        half = headdim // 2
-        v1 = v[..., :half]
-        v2 = v[..., half:]
-
-        # --- z normalization (PolaFormer++) ---
-        # z = q @ mean(k0)^T, scalar per query position
-        k0_mean = k0.mean(dim=2, keepdim=True).transpose(-2, -1)  # (b, h, feat_dim, 1)
-        z_sim = (q_sim @ k0_mean).clamp(min=1e-6)  # (b, h, t, 1)
-        z_opp = (q_opp @ k0_mean).clamp(min=1e-6)
-
-        # --- HAX sparse mask ---
-        sparse_mask = self._build_sparse_mask(q_sim, k0, valid)
-
-        # Apply mask to both flows
-        scale = seq_len ** -0.5  # PolaFormer++ uses (1/N)^0.5 on both K and V
-        attn_logits = torch.matmul(q_sim, (k0 * scale).transpose(-1, -2))
+        # Standard scaled dot-product attention over sparse mask
+        scale = self.headdim ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * scale
         attn_logits = attn_logits + (1.0 - sparse_mask.to(attn_logits.dtype)) * torch.finfo(attn_logits.dtype).min
-        attn_sim = F.softmax(attn_logits, dim=-1)
-        res1 = torch.matmul(attn_sim, v1 * scale) * (1.0 / z_sim)
+        attn = F.softmax(attn_logits, dim=-1)
+        out = torch.matmul(attn, v)
 
-        attn_logits_opp = torch.matmul(q_opp, (k0 * scale).transpose(-1, -2))
-        attn_logits_opp = attn_logits_opp + (1.0 - sparse_mask.to(attn_logits_opp.dtype)) * torch.finfo(attn_logits_opp.dtype).min
-        attn_opp = F.softmax(attn_logits_opp, dim=-1)
-        res2 = torch.matmul(attn_opp, v2 * scale) * (1.0 / z_opp)
-
-        # Concatenate dual-flow results
-        res = torch.cat([res1, res2], dim=-1)  # (b, h, t, headdim)
-        res = rearrange(res, 'b h t d -> b t (h d)')
+        out = rearrange(out, 'b h t d -> b t (h d)')
 
         # Gate + project
         gate = torch.sigmoid(self.attn_gate)
-        return gate * self.out_proj(res)
+        return gate * self.out_proj(out)
 
 
 class USBBlock(nn.Module):
@@ -424,9 +380,9 @@ class USBBlock(nn.Module):
             d_group, d_group, kernel_size=3, padding=0, groups=d_group, bias=False
         )
 
-        # Post-scan polarity-aware sparse attention (over ALL heads)
+        # Post-scan sparse attention (over ALL heads)
         if config.polarity_attention:
-            self.polarity_attn = PolaritySparseAttention(
+            self.sparse_attn = SparseAttention(
                 d_input=d_expanded,
                 nheads=nheads_total,
                 headdim=headdim,
@@ -436,7 +392,7 @@ class USBBlock(nn.Module):
                 use_key_selection=config.use_key_selection,
             )
         else:
-            self.polarity_attn = None
+            self.sparse_attn = None
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -628,10 +584,10 @@ class USBBlock(nn.Module):
         scan_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         scan_out_flat = rearrange(scan_out, 'b t h d -> b t (h d)')
 
-        # Step 6b: Post-scan polarity-aware sparse attention
+        # Step 6b: Post-scan sparse attention (HAX-style)
         # Q from post-scan enhanced states; K/V from pre-scan projections (all heads)
-        if self.polarity_attn is not None:
-            attn_out = scan_out_flat + self.polarity_attn(
+        if self.sparse_attn is not None:
+            attn_out = scan_out_flat + self.sparse_attn(
                 post_scan_states=scan_out_flat,
                 k=k,  # pre-scan K, all heads: (b, t, nheads_total, headdim)
                 v=v,  # pre-scan V, all heads: (b, t, nheads_total, headdim)
