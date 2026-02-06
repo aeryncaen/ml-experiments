@@ -190,6 +190,64 @@ def compute_attn_corr_projector(
     return P.astype(np.float32)
 
 
+def compute_fullspace_geo_target(
+    geo_basis: np.ndarray,
+    embed_init: np.ndarray,
+    ridge: float = 1e-3,
+    center: bool = True,
+    match_row_norm: bool = True,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    B = geo_basis.astype(np.float64)
+    E0 = embed_init.astype(np.float64)
+
+    if center:
+        Bm = B - B.mean(axis=0, keepdims=True)
+        Em = E0 - E0.mean(axis=0, keepdims=True)
+    else:
+        Bm = B
+        Em = E0
+
+    BtB = Bm.T @ Bm
+    d = BtB.shape[0]
+    W = np.linalg.solve(BtB + float(ridge) * np.eye(d, dtype=np.float64), Bm.T @ Em)
+    T = Bm @ W
+
+    if center:
+        T = T + E0.mean(axis=0, keepdims=True)
+
+    if match_row_norm:
+        t_norm = np.linalg.norm(T, axis=1, keepdims=True)
+        e_norm = np.linalg.norm(E0, axis=1, keepdims=True)
+        T = T / np.maximum(t_norm, eps)
+        T = T * e_norm
+
+    return T.astype(np.float32)
+
+
+def compute_embed_projector_from_target(target: np.ndarray, rank: int) -> np.ndarray:
+    C = target.astype(np.float64).T @ target.astype(np.float64)
+    C = 0.5 * (C + C.T)
+    _, eigvecs = np.linalg.eigh(C)
+    d = C.shape[0]
+    k_eff = max(1, min(rank, d))
+    U = eigvecs[:, -k_eff:]
+    P = U @ U.T
+    return P.astype(np.float32)
+
+
+def schedule_linear_hold_ramp(step: int, init_value: float, hold_steps: int, ramp_steps: int) -> float:
+    v0 = float(init_value)
+    h = max(0, int(hold_steps))
+    r = max(0, int(ramp_steps))
+    if step < h:
+        return v0
+    if r > 0 and step < h + r:
+        t = (step - h) / r
+        return v0 + (1.0 - v0) * t
+    return 1.0
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
@@ -256,6 +314,10 @@ class RunConfig:
     eta_topk: int = 16
     geo_init_method: str = "bucket"
     geo_init_blend: float = 0.7
+    geo_init_fullspace: bool = False
+    geo_init_ridge: float = 1e-3
+    geo_init_center: bool = True
+    geo_init_match_row_norm: bool = True
     geo_attn_bias: bool = False
     geo_attn_bias_blend: float = 0.2
     geo_attn_corr_bias: bool = False
@@ -264,6 +326,14 @@ class RunConfig:
     geo_attn_corr_layers: int = 2
     geo_attn_corr_horizons: tuple[int, ...] = (1, 2)
     geo_attn_corr_horizon_weights: tuple[float, ...] = (1.0, 0.5)
+    geo_embed_grad_shape: bool = False
+    geo_embed_grad_rank: int = 16
+    geo_embed_grad_perp_init: float = 0.1
+    geo_embed_grad_hold_steps: int = 250
+    geo_embed_grad_ramp_steps: int = 250
+    geo_embed_reanchor_every: int = 0
+    geo_embed_reanchor_rho: float = 0.0
+    geo_embed_reanchor_until_step: int = 0
 
 
 def get_batch(data: np.ndarray, batch_size: int, block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -349,12 +419,38 @@ def train_one(
 ) -> dict:
     set_seed(seed)
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_head, cfg.n_layer, cfg.block_size, cfg.dropout).to(device)
+    geo_target_t = None
+    geo_embed_proj_t = None
+    with torch.no_grad():
+        E0_np = model.token_emb.weight.detach().cpu().numpy().astype(np.float32)
+
+    if mode == "geo_system" and cfg.geo_init_fullspace:
+        geo_target_np = compute_fullspace_geo_target(
+            geo_basis,
+            E0_np,
+            ridge=cfg.geo_init_ridge,
+            center=cfg.geo_init_center,
+            match_row_norm=cfg.geo_init_match_row_norm,
+        )
+    else:
+        geo_target_np = np.zeros((vocab_size, cfg.d_model), dtype=np.float32)
+        k0 = min(cfg.d_model, geo_basis.shape[1])
+        geo_target_np[:, :k0] = geo_basis[:, :k0].astype(np.float32)
+        if cfg.geo_init_match_row_norm:
+            t_norm = np.linalg.norm(geo_target_np, axis=1, keepdims=True)
+            e_norm = np.linalg.norm(E0_np, axis=1, keepdims=True)
+            geo_target_np = geo_target_np / np.maximum(t_norm, 1e-8)
+            geo_target_np = geo_target_np * e_norm
+
+    geo_target_t = torch.from_numpy(geo_target_np).to(device=device, dtype=model.token_emb.weight.dtype)
+    if mode == "geo_system" and cfg.geo_embed_grad_shape:
+        P_np = compute_embed_projector_from_target(geo_target_np, cfg.geo_embed_grad_rank)
+        geo_embed_proj_t = torch.from_numpy(P_np).to(device=device, dtype=model.token_emb.weight.dtype)
+
     if mode == "geo_system":
         with torch.no_grad():
             E = model.token_emb.weight
-            k = min(E.shape[1], geo_basis.shape[1])
-            B = torch.from_numpy(geo_basis[:, :k]).to(device=device, dtype=E.dtype)
-            E[:, :k] = (1.0 - cfg.geo_init_blend) * E[:, :k] + cfg.geo_init_blend * B
+            E.copy_((1.0 - cfg.geo_init_blend) * E + cfg.geo_init_blend * geo_target_t)
 
             if cfg.geo_attn_bias:
                 P_np = compute_model_projector(geo_basis, cfg.d_model, cfg.eta_topk)
@@ -405,12 +501,26 @@ def train_one(
         eta_shaped_sum = 0.0
         eta_w_sum = 0.0
         eta_cnt = 0
-        for _ in range(cfg.steps_per_epoch):
+        for it in range(cfg.steps_per_epoch):
+            global_step = ep * cfg.steps_per_epoch + it
             xb, yb = get_batch(train_ids, cfg.batch_size, cfg.block_size, device)
             logits = model(xb)
             loss = token_loss(logits, yb, cfg.loss_type, cfg.loss_eps)
             opt.zero_grad()
             loss.backward()
+
+            if mode == "geo_system" and cfg.geo_embed_grad_shape and geo_embed_proj_t is not None:
+                g = model.token_emb.weight.grad
+                if g is not None:
+                    g_proj = g @ geo_embed_proj_t
+                    g_perp = g - g_proj
+                    perp_scale = schedule_linear_hold_ramp(
+                        global_step,
+                        init_value=cfg.geo_embed_grad_perp_init,
+                        hold_steps=cfg.geo_embed_grad_hold_steps,
+                        ramp_steps=cfg.geo_embed_grad_ramp_steps,
+                    )
+                    g.copy_(g_proj + perp_scale * g_perp)
 
             if cfg.optimizer == "adam_eta_follow" and cfg.eta_shape:
                 g = model.token_emb.weight.grad
@@ -437,6 +547,13 @@ def train_one(
                     eta_cnt += 1
 
             opt.step()
+
+            if mode == "geo_system" and cfg.geo_embed_reanchor_every > 0 and cfg.geo_embed_reanchor_rho > 0.0:
+                if global_step <= cfg.geo_embed_reanchor_until_step and (global_step % cfg.geo_embed_reanchor_every == 0):
+                    rho = float(cfg.geo_embed_reanchor_rho)
+                    with torch.no_grad():
+                        E = model.token_emb.weight
+                        E.copy_((1.0 - rho) * E + rho * geo_target_t)
             with torch.no_grad():
                 pred = logits.argmax(dim=-1)
                 train_acc_sum += float((pred == yb).float().mean().item())
@@ -549,6 +666,10 @@ def main() -> None:
     p.add_argument("--eta-topk", type=int, default=16)
     p.add_argument("--geo-init-method", type=str, choices=["bucket", "kl_bucket", "eig"], default="bucket")
     p.add_argument("--geo-init-blend", type=float, default=0.3)
+    p.add_argument("--geo-init-fullspace", action="store_true", default=False)
+    p.add_argument("--geo-init-ridge", type=float, default=1e-3)
+    p.add_argument("--geo-init-no-center", action="store_false", dest="geo_init_center")
+    p.add_argument("--geo-init-no-row-norm-match", action="store_false", dest="geo_init_match_row_norm")
     p.add_argument("--geo-attn-bias", action="store_true", default=False)
     p.add_argument("--geo-attn-bias-blend", type=float, default=0.2)
     p.add_argument("--geo-attn-corr-bias", action="store_true", default=False)
@@ -557,6 +678,15 @@ def main() -> None:
     p.add_argument("--geo-attn-corr-layers", type=int, default=2)
     p.add_argument("--geo-attn-corr-horizons", type=str, default="1,2")
     p.add_argument("--geo-attn-corr-horizon-weights", type=str, default="1.0,0.5")
+    p.add_argument("--geo-only", action="store_true", default=False)
+    p.add_argument("--geo-embed-grad-shape", action="store_true", default=False)
+    p.add_argument("--geo-embed-grad-rank", type=int, default=16)
+    p.add_argument("--geo-embed-grad-perp-init", type=float, default=0.1)
+    p.add_argument("--geo-embed-grad-hold-steps", type=int, default=250)
+    p.add_argument("--geo-embed-grad-ramp-steps", type=int, default=250)
+    p.add_argument("--geo-embed-reanchor-every", type=int, default=0)
+    p.add_argument("--geo-embed-reanchor-rho", type=float, default=0.0)
+    p.add_argument("--geo-embed-reanchor-until-step", type=int, default=0)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
 
@@ -587,6 +717,10 @@ def main() -> None:
         eta_topk=args.eta_topk,
         geo_init_method=args.geo_init_method,
         geo_init_blend=args.geo_init_blend,
+        geo_init_fullspace=args.geo_init_fullspace,
+        geo_init_ridge=args.geo_init_ridge,
+        geo_init_center=args.geo_init_center,
+        geo_init_match_row_norm=args.geo_init_match_row_norm,
         geo_attn_bias=args.geo_attn_bias,
         geo_attn_bias_blend=args.geo_attn_bias_blend,
         geo_attn_corr_bias=args.geo_attn_corr_bias,
@@ -595,6 +729,14 @@ def main() -> None:
         geo_attn_corr_layers=args.geo_attn_corr_layers,
         geo_attn_corr_horizons=tuple(corr_horizons),
         geo_attn_corr_horizon_weights=tuple(corr_h_weights),
+        geo_embed_grad_shape=args.geo_embed_grad_shape,
+        geo_embed_grad_rank=args.geo_embed_grad_rank,
+        geo_embed_grad_perp_init=args.geo_embed_grad_perp_init,
+        geo_embed_grad_hold_steps=args.geo_embed_grad_hold_steps,
+        geo_embed_grad_ramp_steps=args.geo_embed_grad_ramp_steps,
+        geo_embed_reanchor_every=args.geo_embed_reanchor_every,
+        geo_embed_reanchor_rho=args.geo_embed_reanchor_rho,
+        geo_embed_reanchor_until_step=args.geo_embed_reanchor_until_step,
     )
 
     device = get_device()
@@ -633,27 +775,42 @@ def main() -> None:
         )
 
     runs = []
+    modes = ["geo_system"] if args.geo_only else ["baseline", "geo_system"]
     for seed in range(cfg.seeds):
-        for mode in ["baseline", "geo_system"]:
+        for mode in modes:
             print(f"Running mode={mode}, seed={seed}")
             res = train_one(train_ids, val_ids, vocab_size, geo_basis, attn_corr_projector, mode, cfg, seed, device)
             runs.append(res)
 
-    base = summarize(runs, "baseline")
     geo = summarize(runs, "geo_system")
     print("\n=== Summary (mean +- std across seeds) ===")
-    for key in [
-        "val_loss_ep3",
-        "val_acc_ep3",
-        "val_loss_ep5",
-        "val_acc_ep5",
-        "final_val_loss",
-        "final_val_acc",
-        "final_val_ppl",
-    ]:
-        b = base[key]
-        g = geo[key]
-        print(f"{key:14s} | baseline {b['mean']:.4f} +- {b['std']:.4f} | geo_system {g['mean']:.4f} +- {g['std']:.4f} | delta {g['mean'] - b['mean']:+.4f}")
+    if args.geo_only:
+        for key in [
+            "val_loss_ep3",
+            "val_acc_ep3",
+            "val_loss_ep5",
+            "val_acc_ep5",
+            "final_val_loss",
+            "final_val_acc",
+            "final_val_ppl",
+        ]:
+            g = geo[key]
+            print(f"{key:14s} | geo_system {g['mean']:.4f} +- {g['std']:.4f}")
+        base = None
+    else:
+        base = summarize(runs, "baseline")
+        for key in [
+            "val_loss_ep3",
+            "val_acc_ep3",
+            "val_loss_ep5",
+            "val_acc_ep5",
+            "final_val_loss",
+            "final_val_acc",
+            "final_val_ppl",
+        ]:
+            b = base[key]
+            g = geo[key]
+            print(f"{key:14s} | baseline {b['mean']:.4f} +- {b['std']:.4f} | geo_system {g['mean']:.4f} +- {g['std']:.4f} | delta {g['mean'] - b['mean']:+.4f}")
 
     out = {
         "config": vars(args),
