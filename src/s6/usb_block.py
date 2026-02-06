@@ -469,94 +469,10 @@ class USBBlock(nn.Module):
             is_causal=False,
         )
 
-        # Step 7: Multifocal attention over routed windows
-        k_full_g1 = apply_data_dependent_rope(k_all_blend[..., :nph, :], params_g1['rope_freq'])
-        k_full_g2 = apply_data_dependent_rope(k_all_blend[..., nph:2*nph, :], params_g2['rope_freq'])
-        k_full_g3 = apply_data_dependent_rope(k_all_blend[..., 2*nph:3*nph, :], params_g3['rope_freq'])
-        k_full_g3 = apply_rope(k_full_g3, seq_len)
-        k_full_g4 = apply_rope(k_all_blend[..., 3*nph:, :], seq_len)
-
-        q_full = q_all
-        k_full = torch.cat([k_full_g1, k_full_g2, k_full_g3, k_full_g4], dim=-2)
-
-        q_full = q_full.transpose(1, 2)
-        k_full = k_full.transpose(1, 2)
-        v_full = v_all_blend.transpose(1, 2)
-
+        # Step 7: Multifocal attention over routed windows (disabled)
+        # Skip multifocal attention and return low-rank output
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
-
-        router_in = self.router_norm(attn_out)
-        router_scores = self.router(router_in).squeeze(-1)
-        router_scores_raw = router_scores
-        router_temp = F.softplus(self.router_temp) + 1e-4
-        router_scores = router_scores / router_temp
-        if self.router_smooth > 1:
-            kernel = self.router_smooth
-            if kernel % 2 == 0:
-                kernel += 1
-            router_scores = F.avg_pool1d(
-                router_scores.unsqueeze(1), kernel_size=kernel, stride=1, padding=kernel // 2
-            ).squeeze(1)
-        num_centers = max(1, int(round(seq_len ** (1.0 / 3.0))))
-        window = max(1, int(round(math.sqrt(seq_len))))
-        half = window // 2
-
-        topk = torch.topk(router_scores, k=num_centers, dim=1)
-        topk_idx = topk.indices
-        topk_w = torch.softmax(topk.values, dim=1)
-
-        offsets = torch.arange(-half, half + 1, device=attn_out.device)
-        idx = topk_idx.unsqueeze(-1) + offsets
-        idx = idx.clamp(0, seq_len - 1)
-
-        idx_flat = idx.reshape(batch, -1)
-        idx_exp = idx_flat[:, None, :, None].expand(
-            batch, config.nheads_total, idx_flat.shape[1], config.headdim
-        )
-
-        q_flat = torch.gather(q_full, dim=2, index=idx_exp)
-        k_flat = torch.gather(k_full, dim=2, index=idx_exp)
-        v_flat = torch.gather(v_full, dim=2, index=idx_exp)
-
-        q_win = q_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
-        k_win = k_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
-        v_win = v_flat.view(batch, config.nheads_total, num_centers, offsets.numel(), config.headdim)
-
-        q_win = q_win.permute(0, 2, 1, 3, 4).contiguous()
-        k_win = k_win.permute(0, 2, 1, 3, 4).contiguous()
-        v_win = v_win.permute(0, 2, 1, 3, 4).contiguous()
-
-        q_win = q_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
-        k_win = k_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
-        v_win = v_win.view(batch * num_centers * config.nheads_total, offsets.numel(), config.headdim)
-
-        win_out = F.scaled_dot_product_attention(
-            q_win, k_win, v_win,
-            attn_mask=None,
-            is_causal=False,
-        )
-
-        win_out = win_out.view(batch, num_centers, config.nheads_total, offsets.numel(), config.headdim)
-        win_out = win_out.permute(0, 1, 3, 2, 4).contiguous()
-        win_out = win_out.view(batch, num_centers * offsets.numel(), config.d_expanded)
-
-        local_sum = torch.zeros(batch, seq_len, config.d_expanded, device=attn_out.device, dtype=attn_out.dtype)
-        local_weight = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
-
-        idx_out = idx.reshape(batch, -1)
-        idx_out_exp = idx_out.unsqueeze(-1).expand(batch, idx_out.shape[1], config.d_expanded)
-        win_weight = topk_w.unsqueeze(-1).expand(batch, num_centers, offsets.numel()).reshape(batch, -1)
-        win_weight_exp = win_weight.unsqueeze(-1).expand(batch, win_weight.shape[1], config.d_expanded)
-
-        local_sum.scatter_add_(1, idx_out_exp, win_out * win_weight_exp)
-        local_weight.scatter_add_(1, idx_out, win_weight)
-
-        local_out = local_sum / local_weight.clamp_min(1e-6).unsqueeze(-1)
-
-        local_gate = torch.sigmoid(self.local_gate)
-        attn_out = attn_out + local_gate * local_out
-        # attn_out already (B, T, H*D)
 
         if do_debug:
             eps = 1e-6
@@ -615,40 +531,18 @@ class USBBlock(nn.Module):
                     'gate': _gate_stats(params['gate']),
                 }
 
-            topk_overlap = None
-            if self.router_prev_idx is not None and self.router_prev_idx.shape == topk_idx.shape:
-                inter = torch.isin(topk_idx, self.router_prev_idx).sum(dim=1).float()
-                union = 2 * topk_idx.shape[1] - inter
-                topk_overlap = (inter / union.clamp_min(1.0)).mean().item()
-            self.router_prev_idx = topk_idx.detach()
-
-            topk_entropy = 0.0
-            if topk_w.numel() > 0 and topk_w.shape[1] > 1:
-                topk_entropy = (
-                    -(topk_w * (topk_w + eps).log()).sum(dim=1)
-                    / math.log(topk_w.shape[1])
-                ).mean().item()
+            self.router_prev_idx = None
+            router_temp = F.softplus(self.router_temp) + 1e-4
+            local_gate = torch.sigmoid(self.local_gate)
 
             debug = {
                 'g1': _param_block(params_g1),
                 'g2': _param_block(params_g2),
                 'g3': _param_block(params_g3),
                 'router': {
+                    'enabled': False,
                     'temp': router_temp.item(),
                     'smooth': float(self.router_smooth),
-                    'centers': float(num_centers),
-                    'window': float(window),
-                    'topk_entropy': topk_entropy,
-                    'topk_overlap': topk_overlap,
-                    'topk_weight_mean': topk_w.mean().item(),
-                    'topk_weight_min': topk_w.min().item(),
-                    'topk_weight_max': topk_w.max().item(),
-                    'scores_mean': router_scores.mean().item(),
-                    'scores_min': router_scores.min().item(),
-                    'scores_max': router_scores.max().item(),
-                    'scores_raw_mean': router_scores_raw.mean().item(),
-                    'scores_raw_min': router_scores_raw.min().item(),
-                    'scores_raw_max': router_scores_raw.max().item(),
                     'local_gate': local_gate.item(),
                     'kv_blend': kv_blend.item(),
                 },
