@@ -216,6 +216,7 @@ class USBBlock(nn.Module):
         self.router_temp = nn.Parameter(torch.tensor(1.0))
         self.local_gate = nn.Parameter(torch.tensor(-2.0))
         self.kv_blend = nn.Parameter(torch.tensor(-2.0))
+        self.lowrank_gate = nn.Parameter(torch.tensor(-2.0))
         self.router_smooth = 5
         self.router_prev_idx = None
         nn.init.normal_(self.router.weight, std=1e-3)
@@ -468,6 +469,8 @@ class USBBlock(nn.Module):
             attn_mask=None,
             is_causal=False,
         )
+        lowrank_gate = torch.sigmoid(self.lowrank_gate)
+        attn_out = attn_out * lowrank_gate
 
         # Step 7: Multifocal attention over routed windows (disabled)
         # Skip multifocal attention and return low-rank output
@@ -534,6 +537,7 @@ class USBBlock(nn.Module):
             self.router_prev_idx = None
             router_temp = F.softplus(self.router_temp) + 1e-4
             local_gate = torch.sigmoid(self.local_gate)
+            lowrank_gate = torch.sigmoid(self.lowrank_gate)
 
             debug = {
                 'g1': _param_block(params_g1),
@@ -545,6 +549,7 @@ class USBBlock(nn.Module):
                     'smooth': float(self.router_smooth),
                     'local_gate': local_gate.item(),
                     'kv_blend': kv_blend.item(),
+                    'lowrank_gate': lowrank_gate.item(),
                 },
                 'rms': {
                     'k_g1': _rms(k_g1),

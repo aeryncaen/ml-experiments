@@ -527,7 +527,7 @@ def _format_usb_debug(step: int, layer_idx: int, dbg: dict) -> list[str]:
             lines.append(
                 f"[usb] step={step} layer={layer_idx} router "
                 f"enabled=0 temp={router['temp']:.2e} smooth={router['smooth']:.0f} "
-                f"lg={router['local_gate']:.2e} kvb={router['kv_blend']:.2e}"
+                f"lg={router['local_gate']:.2e} kvb={router['kv_blend']:.2e} lrg={router['lowrank_gate']:.2e}"
             )
     return lines
 def _grad_stats(named_params):
