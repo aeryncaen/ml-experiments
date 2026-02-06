@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import json
 import random
+import shlex
 import statistics
 import subprocess
 import sys
@@ -130,6 +131,35 @@ def stable_id(cfg: dict) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
 
+def run_with_heartbeat(
+    cmd: list[str],
+    stdout_log: Path,
+    stderr_log: Path,
+    heartbeat_sec: int,
+    stream_child: bool,
+) -> int:
+    if stream_child:
+        print("child:", shlex.join(cmd), flush=True)
+        return subprocess.run(cmd).returncode
+
+    with stdout_log.open("w", encoding="utf-8") as so, stderr_log.open("w", encoding="utf-8") as se:
+        proc = subprocess.Popen(cmd, stdout=so, stderr=se)
+        t0 = time.perf_counter()
+        last_hb = t0
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                return rc
+            now = time.perf_counter()
+            if heartbeat_sec > 0 and (now - last_hb) >= heartbeat_sec:
+                print(
+                    f"  still running... elapsed={now - t0:.1f}s (logs: {stdout_log.name}, {stderr_log.name})",
+                    flush=True,
+                )
+                last_hb = now
+            time.sleep(0.5)
+
+
 def load_ep1_metrics(result_json: Path) -> dict:
     data = json.loads(result_json.read_text(encoding="utf-8"))
     runs = [r for r in data.get("runs", []) if r.get("mode") == "geo_system"]
@@ -167,6 +197,9 @@ def main() -> None:
     p.add_argument("--out-dir", type=str, default="experiments/tier4/hparam_search_ep1")
     p.add_argument("--resume", action="store_true", default=False)
     p.add_argument("--dry-run", action="store_true", default=False)
+    p.add_argument("--heartbeat-sec", type=int, default=10)
+    p.add_argument("--stream-child", action="store_true", default=False)
+    p.add_argument("--quick", action="store_true", default=False)
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -192,13 +225,19 @@ def main() -> None:
         "eta_min_resid_weight": 0.05,
         "geo_only": True,
     }
+    if args.quick:
+        common["steps_per_epoch"] = 120
+        common["eval_iters"] = 20
+        common["seeds"] = 1
 
     space = candidate_space()
     rng = random.Random(args.seed)
+    print("Generating candidate configs...", flush=True)
     if args.strategy == "grid":
         candidates = list(itertools.islice(iter_grid(space), args.max_runs))
     else:
         candidates = sample_random(space, args.max_runs, rng)
+    print(f"Generated candidates: {len(candidates)}", flush=True)
 
     done_ids = set()
     trials = []
@@ -251,8 +290,13 @@ def main() -> None:
         if args.dry_run:
             rec["status"] = "dry_run"
         else:
-            with stdout_log.open("w", encoding="utf-8") as so, stderr_log.open("w", encoding="utf-8") as se:
-                rc = subprocess.run(cmd, stdout=so, stderr=se).returncode
+            rc = run_with_heartbeat(
+                cmd,
+                stdout_log=stdout_log,
+                stderr_log=stderr_log,
+                heartbeat_sec=max(0, args.heartbeat_sec),
+                stream_child=args.stream_child,
+            )
             if rc != 0:
                 rec["status"] = "failed"
                 rec["returncode"] = rc
