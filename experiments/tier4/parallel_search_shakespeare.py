@@ -799,10 +799,7 @@ def _fmt_val(v, as_int: bool):
 # Numeric axes: (lo, hi, is_int)
 def make_search_axes(n_layer: int) -> dict[str, tuple[float, float, bool]]:
     return {
-        "geo_attn_bias_blend":  (0.0, 1.0, False),
-        "geo_attn_corr_blend":  (0.0, 1.0, False),
         "geo_attn_corr_rank":   (1, 64, True),
-        "geo_attn_corr_layers": (1, n_layer, True),
     }
 
 # Default; overwritten in main() after args are parsed
@@ -816,7 +813,10 @@ BINARY_SEARCH_FIXED: dict[str, object] = {
     "geo_init_ridge": 1e-3,
     "geo_init_match_row_norm": True,
     "geo_attn_bias": True,
+    "geo_attn_bias_blend": 0.3125,
     "geo_attn_corr_bias": True,
+    "geo_attn_corr_blend": 1.0,
+    "geo_attn_corr_layers": 1,
     "geo_attn_corr_horizons": "1,2,3",
     "geo_attn_corr_horizon_weights": "1.0,0.5,0.25",
     "geo_embed_grad_shape": True,
@@ -968,6 +968,7 @@ def main():
 
     global BINARY_SEARCH_AXES
     BINARY_SEARCH_AXES = make_search_axes(args.n_layer)
+    BINARY_SEARCH_FIXED["geo_attn_corr_layers"] = max(1, int(round(0.75 * args.n_layer)))
 
     device = torch.device("cuda") if torch.cuda.is_available() else (
         torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")

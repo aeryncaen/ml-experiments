@@ -717,11 +717,11 @@ def main() -> None:
     p.add_argument("--geo-init-no-center", action="store_false", dest="geo_init_center")
     p.add_argument("--geo-init-no-row-norm-match", action="store_false", dest="geo_init_match_row_norm")
     p.add_argument("--geo-attn-bias", action="store_true", default=False)
-    p.add_argument("--geo-attn-bias-blend", type=float, default=1.0)
+    p.add_argument("--geo-attn-bias-blend", type=float, default=0.3125)
     p.add_argument("--geo-attn-corr-bias", action="store_true", default=False)
-    p.add_argument("--geo-attn-corr-blend", type=float, default=0.5)
+    p.add_argument("--geo-attn-corr-blend", type=float, default=1.0)
     p.add_argument("--geo-attn-corr-rank", type=int, default=1)
-    p.add_argument("--geo-attn-corr-layers", type=int, default=2)
+    p.add_argument("--geo-attn-corr-layers", type=int, default=None)
     p.add_argument("--geo-attn-corr-horizons", type=str, default="1,2,3")
     p.add_argument("--geo-attn-corr-horizon-weights", type=str, default="1.0,0.5,0.25")
     p.add_argument("--geo-only", action="store_true", default=False)
@@ -736,6 +736,9 @@ def main() -> None:
     p.add_argument("--torch-compile", action="store_true", default=False)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
+
+    if args.geo_attn_corr_layers is None:
+        args.geo_attn_corr_layers = max(1, int(round(0.75 * args.n_layer)))
 
     corr_horizons = parse_int_list_csv(args.geo_attn_corr_horizons)
     corr_h_weights = parse_float_list_csv(args.geo_attn_corr_horizon_weights)
