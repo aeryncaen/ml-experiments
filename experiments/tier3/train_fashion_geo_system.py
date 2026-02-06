@@ -158,6 +158,7 @@ class RunConfig:
     chi2_forget_tol: float = 0.01
     chi2_forget_shrink: float = 0.7
     eval_best_val: bool = True
+    hybrid_chi2_scale: float = 0.3
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -202,9 +203,14 @@ def train_one(
     if mode == "geo_system":
         geometry_init_first_layer(model.fc1, eigvecs, eigvals)
 
+    is_hybrid = cfg.optimizer == "adam_chi2_hybrid"
+    is_chi2_family = cfg.optimizer in ("chi2", "adam_chi2_hybrid")
+    adam_opt = None
+    chi2_opt = None
+
     if cfg.optimizer == "adam":
         opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    elif cfg.optimizer == "chi2":
+    elif is_chi2_family:
         if cfg.chi2_per_layer:
             param_groups = [
                 {"params": list(model.fc1.parameters()), "trust_radius": cfg.trust_radius, "name": "fc1"},
@@ -213,12 +219,17 @@ def train_one(
             ]
         else:
             param_groups = model.parameters()
-        opt = Chi2TrustRegion(
+        chi2_opt = Chi2TrustRegion(
             param_groups,
             trust_radius=cfg.trust_radius,
             beta2=cfg.beta2,
-            lr_scale=cfg.lr_scale,
+            lr_scale=(cfg.lr_scale * cfg.hybrid_chi2_scale) if is_hybrid else cfg.lr_scale,
         )
+        if is_hybrid:
+            adam_opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+            opt = chi2_opt
+        else:
+            opt = chi2_opt
     else:
         raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
     train_loader = make_loader(X_train, y_train, cfg.batch_size, shuffle=True)
@@ -267,15 +278,21 @@ def train_one(
                 reg = torch.mean((W - W_proj) ** 2)
                 loss = loss + cfg.reg_lambda * reg
 
-            if cfg.optimizer == "chi2" and cfg.chi2_adaptive:
+            if is_chi2_family and cfg.chi2_adaptive:
                 # Trust-region acceptance test on the same batch.
                 old_loss_val = float(loss.detach().item())
-                backups = [p.data.clone() for p in params]
+                base_ref_loss = old_loss_val
 
-                opt.zero_grad()
+                if is_hybrid:
+                    if adam_opt is None or chi2_opt is None:
+                        raise RuntimeError("Hybrid optimizer state not initialized")
+                    adam_opt.zero_grad()
+                    chi2_opt.zero_grad()
+                else:
+                    opt.zero_grad()
                 loss.backward()
 
-                if cfg.optimizer == "chi2" and cfg.chi2_eta_shape and mode == "geo_system":
+                if is_chi2_family and cfg.chi2_eta_shape and mode == "geo_system":
                     g = model.fc1.weight.grad
                     if g is not None:
                         g_proj = g @ P_top_t
@@ -286,7 +303,24 @@ def train_one(
                         eta_grad_count += 1
                         g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
 
-                opt.step()
+                if is_hybrid:
+                    if adam_opt is None or chi2_opt is None:
+                        raise RuntimeError("Hybrid optimizer state not initialized")
+                    adam_opt.step()
+                    with torch.no_grad():
+                        logits_adam = model(xb)
+                        loss_adam = F.cross_entropy(logits_adam, yb)
+                        if mode == "geo_system" and epoch < cfg.reg_warmup_epochs and cfg.reg_lambda > 0:
+                            Wa = model.fc1.weight
+                            Wa_proj = Wa @ P_top_t
+                            reg_adam = torch.mean((Wa - Wa_proj) ** 2)
+                            loss_adam = loss_adam + cfg.reg_lambda * reg_adam
+                        base_ref_loss = float(loss_adam.item())
+                    backups = [p.data.clone() for p in params]
+                    chi2_opt.step()
+                else:
+                    backups = [p.data.clone() for p in params]
+                    opt.step()
 
                 with torch.no_grad():
                     logits_new = model(xb)
@@ -305,9 +339,9 @@ def train_one(
                     denom_sum += float(stats.get("denom_mean", 0.0))
                     scale_sum += float(stats.get("scale", 0.0))
                     diag_count += 1
-                delta_loss = new_loss_val - old_loss_val
+                delta_loss = new_loss_val - base_ref_loss
                 pred = float((stats or {}).get("pred_linear", 0.0))
-                q = (old_loss_val - new_loss_val) / max(pred, 1e-12)
+                q = (base_ref_loss - new_loss_val) / max(pred, 1e-12)
                 chi2_ctrl["q_ema"] = cfg.chi2_q_beta * chi2_ctrl["q_ema"] + (1.0 - cfg.chi2_q_beta) * q
 
                 # Stochastic deviation bound (online): mean + sigma*std + relative tolerance
@@ -317,10 +351,10 @@ def train_one(
                     std = float(np.sqrt(max(var, 1e-12)))
                 else:
                     std = float("inf")
-                noise_bound = chi2_ctrl["mean_delta"] + cfg.chi2_sigma * std + cfg.chi2_reject_tol * abs(old_loss_val)
+                noise_bound = chi2_ctrl["mean_delta"] + cfg.chi2_sigma * std + cfg.chi2_reject_tol * abs(base_ref_loss)
 
                 # Warmup robustness: avoid hard rejection too early unless clearly harmful
-                hard_bad = delta_loss > max(0.2 * abs(old_loss_val), 1e-3)
+                hard_bad = delta_loss > max(0.2 * abs(base_ref_loss), 1e-3)
                 soft_bad = (delta_loss > noise_bound) and (chi2_ctrl["q_ema"] < cfg.chi2_q_low)
 
                 reject = (c >= 20 and soft_bad) or hard_bad
@@ -366,7 +400,7 @@ def train_one(
 
                     group["trust_radius"] = tr
 
-                old_loss_sum += old_loss_val
+                old_loss_sum += base_ref_loss
                 new_loss_sum += new_loss_val
 
                 # Update online stats of delta after decision path
@@ -378,9 +412,15 @@ def train_one(
                 d2 = x - chi2_ctrl["mean_delta"]
                 chi2_ctrl["m2_delta"] += d * d2
             else:
-                opt.zero_grad()
+                if is_hybrid:
+                    if adam_opt is None or chi2_opt is None:
+                        raise RuntimeError("Hybrid optimizer state not initialized")
+                    adam_opt.zero_grad()
+                    chi2_opt.zero_grad()
+                else:
+                    opt.zero_grad()
                 loss.backward()
-                if cfg.optimizer == "chi2" and cfg.chi2_eta_shape and mode == "geo_system":
+                if is_chi2_family and cfg.chi2_eta_shape and mode == "geo_system":
                     g = model.fc1.weight.grad
                     if g is not None:
                         g_proj = g @ P_top_t
@@ -390,7 +430,13 @@ def train_one(
                         eta_grad_sum += proj / max(total, 1e-12)
                         eta_grad_count += 1
                         g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
-                opt.step()
+                if is_hybrid:
+                    if adam_opt is None or chi2_opt is None:
+                        raise RuntimeError("Hybrid optimizer state not initialized")
+                    adam_opt.step()
+                    chi2_opt.step()
+                else:
+                    opt.step()
 
             bs = xb.shape[0]
             total_loss += float(loss.item()) * bs
@@ -409,7 +455,7 @@ def train_one(
 
         guard_triggered = False
         if (
-            cfg.optimizer == "chi2"
+            is_chi2_family
             and cfg.chi2_forget_guard
             and (epoch + 1) >= 3
             and best_epoch > 0
@@ -419,7 +465,7 @@ def train_one(
                 tr = float(group.get("trust_radius", cfg.trust_radius))
                 group["trust_radius"] = max(cfg.chi2_min_radius, tr * cfg.chi2_forget_shrink)
             guard_triggered = True
-        if cfg.optimizer == "chi2":
+        if is_chi2_family:
             tr_end_by_group = {
                 str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
                 for i, g in enumerate(opt.param_groups)
@@ -445,6 +491,8 @@ def train_one(
                     "chi2_q_ema_by_group": {k: float(v["q_ema"]) for k, v in chi2_group_ctrl.items()},
                     "chi2_eta_grad_mean": float(eta_grad_sum / max(eta_grad_count, 1)),
                     "chi2_forget_guard_triggered": bool(guard_triggered),
+                    "chi2_hybrid": bool(is_hybrid),
+                    "chi2_hybrid_scale": float(cfg.hybrid_chi2_scale),
                 }
             )
         history.append(epoch_rec)
@@ -542,7 +590,7 @@ def main() -> None:
     parser.add_argument("--reg-lambda", type=float, default=1e-3)
     parser.add_argument("--reg-warmup-epochs", type=int, default=8)
     parser.add_argument("--max-train", type=int, default=60000)
-    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2"], default="adam")
+    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2", "adam_chi2_hybrid"], default="adam")
     parser.add_argument("--trust-radius", type=float, default=0.05)
     parser.add_argument("--beta2", type=float, default=0.99)
     parser.add_argument("--lr-scale", type=float, default=1.0)
@@ -569,6 +617,7 @@ def main() -> None:
     parser.add_argument("--chi2-forget-shrink", type=float, default=0.7)
     parser.add_argument("--eval-best-val", action="store_true", default=True)
     parser.add_argument("--eval-last", action="store_false", dest="eval_best_val")
+    parser.add_argument("--hybrid-chi2-scale", type=float, default=0.3)
     parser.add_argument("--out", type=str, default="tier3_fashion_results.json")
     args = parser.parse_args()
 
@@ -602,6 +651,7 @@ def main() -> None:
         chi2_forget_tol=args.chi2_forget_tol,
         chi2_forget_shrink=args.chi2_forget_shrink,
         eval_best_val=args.eval_best_val,
+        hybrid_chi2_scale=args.hybrid_chi2_scale,
     )
 
     device = get_device()
