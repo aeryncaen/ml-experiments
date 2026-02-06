@@ -482,11 +482,17 @@ def _format_usb_debug(step: int, layer_idx: int, dbg: dict) -> list[str]:
     lines = []
     for g in ['g1', 'g2', 'g3']:
         pg = dbg[g]
-        lines.append(
-            f"[usb] step={step} layer={layer_idx} {g} "
-            f"alpha={fmt_stats(pg['alpha'])} beta={fmt_stats(pg['beta'])} gamma={fmt_stats(pg['gamma'])} "
-            f"delta={fmt_stats(pg['delta'])} lambda={fmt_stats(pg['lambda'])} gate={fmt_gate(pg['gate'])}"
-        )
+        if 'gamma' in pg:
+            lines.append(
+                f"[usb] step={step} layer={layer_idx} {g} "
+                f"alpha={fmt_stats(pg['alpha'])} beta={fmt_stats(pg['beta'])} gamma={fmt_stats(pg['gamma'])} "
+                f"delta={fmt_stats(pg['delta'])} lambda={fmt_stats(pg['lambda'])} gate={fmt_gate(pg['gate'])}"
+            )
+        else:
+            lines.append(
+                f"[usb] step={step} layer={layer_idx} {g} "
+                f"alpha={fmt_stats(pg['alpha'])} beta={fmt_stats(pg['beta'])} gate={fmt_gate(pg['gate'])}"
+            )
 
     rms = dbg['rms']
     lines.append(

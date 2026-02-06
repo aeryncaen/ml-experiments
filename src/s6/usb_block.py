@@ -1,7 +1,7 @@
 """
 Unified Sequence Block (USB) Implementation
 
-Fuses SSM-style scans, attention, and MLP into a single expand-process-contract block.
+    Fuses SSM-style scans and conv into a single expand-process-contract block.
 """
 
 from dataclasses import dataclass
@@ -73,7 +73,7 @@ class PerHeadProjections(nn.Module):
     """
     Fused projections for per-head content-dependent parameters.
     
-    Each scan head needs: α, β, γ (trapezoidal coeffs), gate, rope_freq
+    Each scan head needs: α, β (Mamba-style coeffs), gate, rope_freq
     We fuse these into a single projection per group for efficiency.
     """
     
@@ -84,11 +84,10 @@ class PerHeadProjections(nn.Module):
         
         # Fused projection for all per-head parameters:
         # - alpha: 1 scalar per head (decay)
-        # - delta: 1 scalar per head (step size)
-        # - lambda: 1 scalar per head (trapezoidal mixing)
+        # - beta: 1 scalar per head (input scale)
         # - gate: headdim values per head (per-dimension gating)
         # - rope_freq: headdim // 2 values per head (rotation frequencies for pairs)
-        self.n_scalar_params = 3  # alpha, delta, lambda
+        self.n_scalar_params = 2  # alpha, beta
         self.n_gate_params = headdim
         self.n_rope_params = headdim // 2
         
@@ -107,7 +106,7 @@ class PerHeadProjections(nn.Module):
         Returns:
             dict with:
                 alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-                beta, gamma: (batch, seq_len, nheads) - trapezoidal coefficients
+                beta: (batch, seq_len, nheads) - input coefficients
                 gate: (batch, seq_len, nheads, headdim) - per-dim injection gates in (0, 1)
                 rope_freq: (batch, seq_len, nheads, headdim // 2) - rotation frequencies
         """
@@ -120,12 +119,10 @@ class PerHeadProjections(nn.Module):
         # Split into components
         idx = 0
         
-        # Scalars: alpha, delta, lambda
+        # Scalars: alpha, beta
         alpha_raw = out[..., idx]
         idx += 1
-        delta_raw = out[..., idx]
-        idx += 1
-        lambda_raw = out[..., idx]
+        beta_raw = out[..., idx]
         idx += 1
         
         # Gate: per-dimension
@@ -137,16 +134,12 @@ class PerHeadProjections(nn.Module):
         
         # Apply activation functions
         alpha = torch.exp(-F.softplus(alpha_raw))  # (0, 1)
-        delta = F.softplus(delta_raw)
-        lam = torch.sigmoid(lambda_raw)
-        beta = (1.0 - lam) * delta * alpha
-        gamma = lam * delta
+        beta = F.softplus(beta_raw)
         gate = torch.sigmoid(gate_raw)  # (0, 1) per dimension
         
         return {
             'alpha': alpha,
             'beta': beta,
-            'gamma': gamma,
             'gate': gate,
             'rope_freq': rope_freq,
         }
@@ -320,7 +313,6 @@ class USBBlock(nn.Module):
             kv=kv_g1,
             alpha=params_g1['alpha'],
             beta=params_g1['beta'],
-            gamma=params_g1['gamma'],
             init_state=init_g1,
         )
         
@@ -329,7 +321,6 @@ class USBBlock(nn.Module):
             kv=kv_g2,
             alpha=params_g2['alpha'],
             beta=params_g2['beta'],
-            gamma=params_g2['gamma'],
             init_state=init_g2,
         )
         
@@ -367,7 +358,7 @@ class USBBlock(nn.Module):
         conv_g3_out = conv_g3(v_g3)
         out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
-        # Step 5: Passthrough for G4 (standard RoPE only)
+        # Step 5: Passthrough for G4
         out_g4 = v_g4  # No scan, just passthrough
 
         # Step 6: No attention - concatenate scan outputs
@@ -419,15 +410,9 @@ class USBBlock(nn.Module):
             def _param_block(params: dict) -> dict:
                 alpha = params['alpha']
                 beta = params['beta']
-                gamma = params['gamma']
-                delta = gamma + beta / (alpha + eps)
-                lam = gamma / (delta + eps)
                 return {
                     'alpha': _stats(alpha),
                     'beta': _stats(beta),
-                    'gamma': _stats(gamma),
-                    'delta': _stats(delta),
-                    'lambda': _stats(lam),
                     'gate': _gate_stats(params['gate']),
                 }
 
