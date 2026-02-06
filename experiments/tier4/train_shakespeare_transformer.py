@@ -68,6 +68,28 @@ def compute_token_operator(tokens: np.ndarray, vocab_size: int) -> np.ndarray:
     return sym
 
 
+def compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int) -> np.ndarray:
+    # Build width token-distribution vectors from deterministic context buckets.
+    # Output basis shape: [vocab_size, width].
+    # Bucket identity is derived from short context (prev2, prev1), then mapped to width.
+    if len(tokens) < 2:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+    basis = np.zeros((vocab_size, width), dtype=np.float64)
+    cur = tokens[2:]
+    prev1 = tokens[1:-1]
+    prev2 = tokens[:-2]
+    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
+    buckets = context_id % width
+    np.add.at(basis, (cur, buckets), 1.0)
+
+    col_sum = basis.sum(axis=0, keepdims=True)
+    basis = basis / np.maximum(col_sum, 1.0)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
@@ -132,6 +154,8 @@ class RunConfig:
     eta_dist_tau: float = 2.0
     eta_min_resid_weight: float = 0.05
     eta_topk: int = 16
+    geo_init_method: str = "bucket"
+    geo_init_blend: float = 0.7
 
 
 def get_batch(data: np.ndarray, batch_size: int, block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,16 +228,23 @@ def eval_stats(
     return out
 
 
-def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, op_top: np.ndarray, mode: str, cfg: RunConfig, seed: int, device: torch.device) -> dict:
+def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, geo_basis: np.ndarray, mode: str, cfg: RunConfig, seed: int, device: torch.device) -> dict:
     set_seed(seed)
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_head, cfg.n_layer, cfg.block_size, cfg.dropout).to(device)
     if mode == "geo_system":
         with torch.no_grad():
-            k = min(cfg.eta_topk, cfg.d_model, op_top.shape[1])
-            model.token_emb.weight[:, :k] = torch.from_numpy(op_top[:, -k:].astype(np.float32)).to(device)
+            E = model.token_emb.weight
+            k = min(E.shape[1], geo_basis.shape[1])
+            B = torch.from_numpy(geo_basis[:, :k]).to(device=device, dtype=E.dtype)
+            E[:, :k] = (1.0 - cfg.geo_init_blend) * E[:, :k] + cfg.geo_init_blend * B
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
-    P_top_t = torch.from_numpy(op_top.astype(np.float32)).to(device)
+    if geo_basis.shape[1] >= cfg.d_model:
+        P_top_t = torch.from_numpy(geo_basis[:, : cfg.d_model].astype(np.float32)).to(device)
+    else:
+        pad = np.zeros((vocab_size, cfg.d_model), dtype=np.float32)
+        pad[:, : geo_basis.shape[1]] = geo_basis
+        P_top_t = torch.from_numpy(pad).to(device)
     history = []
     best_val = float("inf")
     best_epoch = 0
@@ -369,6 +400,8 @@ def main() -> None:
     p.add_argument("--eta-dist-tau", type=float, default=2.0)
     p.add_argument("--eta-min-resid-weight", type=float, default=0.05)
     p.add_argument("--eta-topk", type=int, default=16)
+    p.add_argument("--geo-init-method", type=str, choices=["bucket", "eig"], default="bucket")
+    p.add_argument("--geo-init-blend", type=float, default=0.3)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
 
@@ -392,6 +425,8 @@ def main() -> None:
         eta_dist_tau=args.eta_dist_tau,
         eta_min_resid_weight=args.eta_min_resid_weight,
         eta_topk=args.eta_topk,
+        geo_init_method=args.geo_init_method,
+        geo_init_blend=args.geo_init_blend,
     )
 
     device = get_device()
@@ -409,13 +444,17 @@ def main() -> None:
     print(f"Chars={n} vocab={vocab_size} train={len(train_ids)} val={len(val_ids)}")
 
     op = compute_token_operator(train_ids, vocab_size)
-    _, eigvecs = np.linalg.eigh(op)
+    if cfg.geo_init_method == "eig":
+        _, eigvecs = np.linalg.eigh(op)
+        geo_basis = eigvecs[:, -cfg.d_model :].astype(np.float32)
+    else:
+        geo_basis = compute_bucket_basis(train_ids, vocab_size, cfg.d_model)
 
     runs = []
     for seed in range(cfg.seeds):
         for mode in ["baseline", "geo_system"]:
             print(f"Running mode={mode}, seed={seed}")
-            res = train_one(train_ids, val_ids, vocab_size, eigvecs, mode, cfg, seed, device)
+            res = train_one(train_ids, val_ids, vocab_size, geo_basis, mode, cfg, seed, device)
             runs.append(res)
 
     base = summarize(runs, "baseline")
