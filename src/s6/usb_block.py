@@ -252,10 +252,10 @@ class USBBlock(nn.Module):
         k = self.k_proj(x_exp)
         v = self.v_proj(x_exp)
         
-        # Apply SiLU + RMSNorm
-        q = self.q_norm(F.silu(q))
-        k = self.k_norm(F.silu(k))
-        v = self.v_norm(F.silu(v))
+        # Apply RMSNorm (no activation on Q/K/V)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
         
         # Reshape to heads
         q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
