@@ -127,6 +127,7 @@ class S5Wrapper(nn.Module):
         super().__init__()
         if not HAS_S5:
             raise ImportError("S5 not available. Install s5-pytorch.")
+        assert S5Module is not None
         self.s5 = S5Module(width=width, state_width=state_width)
 
     def forward(self, x):
@@ -150,6 +151,7 @@ class MambaWrapper(nn.Module):
         super().__init__()
         if not HAS_MAMBA:
             raise ImportError("Mamba not available. Install mamba_ssm.")
+        assert Mamba is not None
         self.mamba = Mamba(d_model=d_model, use_fast_path=True, **kwargs)
 
     def forward(self, x):
@@ -440,17 +442,70 @@ def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, devi
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+def _grad_stats(named_params):
+    total_sq = 0.0
+    total_abs = 0.0
+    total_elems = 0
+    max_abs = 0.0
+    max_name = None
+    has_nan = False
+    has_inf = False
+
+    for name, param in named_params:
+        grad = param.grad
+        if grad is None:
+            continue
+        if grad.is_sparse:
+            grad = grad.coalesce().values()
+        if grad.numel() == 0:
+            continue
+        grad = grad.detach()
+
+        has_nan = has_nan or torch.isnan(grad).any().item()
+        has_inf = has_inf or torch.isinf(grad).any().item()
+
+        abs_grad = grad.abs()
+        max_val = abs_grad.max().item()
+        if max_val > max_abs:
+            max_abs = max_val
+            max_name = name
+
+        total_sq += grad.float().pow(2).sum().item()
+        total_abs += abs_grad.float().sum().item()
+        total_elems += grad.numel()
+
+    global_norm = math.sqrt(total_sq)
+    mean_abs = total_abs / total_elems if total_elems else 0.0
+    return {
+        'global_norm': global_norm,
+        'mean_abs': mean_abs,
+        'max_abs': max_abs,
+        'max_name': max_name,
+        'has_nan': has_nan,
+        'has_inf': has_inf,
+    }
+
+
 def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, device='cpu',
-               preloaded_data=None, early_stop_acc=0.99):
+               preloaded_data=None, early_stop_acc=0.99, grad_log_every=50,
+               grad_explode=1e3, grad_vanish=1e-6):
     """Train with epochs and early stopping when val accuracy exceeds threshold."""
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
+
+    tracked_named_params = list(model.named_parameters())
+    embed = None
+    marker_embed = None
+    head = None
+    vocab_size = None
 
     if task_name == 'delay':
         vocab_size = 32
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
     elif task_name == 'selective_copy':
         vocab_size = 32
         embed = nn.Embedding(vocab_size, dim).to(device)
@@ -458,21 +513,30 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters())
                          + list(marker_embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"marker_embed.{n}", p) for n, p in marker_embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
     elif task_name == 'parity':
         vocab_size = 2
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
     elif task_name == 'mod_arith':
         vocab_size = 5
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
     elif task_name == 'induction':
         vocab_size = 32
         embed = nn.Embedding(vocab_size, dim).to(device)
         head = nn.Linear(dim, vocab_size).to(device)
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
 
     assert preloaded_data is not None, "preloaded_data required — use pregen_task_data()"
     train_data = preloaded_data['train']
@@ -480,6 +544,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
 
     def _forward(batch):
         if task_name == 'delay':
+            assert embed is not None and head is not None
+            assert vocab_size is not None
             inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
@@ -487,6 +553,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'selective_copy':
+            assert embed is not None and marker_embed is not None and head is not None
+            assert vocab_size is not None
             tokens, markers, tgt = batch
             x = embed(tokens) + marker_embed(markers)
             y = head(model(x))
@@ -497,6 +565,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
                 acc = (y_last.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'parity':
+            assert embed is not None and head is not None
+            assert vocab_size is not None
             inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
@@ -504,6 +574,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         elif task_name == 'mod_arith':
+            assert embed is not None and head is not None
+            assert vocab_size is not None
             inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
@@ -511,6 +583,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
         else:  # induction
+            assert embed is not None and head is not None
+            assert vocab_size is not None
             inp, tgt = batch
             y = head(model(embed(inp)))
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
@@ -541,6 +615,13 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     n_train = len(train_data)
     total_steps = 0
     initial_loss = None
+
+    grad_min_norm = float('inf')
+    grad_max_norm = 0.0
+    grad_explode_steps = 0
+    grad_vanish_steps = 0
+    grad_nan_steps = 0
+    grad_inf_steps = 0
     
     # Track best result
     best_epoch = 0
@@ -564,6 +645,29 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
             
             opt.zero_grad(set_to_none=True)
             loss.backward()
+
+            if grad_log_every and (total_steps % grad_log_every == 0):
+                stats = _grad_stats(tracked_named_params)
+                grad_min_norm = min(grad_min_norm, stats['global_norm'])
+                grad_max_norm = max(grad_max_norm, stats['global_norm'])
+
+                if stats['has_nan']:
+                    grad_nan_steps += 1
+                if stats['has_inf']:
+                    grad_inf_steps += 1
+                if stats['global_norm'] > grad_explode:
+                    grad_explode_steps += 1
+                if stats['global_norm'] < grad_vanish:
+                    grad_vanish_steps += 1
+
+                if (stats['has_nan'] or stats['has_inf'] or
+                        stats['global_norm'] > grad_explode or stats['global_norm'] < grad_vanish):
+                    max_name = stats['max_name'] if stats['max_name'] else "n/a"
+                    tqdm.write(
+                        f"[grad] step={total_steps} norm={stats['global_norm']:.3e} "
+                        f"mean_abs={stats['mean_abs']:.3e} max_abs={stats['max_abs']:.3e} "
+                        f"max_param={max_name} nan={stats['has_nan']} inf={stats['has_inf']}"
+                    )
             opt.step()
             
             epoch_losses.append(loss.item())
@@ -608,6 +712,15 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     peak_mem = 0
     if device == 'cuda':
         peak_mem = (torch.cuda.max_memory_allocated() - mem_baseline) / 1024 / 1024  # MB
+
+    if grad_log_every:
+        if grad_min_norm == float('inf'):
+            grad_min_norm = 0.0
+        tqdm.write(
+            f"[grad] summary min_norm={grad_min_norm:.3e} max_norm={grad_max_norm:.3e} "
+            f"explode={grad_explode_steps} vanish={grad_vanish_steps} "
+            f"nan={grad_nan_steps} inf={grad_inf_steps}"
+        )
 
     return {
         'initial': initial_loss if initial_loss else 0.0,
@@ -713,6 +826,12 @@ if __name__ == '__main__':
     parser.add_argument('--early-stop-acc', type=float, default=0.99, help='Early stop when val acc exceeds this')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--seq-len', type=int, default=32, help='Sequence length')
+    parser.add_argument('--grad-log-every', type=int, default=50,
+                        help='Log gradient stats every N steps (0 to disable)')
+    parser.add_argument('--grad-explode', type=float, default=1e3,
+                        help='Gradient norm threshold for explosion warning')
+    parser.add_argument('--grad-vanish', type=float, default=1e-6,
+                        help='Gradient norm threshold for vanishing warning')
     parser.add_argument('--models', type=str, nargs='+', default=None,
                         help='Specific models to test (default: all)')
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
@@ -787,7 +906,10 @@ if __name__ == '__main__':
                 model = torch.compile(model, mode=args.compile_mode)
             
             r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-3, B=B, L=L, device=DEVICE,
-                           preloaded_data=task_data, early_stop_acc=args.early_stop_acc)
+                           preloaded_data=task_data, early_stop_acc=args.early_stop_acc,
+                           grad_log_every=args.grad_log_every,
+                           grad_explode=args.grad_explode,
+                           grad_vanish=args.grad_vanish)
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['best_epoch']:>6} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['stop_reason']:>10}")
             
             # Store result
