@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .scan import forward_scan, backward_scan
+from .scan import forward_scan
 from .rope import apply_data_dependent_rope
 
 
@@ -280,7 +280,7 @@ class USBBlock(nn.Module):
         k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
         v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
         
-        # Step 4: Directional scans for G1, G2; G3 uses a 3-wide conv
+        # Step 4: Scan G1+G2 together; G3 uses a 3-wide conv
         
         # Get per-head parameters for each scan group
         params_g1 = self.scan_proj_g1(x_exp)
@@ -288,11 +288,6 @@ class USBBlock(nn.Module):
         params_g3 = self.scan_proj_g3(x_exp)
         
         # Apply data-dependent RoPE to K before scanning
-        k_g1_attn = k_g1
-        k_g2_attn = k_g2
-        k_g3_attn = k_g3
-        k_g4_attn = k_g4
-
         k_g1 = apply_data_dependent_rope(k_g1, params_g1['rope_freq'])
         k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
         k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
@@ -311,13 +306,26 @@ class USBBlock(nn.Module):
             kv_g1 = k_g1 * v_g1
             init_g1 = repeat(self.init_state_g1, 'h d -> b h d', b=batch)
         
-        # G2: backward scan
-        if modes[1] == 'outer':
-            kv_g2 = k_g2.unsqueeze(-1) * v_g2.unsqueeze(-2)
-            init_g2 = repeat(self.init_state_g2, 'h d1 d2 -> b h d1 d2', b=batch)
+        # Combine G1+G2 for a single scan
+        k_g12 = torch.cat([k_g1, k_g2], dim=-2)
+        v_g12 = torch.cat([v_g1, v_g2], dim=-2)
+        gate_g12 = torch.cat([params_g1['gate'], params_g2['gate']], dim=-2)
+
+        params_g12 = {
+            'alpha': torch.cat([params_g1['alpha'], params_g2['alpha']], dim=-1),
+            'delta': torch.cat([params_g1['delta'], params_g2['delta']], dim=-1),
+            'epsilon': torch.cat([params_g1['epsilon'], params_g2['epsilon']], dim=-1),
+            'zeta': torch.cat([params_g1['zeta'], params_g2['zeta']], dim=-1),
+        }
+
+        if modes[0] == 'outer':
+            kv_g12 = k_g12.unsqueeze(-1) * v_g12.unsqueeze(-2)
+            init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
+            init_g12 = repeat(init_g12, 'h d1 d2 -> b h d1 d2', b=batch)
         else:
-            kv_g2 = k_g2 * v_g2
-            init_g2 = repeat(self.init_state_g2, 'h d -> b h d', b=batch)
+            kv_g12 = k_g12 * v_g12
+            init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
+            init_g12 = repeat(init_g12, 'h d -> b h d', b=batch)
         
         
         # Run scans
@@ -331,14 +339,14 @@ class USBBlock(nn.Module):
             init_state=init_g1,
         )
         
-        # Backward scan (G2): starts at t=-1, moves backward
-        state_g2 = backward_scan(
-            kv=kv_g2,
-            alpha=params_g2['alpha'],
-            delta=params_g2['delta'],
-            epsilon=params_g2['epsilon'],
-            zeta=params_g2['zeta'],
-            init_state=init_g2,
+        # Forward scan (G1+G2): starts at t=0, moves forward
+        state_g12 = forward_scan(
+            kv=kv_g12,
+            alpha=params_g12['alpha'],
+            delta=params_g12['delta'],
+            epsilon=params_g12['epsilon'],
+            zeta=params_g12['zeta'],
+            init_state=init_g12,
         )
         
         
@@ -351,19 +359,24 @@ class USBBlock(nn.Module):
         state_g1_read = None
         state_g2_read = None
         
-        # G1 readout
+        # G1+G2 readout
         if modes[0] == 'outer':
-            state_g1_read = torch.einsum('bthjk,bthj->bthk', state_g1, k_g1) * scale
-            out_g1 = v_g1 + params_g1['gate'] * state_g1_read
+            state_g12_read = torch.einsum('bthjk,bthj->bthk', state_g12, k_g12) * scale
+            out_g12 = v_g12 + gate_g12 * state_g12_read
         else:
-            out_g1 = v_g1 + params_g1['gate'] * state_g1
-        
-        # G2 readout
-        if modes[1] == 'outer':
-            state_g2_read = torch.einsum('bthjk,bthj->bthk', state_g2, k_g2) * scale
-            out_g2 = v_g2 + params_g2['gate'] * state_g2_read
+            state_g12_read = None
+            out_g12 = v_g12 + gate_g12 * state_g12
+
+        out_g1, out_g2 = out_g12[..., :nph, :], out_g12[..., nph:, :]
+        state_g1, state_g2 = state_g12[..., :nph, ...], state_g12[..., nph:, ...]
+        if state_g12_read is not None:
+            state_g1_read, state_g2_read = (
+                state_g12_read[..., :nph, :],
+                state_g12_read[..., nph:, :],
+            )
         else:
-            out_g2 = v_g2 + params_g2['gate'] * state_g2
+            state_g1_read = None
+            state_g2_read = None
         
         # G3 readout: depthwise conv over sequence (causal)
         def conv_g3(x_heads: torch.Tensor) -> torch.Tensor:
