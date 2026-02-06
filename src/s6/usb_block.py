@@ -391,7 +391,7 @@ class USBBlock(nn.Module):
         # Step 6: Low-rank attention (full Q against downsampled KV)
         v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
 
-        target_len = max(1, int(math.sqrt(seq_len)))
+        target_len = max(1, int(math.sqrt(seq_len * 1.5)))
 
         k_flat = rearrange(torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2), 'b t h d -> b t (h d)')
         v_flat = rearrange(v_all, 'b t h d -> b t (h d)')
