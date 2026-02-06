@@ -73,7 +73,7 @@ class PerHeadProjections(nn.Module):
     """
     Fused projections for per-head content-dependent parameters.
     
-    Each scan head needs: α[t], c0[t], c1[t], c2[t], gate[t], rope_freq[t]
+    Each scan head needs: α, β, γ (trapezoidal coeffs), gate, rope_freq
     We fuse these into a single projection per group for efficiency.
     """
     
@@ -83,11 +83,12 @@ class PerHeadProjections(nn.Module):
         self.headdim = headdim
         
         # Fused projection for all per-head parameters:
-        # - α: 1 scalar per head
-        # - c0, c1, c2: 3 scalars per head  
+        # - alpha: 1 scalar per head (decay)
+        # - delta: 1 scalar per head (step size)
+        # - lambda: 1 scalar per head (trapezoidal mixing)
         # - gate: headdim values per head (per-dimension gating)
         # - rope_freq: headdim // 2 values per head (rotation frequencies for pairs)
-        self.n_scalar_params = 4  # α, c0, c1, c2
+        self.n_scalar_params = 3  # alpha, delta, lambda
         self.n_gate_params = headdim
         self.n_rope_params = headdim // 2
         
@@ -106,7 +107,7 @@ class PerHeadProjections(nn.Module):
         Returns:
             dict with:
                 alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-                c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+                beta, gamma: (batch, seq_len, nheads) - trapezoidal coefficients
                 gate: (batch, seq_len, nheads, headdim) - per-dim injection gates in (0, 1)
                 rope_freq: (batch, seq_len, nheads, headdim // 2) - rotation frequencies
         """
@@ -119,14 +120,12 @@ class PerHeadProjections(nn.Module):
         # Split into components
         idx = 0
         
-        # Scalars: α, c0, c1, c2
+        # Scalars: alpha, delta, lambda
         alpha_raw = out[..., idx]
         idx += 1
-        c0 = out[..., idx]
+        delta_raw = out[..., idx]
         idx += 1
-        c1 = out[..., idx]
-        idx += 1
-        c2 = out[..., idx]
+        lambda_raw = out[..., idx]
         idx += 1
         
         # Gate: per-dimension
@@ -138,13 +137,16 @@ class PerHeadProjections(nn.Module):
         
         # Apply activation functions
         alpha = torch.exp(-F.softplus(alpha_raw))  # (0, 1)
+        delta = F.softplus(delta_raw)
+        lam = torch.sigmoid(lambda_raw)
+        beta = (1.0 - lam) * delta * alpha
+        gamma = lam * delta
         gate = torch.sigmoid(gate_raw)  # (0, 1) per dimension
         
         return {
             'alpha': alpha,
-            'c0': c0,
-            'c1': c1,
-            'c2': c2,
+            'beta': beta,
+            'gamma': gamma,
             'gate': gate,
             'rope_freq': rope_freq,
         }
@@ -311,9 +313,8 @@ class USBBlock(nn.Module):
         state_g1 = forward_scan(
             kv=kv_g1,
             alpha=params_g1['alpha'],
-            c0=params_g1['c0'],
-            c1=params_g1['c1'],
-            c2=params_g1['c2'],
+            beta=params_g1['beta'],
+            gamma=params_g1['gamma'],
             init_state=init_g1,
         )
         
@@ -321,9 +322,8 @@ class USBBlock(nn.Module):
         state_g2 = backward_scan(
             kv=kv_g2,
             alpha=params_g2['alpha'],
-            c0=params_g2['c0'],
-            c1=params_g2['c1'],
-            c2=params_g2['c2'],
+            beta=params_g2['beta'],
+            gamma=params_g2['gamma'],
             init_state=init_g2,
         )
         

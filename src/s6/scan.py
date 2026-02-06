@@ -10,31 +10,30 @@ Supports two modes:
 """
 
 import torch
-from typing import Optional, List
+from typing import List
 
 
 def forward_scan(
     kv: torch.Tensor,
     alpha: torch.Tensor,
-    c0: torch.Tensor,
-    c1: torch.Tensor,
-    c2: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
     init_state: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Forward causal scan with AB-2 integration.
+    Forward causal scan with trapezoidal discretization.
     
-    Starts at t=0, moves forward. Integrates current position and two steps back.
+    Starts at t=0, moves forward. Integrates current and previous positions.
     
-    state_t = c0[t] * kv_t
-            + c1[t] * (α[t]   * state_{t-1} + kv_{t-1})
-            + c2[t] * (α[t]²  * state_{t-2} + kv_{t-2})
+    state_t = α[t] * state_{t-1}
+            + β[t] * kv_{t-1}
+            + γ[t] * kv_t
     
     Args:
         kv: (batch, seq_len, nheads, headdim) for elementwise mode
             (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        beta, gamma: (batch, seq_len, nheads) - trapezoidal coefficients
         init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
@@ -53,41 +52,31 @@ def forward_scan(
     # Collect states in a list to avoid inplace ops
     state_list: List[torch.Tensor] = []
     
-    # State history (need t-1 and t-2)
+    # State history (need t-1)
     state_tm1 = init_state
-    state_tm2 = torch.zeros_like(init_state)
     
     # KV history - same shape as state
     if outer_mode:
         kv_tm1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
-        kv_tm2 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
         # Coefficients need extra dims for broadcasting
         coef_dims = (slice(None), slice(None), None, None)  # (batch, nheads, 1, 1)
     else:
         kv_tm1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-        kv_tm2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
         coef_dims = (slice(None), slice(None), None)  # (batch, nheads, 1)
     
     for t in range(seq_len):
         kv_t = kv[:, t]
         alpha_t = alpha[:, t][coef_dims]
-        c0_t = c0[:, t][coef_dims]
-        c1_t = c1[:, t][coef_dims]
-        c2_t = c2[:, t][coef_dims]
-        
-        # AB-2 integration
-        state_t = (
-            c0_t * kv_t
-            + c1_t * (alpha_t * state_tm1 + kv_tm1)
-            + c2_t * (alpha_t.pow(2) * state_tm2 + kv_tm2)
-        )
+        beta_t = beta[:, t][coef_dims]
+        gamma_t = gamma[:, t][coef_dims]
+
+        # Trapezoidal integration
+        state_t = alpha_t * state_tm1 + beta_t * kv_tm1 + gamma_t * kv_t
         
         state_list.append(state_t)
         
         # Shift history
-        state_tm2 = state_tm1
         state_tm1 = state_t
-        kv_tm2 = kv_tm1
         kv_tm1 = kv_t
     
     # Stack along seq dimension
@@ -97,25 +86,24 @@ def forward_scan(
 def backward_scan(
     kv: torch.Tensor,
     alpha: torch.Tensor,
-    c0: torch.Tensor,
-    c1: torch.Tensor,
-    c2: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
     init_state: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Backward causal scan with AB-2 integration.
+    Backward causal scan with trapezoidal discretization.
     
-    Starts at t=T-1 (end), moves backward. Integrates current position and two steps forward.
+    Starts at t=T-1 (end), moves backward. Integrates current and next positions.
     
-    state_t = c0[t] * kv_t
-            + c1[t] * (α[t]   * state_{t+1} + kv_{t+1})
-            + c2[t] * (α[t]²  * state_{t+2} + kv_{t+2})
+    state_t = α[t] * state_{t+1}
+            + β[t] * kv_{t+1}
+            + γ[t] * kv_t
     
     Args:
         kv: (batch, seq_len, nheads, headdim) for elementwise mode
             (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        beta, gamma: (batch, seq_len, nheads) - trapezoidal coefficients
         init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
@@ -134,40 +122,30 @@ def backward_scan(
     # Collect states in a list (will be reversed)
     state_list: List[torch.Tensor] = []
     
-    # State history (need t+1 and t+2)
+    # State history (need t+1)
     state_tp1 = init_state
-    state_tp2 = torch.zeros_like(init_state)
     
     # KV history
     if outer_mode:
         kv_tp1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
-        kv_tp2 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
         coef_dims = (slice(None), slice(None), None, None)
     else:
         kv_tp1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-        kv_tp2 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
         coef_dims = (slice(None), slice(None), None)
     
     for t in range(seq_len - 1, -1, -1):
         kv_t = kv[:, t]
         alpha_t = alpha[:, t][coef_dims]
-        c0_t = c0[:, t][coef_dims]
-        c1_t = c1[:, t][coef_dims]
-        c2_t = c2[:, t][coef_dims]
-        
-        # AB-2 integration (backward direction)
-        state_t = (
-            c0_t * kv_t
-            + c1_t * (alpha_t * state_tp1 + kv_tp1)
-            + c2_t * (alpha_t.pow(2) * state_tp2 + kv_tp2)
-        )
+        beta_t = beta[:, t][coef_dims]
+        gamma_t = gamma[:, t][coef_dims]
+
+        # Trapezoidal integration (backward direction)
+        state_t = alpha_t * state_tp1 + beta_t * kv_tp1 + gamma_t * kv_t
         
         state_list.append(state_t)
         
         # Shift history
-        state_tp2 = state_tp1
         state_tp1 = state_t
-        kv_tp2 = kv_tp1
         kv_tp1 = kv_t
     
     # Reverse and stack (we collected in reverse order)
@@ -178,115 +156,25 @@ def backward_scan(
 def centered_scan(
     kv: torch.Tensor,
     alpha: torch.Tensor,
-    c0: torch.Tensor,
-    c1: torch.Tensor,
-    c2: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
     init_state: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Centered scan with AB-2 integration.
-    
-    Starts at midpoint, propagates outward in both directions simultaneously.
-    Integrates current position, one step back, and one step forward.
-    
-    state_t = c0[t] * kv_t
-            + c1[t] * (α[t] * state_{t-1} + kv_{t-1})
-            + c2[t] * (α[t] * state_{t+1} + kv_{t+1})
-    
-    Note: Both directions use α[t] (not α[t]²) since it's one step each way.
+    Centered scan using a symmetric trapezoidal approximation.
+
+    Returns the average of forward and backward trapezoidal scans.
     
     Args:
         kv: (batch, seq_len, nheads, headdim) for elementwise mode
             (batch, seq_len, nheads, headdim, headdim) for outer product mode
         alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-        c0, c1, c2: (batch, seq_len, nheads) - AB-2 coefficients
+        beta, gamma: (batch, seq_len, nheads) - trapezoidal coefficients
         init_state: (batch, nheads, headdim) or (batch, nheads, headdim, headdim)
     
     Returns:
         states: same shape as kv - accumulated states at each position
     """
-    outer_mode = kv.ndim == 5
-    
-    if outer_mode:
-        batch, seq_len, nheads, headdim, _ = kv.shape
-        coef_dims = (slice(None), slice(None), None, None)
-    else:
-        batch, seq_len, nheads, headdim = kv.shape
-        coef_dims = (slice(None), slice(None), None)
-    
-    device = kv.device
-    dtype = kv.dtype
-    
-    # Use a dict to store states by position (avoids inplace ops)
-    state_dict = {}
-    
-    # Start from the middle
-    mid = seq_len // 2
-    
-    # Initialize the center position
-    kv_mid = kv[:, mid]
-    c0_mid = c0[:, mid][coef_dims]
-    state_dict[mid] = c0_mid * kv_mid
-    
-    # Zero tensor for boundary conditions
-    if outer_mode:
-        zeros = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
-    else:
-        zeros = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-    
-    # Expand outward from center
-    # We process positions in order of distance from center
-    for dist in range(1, max(mid + 1, seq_len - mid)):
-        # Left side: mid - dist
-        left_idx = mid - dist
-        if left_idx >= 0:
-            kv_t = kv[:, left_idx]
-            alpha_t = alpha[:, left_idx][coef_dims]
-            c0_t = c0[:, left_idx][coef_dims]
-            c1_t = c1[:, left_idx][coef_dims]
-            c2_t = c2[:, left_idx][coef_dims]
-            
-            # Get neighbors (inward = toward center)
-            # t-1 is further from center (may not exist yet or be at boundary)
-            # t+1 is toward center (already computed)
-            kv_tm1 = kv[:, left_idx - 1] if left_idx > 0 else zeros
-            kv_tp1 = kv[:, left_idx + 1]
-            
-            state_tm1 = state_dict.get(left_idx - 1, init_state)
-            state_tp1 = state_dict[left_idx + 1]  # Already computed (closer to center)
-            
-            state_t = (
-                c0_t * kv_t
-                + c1_t * (alpha_t * state_tm1 + kv_tm1)
-                + c2_t * (alpha_t * state_tp1 + kv_tp1)
-            )
-            state_dict[left_idx] = state_t
-        
-        # Right side: mid + dist
-        right_idx = mid + dist
-        if right_idx < seq_len:
-            kv_t = kv[:, right_idx]
-            alpha_t = alpha[:, right_idx][coef_dims]
-            c0_t = c0[:, right_idx][coef_dims]
-            c1_t = c1[:, right_idx][coef_dims]
-            c2_t = c2[:, right_idx][coef_dims]
-            
-            # Get neighbors (inward = toward center)
-            # t+1 is further from center (may not exist yet or be at boundary)
-            # t-1 is toward center (already computed)
-            kv_tp1 = kv[:, right_idx + 1] if right_idx < seq_len - 1 else zeros
-            kv_tm1 = kv[:, right_idx - 1]
-            
-            state_tp1 = state_dict.get(right_idx + 1, init_state)
-            state_tm1 = state_dict[right_idx - 1]  # Already computed (closer to center)
-            
-            state_t = (
-                c0_t * kv_t
-                + c1_t * (alpha_t * state_tm1 + kv_tm1)
-                + c2_t * (alpha_t * state_tp1 + kv_tp1)
-            )
-            state_dict[right_idx] = state_t
-    
-    # Collect in order and stack
-    state_list = [state_dict[i] for i in range(seq_len)]
-    return torch.stack(state_list, dim=1)
+    state_fwd = forward_scan(kv, alpha, beta, gamma, init_state)
+    state_bwd = backward_scan(kv, alpha, beta, gamma, init_state)
+    return 0.5 * (state_fwd + state_bwd)
