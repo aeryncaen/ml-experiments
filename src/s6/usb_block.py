@@ -479,13 +479,16 @@ class USBBlock(nn.Module):
         half = window // 2
 
         local_out = torch.zeros_like(attn_out)
-        local_counts = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
+        local_weight = torch.zeros(batch, seq_len, device=attn_out.device, dtype=attn_out.dtype)
 
-        topk_idx = torch.topk(router_scores, k=num_centers, dim=1).indices
+        topk = torch.topk(router_scores, k=num_centers, dim=1)
+        topk_idx = topk.indices
+        topk_w = torch.softmax(topk.values, dim=1)
 
         for b in range(batch):
-            for idx in topk_idx[b]:
+            for i, idx in enumerate(topk_idx[b]):
                 center = int(idx.item())
+                weight = topk_w[b, i]
                 start = max(0, center - half)
                 end = min(seq_len, center + half + 1)
                 win_idx = torch.arange(start, end, device=attn_out.device)
@@ -502,11 +505,11 @@ class USBBlock(nn.Module):
                 win_out = win_out.transpose(0, 1)
                 win_out = rearrange(win_out, 't h d -> t (h d)')
 
-                local_out[b, win_idx] += win_out
-                local_counts[b, win_idx] += 1
-
-        local_counts = local_counts.clamp_min(1.0).unsqueeze(-1)
-        local_out = local_out / local_counts
+                w_old = local_weight[b, win_idx]
+                w_new = w_old + weight
+                alpha = weight / w_new
+                local_out[b, win_idx] = (1.0 - alpha).unsqueeze(-1) * local_out[b, win_idx] + alpha.unsqueeze(-1) * win_out
+                local_weight[b, win_idx] = w_new
 
         attn_out = attn_out + local_out
         # attn_out already (B, T, H*D)
