@@ -210,9 +210,9 @@ class SelectionMLP(nn.Module):
             delta: (batch, seq_len, d_model) — increment in original space
         """
         # SwiGLU in the orthogonal coordinate space
+        coeffs = self.norm(coeffs)
         h = F.silu(self.w_gate(coeffs)) * self.w_up(coeffs)
         delta_coeffs = self.w_down(h)
-        delta_coeffs = self.norm(delta_coeffs)
 
         # Map back to original space: delta = U @ delta_coeffs
         delta = torch.einsum('blij,blj->bli', U, delta_coeffs)  # (B, L, D)
