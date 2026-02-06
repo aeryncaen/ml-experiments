@@ -25,9 +25,8 @@ def forward_scan(
     
     Starts at t=0, moves forward. Integrates current and previous positions.
     
-    state_t = α[t] * state_{t-1}
-            + β[t] * kv_{t-1}
-            + γ[t] * kv_t
+    state_t = α[t] * state_{t-1} + s_t
+    s_t = β[t] * kv_{t-1} + γ[t] * kv_t
     
     Args:
         kv: (batch, seq_len, nheads, headdim) for elementwise mode
@@ -49,35 +48,32 @@ def forward_scan(
     device = kv.device
     dtype = kv.dtype
     
+    # Bidiagonal conv (kv_{t-1}, kv_t)
+    if outer_mode:
+        coef_shape = (batch, seq_len, nheads, 1, 1)
+    else:
+        coef_shape = (batch, seq_len, nheads, 1)
+
+    beta_e = beta.view(coef_shape)
+    gamma_e = gamma.view(coef_shape)
+
+    kv_tm1 = torch.cat([torch.zeros_like(kv[:, :1]), kv[:, :-1]], dim=1)
+    s = gamma_e * kv + beta_e * kv_tm1
+
     # Collect states in a list to avoid inplace ops
     state_list: List[torch.Tensor] = []
-    
-    # State history (need t-1)
     state_tm1 = init_state
-    
-    # KV history - same shape as state
-    if outer_mode:
-        kv_tm1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
-        # Coefficients need extra dims for broadcasting
-        coef_dims = (slice(None), slice(None), None, None)  # (batch, nheads, 1, 1)
-    else:
-        kv_tm1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-        coef_dims = (slice(None), slice(None), None)  # (batch, nheads, 1)
-    
-    for t in range(seq_len):
-        kv_t = kv[:, t]
-        alpha_t = alpha[:, t][coef_dims]
-        beta_t = beta[:, t][coef_dims]
-        gamma_t = gamma[:, t][coef_dims]
 
-        # Trapezoidal integration
-        state_t = alpha_t * state_tm1 + beta_t * kv_tm1 + gamma_t * kv_t
-        
+    for t in range(seq_len):
+        alpha_t = alpha[:, t]
+        if outer_mode:
+            alpha_t = alpha_t[..., None, None]
+        else:
+            alpha_t = alpha_t[..., None]
+
+        state_t = alpha_t * state_tm1 + s[:, t]
         state_list.append(state_t)
-        
-        # Shift history
         state_tm1 = state_t
-        kv_tm1 = kv_t
     
     # Stack along seq dimension
     return torch.stack(state_list, dim=1)
@@ -95,9 +91,8 @@ def backward_scan(
     
     Starts at t=T-1 (end), moves backward. Integrates current and next positions.
     
-    state_t = α[t] * state_{t+1}
-            + β[t] * kv_{t+1}
-            + γ[t] * kv_t
+    state_t = α[t] * state_{t+1} + s_t
+    s_t = β[t] * kv_{t+1} + γ[t] * kv_t
     
     Args:
         kv: (batch, seq_len, nheads, headdim) for elementwise mode
@@ -119,34 +114,32 @@ def backward_scan(
     device = kv.device
     dtype = kv.dtype
     
+    # Bidiagonal conv (kv_{t+1}, kv_t)
+    if outer_mode:
+        coef_shape = (batch, seq_len, nheads, 1, 1)
+    else:
+        coef_shape = (batch, seq_len, nheads, 1)
+
+    beta_e = beta.view(coef_shape)
+    gamma_e = gamma.view(coef_shape)
+
+    kv_tp1 = torch.cat([kv[:, 1:], torch.zeros_like(kv[:, :1])], dim=1)
+    s = gamma_e * kv + beta_e * kv_tp1
+
     # Collect states in a list (will be reversed)
     state_list: List[torch.Tensor] = []
-    
-    # State history (need t+1)
     state_tp1 = init_state
-    
-    # KV history
-    if outer_mode:
-        kv_tp1 = torch.zeros(batch, nheads, headdim, headdim, device=device, dtype=dtype)
-        coef_dims = (slice(None), slice(None), None, None)
-    else:
-        kv_tp1 = torch.zeros(batch, nheads, headdim, device=device, dtype=dtype)
-        coef_dims = (slice(None), slice(None), None)
-    
-    for t in range(seq_len - 1, -1, -1):
-        kv_t = kv[:, t]
-        alpha_t = alpha[:, t][coef_dims]
-        beta_t = beta[:, t][coef_dims]
-        gamma_t = gamma[:, t][coef_dims]
 
-        # Trapezoidal integration (backward direction)
-        state_t = alpha_t * state_tp1 + beta_t * kv_tp1 + gamma_t * kv_t
-        
+    for t in range(seq_len - 1, -1, -1):
+        alpha_t = alpha[:, t]
+        if outer_mode:
+            alpha_t = alpha_t[..., None, None]
+        else:
+            alpha_t = alpha_t[..., None]
+
+        state_t = alpha_t * state_tp1 + s[:, t]
         state_list.append(state_t)
-        
-        # Shift history
         state_tp1 = state_t
-        kv_tp1 = kv_t
     
     # Reverse and stack (we collected in reverse order)
     state_list.reverse()
