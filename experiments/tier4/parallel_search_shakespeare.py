@@ -881,7 +881,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--eval-iters", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--block-size", type=int, default=64)
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--n-head", type=int, default=2)
