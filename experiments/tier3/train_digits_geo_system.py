@@ -176,7 +176,8 @@ class RunConfig:
     eval_best_val: bool = True
     hybrid_chi2_scale: float = 0.3
     loss_type: str = "ce"
-    loss_eps: float = 1e-8
+    loss_eps: float = 1e-6
+    chi2_tail_threshold: float = 1e-4
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -233,6 +234,40 @@ def eval_loss_acc(
             correct += int((pred == yb).sum().item())
             total += int(yb.shape[0])
     return total_loss / max(total, 1), correct / max(total, 1)
+
+
+def eval_chi2_tail_stats(
+    model: nn.Module,
+    X: np.ndarray,
+    y: np.ndarray,
+    device: torch.device,
+    loss_eps: float,
+    tail_threshold: float,
+    batch_size: int = 1024,
+) -> dict:
+    model.eval()
+    n = 0
+    inv_sum = 0.0
+    inv_max = 0.0
+    low_count = 0
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            xb = torch.from_numpy(X[i : i + batch_size].astype(np.float32)).to(device)
+            yb = torch.from_numpy(y[i : i + batch_size].astype(np.int64)).to(device)
+            logits = model(xb)
+            p = torch.softmax(logits, dim=1)
+            py = p.gather(1, yb.view(-1, 1)).squeeze(1)
+            inv_py = 1.0 / torch.clamp(py, min=loss_eps)
+            bs = int(yb.shape[0])
+            n += bs
+            inv_sum += float(torch.sum(inv_py).item())
+            inv_max = max(inv_max, float(torch.max(inv_py).item()))
+            low_count += int((py < tail_threshold).sum().item())
+    return {
+        "inv_py_mean": inv_sum / max(n, 1),
+        "inv_py_max": inv_max,
+        "py_low_frac": low_count / max(n, 1),
+    }
 
 
 def train_one(
@@ -360,6 +395,10 @@ def train_one(
         eta_grad_raw_count = 0
         eta_resid_w_sum = 0.0
         eta_resid_w_count = 0
+        chi2_inv_py_sum = 0.0
+        chi2_inv_py_count = 0
+        chi2_inv_py_max = 0.0
+        chi2_py_low_count = 0
         tr_start_by_group = {
             str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
             for i, g in enumerate(opt.param_groups)
@@ -370,6 +409,15 @@ def train_one(
 
             logits = model(xb)
             loss = classification_loss(logits, yb, loss_type=cfg.loss_type, eps=cfg.loss_eps)
+            if cfg.loss_type == "chi2":
+                with torch.no_grad():
+                    p_tr = torch.softmax(logits, dim=1)
+                    py_tr = p_tr.gather(1, yb.view(-1, 1)).squeeze(1)
+                    inv_py_tr = 1.0 / torch.clamp(py_tr, min=cfg.loss_eps)
+                    chi2_inv_py_sum += float(torch.sum(inv_py_tr).item())
+                    chi2_inv_py_count += int(yb.shape[0])
+                    chi2_inv_py_max = max(chi2_inv_py_max, float(torch.max(inv_py_tr).item()))
+                    chi2_py_low_count += int((py_tr < cfg.chi2_tail_threshold).sum().item())
 
             if mode == "geo_system" and epoch < cfg.reg_warmup_epochs:
                 # Spectral shaping regularizer:
@@ -543,11 +591,33 @@ def train_one(
         train_loss = total_loss / max(n_seen, 1)
         train_acc = n_correct / max(n_seen, 1)
         val_loss, val_acc = eval_loss_acc(model, X_val, y_val, device, loss_type=cfg.loss_type, loss_eps=cfg.loss_eps)
+        val_chi2_tail = None
+        if cfg.loss_type == "chi2":
+            val_chi2_tail = eval_chi2_tail_stats(
+                model,
+                X_val,
+                y_val,
+                device,
+                loss_eps=cfg.loss_eps,
+                tail_threshold=cfg.chi2_tail_threshold,
+            )
         print(
             f"epoch {epoch + 1:02d}/{cfg.epochs:02d} "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
         )
+        if cfg.loss_type == "chi2":
+            val_tail = val_chi2_tail or {"inv_py_mean": float("nan"), "inv_py_max": float("nan"), "py_low_frac": float("nan")}
+            train_inv_py_mean = chi2_inv_py_sum / max(chi2_inv_py_count, 1)
+            train_py_low_frac = chi2_py_low_count / max(chi2_inv_py_count, 1)
+            print(
+                f"  chi2_tail train_inv_py_mean={train_inv_py_mean:.3f} "
+                f"train_inv_py_max={chi2_inv_py_max:.3f} "
+                f"train_py_low_frac={train_py_low_frac:.4f} "
+                f"val_inv_py_mean={val_tail['inv_py_mean']:.3f} "
+                f"val_inv_py_max={val_tail['inv_py_max']:.3f} "
+                f"val_py_low_frac={val_tail['py_low_frac']:.4f}"
+            )
         epoch_rec = {
             "epoch": epoch + 1,
             "train_loss": train_loss,
@@ -555,6 +625,18 @@ def train_one(
             "val_loss": val_loss,
             "val_acc": val_acc,
         }
+        if cfg.loss_type == "chi2":
+            val_tail = val_chi2_tail or {"inv_py_mean": float("nan"), "inv_py_max": float("nan"), "py_low_frac": float("nan")}
+            epoch_rec.update(
+                {
+                    "chi2_train_inv_py_mean": float(chi2_inv_py_sum / max(chi2_inv_py_count, 1)),
+                    "chi2_train_inv_py_max": float(chi2_inv_py_max),
+                    "chi2_train_py_low_frac": float(chi2_py_low_count / max(chi2_inv_py_count, 1)),
+                    "chi2_val_inv_py_mean": float(val_tail["inv_py_mean"]),
+                    "chi2_val_inv_py_max": float(val_tail["inv_py_max"]),
+                    "chi2_val_py_low_frac": float(val_tail["py_low_frac"]),
+                }
+            )
         if val_acc > best_val_acc:
             best_val_acc = float(val_acc)
             best_epoch = epoch + 1
@@ -705,7 +787,8 @@ def main() -> None:
     parser.add_argument("--eval-last", action="store_false", dest="eval_best_val")
     parser.add_argument("--hybrid-chi2-scale", type=float, default=0.3)
     parser.add_argument("--loss-type", type=str, choices=["ce", "chi2"], default="ce")
-    parser.add_argument("--loss-eps", type=float, default=1e-8)
+    parser.add_argument("--loss-eps", type=float, default=1e-6)
+    parser.add_argument("--chi2-tail-threshold", type=float, default=1e-4)
     parser.add_argument("--out", type=str, default="tier3_digits_results.json")
     args = parser.parse_args()
 
@@ -743,6 +826,7 @@ def main() -> None:
         hybrid_chi2_scale=args.hybrid_chi2_scale,
         loss_type=args.loss_type,
         loss_eps=args.loss_eps,
+        chi2_tail_threshold=args.chi2_tail_threshold,
     )
 
     device = get_device()
