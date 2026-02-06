@@ -168,6 +168,8 @@ class RunConfig:
     chi2_eta_shape: bool = True
     chi2_eta_proj_scale: float = 1.2
     chi2_eta_resid_scale: float = 0.8
+    chi2_eta_dist_tau: float = 2.0
+    chi2_eta_min_resid_weight: float = 0.05
     chi2_forget_guard: bool = True
     chi2_forget_tol: float = 0.01
     chi2_forget_shrink: float = 0.7
@@ -268,6 +270,24 @@ def train_one(
     best_epoch = 0
     best_state = None
 
+    def apply_eta_shaping() -> float | None:
+        if (not cfg.chi2_eta_shape) or mode != "geo_system":
+            return None
+        g = model.fc1.weight.grad
+        if g is None:
+            return None
+        g_proj = g @ P_top_t
+        g_res = g - g_proj
+        row_dist = torch.norm(g_res, dim=1, keepdim=True)
+        row_proj_norm = torch.norm(g_proj, dim=1, keepdim=True)
+        rel_dist = row_dist / (row_proj_norm + 1e-12)
+        resid_weight = torch.exp(-cfg.chi2_eta_dist_tau * rel_dist)
+        resid_weight = torch.clamp(resid_weight, min=cfg.chi2_eta_min_resid_weight, max=1.0)
+        total = float(torch.sum(g * g).item())
+        proj = float(torch.sum(g_proj * g_proj).item())
+        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * resid_weight * g_res)
+        return proj / max(total, 1e-12)
+
     for epoch in range(cfg.epochs):
         model.train()
         total_loss = 0.0
@@ -314,16 +334,11 @@ def train_one(
                 else:
                     opt.zero_grad()
                 loss.backward()
-                if is_chi2_family and cfg.chi2_eta_shape and mode == "geo_system":
-                    g = model.fc1.weight.grad
-                    if g is not None:
-                        g_proj = g @ P_top_t
-                        g_res = g - g_proj
-                        total = float(torch.sum(g * g).item())
-                        proj = float(torch.sum(g_proj * g_proj).item())
-                        eta_grad_sum += proj / max(total, 1e-12)
+                if is_chi2_family:
+                    eta_ratio = apply_eta_shaping()
+                    if eta_ratio is not None:
+                        eta_grad_sum += eta_ratio
                         eta_grad_count += 1
-                        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
                 if is_hybrid:
                     if adam_opt is None or chi2_opt is None:
                         raise RuntimeError("Hybrid optimizer state not initialized")
@@ -436,16 +451,11 @@ def train_one(
                 else:
                     opt.zero_grad()
                 loss.backward()
-                if is_chi2_family and cfg.chi2_eta_shape and mode == "geo_system":
-                    g = model.fc1.weight.grad
-                    if g is not None:
-                        g_proj = g @ P_top_t
-                        g_res = g - g_proj
-                        total = float(torch.sum(g * g).item())
-                        proj = float(torch.sum(g_proj * g_proj).item())
-                        eta_grad_sum += proj / max(total, 1e-12)
+                if is_chi2_family:
+                    eta_ratio = apply_eta_shaping()
+                    if eta_ratio is not None:
+                        eta_grad_sum += eta_ratio
                         eta_grad_count += 1
-                        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * g_res)
                 if is_hybrid:
                     if adam_opt is None or chi2_opt is None:
                         raise RuntimeError("Hybrid optimizer state not initialized")
@@ -593,6 +603,8 @@ def main() -> None:
     parser.add_argument("--no-chi2-eta-shape", action="store_false", dest="chi2_eta_shape")
     parser.add_argument("--chi2-eta-proj-scale", type=float, default=1.2)
     parser.add_argument("--chi2-eta-resid-scale", type=float, default=0.8)
+    parser.add_argument("--chi2-eta-dist-tau", type=float, default=2.0)
+    parser.add_argument("--chi2-eta-min-resid-weight", type=float, default=0.05)
     parser.add_argument("--chi2-forget-guard", action="store_true", default=True)
     parser.add_argument("--no-chi2-forget-guard", action="store_false", dest="chi2_forget_guard")
     parser.add_argument("--chi2-forget-tol", type=float, default=0.01)
@@ -628,6 +640,8 @@ def main() -> None:
         chi2_eta_shape=args.chi2_eta_shape,
         chi2_eta_proj_scale=args.chi2_eta_proj_scale,
         chi2_eta_resid_scale=args.chi2_eta_resid_scale,
+        chi2_eta_dist_tau=args.chi2_eta_dist_tau,
+        chi2_eta_min_resid_weight=args.chi2_eta_min_resid_weight,
         chi2_forget_guard=args.chi2_forget_guard,
         chi2_forget_tol=args.chi2_forget_tol,
         chi2_forget_shrink=args.chi2_forget_shrink,
