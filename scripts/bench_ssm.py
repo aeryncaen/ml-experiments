@@ -168,6 +168,7 @@ from heuristic_secrets.models.backbone import SEBlock
 # S6 / USB (Unified Sequence Block)
 # ---------------------------------------------------------------------------
 from s6.usb_block import USBBlock, USBConfig
+from ideal.stack import IdealWrapper
 
 
 class USBWrapper(nn.Module):
@@ -1017,6 +1018,9 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # LearnedAttnAct MLP: SwiGLU with linear attention activation
     try_add('AttnActMLP', lambda: LearnedAttnActMLP(d_model=dim, ffn_mult=4, n_heads=4))
+
+    # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
+    try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0))
 
     return models
 
