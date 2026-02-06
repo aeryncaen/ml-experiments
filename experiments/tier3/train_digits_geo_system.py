@@ -164,6 +164,7 @@ class RunConfig:
     chi2_q_low: float = 0.05
     chi2_q_high: float = 0.5
     chi2_q_beta: float = 0.9
+    chi2_per_layer: bool = True
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -218,8 +219,16 @@ def train_one(
     if cfg.optimizer == "adam":
         opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     elif cfg.optimizer == "chi2":
+        if cfg.chi2_per_layer:
+            param_groups = [
+                {"params": list(model.fc1.parameters()), "trust_radius": cfg.trust_radius, "name": "fc1"},
+                {"params": list(model.fc2.parameters()), "trust_radius": cfg.trust_radius, "name": "fc2"},
+                {"params": list(model.fc3.parameters()), "trust_radius": cfg.trust_radius, "name": "fc3"},
+            ]
+        else:
+            param_groups = model.parameters()
         opt = Chi2TrustRegion(
-            model.parameters(),
+            param_groups,
             trust_radius=cfg.trust_radius,
             beta2=cfg.beta2,
             lr_scale=cfg.lr_scale,
@@ -236,6 +245,7 @@ def train_one(
         "m2_delta": 0.0,
         "q_ema": 0.0,
     }
+    chi2_group_ctrl = {}
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -250,7 +260,10 @@ def train_one(
         denom_sum = 0.0
         scale_sum = 0.0
         diag_count = 0
-        tr_start = float(opt.param_groups[0].get("trust_radius", 0.0))
+        tr_start_by_group = {
+            str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
+            for i, g in enumerate(opt.param_groups)
+        }
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
@@ -284,8 +297,6 @@ def train_one(
                         new_loss = new_loss + cfg.reg_lambda * reg_new
                     new_loss_val = float(new_loss.item())
 
-                group = opt.param_groups[0]
-                tr = float(group["trust_radius"])
                 stats = getattr(opt, "last_stats", None)
                 if stats is not None:
                     step_l2_sum += float(stats.get("step_l2", 0.0))
@@ -310,18 +321,46 @@ def train_one(
                 soft_bad = (delta_loss > noise_bound) and (chi2_ctrl["q_ema"] < cfg.chi2_q_low)
                 reject = (c >= 20 and soft_bad) or hard_bad
 
+                per_group_stats = (stats or {}).get("groups", [])
+                total_pred = float(sum(max(0.0, float(gs.get("pred_linear", 0.0))) for gs in per_group_stats))
+                global_linf = float((stats or {}).get("step_linf", 0.0))
+
                 if reject:
                     for p, b in zip(params, backups):
                         p.data.copy_(b)
-                    tr = max(cfg.chi2_min_radius, tr * cfg.chi2_shrink)
                     n_reject += 1
                 else:
-                    if chi2_ctrl["q_ema"] > cfg.chi2_q_high:
-                        tr = min(cfg.chi2_max_radius, tr * (cfg.chi2_grow * 1.02))
-                    else:
-                        tr = min(cfg.chi2_max_radius, tr * cfg.chi2_grow)
                     n_accept += 1
-                group["trust_radius"] = tr
+
+                for gi, group in enumerate(opt.param_groups):
+                    gname = str(group.get("name", f"group_{gi}"))
+                    tr = float(group.get("trust_radius", cfg.trust_radius))
+                    gs = next((x for x in per_group_stats if str(x.get("name", "")) == gname), None)
+                    pred_i = float((gs or {}).get("pred_linear", 0.0))
+                    linf_i = float((gs or {}).get("step_linf", 0.0))
+                    pred_share = pred_i / max(total_pred, 1e-12)
+                    linf_share = linf_i / max(global_linf, 1e-12)
+
+                    if gname not in chi2_group_ctrl:
+                        chi2_group_ctrl[gname] = {"q_ema": 0.0}
+
+                    local_q = q / (1.0 + 0.5 * linf_share)
+                    chi2_group_ctrl[gname]["q_ema"] = (
+                        cfg.chi2_q_beta * chi2_group_ctrl[gname]["q_ema"]
+                        + (1.0 - cfg.chi2_q_beta) * local_q
+                    )
+
+                    if reject:
+                        local_shrink = cfg.chi2_shrink ** (1.0 + 0.5 * linf_share)
+                        tr = max(cfg.chi2_min_radius, tr * local_shrink)
+                    else:
+                        local_grow = cfg.chi2_grow * (1.0 + 0.05 * pred_share)
+                        if chi2_group_ctrl[gname]["q_ema"] > cfg.chi2_q_high:
+                            local_grow *= 1.02
+                        tr = min(cfg.chi2_max_radius, tr * local_grow)
+
+                    group["trust_radius"] = tr
+
                 old_loss_sum += old_loss_val
                 new_loss_sum += new_loss_val
 
@@ -345,14 +384,19 @@ def train_one(
         val_acc = accuracy(model, X_val, y_val, device)
         epoch_rec = {"epoch": epoch + 1, "train_loss": train_loss, "val_acc": val_acc}
         if cfg.optimizer == "chi2":
-            tr_end = float(opt.param_groups[0].get("trust_radius", 0.0))
+            tr_end_by_group = {
+                str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
+                for i, g in enumerate(opt.param_groups)
+            }
             epoch_rec.update(
                 {
                     "chi2_accept": int(n_accept),
                     "chi2_reject": int(n_reject),
                     "chi2_accept_rate": float(n_accept / max(n_accept + n_reject, 1)),
-                    "chi2_trust_radius_start": tr_start,
-                    "chi2_trust_radius_end": tr_end,
+                    "chi2_trust_radius_start": float(np.mean(list(tr_start_by_group.values()))),
+                    "chi2_trust_radius_end": float(np.mean(list(tr_end_by_group.values()))),
+                    "chi2_trust_radius_start_by_group": tr_start_by_group,
+                    "chi2_trust_radius_end_by_group": tr_end_by_group,
                     "chi2_old_loss_mean": float(old_loss_sum / max(diag_count, 1)),
                     "chi2_new_loss_mean": float(new_loss_sum / max(diag_count, 1)),
                     "chi2_step_l2_mean": float(step_l2_sum / max(diag_count, 1)),
@@ -362,6 +406,7 @@ def train_one(
                     "chi2_delta_mean": float(chi2_ctrl["mean_delta"]),
                     "chi2_delta_std": float(np.sqrt(max(chi2_ctrl["m2_delta"] / max(chi2_ctrl["count"] - 1, 1), 0.0))),
                     "chi2_q_ema": float(chi2_ctrl["q_ema"]),
+                    "chi2_q_ema_by_group": {k: float(v["q_ema"]) for k, v in chi2_group_ctrl.items()},
                 }
             )
         history.append(epoch_rec)
@@ -432,6 +477,8 @@ def main() -> None:
     parser.add_argument("--chi2-q-low", type=float, default=0.05)
     parser.add_argument("--chi2-q-high", type=float, default=0.5)
     parser.add_argument("--chi2-q-beta", type=float, default=0.9)
+    parser.add_argument("--chi2-per-layer", action="store_true", default=True)
+    parser.add_argument("--no-chi2-per-layer", action="store_false", dest="chi2_per_layer")
     parser.add_argument("--out", type=str, default="tier3_digits_results.json")
     args = parser.parse_args()
 
@@ -456,6 +503,7 @@ def main() -> None:
         chi2_q_low=args.chi2_q_low,
         chi2_q_high=args.chi2_q_high,
         chi2_q_beta=args.chi2_q_beta,
+        chi2_per_layer=args.chi2_per_layer,
     )
 
     device = get_device()

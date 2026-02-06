@@ -55,6 +55,7 @@ class Chi2TrustRegion(Optimizer):
             "grad_l2": 0.0,
             "precond_grad_l2": 0.0,
             "pred_linear": 0.0,
+            "groups": [],
         }
 
     @torch.no_grad()
@@ -64,7 +65,17 @@ class Chi2TrustRegion(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
+        global_step_sq = 0.0
+        global_step_linf = 0.0
+        global_grad_sq = 0.0
+        global_pre_sq = 0.0
+        global_denom = 0.0
+        global_pred = 0.0
+        global_params = 0
+        global_tensors = 0
+        group_stats = []
+
+        for gi, group in enumerate(self.param_groups):
             trust_radius = group["trust_radius"]
             beta2 = group["beta2"]
             beta1 = group["beta1"]
@@ -72,6 +83,7 @@ class Chi2TrustRegion(Optimizer):
             weight_decay = group["weight_decay"]
             lr_scale = group["lr_scale"]
             max_step_l2 = group["max_step_l2"]
+            group_name = group.get("name", f"group_{gi}")
 
             # First pass: update metric states and compute denom = g^T G^{-1} g
             denom_sum = 0.0
@@ -137,18 +149,43 @@ class Chi2TrustRegion(Optimizer):
                 step_sq_sum += torch.sum(delta * delta).item()
                 step_linf = max(step_linf, torch.max(torch.abs(delta)).item())
 
-            self.last_stats = {
-                "denom_mean": float(denom_sum),
-                "scale": float(scale),
-                "n_tensors": int(len(tensors)),
-                "n_params": int(denom_count),
-                "step_l2": float(math.sqrt(max(step_sq_sum, 0.0))),
-                "step_linf": float(step_linf),
-                "grad_l2": float(math.sqrt(max(grad_sq_sum, 0.0))),
-                "precond_grad_l2": float(math.sqrt(max(pre_sq_sum, 0.0))),
-                # First-order predicted reduction proxy:
-                # pred = -g^T delta = scale * <m_hat, inv_metric_grad>
-                "pred_linear": float(max(scale * denom_sum, 0.0)),
-            }
+            group_pred = float(max(scale * denom_sum, 0.0))
+            global_step_sq += step_sq_sum
+            global_step_linf = max(global_step_linf, step_linf)
+            global_grad_sq += grad_sq_sum
+            global_pre_sq += pre_sq_sum
+            global_denom += denom_sum
+            global_pred += group_pred
+            global_params += denom_count
+            global_tensors += len(tensors)
+            group_stats.append(
+                {
+                    "index": int(gi),
+                    "name": str(group_name),
+                    "trust_radius": float(trust_radius),
+                    "denom_mean": float(denom_sum),
+                    "scale": float(scale),
+                    "n_tensors": int(len(tensors)),
+                    "n_params": int(denom_count),
+                    "step_l2": float(math.sqrt(max(step_sq_sum, 0.0))),
+                    "step_linf": float(step_linf),
+                    "grad_l2": float(math.sqrt(max(grad_sq_sum, 0.0))),
+                    "precond_grad_l2": float(math.sqrt(max(pre_sq_sum, 0.0))),
+                    "pred_linear": group_pred,
+                }
+            )
+
+        self.last_stats = {
+            "denom_mean": float(global_denom),
+            "scale": float(sum(gs["scale"] for gs in group_stats) / max(len(group_stats), 1)),
+            "n_tensors": int(global_tensors),
+            "n_params": int(global_params),
+            "step_l2": float(math.sqrt(max(global_step_sq, 0.0))),
+            "step_linf": float(global_step_linf),
+            "grad_l2": float(math.sqrt(max(global_grad_sq, 0.0))),
+            "precond_grad_l2": float(math.sqrt(max(global_pre_sq, 0.0))),
+            "pred_linear": float(global_pred),
+            "groups": group_stats,
+        }
 
         return loss
