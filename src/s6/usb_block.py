@@ -5,6 +5,7 @@ Fuses SSM-style scans, attention, and MLP into a single expand-process-contract 
 """
 
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 import torch
@@ -14,6 +15,7 @@ from einops import rearrange, repeat
 
 from .scan import forward_scan, backward_scan
 from .rope import apply_data_dependent_rope, apply_rope
+from heuristic_secrets.models.scatter_attention import SIRENDownsampleND
 
 
 @dataclass
@@ -203,6 +205,10 @@ class USBBlock(nn.Module):
         self.conv_g3 = nn.Conv1d(
             d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
         )
+
+        # Low-rank attention downsamplers (SIREN)
+        self.attn_downsample = SIRENDownsampleND(d_expanded, ndim=1)
+        self.attn_rope_downsample = SIRENDownsampleND(d_group // 2, ndim=1)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -290,6 +296,11 @@ class USBBlock(nn.Module):
         params_g3 = self.scan_proj_g3(x_exp)
         
         # Apply data-dependent RoPE to K before scanning
+        k_g1_attn = k_g1
+        k_g2_attn = k_g2
+        k_g3_attn = k_g3
+        k_g4_attn = k_g4
+
         k_g1 = apply_data_dependent_rope(k_g1, params_g1['rope_freq'])
         k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
         k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
@@ -370,37 +381,77 @@ class USBBlock(nn.Module):
         conv_g3_out = conv_g3(v_g3)
         out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
-        # Apply data-dependent RoPE to Q for attention
+        # Step 5: Passthrough for G4 (standard RoPE only)
+        out_g4 = v_g4  # No scan, just passthrough
+
+        # Step 6: Low-rank attention (full Q against downsampled KV)
+        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
+        k_all = torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2)
+        v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
+
+        target_len = max(1, int(math.sqrt(seq_len)))
+
+        k_flat = rearrange(k_all, 'b t h d -> b t (h d)')
+        v_flat = rearrange(v_all, 'b t h d -> b t (h d)')
+        k_down_flat = self.attn_downsample(k_flat, (target_len,))
+        v_down_flat = self.attn_downsample(v_flat, (target_len,))
+        k_down = rearrange(k_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
+        v_down = rearrange(v_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
+
+        # Apply data-dependent RoPE to Q after downsampling
         q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
         q_g2 = apply_data_dependent_rope(q_g2, params_g2['rope_freq'])
         q_g3 = apply_data_dependent_rope(q_g3, params_g3['rope_freq'])
-        
-        # Step 5: Passthrough for G4 (standard RoPE only)
-        q_g4 = apply_rope(q_g4, seq_len)
-        k_g4 = apply_rope(k_g4, seq_len)
-        out_g4 = v_g4  # No scan, just passthrough
-        
-        # G3 also gets standard RoPE at attention level (in addition to DD-RoPE at scan level)
+
+        # Standard RoPE for G3/G4 on Q (after DD-RoPE for G3)
         q_g3 = apply_rope(q_g3, seq_len)
-        # Note: k_g3 already has DD-RoPE, we apply standard RoPE on top
-        k_g3_for_attn = apply_rope(k_g3, seq_len)
-        
-        # Step 6: Attention using SDPA
-        # Concatenate all groups back together
-        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)  # (batch, seq_len, nheads_total, headdim)
-        k_all = torch.cat([k_g1, k_g2, k_g3_for_attn, k_g4], dim=-2)
-        v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
-        
+        q_g4 = apply_rope(q_g4, seq_len)
+
+        # Downsample rope_freq for K (apply RoPE after downsampling)
+        if target_len == seq_len:
+            rope_g1 = params_g1['rope_freq']
+            rope_g2 = params_g2['rope_freq']
+            rope_g3 = params_g3['rope_freq']
+        else:
+            rope_g1_flat = rearrange(params_g1['rope_freq'], 'b t h d -> b t (h d)')
+            rope_g2_flat = rearrange(params_g2['rope_freq'], 'b t h d -> b t (h d)')
+            rope_g3_flat = rearrange(params_g3['rope_freq'], 'b t h d -> b t (h d)')
+            rope_g1_flat = self.attn_rope_downsample(rope_g1_flat, (target_len,))
+            rope_g2_flat = self.attn_rope_downsample(rope_g2_flat, (target_len,))
+            rope_g3_flat = self.attn_rope_downsample(rope_g3_flat, (target_len,))
+            rope_g1 = rearrange(rope_g1_flat, 'b t (h d) -> b t h d', h=nph)
+            rope_g2 = rearrange(rope_g2_flat, 'b t (h d) -> b t h d', h=nph)
+            rope_g3 = rearrange(rope_g3_flat, 'b t (h d) -> b t h d', h=nph)
+
+        k_g1_d, k_g2_d, k_g3_d, k_g4_d = (
+            k_down[..., :nph, :],
+            k_down[..., nph:2*nph, :],
+            k_down[..., 2*nph:3*nph, :],
+            k_down[..., 3*nph:, :],
+        )
+
+        k_g1_d = apply_data_dependent_rope(k_g1_d, rope_g1)
+        k_g2_d = apply_data_dependent_rope(k_g2_d, rope_g2)
+        k_g3_d = apply_data_dependent_rope(k_g3_d, rope_g3)
+
+        # Standard RoPE for G3/G4 on K (after DD-RoPE for G3)
+        k_g3_d = apply_rope(k_g3_d, target_len)
+        k_g4_d = apply_rope(k_g4_d, target_len)
+
+        # Concatenate for SDPA
+        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
+        k_all = torch.cat([k_g1_d, k_g2_d, k_g3_d, k_g4_d], dim=-2)
+
         # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
         q_sdpa = q_all.transpose(1, 2)
         k_sdpa = k_all.transpose(1, 2)
-        v_sdpa = v_all.transpose(1, 2)
-        
-        # Causal attention
+        v_sdpa = v_down.transpose(1, 2)
+
+        # Acausal attention (mask ignored for low-rank)
         attn_out = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa, 
-            attn_mask=attention_mask,
-            is_causal=True
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=None,
+            is_causal=False,
         )
         
         # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
