@@ -119,6 +119,41 @@ def compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps
     return basis.astype(np.float32)
 
 
+def compute_kl_bucket_mtp_basis(
+    tokens: np.ndarray,
+    vocab_size: int,
+    width: int,
+    mtp_weights: list[float],
+    eps: float = 1e-8,
+) -> np.ndarray:
+    # Objective-skewed KL bucket basis using weighted multi-token prediction horizons.
+    if len(tokens) < 3:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+
+    counts = np.zeros((vocab_size, width), dtype=np.float64)
+    for h, w in enumerate(mtp_weights, start=1):
+        if w == 0.0 or len(tokens) - h - 1 <= 0:
+            continue
+        cur = tokens[h + 1 :]
+        prev1 = tokens[1:-h]
+        prev2 = tokens[: -(h + 1)]
+        context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
+        buckets = context_id % width
+        np.add.at(counts, (cur, buckets), float(w))
+
+    col_sum = counts.sum(axis=0, keepdims=True)
+    p_t_given_b = counts / np.maximum(col_sum, 1.0)
+    token_sum = counts.sum(axis=1, keepdims=True)
+    p_t = token_sum / np.maximum(np.sum(counts), 1.0)
+
+    basis = np.log(p_t_given_b + eps) - np.log(p_t + eps)
+    basis = np.tanh(0.5 * basis)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
 def compute_model_projector(geo_basis: np.ndarray, d_model: int, k: int) -> np.ndarray:
     B = geo_basis[:, :d_model].astype(np.float64)
     cov = B.T @ B
@@ -313,6 +348,7 @@ class RunConfig:
     eta_min_resid_weight: float = 0.05
     eta_topk: int = 16
     geo_init_method: str = "bucket"
+    geo_init_mtp_weights: str = "1.0,0.5,0.25"
     geo_init_blend: float = 0.7
     geo_init_fullspace: bool = False
     geo_init_ridge: float = 1e-3
@@ -664,7 +700,8 @@ def main() -> None:
     p.add_argument("--eta-dist-tau", type=float, default=2.0)
     p.add_argument("--eta-min-resid-weight", type=float, default=0.05)
     p.add_argument("--eta-topk", type=int, default=16)
-    p.add_argument("--geo-init-method", type=str, choices=["bucket", "kl_bucket", "eig"], default="bucket")
+    p.add_argument("--geo-init-method", type=str, choices=["bucket", "kl_bucket", "kl_bucket_mtp", "eig"], default="bucket")
+    p.add_argument("--geo-init-mtp-weights", type=str, default="1.0,0.5,0.25")
     p.add_argument("--geo-init-blend", type=float, default=0.3)
     p.add_argument("--geo-init-fullspace", action="store_true", default=False)
     p.add_argument("--geo-init-ridge", type=float, default=1e-3)
@@ -716,6 +753,7 @@ def main() -> None:
         eta_min_resid_weight=args.eta_min_resid_weight,
         eta_topk=args.eta_topk,
         geo_init_method=args.geo_init_method,
+        geo_init_mtp_weights=args.geo_init_mtp_weights,
         geo_init_blend=args.geo_init_blend,
         geo_init_fullspace=args.geo_init_fullspace,
         geo_init_ridge=args.geo_init_ridge,
@@ -757,6 +795,11 @@ def main() -> None:
     if cfg.geo_init_method == "eig":
         _, eigvecs = np.linalg.eigh(op)
         geo_basis = eigvecs[:, -cfg.d_model :].astype(np.float32)
+    elif cfg.geo_init_method == "kl_bucket_mtp":
+        mtp_w = parse_float_list_csv(cfg.geo_init_mtp_weights)
+        if not mtp_w:
+            mtp_w = [1.0, 0.5, 0.25]
+        geo_basis = compute_kl_bucket_mtp_basis(train_ids, vocab_size, cfg.d_model, mtp_w)
     elif cfg.geo_init_method == "kl_bucket":
         geo_basis = compute_kl_bucket_basis(train_ids, vocab_size, cfg.d_model)
     else:
