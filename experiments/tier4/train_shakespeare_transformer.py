@@ -129,6 +129,67 @@ def compute_model_projector(geo_basis: np.ndarray, d_model: int, k: int) -> np.n
     return P.astype(np.float32)
 
 
+def parse_int_list_csv(s: str) -> list[int]:
+    vals = [x.strip() for x in s.split(",") if x.strip()]
+    return [int(x) for x in vals]
+
+
+def parse_float_list_csv(s: str) -> list[float]:
+    vals = [x.strip() for x in s.split(",") if x.strip()]
+    return [float(x) for x in vals]
+
+
+def compute_weighted_shift_operator(
+    tokens: np.ndarray,
+    vocab_size: int,
+    horizons: list[int],
+    horizon_weights: list[float],
+) -> np.ndarray:
+    if len(tokens) < 2:
+        return np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    for h, w in zip(horizons, horizon_weights):
+        if h <= 0 or w == 0.0 or len(tokens) <= h:
+            continue
+        a = tokens[:-h]
+        b = tokens[h:]
+        np.add.at(counts, (a, b), w)
+    sym = 0.5 * (counts + counts.T)
+    total = np.sum(sym)
+    if total > 0:
+        sym = sym / total
+    return sym
+
+
+def compute_attn_corr_projector(
+    tokens: np.ndarray,
+    vocab_size: int,
+    geo_basis: np.ndarray,
+    d_model: int,
+    rank: int,
+    horizons: list[int],
+    horizon_weights: list[float],
+    eps: float = 1e-8,
+) -> np.ndarray:
+    op = compute_weighted_shift_operator(tokens, vocab_size, horizons, horizon_weights)
+    p_tok = np.sum(op, axis=1, keepdims=True)
+    denom = p_tok @ p_tok.T
+    pmi = np.log(op + eps) - np.log(denom + eps)
+    pmi = 0.5 * (pmi + pmi.T)
+
+    B = np.zeros((vocab_size, d_model), dtype=np.float64)
+    k = min(d_model, geo_basis.shape[1])
+    B[:, :k] = geo_basis[:, :k].astype(np.float64)
+
+    C = B.T @ pmi @ B
+    C = 0.5 * (C + C.T)
+    _, eigvecs = np.linalg.eigh(C)
+    k_eff = max(1, min(rank, d_model))
+    U = eigvecs[:, -k_eff:]
+    P = U @ U.T
+    return P.astype(np.float32)
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
@@ -197,6 +258,12 @@ class RunConfig:
     geo_init_blend: float = 0.7
     geo_attn_bias: bool = False
     geo_attn_bias_blend: float = 0.2
+    geo_attn_corr_bias: bool = False
+    geo_attn_corr_blend: float = 0.2
+    geo_attn_corr_rank: int = 16
+    geo_attn_corr_layers: int = 2
+    geo_attn_corr_horizons: tuple[int, ...] = (1, 2)
+    geo_attn_corr_horizon_weights: tuple[float, ...] = (1.0, 0.5)
 
 
 def get_batch(data: np.ndarray, batch_size: int, block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -269,7 +336,17 @@ def eval_stats(
     return out
 
 
-def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, geo_basis: np.ndarray, mode: str, cfg: RunConfig, seed: int, device: torch.device) -> dict:
+def train_one(
+    train_ids: np.ndarray,
+    val_ids: np.ndarray,
+    vocab_size: int,
+    geo_basis: np.ndarray,
+    attn_corr_projector: np.ndarray | None,
+    mode: str,
+    cfg: RunConfig,
+    seed: int,
+    device: torch.device,
+) -> dict:
     set_seed(seed)
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_head, cfg.n_layer, cfg.block_size, cfg.dropout).to(device)
     if mode == "geo_system":
@@ -284,6 +361,8 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, geo_b
                 P_t = torch.from_numpy(P_np).to(device=device, dtype=E.dtype)
                 b = float(cfg.geo_attn_bias_blend)
                 for blk in model.blocks:
+                    if not isinstance(blk, Block):
+                        continue
                     attn = blk.attn
                     d = cfg.d_model
                     W = attn.in_proj_weight
@@ -291,6 +370,20 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, geo_b
                         W[s0:s1, :].copy_((1.0 - b) * W[s0:s1, :] + b * (W[s0:s1, :] @ P_t))
                     Wo = attn.out_proj.weight
                     Wo.copy_((1.0 - b) * Wo + b * (Wo @ P_t))
+
+            if cfg.geo_attn_corr_bias and attn_corr_projector is not None:
+                P_corr_t = torch.from_numpy(attn_corr_projector).to(device=device, dtype=E.dtype)
+                b_corr = float(cfg.geo_attn_corr_blend)
+                n_layers = max(0, min(cfg.geo_attn_corr_layers, len(model.blocks)))
+                for li in range(n_layers):
+                    blk = model.blocks[li]
+                    if not isinstance(blk, Block):
+                        continue
+                    attn = blk.attn
+                    d = cfg.d_model
+                    W = attn.in_proj_weight
+                    for s0, s1 in ((0, d), (d, 2 * d)):
+                        W[s0:s1, :].copy_((1.0 - b_corr) * W[s0:s1, :] + b_corr * (W[s0:s1, :] @ P_corr_t))
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
     if geo_basis.shape[1] >= cfg.d_model:
@@ -458,8 +551,19 @@ def main() -> None:
     p.add_argument("--geo-init-blend", type=float, default=0.3)
     p.add_argument("--geo-attn-bias", action="store_true", default=False)
     p.add_argument("--geo-attn-bias-blend", type=float, default=0.2)
+    p.add_argument("--geo-attn-corr-bias", action="store_true", default=False)
+    p.add_argument("--geo-attn-corr-blend", type=float, default=0.2)
+    p.add_argument("--geo-attn-corr-rank", type=int, default=16)
+    p.add_argument("--geo-attn-corr-layers", type=int, default=2)
+    p.add_argument("--geo-attn-corr-horizons", type=str, default="1,2")
+    p.add_argument("--geo-attn-corr-horizon-weights", type=str, default="1.0,0.5")
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
+
+    corr_horizons = parse_int_list_csv(args.geo_attn_corr_horizons)
+    corr_h_weights = parse_float_list_csv(args.geo_attn_corr_horizon_weights)
+    if len(corr_horizons) != len(corr_h_weights):
+        raise ValueError("--geo-attn-corr-horizons and --geo-attn-corr-horizon-weights must have same length")
 
     cfg = RunConfig(
         epochs=args.epochs,
@@ -485,6 +589,12 @@ def main() -> None:
         geo_init_blend=args.geo_init_blend,
         geo_attn_bias=args.geo_attn_bias,
         geo_attn_bias_blend=args.geo_attn_bias_blend,
+        geo_attn_corr_bias=args.geo_attn_corr_bias,
+        geo_attn_corr_blend=args.geo_attn_corr_blend,
+        geo_attn_corr_rank=args.geo_attn_corr_rank,
+        geo_attn_corr_layers=args.geo_attn_corr_layers,
+        geo_attn_corr_horizons=tuple(corr_horizons),
+        geo_attn_corr_horizon_weights=tuple(corr_h_weights),
     )
 
     device = get_device()
@@ -510,11 +620,23 @@ def main() -> None:
     else:
         geo_basis = compute_bucket_basis(train_ids, vocab_size, cfg.d_model)
 
+    attn_corr_projector = None
+    if cfg.geo_attn_corr_bias:
+        attn_corr_projector = compute_attn_corr_projector(
+            train_ids,
+            vocab_size,
+            geo_basis,
+            cfg.d_model,
+            cfg.geo_attn_corr_rank,
+            list(cfg.geo_attn_corr_horizons),
+            list(cfg.geo_attn_corr_horizon_weights),
+        )
+
     runs = []
     for seed in range(cfg.seeds):
         for mode in ["baseline", "geo_system"]:
             print(f"Running mode={mode}, seed={seed}")
-            res = train_one(train_ids, val_ids, vocab_size, geo_basis, mode, cfg, seed, device)
+            res = train_one(train_ids, val_ids, vocab_size, geo_basis, attn_corr_projector, mode, cfg, seed, device)
             runs.append(res)
 
     base = summarize(runs, "baseline")
