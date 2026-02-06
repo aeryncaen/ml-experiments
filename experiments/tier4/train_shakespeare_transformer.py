@@ -119,6 +119,16 @@ def compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps
     return basis.astype(np.float32)
 
 
+def compute_model_projector(geo_basis: np.ndarray, d_model: int, k: int) -> np.ndarray:
+    B = geo_basis[:, :d_model].astype(np.float64)
+    cov = B.T @ B
+    _, eigvecs = np.linalg.eigh(cov)
+    k_eff = max(1, min(k, d_model))
+    U = eigvecs[:, -k_eff:]
+    P = U @ U.T
+    return P.astype(np.float32)
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
@@ -185,6 +195,8 @@ class RunConfig:
     eta_topk: int = 16
     geo_init_method: str = "bucket"
     geo_init_blend: float = 0.7
+    geo_attn_bias: bool = False
+    geo_attn_bias_blend: float = 0.2
 
 
 def get_batch(data: np.ndarray, batch_size: int, block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -266,6 +278,19 @@ def train_one(train_ids: np.ndarray, val_ids: np.ndarray, vocab_size: int, geo_b
             k = min(E.shape[1], geo_basis.shape[1])
             B = torch.from_numpy(geo_basis[:, :k]).to(device=device, dtype=E.dtype)
             E[:, :k] = (1.0 - cfg.geo_init_blend) * E[:, :k] + cfg.geo_init_blend * B
+
+            if cfg.geo_attn_bias:
+                P_np = compute_model_projector(geo_basis, cfg.d_model, cfg.eta_topk)
+                P_t = torch.from_numpy(P_np).to(device=device, dtype=E.dtype)
+                b = float(cfg.geo_attn_bias_blend)
+                for blk in model.blocks:
+                    attn = blk.attn
+                    d = cfg.d_model
+                    W = attn.in_proj_weight
+                    for s0, s1 in ((0, d), (d, 2 * d), (2 * d, 3 * d)):
+                        W[s0:s1, :].copy_((1.0 - b) * W[s0:s1, :] + b * (W[s0:s1, :] @ P_t))
+                    Wo = attn.out_proj.weight
+                    Wo.copy_((1.0 - b) * Wo + b * (Wo @ P_t))
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
     if geo_basis.shape[1] >= cfg.d_model:
@@ -431,6 +456,8 @@ def main() -> None:
     p.add_argument("--eta-topk", type=int, default=16)
     p.add_argument("--geo-init-method", type=str, choices=["bucket", "kl_bucket", "eig"], default="bucket")
     p.add_argument("--geo-init-blend", type=float, default=0.3)
+    p.add_argument("--geo-attn-bias", action="store_true", default=False)
+    p.add_argument("--geo-attn-bias-blend", type=float, default=0.2)
     p.add_argument("--out", type=str, default="tier4_shakespeare_results.json")
     args = p.parse_args()
 
@@ -456,6 +483,8 @@ def main() -> None:
         eta_topk=args.eta_topk,
         geo_init_method=args.geo_init_method,
         geo_init_blend=args.geo_init_blend,
+        geo_attn_bias=args.geo_attn_bias,
+        geo_attn_bias_blend=args.geo_attn_bias_blend,
     )
 
     device = get_device()
