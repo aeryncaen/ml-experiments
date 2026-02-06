@@ -166,8 +166,8 @@ class RunConfig:
     chi2_q_beta: float = 0.9
     chi2_per_layer: bool = True
     chi2_eta_shape: bool = True
-    chi2_eta_proj_scale: float = 1.2
-    chi2_eta_resid_scale: float = 0.8
+    chi2_eta_proj_scale: float = 1.0
+    chi2_eta_resid_scale: float = 1.0
     chi2_eta_dist_tau: float = 2.0
     chi2_eta_min_resid_weight: float = 0.05
     chi2_forget_guard: bool = True
@@ -289,15 +289,15 @@ def train_one(
     best_epoch = 0
     best_state = None
 
-    def apply_eta_shaping(enable: bool) -> tuple[float | None, float | None]:
-        # Returns (raw_eta, shaped_eta)
+    def apply_eta_shaping(enable: bool) -> tuple[float | None, float | None, float | None]:
+        # Returns (raw_eta, shaped_eta, mean_resid_weight)
         if not cfg.chi2_eta_shape:
-            return None, None
+            return None, None, None
         if not enable:
-            return None, None
+            return None, None, None
         g = model.fc1.weight.grad
         if g is None:
-            return None, None
+            return None, None, None
         g_proj = g @ P_top_t
         g_res = g - g_proj
         row_dist = torch.norm(g_res, dim=1, keepdim=True)
@@ -308,12 +308,13 @@ def train_one(
         total = float(torch.sum(g * g).item())
         proj = float(torch.sum(g_proj * g_proj).item())
         raw_eta = proj / max(total, 1e-12)
-        g.copy_(cfg.chi2_eta_proj_scale * g_proj + cfg.chi2_eta_resid_scale * resid_weight * g_res)
+        g.copy_(g_proj + resid_weight * g_res)
         total_after = float(torch.sum(g * g).item())
         g_after_proj = g @ P_top_t
         proj_after = float(torch.sum(g_after_proj * g_after_proj).item())
         shaped_eta = proj_after / max(total_after, 1e-12)
-        return raw_eta, shaped_eta
+        mean_w = float(torch.mean(resid_weight).item())
+        return raw_eta, shaped_eta, mean_w
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -333,6 +334,8 @@ def train_one(
         eta_grad_count = 0
         eta_grad_raw_sum = 0.0
         eta_grad_raw_count = 0
+        eta_resid_w_sum = 0.0
+        eta_resid_w_count = 0
         tr_start_by_group = {
             str(g.get("name", f"group_{i}")): float(g.get("trust_radius", 0.0))
             for i, g in enumerate(opt.param_groups)
@@ -365,13 +368,16 @@ def train_one(
                     opt.zero_grad()
                 loss.backward()
                 if is_chi2_family:
-                    raw_eta, shaped_eta = apply_eta_shaping(enable=True)
+                    raw_eta, shaped_eta, mean_w = apply_eta_shaping(enable=True)
                     if raw_eta is not None:
                         eta_grad_raw_sum += raw_eta
                         eta_grad_raw_count += 1
                     if shaped_eta is not None:
                         eta_grad_sum += shaped_eta
                         eta_grad_count += 1
+                    if mean_w is not None:
+                        eta_resid_w_sum += mean_w
+                        eta_resid_w_count += 1
                 if is_hybrid:
                     if adam_opt is None or chi2_opt is None:
                         raise RuntimeError("Hybrid optimizer state not initialized")
@@ -485,13 +491,16 @@ def train_one(
                     opt.zero_grad()
                 loss.backward()
                 if is_chi2_family or is_eta_follow:
-                    raw_eta, shaped_eta = apply_eta_shaping(enable=(is_chi2_family or is_eta_follow))
+                    raw_eta, shaped_eta, mean_w = apply_eta_shaping(enable=(is_chi2_family or is_eta_follow))
                     if raw_eta is not None:
                         eta_grad_raw_sum += raw_eta
                         eta_grad_raw_count += 1
                     if shaped_eta is not None:
                         eta_grad_sum += shaped_eta
                         eta_grad_count += 1
+                    if mean_w is not None:
+                        eta_resid_w_sum += mean_w
+                        eta_resid_w_count += 1
                 if is_hybrid:
                     if adam_opt is None or chi2_opt is None:
                         raise RuntimeError("Hybrid optimizer state not initialized")
@@ -574,6 +583,7 @@ def train_one(
                 {
                     "eta_grad_raw_mean": float(eta_grad_raw_sum / max(eta_grad_raw_count, 1)),
                     "eta_grad_shaped_mean": float(eta_grad_sum / max(eta_grad_count, 1)),
+                    "eta_resid_weight_mean": float(eta_resid_w_sum / max(eta_resid_w_count, 1)),
                 }
             )
         history.append(epoch_rec)
