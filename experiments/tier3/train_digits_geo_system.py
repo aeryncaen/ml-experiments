@@ -227,11 +227,12 @@ def train_one(
         raise ValueError(mode)
 
     is_hybrid = cfg.optimizer == "adam_chi2_hybrid"
+    is_eta_follow = cfg.optimizer == "adam_eta_follow"
     is_chi2_family = cfg.optimizer in ("chi2", "adam_chi2_hybrid")
     adam_opt = None
     chi2_opt = None
 
-    if cfg.optimizer == "adam":
+    if cfg.optimizer in ("adam", "adam_eta_follow"):
         opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     elif is_chi2_family:
         if cfg.chi2_per_layer:
@@ -451,7 +452,7 @@ def train_one(
                 else:
                     opt.zero_grad()
                 loss.backward()
-                if is_chi2_family:
+                if is_chi2_family or is_eta_follow:
                     eta_ratio = apply_eta_shaping()
                     if eta_ratio is not None:
                         eta_grad_sum += eta_ratio
@@ -518,6 +519,8 @@ def train_one(
                     "chi2_hybrid_scale": float(cfg.hybrid_chi2_scale),
                 }
             )
+        elif is_eta_follow:
+            epoch_rec.update({"eta_grad_mean": float(eta_grad_sum / max(eta_grad_count, 1))})
         history.append(epoch_rec)
 
     # Final evaluations on clean + shifts
@@ -582,7 +585,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--reg-lambda", type=float, default=2e-3)
     parser.add_argument("--reg-warmup-epochs", type=int, default=6)
-    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2", "adam_chi2_hybrid"], default="adam")
+    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2", "adam_chi2_hybrid", "adam_eta_follow"], default="adam")
     parser.add_argument("--trust-radius", type=float, default=0.05)
     parser.add_argument("--beta2", type=float, default=0.99)
     parser.add_argument("--lr-scale", type=float, default=1.0)
