@@ -204,10 +204,6 @@ class USBBlock(nn.Module):
             d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
         )
 
-        # Content-dependent attention gate
-        self.attn_gate = nn.Linear(d_expanded, 1, bias=True)
-        nn.init.zeros_(self.attn_gate.weight)
-        nn.init.constant_(self.attn_gate.bias, -2.0)
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -428,9 +424,6 @@ class USBBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
 
-        # Content-dependent gating
-        attn_gate = torch.sigmoid(self.attn_gate(attn_in_flat))
-        attn_out = attn_out * attn_gate
 
         if do_debug:
             eps = 1e-6
