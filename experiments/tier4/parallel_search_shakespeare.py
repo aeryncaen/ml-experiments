@@ -681,7 +681,7 @@ def run_parallel_search(
         k0 = min(d_model, geo_basis.shape[1])
         geo_target_np[:, :k0] = geo_basis[:, :k0]
         if cfg.geo_init_match_row_norm:
-            E0 = bm.params["token_emb.weight"][i].detach().cpu().numpy()
+            E0 = bm.params["token_emb.weight"][i].detach().cpu().float().numpy()
             t_norm = np.linalg.norm(geo_target_np, axis=1, keepdims=True)
             e_norm = np.linalg.norm(E0, axis=1, keepdims=True)
             geo_target_np = geo_target_np / np.maximum(t_norm, 1e-8) * e_norm
