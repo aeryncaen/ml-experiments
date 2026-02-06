@@ -884,7 +884,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--block-size", type=int, default=64)
     p.add_argument("--d-model", type=int, default=64)
-    p.add_argument("--n-head", type=int, default=4)
+    p.add_argument("--n-head", type=int, default=2)
     p.add_argument("--n-layer", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
