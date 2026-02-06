@@ -801,8 +801,8 @@ BINARY_SEARCH_AXES: dict[str, tuple[float, float, bool]] = {
     "geo_init_blend":            (0.4, 0.95, False),
     "geo_embed_grad_rank":       (4, 32, True),
     "geo_embed_grad_perp_init":  (0.05, 0.4, False),
-    "geo_embed_grad_hold_steps": (50, 400, True),
-    "geo_embed_grad_ramp_steps": (50, 400, True),
+    "geo_embed_grad_hold_steps": (10, 150, True),
+    "geo_embed_grad_ramp_steps": (10, 150, True),
     "geo_embed_reanchor_rho":    (0.0, 0.04, False),
 }
 
