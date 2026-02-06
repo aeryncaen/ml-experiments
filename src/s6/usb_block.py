@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .scan import forward_scan, backward_scan
-from .rope import apply_data_dependent_rope, apply_rope
+from .rope import apply_data_dependent_rope
 
 
 @dataclass
@@ -179,18 +179,15 @@ class USBBlock(nn.Module):
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: QKV projections
-        self.q_proj = nn.Linear(d_expanded, d_expanded, bias=False)
+        # Step 2: KV projections
         self.k_proj = nn.Linear(d_expanded, d_expanded, bias=False)
         self.v_proj = nn.Linear(d_expanded, d_expanded, bias=False)
 
-        # Gated RMSNorm for Q, K, V
-        self.q_norm = GatedRMSNorm(d_expanded)
+        # Gated RMSNorm for K, V
         self.k_norm = GatedRMSNorm(d_expanded)
         self.v_norm = GatedRMSNorm(d_expanded)
 
-        # QK bias (per-head, initialized to 1.0)
-        self.q_bias = nn.Parameter(torch.ones(nheads_total, headdim))
+        # K bias (per-head, initialized to 1.0)
         self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         
         # Per-head projections for scan groups (G1, G2, G3)
@@ -203,7 +200,6 @@ class USBBlock(nn.Module):
         self.conv_g3 = nn.Conv1d(
             d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
         )
-
         
         # Learnable initial states for scan heads (G1, G2, G3)
         # Shape depends on per-group scan_state_modes:
@@ -257,7 +253,7 @@ class USBBlock(nn.Module):
         # Step 1: Expansion with SiLU
         x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
         
-        # Step 2: KV projection (Q comes later from enhanced dims)
+        # Step 2: KV projection
         k = self.k_proj(x_exp)
         v = self.v_proj(x_exp)
 
@@ -371,59 +367,12 @@ class USBBlock(nn.Module):
         conv_g3_out = conv_g3(v_g3)
         out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
-        # Step 5: Passthrough for G4
+        # Step 5: Passthrough for G4 (standard RoPE only)
         out_g4 = v_g4  # No scan, just passthrough
 
-        # Step 6: Full attention with Q from enhanced dims
-        attn_in = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
-        attn_in_flat = rearrange(attn_in, 'b t h d -> b t (h d)')
-
-        q = self.q_proj(attn_in_flat)
-        q = self.q_norm(q)
-        q = rearrange(q, 'b t (h d) -> b t h d', h=config.nheads_total)
-        q = q + self.q_bias
-
-        # Apply data-dependent RoPE to Q for attention
-        q_g1, q_g2, q_g3, q_g4 = (
-            q[..., :nph, :],
-            q[..., nph:2*nph, :],
-            q[..., 2*nph:3*nph, :],
-            q[..., 3*nph:, :],
-        )
-
-        q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
-        q_g2 = apply_data_dependent_rope(q_g2, params_g2['rope_freq'])
-        q_g3 = apply_data_dependent_rope(q_g3, params_g3['rope_freq'])
-
-        # Standard RoPE for G3/G4 on Q (after DD-RoPE for G3)
-        q_g3 = apply_rope(q_g3, seq_len)
-        q_g4 = apply_rope(q_g4, seq_len)
-
-        # Standard RoPE for G3/G4 on K (after DD-RoPE for G3)
-        k_g3_for_attn = apply_rope(k_g3, seq_len)
-        k_g4_for_attn = apply_rope(k_g4, seq_len)
-
-        # Concatenate for SDPA
-        q_all = torch.cat([q_g1, q_g2, q_g3, q_g4], dim=-2)
-        k_all = torch.cat([k_g1, k_g2, k_g3_for_attn, k_g4_for_attn], dim=-2)
-        v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
-
-        # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
-        q_sdpa = q_all.transpose(1, 2)
-        k_sdpa = k_all.transpose(1, 2)
-        v_sdpa = v_all.transpose(1, 2)
-
-        # Acausal attention
-        attn_out = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=attention_mask,
-            is_causal=False,
-        )
-
-        # Transpose back and flatten
-        attn_out = attn_out.transpose(1, 2)
+        # Step 6: No attention - concatenate scan outputs
+        attn_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
-
 
         if do_debug:
             eps = 1e-6
