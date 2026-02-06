@@ -858,6 +858,7 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--data-path", type=str, default="./data/tinyshakespeare/input.txt")
     p.add_argument("--binary-levels", type=int, default=2)
+    p.add_argument("--config-batch", type=int, default=64)
     p.add_argument("--top-k", type=int, default=25)
     p.add_argument("--out", type=str, default="experiments/tier4/parallel_search_results.json")
     args = p.parse_args()
@@ -881,27 +882,37 @@ def main():
 
     # Generate configs
     print("Generating binary grid configs...", flush=True)
-    configs = generate_full_binary_grid(args.binary_levels)
-    print(f"Generated {len(configs)} configs", flush=True)
+    all_configs = generate_full_binary_grid(args.binary_levels)
+    print(f"Generated {len(all_configs)} configs, config_batch={args.config_batch}", flush=True)
 
-    # Run
-    results = run_parallel_search(
-        configs=configs,
-        train_ids=train_ids,
-        val_ids=val_ids,
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        n_head=args.n_head,
-        n_layer=args.n_layer,
-        block_size=args.block_size,
-        dropout=args.dropout,
-        lr=args.lr,
-        steps=args.steps,
-        eval_iters=args.eval_iters,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        device=device,
-    )
+    # Run in config batches
+    results: list[dict] = []
+    n_batches = (len(all_configs) + args.config_batch - 1) // args.config_batch
+    for bi in range(n_batches):
+        start = bi * args.config_batch
+        end = min(start + args.config_batch, len(all_configs))
+        configs = all_configs[start:end]
+        print(f"\n--- Config batch {bi+1}/{n_batches} ({len(configs)} configs, {start}-{end-1}) ---", flush=True)
+        batch_results = run_parallel_search(
+            configs=configs,
+            train_ids=train_ids,
+            val_ids=val_ids,
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            n_head=args.n_head,
+            n_layer=args.n_layer,
+            block_size=args.block_size,
+            dropout=args.dropout,
+            lr=args.lr,
+            steps=args.steps,
+            eval_iters=args.eval_iters,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            device=device,
+        )
+        results.extend(batch_results)
+
+    results.sort(key=lambda r: (-r["val_acc"], r["val_loss"]))
 
     # Print top results
     top_k = min(args.top_k, len(results))
@@ -932,7 +943,7 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = {
-        "n_configs": len(configs),
+        "n_configs": len(all_configs),
         "strategy": "binary_grid",
         "binary_levels": args.binary_levels,
         "steps": args.steps,
