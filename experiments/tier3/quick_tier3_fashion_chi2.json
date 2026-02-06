@@ -1,0 +1,112 @@
+{
+  "config": {
+    "data_dir": "./data",
+    "epochs": 1,
+    "seeds": 1,
+    "batch_size": 256,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 8000,
+    "optimizer": "chi2",
+    "trust_radius": 0.03,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "out": "quick_tier3_fashion_chi2.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.10000000000000002,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.101,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.101,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.1,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.10000000000000002,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.101,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.101,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.1,
+      "acc_border": 0.1,
+      "acc_center": 0.1,
+      "acc_contrast": 0.1,
+      "robust_avg": 0.10000000000000002,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 111409.0036046753,
+          "val_acc": 0.101
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.1,
+      "acc_border": 0.1,
+      "acc_center": 0.1,
+      "acc_contrast": 0.1,
+      "robust_avg": 0.10000000000000002,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 614436.7918112793,
+          "val_acc": 0.101
+        }
+      ]
+    }
+  ]
+}

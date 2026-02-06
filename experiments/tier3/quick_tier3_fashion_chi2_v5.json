@@ -1,0 +1,122 @@
+{
+  "config": {
+    "data_dir": "./data",
+    "epochs": 2,
+    "seeds": 1,
+    "batch_size": 256,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 12000,
+    "optimizer": "chi2",
+    "trust_radius": 0.05,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "out": "quick_tier3_fashion_chi2_v5.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.3157,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.3177,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.3122,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.3158,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.3152333333333333,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.3148,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.3148,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.5491,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.5219,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.4784,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.5488,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.5163666666666666,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.553,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.553,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.3157,
+      "acc_border": 0.3177,
+      "acc_center": 0.3122,
+      "acc_contrast": 0.3158,
+      "robust_avg": 0.3152333333333333,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 34981689.82926414,
+          "val_acc": 0.171
+        },
+        {
+          "epoch": 2,
+          "train_loss": 9972513.913714286,
+          "val_acc": 0.3148
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.5491,
+      "acc_border": 0.5219,
+      "acc_center": 0.4784,
+      "acc_contrast": 0.5488,
+      "robust_avg": 0.5163666666666666,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 26631517.952272166,
+          "val_acc": 0.269
+        },
+        {
+          "epoch": 2,
+          "train_loss": 4044809.697142857,
+          "val_acc": 0.553
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "config": {
+    "data_dir": "./data",
+    "epochs": 2,
+    "seeds": 1,
+    "batch_size": 256,
+    "lr": 0.0007,
+    "reg_lambda": 0.001,
+    "reg_warmup_epochs": 8,
+    "max_train": 12000,
+    "optimizer": "chi2",
+    "trust_radius": 0.05,
+    "beta2": 0.99,
+    "lr_scale": 1.0,
+    "out": "quick_tier3_fashion_chi2_v2.json"
+  },
+  "device": "mps",
+  "baseline": {
+    "clean_acc": {
+      "mean": 0.1023,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.0994,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.104,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.1024,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.10193333333333333,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.0988,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.0988,
+      "std": 0.0
+    }
+  },
+  "geo_system": {
+    "clean_acc": {
+      "mean": 0.1006,
+      "std": 0.0
+    },
+    "acc_border": {
+      "mean": 0.0962,
+      "std": 0.0
+    },
+    "acc_center": {
+      "mean": 0.0941,
+      "std": 0.0
+    },
+    "acc_contrast": {
+      "mean": 0.1005,
+      "std": 0.0
+    },
+    "robust_avg": {
+      "mean": 0.09693333333333333,
+      "std": 0.0
+    },
+    "val_acc_ep3": {
+      "mean": 0.1054,
+      "std": 0.0
+    },
+    "val_acc_ep5": {
+      "mean": 0.1054,
+      "std": 0.0
+    }
+  },
+  "runs": [
+    {
+      "mode": "baseline",
+      "seed": 0,
+      "clean_acc": 0.1023,
+      "acc_border": 0.0994,
+      "acc_center": 0.104,
+      "acc_contrast": 0.1024,
+      "robust_avg": 0.10193333333333333,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 1544909165.9778357,
+          "val_acc": 0.0976
+        },
+        {
+          "epoch": 2,
+          "train_loss": 1397480853.3577142,
+          "val_acc": 0.0988
+        }
+      ]
+    },
+    {
+      "mode": "geo_system",
+      "seed": 0,
+      "clean_acc": 0.1006,
+      "acc_border": 0.0962,
+      "acc_center": 0.0941,
+      "acc_contrast": 0.1005,
+      "robust_avg": 0.09693333333333333,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 1362812169.007701,
+          "val_acc": 0.1002
+        },
+        {
+          "epoch": 2,
+          "train_loss": 1154337587.4925714,
+          "val_acc": 0.1054
+        }
+      ]
+    }
+  ]
+}

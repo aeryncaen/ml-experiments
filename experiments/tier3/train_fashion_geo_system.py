@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.datasets import FashionMNIST
 
+from chi2_optimizer import Chi2TrustRegion
+
 
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
@@ -134,6 +136,10 @@ class RunConfig:
     reg_lambda: float = 1e-3
     reg_warmup_epochs: int = 8
     max_train: int = 60000
+    optimizer: str = "adam"
+    trust_radius: float = 0.05
+    beta2: float = 0.99
+    lr_scale: float = 1.0
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -178,7 +184,17 @@ def train_one(
     if mode == "geo_system":
         geometry_init_first_layer(model.fc1, eigvecs, eigvals)
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    if cfg.optimizer == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    elif cfg.optimizer == "chi2":
+        opt = Chi2TrustRegion(
+            model.parameters(),
+            trust_radius=cfg.trust_radius,
+            beta2=cfg.beta2,
+            lr_scale=cfg.lr_scale,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
     train_loader = make_loader(X_train, y_train, cfg.batch_size, shuffle=True)
     history = []
 
@@ -291,6 +307,10 @@ def main() -> None:
     parser.add_argument("--reg-lambda", type=float, default=1e-3)
     parser.add_argument("--reg-warmup-epochs", type=int, default=8)
     parser.add_argument("--max-train", type=int, default=60000)
+    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2"], default="adam")
+    parser.add_argument("--trust-radius", type=float, default=0.05)
+    parser.add_argument("--beta2", type=float, default=0.99)
+    parser.add_argument("--lr-scale", type=float, default=1.0)
     parser.add_argument("--out", type=str, default="tier3_fashion_results.json")
     args = parser.parse_args()
 
@@ -302,10 +322,15 @@ def main() -> None:
         reg_lambda=args.reg_lambda,
         reg_warmup_epochs=args.reg_warmup_epochs,
         max_train=args.max_train,
+        optimizer=args.optimizer,
+        trust_radius=args.trust_radius,
+        beta2=args.beta2,
+        lr_scale=args.lr_scale,
     )
 
     device = get_device()
     print(f"Device: {device}")
+    print(f"Optimizer: {cfg.optimizer}")
 
     X_train, y_train, X_val, y_val, X_test, y_test = load_fashion(args.data_dir, args.max_train)
     print(f"Train/Val/Test: {len(X_train)}/{len(X_val)}/{len(X_test)}")

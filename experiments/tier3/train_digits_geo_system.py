@@ -33,6 +33,8 @@ from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+from chi2_optimizer import Chi2TrustRegion
+
 
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
@@ -148,6 +150,10 @@ class RunConfig:
     seeds: int = 3
     reg_lambda: float = 2e-3
     reg_warmup_epochs: int = 6
+    optimizer: str = "adam"
+    trust_radius: float = 0.05
+    beta2: float = 0.99
+    lr_scale: float = 1.0
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
@@ -199,7 +205,17 @@ def train_one(
     else:
         raise ValueError(mode)
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    if cfg.optimizer == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    elif cfg.optimizer == "chi2":
+        opt = Chi2TrustRegion(
+            model.parameters(),
+            trust_radius=cfg.trust_radius,
+            beta2=cfg.beta2,
+            lr_scale=cfg.lr_scale,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
     train_loader = make_loader(X_train, y_train, cfg.batch_size, shuffle=True)
 
     history = []
@@ -286,6 +302,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--reg-lambda", type=float, default=2e-3)
     parser.add_argument("--reg-warmup-epochs", type=int, default=6)
+    parser.add_argument("--optimizer", type=str, choices=["adam", "chi2"], default="adam")
+    parser.add_argument("--trust-radius", type=float, default=0.05)
+    parser.add_argument("--beta2", type=float, default=0.99)
+    parser.add_argument("--lr-scale", type=float, default=1.0)
     parser.add_argument("--out", type=str, default="tier3_digits_results.json")
     args = parser.parse_args()
 
@@ -296,10 +316,15 @@ def main() -> None:
         lr=args.lr,
         reg_lambda=args.reg_lambda,
         reg_warmup_epochs=args.reg_warmup_epochs,
+        optimizer=args.optimizer,
+        trust_radius=args.trust_radius,
+        beta2=args.beta2,
+        lr_scale=args.lr_scale,
     )
 
     device = get_device()
     print(f"Device: {device}")
+    print(f"Optimizer: {cfg.optimizer}")
 
     data = load_digits()
     X = data.data.astype(np.float64)
