@@ -403,6 +403,9 @@ def main() -> None:
     p.add_argument("--strategy", choices=["random", "grid"], default="random")
     p.add_argument("--max-runs", type=int, default=64)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--seeds", type=int, default=1)
+    p.add_argument("--steps-per-epoch", type=int, default=300)
+    p.add_argument("--eval-iters", type=int, default=50)
     p.add_argument("--python", type=str, default=sys.executable)
     p.add_argument(
         "--runner",
@@ -430,14 +433,14 @@ def main() -> None:
 
     common = {
         "epochs": 1,
-        "steps_per_epoch": 300,
-        "eval_iters": 50,
+        "steps_per_epoch": args.steps_per_epoch,
+        "eval_iters": args.eval_iters,
         "batch_size": 512,
         "block_size": 64,
         "d_model": 64,
         "n_head": 4,
         "n_layer": 4,
-        "seeds": 5,
+        "seeds": args.seeds,
         "optimizer": "adam",
         "loss_type": "ce",
         "eta_shape": True,
@@ -509,7 +512,7 @@ def main() -> None:
 
     total_pending = len(pending)
     print(
-        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={mode}",
+        f"Starting search: strategy={args.strategy} requested={args.max_runs} pending={total_pending} resume={args.resume} mode={mode} seeds={common['seeds']} steps={common['steps_per_epoch']} eval_iters={common['eval_iters']}",
         flush=True,
     )
 
