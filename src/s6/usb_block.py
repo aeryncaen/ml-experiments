@@ -215,6 +215,7 @@ class USBBlock(nn.Module):
         self.router = nn.Linear(d_expanded, 1, bias=False)
         self.router_temp = nn.Parameter(torch.tensor(1.0))
         self.local_gate = nn.Parameter(torch.tensor(-2.0))
+        self.kv_blend = nn.Parameter(torch.tensor(-2.0))
         nn.init.zeros_(self.router.weight)
         
         # Learnable initial states for scan heads (G1, G2, G3)
@@ -392,12 +393,19 @@ class USBBlock(nn.Module):
         out_g4 = v_g4  # No scan, just passthrough
 
         # Step 6: Low-rank attention (full Q against downsampled KV)
-        v_all = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
+        kv_blend = torch.sigmoid(self.kv_blend)
+        k_pre = torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2)
+        k_post = torch.cat([k_g1, k_g2, k_g3, k_g4], dim=-2)
+        v_pre = torch.cat([v_g1, v_g2, v_g3, v_g4], dim=-2)
+        v_post = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
+
+        k_all_blend = (1.0 - kv_blend) * k_pre + kv_blend * k_post
+        v_all_blend = (1.0 - kv_blend) * v_pre + kv_blend * v_post
 
         target_len = max(1, int(math.sqrt(seq_len * 1.5)))
 
-        k_flat = rearrange(torch.cat([k_g1_attn, k_g2_attn, k_g3_attn, k_g4_attn], dim=-2), 'b t h d -> b t (h d)')
-        v_flat = rearrange(v_all, 'b t h d -> b t (h d)')
+        k_flat = rearrange(k_all_blend, 'b t h d -> b t (h d)')
+        v_flat = rearrange(v_all_blend, 'b t h d -> b t (h d)')
         k_down_flat = self.attn_downsample(k_flat, (target_len,))
         v_down_flat = self.attn_downsample(v_flat, (target_len,))
         k_down = rearrange(k_down_flat, 'b t (h d) -> b t h d', h=config.nheads_total)
@@ -460,18 +468,18 @@ class USBBlock(nn.Module):
         )
 
         # Step 7: Multifocal attention over routed windows
-        k_full_g1 = apply_data_dependent_rope(k_g1_attn, params_g1['rope_freq'])
-        k_full_g2 = apply_data_dependent_rope(k_g2_attn, params_g2['rope_freq'])
-        k_full_g3 = apply_data_dependent_rope(k_g3_attn, params_g3['rope_freq'])
+        k_full_g1 = apply_data_dependent_rope(k_all_blend[..., :nph, :], params_g1['rope_freq'])
+        k_full_g2 = apply_data_dependent_rope(k_all_blend[..., nph:2*nph, :], params_g2['rope_freq'])
+        k_full_g3 = apply_data_dependent_rope(k_all_blend[..., 2*nph:3*nph, :], params_g3['rope_freq'])
         k_full_g3 = apply_rope(k_full_g3, seq_len)
-        k_full_g4 = apply_rope(k_g4_attn, seq_len)
+        k_full_g4 = apply_rope(k_all_blend[..., 3*nph:, :], seq_len)
 
         q_full = q_all
         k_full = torch.cat([k_full_g1, k_full_g2, k_full_g3, k_full_g4], dim=-2)
 
         q_full = q_full.transpose(1, 2)
         k_full = k_full.transpose(1, 2)
-        v_full = v_all.transpose(1, 2)
+        v_full = v_all_blend.transpose(1, 2)
 
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
