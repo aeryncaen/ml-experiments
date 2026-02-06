@@ -48,19 +48,19 @@ class RMSNorm(nn.Module):
         return x * rms * self.weight
 
 
-def cayley(A: torch.Tensor) -> torch.Tensor:
+def skew_to_orthogonal(A: torch.Tensor) -> torch.Tensor:
     """
-    Cayley transform: U = (I - A)(I + A)^{-1} for skew-symmetric A.
-    Always produces an orthogonal matrix when A is skew-symmetric.
+    Map skew-symmetric A to orthogonal U via matrix exponential.
+    exp(A) is always orthogonal when A is skew-symmetric (A = -A^T).
+
+    More numerically stable than Cayley on MPS and with autograd.
 
     Args:
         A: (..., d, d) skew-symmetric matrices
     Returns:
         U: (..., d, d) orthogonal matrices
     """
-    d = A.shape[-1]
-    I = torch.eye(d, device=A.device, dtype=A.dtype)
-    return torch.linalg.solve(I + A, I - A)
+    return torch.matrix_exp(A)
 
 
 class OrthogonalProjection(nn.Module):
@@ -127,8 +127,8 @@ class OrthogonalProjection(nn.Module):
         # Total skew-symmetric matrix
         A = A_base.unsqueeze(0) + A_data  # (batch, d, d)
 
-        # Cayley transform -> orthogonal
-        U = cayley(A)  # (batch, d, d)
+        # Matrix exponential of skew-symmetric -> orthogonal
+        U = skew_to_orthogonal(A)  # (batch, d, d)
         return U
 
     def forward(self, r: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
