@@ -486,9 +486,46 @@ def _grad_stats(named_params):
     }
 
 
+def _tensor_stats(tensor: torch.Tensor) -> dict:
+    t = tensor.detach()
+    if t.is_sparse:
+        t = t.coalesce().values()
+    if t.numel() == 0:
+        return {
+            'mean_abs': 0.0,
+            'max_abs': 0.0,
+            'has_nan': False,
+            'has_inf': False,
+        }
+    has_nan = torch.isnan(t).any().item()
+    has_inf = torch.isinf(t).any().item()
+    abs_t = t.abs()
+    return {
+        'mean_abs': abs_t.float().mean().item(),
+        'max_abs': abs_t.max().item(),
+        'has_nan': has_nan,
+        'has_inf': has_inf,
+    }
+
+
+def _make_activation_hook(name, store, active_flag):
+    def hook(_module, _inputs, output):
+        if not active_flag['on']:
+            return
+        out = output
+        if isinstance(out, (tuple, list)) and len(out) > 0:
+            out = out[0]
+        if not torch.is_tensor(out):
+            return
+        store[name] = _tensor_stats(out)
+
+    return hook
+
+
 def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, device='cpu',
                preloaded_data=None, early_stop_acc=0.99, grad_log_every=50,
-               grad_explode=1e3, grad_vanish=1e-6):
+               grad_explode=1e3, grad_vanish=1e-6, act_log_every=50,
+               act_explode=1e3):
     """Train with epochs and early stopping when val accuracy exceeds threshold."""
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
@@ -498,6 +535,10 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     marker_embed = None
     head = None
     vocab_size = None
+
+    act_stats_step = {}
+    act_active = {'on': False}
+    act_hooks = []
 
     if task_name == 'delay':
         vocab_size = 32
@@ -537,6 +578,17 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
         tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
         tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
+
+    if act_log_every:
+        if isinstance(model, StackedModel):
+            for i, layer in enumerate(model.layers):
+                act_hooks.append(layer.register_forward_hook(
+                    _make_activation_hook(f"layer{i}", act_stats_step, act_active)
+                ))
+        else:
+            act_hooks.append(model.register_forward_hook(
+                _make_activation_hook("model", act_stats_step, act_active)
+            ))
 
     assert preloaded_data is not None, "preloaded_data required — use pregen_task_data()"
     train_data = preloaded_data['train']
@@ -622,6 +674,11 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     grad_vanish_steps = 0
     grad_nan_steps = 0
     grad_inf_steps = 0
+
+    act_max_abs = 0.0
+    act_explode_steps = 0
+    act_nan_steps = 0
+    act_inf_steps = 0
     
     # Track best result
     best_epoch = 0
@@ -641,7 +698,39 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
         step_pbar = tqdm(train_indices, desc=f"Epoch {epoch+1}", leave=False, ncols=80)
         for idx in step_pbar:
             batch = train_data[idx]
+            track_act = act_log_every and (total_steps % act_log_every == 0)
+            if track_act:
+                act_stats_step.clear()
+                act_active['on'] = True
             loss, acc = _forward(batch)
+            act_active['on'] = False
+
+            if track_act:
+                step_max_abs = 0.0
+                step_max_name = None
+                step_has_nan = False
+                step_has_inf = False
+                for name, stats in act_stats_step.items():
+                    if stats['max_abs'] > step_max_abs:
+                        step_max_abs = stats['max_abs']
+                        step_max_name = name
+                    step_has_nan = step_has_nan or stats['has_nan']
+                    step_has_inf = step_has_inf or stats['has_inf']
+
+                act_max_abs = max(act_max_abs, step_max_abs)
+                if step_has_nan:
+                    act_nan_steps += 1
+                if step_has_inf:
+                    act_inf_steps += 1
+                if step_max_abs > act_explode:
+                    act_explode_steps += 1
+
+                if step_has_nan or step_has_inf or step_max_abs > act_explode:
+                    max_name = step_max_name if step_max_name else "n/a"
+                    tqdm.write(
+                        f"[act] step={total_steps} max_abs={step_max_abs:.3e} "
+                        f"max_module={max_name} nan={step_has_nan} inf={step_has_inf}"
+                    )
             
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -721,6 +810,15 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
             f"explode={grad_explode_steps} vanish={grad_vanish_steps} "
             f"nan={grad_nan_steps} inf={grad_inf_steps}"
         )
+
+    if act_log_every:
+        tqdm.write(
+            f"[act] summary max_abs={act_max_abs:.3e} explode={act_explode_steps} "
+            f"nan={act_nan_steps} inf={act_inf_steps}"
+        )
+
+    for hook in act_hooks:
+        hook.remove()
 
     return {
         'initial': initial_loss if initial_loss else 0.0,
@@ -832,6 +930,10 @@ if __name__ == '__main__':
                         help='Gradient norm threshold for explosion warning')
     parser.add_argument('--grad-vanish', type=float, default=1e-6,
                         help='Gradient norm threshold for vanishing warning')
+    parser.add_argument('--act-log-every', type=int, default=50,
+                        help='Log activation stats every N steps (0 to disable)')
+    parser.add_argument('--act-explode', type=float, default=1e3,
+                        help='Activation max-abs threshold for explosion warning')
     parser.add_argument('--models', type=str, nargs='+', default=None,
                         help='Specific models to test (default: all)')
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
@@ -909,7 +1011,9 @@ if __name__ == '__main__':
                            preloaded_data=task_data, early_stop_acc=args.early_stop_acc,
                            grad_log_every=args.grad_log_every,
                            grad_explode=args.grad_explode,
-                           grad_vanish=args.grad_vanish)
+                           grad_vanish=args.grad_vanish,
+                           act_log_every=args.act_log_every,
+                           act_explode=args.act_explode)
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['best_epoch']:>6} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['stop_reason']:>10}")
             
             # Store result
