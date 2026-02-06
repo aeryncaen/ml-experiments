@@ -482,7 +482,13 @@ def _format_usb_debug(step: int, layer_idx: int, dbg: dict) -> list[str]:
     lines = []
     for g in ['g1', 'g2', 'g3']:
         pg = dbg[g]
-        if 'gamma' in pg:
+        if 'delta' in pg and 'epsilon' in pg and 'zeta' in pg:
+            lines.append(
+                f"[usb] step={step} layer={layer_idx} {g} "
+                f"alpha={fmt_stats(pg['alpha'])} delta={fmt_stats(pg['delta'])} "
+                f"epsilon={fmt_stats(pg['epsilon'])} zeta={fmt_stats(pg['zeta'])} gate={fmt_gate(pg['gate'])}"
+            )
+        elif 'gamma' in pg:
             lines.append(
                 f"[usb] step={step} layer={layer_idx} {g} "
                 f"alpha={fmt_stats(pg['alpha'])} beta={fmt_stats(pg['beta'])} gamma={fmt_stats(pg['gamma'])} "

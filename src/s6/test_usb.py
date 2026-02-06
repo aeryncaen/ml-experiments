@@ -97,25 +97,27 @@ def test_scan_functions():
     
     kv = torch.randn(batch, seq_len, nheads, headdim)
     alpha = torch.sigmoid(torch.randn(batch, seq_len, nheads))  # (0, 1)
-    beta = torch.randn(batch, seq_len, nheads)
+    delta = torch.randn(batch, seq_len, nheads)
+    epsilon = torch.randn(batch, seq_len, nheads)
+    zeta = torch.randn(batch, seq_len, nheads)
     init_state = torch.zeros(batch, nheads, headdim)
     
     print(f"\nScan functions:")
     
     # Forward scan
-    state_fwd = forward_scan(kv, alpha, beta, init_state)
+    state_fwd = forward_scan(kv, alpha, delta, epsilon, zeta, init_state)
     assert state_fwd.shape == kv.shape, f"Forward scan shape mismatch"
     assert not torch.isnan(state_fwd).any(), "Forward scan contains NaN"
     print("  Forward scan: PASSED")
     
     # Backward scan
-    state_bwd = backward_scan(kv, alpha, beta, init_state)
+    state_bwd = backward_scan(kv, alpha, delta, epsilon, zeta, init_state)
     assert state_bwd.shape == kv.shape, f"Backward scan shape mismatch"
     assert not torch.isnan(state_bwd).any(), "Backward scan contains NaN"
     print("  Backward scan: PASSED")
     
     # Centered scan
-    state_ctr = centered_scan(kv, alpha, beta, init_state)
+    state_ctr = centered_scan(kv, alpha, delta, epsilon, zeta, init_state)
     assert state_ctr.shape == kv.shape, f"Centered scan shape mismatch"
     assert not torch.isnan(state_ctr).any(), "Centered scan contains NaN"
     print("  Centered scan: PASSED")

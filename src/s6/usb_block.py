@@ -6,6 +6,7 @@ Unified Sequence Block (USB) Implementation
 
 from dataclasses import dataclass
 from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -73,7 +74,7 @@ class PerHeadProjections(nn.Module):
     """
     Fused projections for per-head content-dependent parameters.
     
-    Each scan head needs: α, β (Mamba-style coeffs), gate, rope_freq
+    Each scan head needs: α, δ/ε/ζ (Simpson coeffs), gate, rope_freq
     We fuse these into a single projection per group for efficiency.
     """
     
@@ -84,10 +85,11 @@ class PerHeadProjections(nn.Module):
         
         # Fused projection for all per-head parameters:
         # - alpha: 1 scalar per head (decay)
-        # - beta: 1 scalar per head (input scale)
+        # - dt: 1 scalar per head (step size)
+        # - simpson_logits: 3 scalars per head (δ/ε/ζ weights)
         # - gate: headdim values per head (per-dimension gating)
         # - rope_freq: headdim // 2 values per head (rotation frequencies for pairs)
-        self.n_scalar_params = 2  # alpha, beta
+        self.n_scalar_params = 5  # alpha, dt, simpson_logits(3)
         self.n_gate_params = headdim
         self.n_rope_params = headdim // 2
         
@@ -106,7 +108,7 @@ class PerHeadProjections(nn.Module):
         Returns:
             dict with:
                 alpha: (batch, seq_len, nheads) - decay rates in (0, 1)
-                beta: (batch, seq_len, nheads) - input coefficients
+                delta, epsilon, zeta: (batch, seq_len, nheads) - Simpson coefficients
                 gate: (batch, seq_len, nheads, headdim) - per-dim injection gates in (0, 1)
                 rope_freq: (batch, seq_len, nheads, headdim // 2) - rotation frequencies
         """
@@ -119,11 +121,13 @@ class PerHeadProjections(nn.Module):
         # Split into components
         idx = 0
         
-        # Scalars: alpha, beta
+        # Scalars: alpha, dt, simpson logits
         alpha_raw = out[..., idx]
         idx += 1
-        beta_raw = out[..., idx]
+        dt_raw = out[..., idx]
         idx += 1
+        simpson_logits = out[..., idx:idx + 3]
+        idx += 3
         
         # Gate: per-dimension
         gate_raw = out[..., idx:idx + self.n_gate_params]
@@ -134,12 +138,19 @@ class PerHeadProjections(nn.Module):
         
         # Apply activation functions
         alpha = torch.exp(-F.softplus(alpha_raw))  # (0, 1)
-        beta = F.softplus(beta_raw)
+        dt = F.softplus(dt_raw)
+        simpson_bias = torch.tensor([0.0, math.log(4.0), 0.0], device=x.device, dtype=x.dtype)
+        simpson_weights = F.softmax(simpson_logits + simpson_bias, dim=-1)
+        delta = simpson_weights[..., 0] * dt * alpha.pow(2)
+        epsilon = simpson_weights[..., 1] * dt * alpha
+        zeta = simpson_weights[..., 2] * dt
         gate = torch.sigmoid(gate_raw)  # (0, 1) per dimension
         
         return {
             'alpha': alpha,
-            'beta': beta,
+            'delta': delta,
+            'epsilon': epsilon,
+            'zeta': zeta,
             'gate': gate,
             'rope_freq': rope_freq,
         }
@@ -190,9 +201,9 @@ class USBBlock(nn.Module):
         self.scan_proj_g2 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
         self.scan_proj_g3 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
 
-        # G3 depthwise conv (k=3) replacing centered scan
+        # G3 depthwise conv (k=3) replacing centered scan (causal)
         self.conv_g3 = nn.Conv1d(
-            d_group, d_group, kernel_size=3, padding=1, groups=d_group, bias=False
+            d_group, d_group, kernel_size=3, padding=0, groups=d_group, bias=False
         )
         
         # Learnable initial states for scan heads (G1, G2, G3)
@@ -314,7 +325,9 @@ class USBBlock(nn.Module):
         state_g1 = forward_scan(
             kv=kv_g1,
             alpha=params_g1['alpha'],
-            beta=params_g1['beta'],
+            delta=params_g1['delta'],
+            epsilon=params_g1['epsilon'],
+            zeta=params_g1['zeta'],
             init_state=init_g1,
         )
         
@@ -322,7 +335,9 @@ class USBBlock(nn.Module):
         state_g2 = backward_scan(
             kv=kv_g2,
             alpha=params_g2['alpha'],
-            beta=params_g2['beta'],
+            delta=params_g2['delta'],
+            epsilon=params_g2['epsilon'],
+            zeta=params_g2['zeta'],
             init_state=init_g2,
         )
         
@@ -350,10 +365,11 @@ class USBBlock(nn.Module):
         else:
             out_g2 = v_g2 + params_g2['gate'] * state_g2
         
-        # G3 readout: depthwise conv over sequence
+        # G3 readout: depthwise conv over sequence (causal)
         def conv_g3(x_heads: torch.Tensor) -> torch.Tensor:
             b_, t_, h_, d_ = x_heads.shape
             x_flat = rearrange(x_heads, 'b t h d -> b (h d) t')
+            x_flat = F.pad(x_flat, (2, 0))
             y = self.conv_g3(x_flat)
             return rearrange(y, 'b (h d) t -> b t h d', h=h_)
 
@@ -411,10 +427,14 @@ class USBBlock(nn.Module):
 
             def _param_block(params: dict) -> dict:
                 alpha = params['alpha']
-                beta = params['beta']
+                delta = params['delta']
+                epsilon = params['epsilon']
+                zeta = params['zeta']
                 return {
                     'alpha': _stats(alpha),
-                    'beta': _stats(beta),
+                    'delta': _stats(delta),
+                    'epsilon': _stats(epsilon),
+                    'zeta': _stats(zeta),
                     'gate': _gate_stats(params['gate']),
                 }
 
