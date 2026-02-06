@@ -130,6 +130,90 @@ def sample_random(space: dict[str, list], n: int, rng: random.Random) -> list[di
     return out
 
 
+def load_best_config(path: str) -> dict:
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    top = data.get("top", [])
+    if not top:
+        raise ValueError(f"No top entries in {path}")
+    return dict(top[0]["config"])
+
+
+def binary_values(base: float, lo: float, hi: float, levels: int, as_int: bool) -> list:
+    vals = [float(base)]
+    span = hi - lo
+    for i in range(1, levels + 1):
+        step = span / (2 ** i)
+        vals.append(max(lo, min(hi, float(base) - step)))
+        vals.append(max(lo, min(hi, float(base) + step)))
+    if as_int:
+        out = sorted({int(round(v)) for v in vals})
+    else:
+        out = sorted({round(float(v), 8) for v in vals})
+    return out
+
+
+def build_binary_candidates(base_cfg: dict, keys: list[str], levels: int, max_runs: int, rng: random.Random) -> list[dict]:
+    bounds = {
+        "geo_init_blend": (0.1, 0.95, False),
+        "geo_init_ridge": (1e-5, 1e-1, False),
+        "geo_attn_bias_blend": (0.05, 0.95, False),
+        "geo_attn_corr_blend": (0.05, 0.6, False),
+        "geo_attn_corr_rank": (4, 32, True),
+        "geo_attn_corr_layers": (1, 4, True),
+        "geo_embed_grad_perp_init": (0.01, 0.4, False),
+        "geo_embed_grad_hold_steps": (50, 500, True),
+        "geo_embed_grad_ramp_steps": (50, 500, True),
+        "geo_embed_grad_rank": (4, 32, True),
+        "geo_embed_reanchor_rho": (0.0, 0.05, False),
+    }
+
+    value_space: dict[str, list] = {}
+    for k in keys:
+        if k not in base_cfg or k not in bounds:
+            continue
+        lo, hi, as_int = bounds[k]
+        value_space[k] = binary_values(float(base_cfg[k]), lo, hi, levels, as_int)
+
+    # Start with the base config itself.
+    cands = [dict(base_cfg)]
+
+    # Coordinate-wise binary perturbations around base.
+    for k, vals in value_space.items():
+        for v in vals:
+            cfg = dict(base_cfg)
+            cfg[k] = v
+            cands.append(cfg)
+
+    # Pairwise combinations for strongest interacting params.
+    pair_keys = [k for k in ["geo_init_blend", "geo_attn_corr_blend", "geo_embed_grad_perp_init", "geo_embed_grad_hold_steps"] if k in value_space]
+    for i in range(len(pair_keys)):
+        for j in range(i + 1, len(pair_keys)):
+            k1, k2 = pair_keys[i], pair_keys[j]
+            for v1 in value_space[k1]:
+                for v2 in value_space[k2]:
+                    cfg = dict(base_cfg)
+                    cfg[k1] = v1
+                    cfg[k2] = v2
+                    cands.append(cfg)
+
+    # Deduplicate + keep valid
+    seen = set()
+    uniq = []
+    for cfg in cands:
+        s = json.dumps(cfg, sort_keys=True)
+        if s in seen:
+            continue
+        seen.add(s)
+        if is_valid(cfg):
+            uniq.append(cfg)
+
+    if len(uniq) <= max_runs:
+        return uniq
+    rng.shuffle(uniq)
+    return uniq[:max_runs]
+
+
 def stable_id(cfg: dict) -> str:
     s = json.dumps(cfg, sort_keys=True)
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
@@ -400,9 +484,16 @@ def load_ep1_metrics(result_json: Path) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Hyperparameter/config search for best Shakespeare epoch-1 geo results")
-    p.add_argument("--strategy", choices=["random", "grid"], default="random")
+    p.add_argument("--strategy", choices=["random", "grid", "binary"], default="random")
     p.add_argument("--max-runs", type=int, default=64)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--binary-base", type=str, default="leaderboard_ep1.json")
+    p.add_argument(
+        "--binary-keys",
+        type=str,
+        default="geo_init_blend,geo_init_ridge,geo_attn_corr_blend,geo_attn_corr_rank,geo_attn_corr_layers,geo_embed_grad_perp_init,geo_embed_grad_hold_steps,geo_embed_grad_ramp_steps,geo_embed_grad_rank,geo_embed_reanchor_rho",
+    )
+    p.add_argument("--binary-levels", type=int, default=3)
     p.add_argument("--seeds", type=int, default=1)
     p.add_argument("--steps-per-epoch", type=int, default=300)
     p.add_argument("--eval-iters", type=int, default=50)
@@ -489,6 +580,17 @@ def main() -> None:
     print("Generating candidate configs...", flush=True)
     if args.strategy == "grid":
         candidates = list(itertools.islice(iter_grid(space), args.max_runs))
+    elif args.strategy == "binary":
+        base_cfg = load_best_config(args.binary_base)
+        binary_keys = [k.strip() for k in args.binary_keys.split(",") if k.strip()]
+        candidates = build_binary_candidates(
+            base_cfg,
+            keys=binary_keys,
+            levels=max(1, int(args.binary_levels)),
+            max_runs=args.max_runs,
+            rng=rng,
+        )
+        print(f"Binary base from {args.binary_base}: {base_cfg}", flush=True)
     else:
         candidates = sample_random(space, args.max_runs, rng)
     print(f"Generated candidates: {len(candidates)}", flush=True)
