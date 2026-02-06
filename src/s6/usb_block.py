@@ -163,6 +163,11 @@ class USBBlock(nn.Module):
     def __init__(self, config: USBConfig):
         super().__init__()
         self.config = config
+
+        # Debug instrumentation (set externally)
+        self.debug = False
+        self.debug_active = False
+        self.last_debug = None
         
         d_model = config.d_model
         d_expanded = config.d_expanded
@@ -240,6 +245,10 @@ class USBBlock(nn.Module):
         batch, seq_len, _ = x.shape
         config = self.config
         residual = x
+
+        do_debug = self.debug and self.debug_active
+        if do_debug:
+            self.last_debug = None
         
         # Pre-norm
         x = self.norm(x)
@@ -333,6 +342,9 @@ class USBBlock(nn.Module):
         # For outer mode: query with k to retrieve v (k-based readout)
         # For elementwise mode: state is already the right shape
         scale = config.headdim ** -0.5
+
+        state_g1_read = None
+        state_g2_read = None
         
         # G1 readout
         if modes[0] == 'outer':
@@ -355,7 +367,8 @@ class USBBlock(nn.Module):
             y = self.conv_g3(x_flat)
             return rearrange(y, 'b (h d) t -> b t h d', h=h_)
 
-        out_g3 = v_g3 + params_g3['gate'] * conv_g3(v_g3)
+        conv_g3_out = conv_g3(v_g3)
+        out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
         # Apply data-dependent RoPE to Q for attention
         q_g1 = apply_data_dependent_rope(q_g1, params_g1['rope_freq'])
@@ -393,6 +406,91 @@ class USBBlock(nn.Module):
         # Transpose back and flatten: (B, H, T, D) -> (B, T, H*D)
         attn_out = attn_out.transpose(1, 2)
         attn_out = rearrange(attn_out, 'b t h d -> b t (h d)')
+
+        if do_debug:
+            eps = 1e-6
+
+            def _rms(t: torch.Tensor) -> float:
+                t = t.detach()
+                if t.is_sparse:
+                    t = t.coalesce().values()
+                return t.float().pow(2).mean().sqrt().item()
+
+            def _stats(t: torch.Tensor) -> dict:
+                t = t.detach()
+                if t.is_sparse:
+                    t = t.coalesce().values()
+                return {
+                    'mean': t.float().mean().item(),
+                    'min': t.min().item(),
+                    'max': t.max().item(),
+                }
+
+            def _gate_stats(g: torch.Tensor) -> dict:
+                g = g.detach()
+                return {
+                    'mean': g.float().mean().item(),
+                    'low': (g < 0.01).float().mean().item(),
+                    'high': (g > 0.99).float().mean().item(),
+                }
+
+            def _seq_rms(t: torch.Tensor, outer: bool) -> dict:
+                if outer:
+                    dims = (0, 2, 3, 4)
+                else:
+                    dims = (0, 2, 3)
+                seq_rms = t.detach().float().pow(2).mean(dim=dims).sqrt()
+                mid = seq_rms.shape[0] // 2
+                return {
+                    't0': seq_rms[0].item(),
+                    'tmid': seq_rms[mid].item(),
+                    'tend': seq_rms[-1].item(),
+                    'min': seq_rms.min().item(),
+                    'max': seq_rms.max().item(),
+                }
+
+            def _param_block(params: dict) -> dict:
+                alpha = params['alpha']
+                beta = params['beta']
+                gamma = params['gamma']
+                delta = gamma + beta / (alpha + eps)
+                lam = gamma / (delta + eps)
+                return {
+                    'alpha': _stats(alpha),
+                    'beta': _stats(beta),
+                    'gamma': _stats(gamma),
+                    'delta': _stats(delta),
+                    'lambda': _stats(lam),
+                    'gate': _gate_stats(params['gate']),
+                }
+
+            debug = {
+                'g1': _param_block(params_g1),
+                'g2': _param_block(params_g2),
+                'g3': _param_block(params_g3),
+                'rms': {
+                    'k_g1': _rms(k_g1),
+                    'v_g1': _rms(v_g1),
+                    'state_g1': _rms(state_g1),
+                    'state_read_g1': _rms(state_g1_read) if state_g1_read is not None else 0.0,
+                    'out_g1': _rms(out_g1),
+                    'k_g2': _rms(k_g2),
+                    'v_g2': _rms(v_g2),
+                    'state_g2': _rms(state_g2),
+                    'state_read_g2': _rms(state_g2_read) if state_g2_read is not None else 0.0,
+                    'out_g2': _rms(out_g2),
+                    'v_g3': _rms(v_g3),
+                    'conv_g3': _rms(conv_g3_out),
+                    'out_g3': _rms(out_g3),
+                    'attn_out': _rms(attn_out),
+                },
+                'seq_rms': {
+                    'g1': _seq_rms(state_g1, modes[0] == 'outer'),
+                    'g2': _seq_rms(state_g2, modes[1] == 'outer'),
+                },
+            }
+
+            self.last_debug = debug
         
         # Step 7: Down-projection
         out = self.down_proj(attn_out)

@@ -442,6 +442,72 @@ def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, devi
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+def _set_usb_debug(model, enabled: bool) -> None:
+    for m in model.modules():
+        if isinstance(m, USBBlock):
+            m.debug = enabled
+
+
+def _set_usb_debug_active(model, active: bool) -> None:
+    for m in model.modules():
+        if isinstance(m, USBBlock):
+            m.debug_active = active
+
+
+def _collect_usb_debug(model):
+    logs = []
+    if hasattr(model, 'layers'):
+        for i, layer in enumerate(model.layers):
+            usb = getattr(layer, 'usb', None)
+            dbg = getattr(usb, 'last_debug', None) if usb is not None else None
+            if dbg is not None:
+                logs.append((i, dbg))
+    else:
+        for i, m in enumerate([m for m in model.modules() if isinstance(m, USBBlock)]):
+            if m.last_debug is not None:
+                logs.append((i, m.last_debug))
+    return logs
+
+
+def _format_usb_debug(step: int, layer_idx: int, dbg: dict) -> list[str]:
+    def fmt_stats(s: dict) -> str:
+        return f"{s['mean']:.2e}/{s['min']:.2e}/{s['max']:.2e}"
+
+    def fmt_gate(s: dict) -> str:
+        return f"{s['mean']:.2e} lo={s['low']:.2e} hi={s['high']:.2e}"
+
+    def fmt_seq(s: dict) -> str:
+        return f"t0={s['t0']:.2e} tm={s['tmid']:.2e} te={s['tend']:.2e} min={s['min']:.2e} max={s['max']:.2e}"
+
+    lines = []
+    for g in ['g1', 'g2', 'g3']:
+        pg = dbg[g]
+        lines.append(
+            f"[usb] step={step} layer={layer_idx} {g} "
+            f"alpha={fmt_stats(pg['alpha'])} beta={fmt_stats(pg['beta'])} gamma={fmt_stats(pg['gamma'])} "
+            f"delta={fmt_stats(pg['delta'])} lambda={fmt_stats(pg['lambda'])} gate={fmt_gate(pg['gate'])}"
+        )
+
+    rms = dbg['rms']
+    lines.append(
+        f"[usb] step={step} layer={layer_idx} rms "
+        f"k1={rms['k_g1']:.2e} v1={rms['v_g1']:.2e} s1={rms['state_g1']:.2e} "
+        f"sr1={rms['state_read_g1']:.2e} o1={rms['out_g1']:.2e}"
+    )
+    lines.append(
+        f"[usb] step={step} layer={layer_idx} rms "
+        f"k2={rms['k_g2']:.2e} v2={rms['v_g2']:.2e} s2={rms['state_g2']:.2e} "
+        f"sr2={rms['state_read_g2']:.2e} o2={rms['out_g2']:.2e}"
+    )
+    lines.append(
+        f"[usb] step={step} layer={layer_idx} rms "
+        f"v3={rms['v_g3']:.2e} c3={rms['conv_g3']:.2e} o3={rms['out_g3']:.2e} attn={rms['attn_out']:.2e}"
+    )
+
+    seq = dbg['seq_rms']
+    lines.append(f"[usb] step={step} layer={layer_idx} seq g1 {fmt_seq(seq['g1'])}")
+    lines.append(f"[usb] step={step} layer={layer_idx} seq g2 {fmt_seq(seq['g2'])}")
+    return lines
 def _grad_stats(named_params):
     total_sq = 0.0
     total_abs = 0.0
@@ -525,7 +591,7 @@ def _make_activation_hook(name, store, active_flag):
 def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, device='cpu',
                preloaded_data=None, early_stop_acc=0.99, grad_log_every=50,
                grad_explode=1e3, grad_vanish=1e-6, act_log_every=50,
-               act_explode=1e3):
+               act_explode=1e3, usb_debug_every=0):
     """Train with epochs and early stopping when val accuracy exceeds threshold."""
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
@@ -535,6 +601,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     marker_embed = None
     head = None
     vocab_size = None
+
+    if usb_debug_every:
+        _set_usb_debug(model, True)
 
     act_stats_step = {}
     act_active = {'on': False}
@@ -698,12 +767,20 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
         step_pbar = tqdm(train_indices, desc=f"Epoch {epoch+1}", leave=False, ncols=80)
         for idx in step_pbar:
             batch = train_data[idx]
+            track_usb = usb_debug_every and (total_steps % usb_debug_every == 0)
+            if track_usb:
+                _set_usb_debug_active(model, True)
             track_act = act_log_every and (total_steps % act_log_every == 0)
             if track_act:
                 act_stats_step.clear()
                 act_active['on'] = True
             loss, acc = _forward(batch)
             act_active['on'] = False
+            if track_usb:
+                _set_usb_debug_active(model, False)
+                for layer_idx, dbg in _collect_usb_debug(model):
+                    for line in _format_usb_debug(total_steps, layer_idx, dbg):
+                        tqdm.write(line)
 
             if track_act:
                 step_max_abs = 0.0
@@ -934,6 +1011,8 @@ if __name__ == '__main__':
                         help='Log activation stats every N steps (0 to disable)')
     parser.add_argument('--act-explode', type=float, default=1e3,
                         help='Activation max-abs threshold for explosion warning')
+    parser.add_argument('--usb-debug-every', type=int, default=0,
+                        help='Log USB internal stats every N steps (0 to disable)')
     parser.add_argument('--models', type=str, nargs='+', default=None,
                         help='Specific models to test (default: all)')
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
@@ -1013,7 +1092,8 @@ if __name__ == '__main__':
                            grad_explode=args.grad_explode,
                            grad_vanish=args.grad_vanish,
                            act_log_every=args.act_log_every,
-                           act_explode=args.act_explode)
+                           act_explode=args.act_explode,
+                           usb_debug_every=args.usb_debug_every)
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['best_epoch']:>6} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['stop_reason']:>10}")
             
             # Store result
