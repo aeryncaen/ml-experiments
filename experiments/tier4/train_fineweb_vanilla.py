@@ -15,6 +15,12 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 from s6 import USBBlock, USBConfig
 
 
@@ -351,100 +357,81 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
-        with torch.autograd.profiler.record_function("tf/attn_qkv_rope"):
-            q = self.q(x).view(b, t, self.n_head, self.head_dim)
-            k = self.k(x).view(b, t, self.n_head, self.head_dim)
-            v = self.v(x).view(b, t, self.n_head, self.head_dim)
-            cos, sin = self.rotary(q)
-            q = apply_rotary(q, cos, sin)
-            k = apply_rotary(k, cos, sin)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-        with torch.autograd.profiler.record_function("tf/attn_sdpa"):
-            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        q = self.q(x).view(b, t, self.n_head, self.head_dim)
+        k = self.k(x).view(b, t, self.n_head, self.head_dim)
+        v = self.v(x).view(b, t, self.n_head, self.head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+        if HAS_FLASH_ATTN:
+            y = flash_attn_func(q, k, v, causal=True)         # (b, t, h, d)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+        y = y.contiguous().view(b, t, c)
         return self.proj(y)
 
 
 class ShiftAttention(nn.Module):
-    """Attention with temporal channel shifts on K and V.
+    """Attention with temporal channel-group shifts on K and V.
 
-    Different heads use different shift amounts (0, 1, 2, 4, 8, ...),
-    so each KV entry carries local temporal context from neighbors.
+    Within each head, d_head is split into groups. Each group's channels
+    at position t come from a different past position (t, t-1, t-2, t-4).
+    Each KV cache entry becomes a chimera encoding a temporal neighborhood.
     No new parameters. FlashAttention unchanged. Just a reindex.
     """
 
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, d_model: int, n_head: int, shifts: tuple[int, ...] = (0, 1, 2, 4)):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.head_dim = d_model // n_head
+        assert self.head_dim % len(shifts) == 0, \
+            f"head_dim {self.head_dim} must be divisible by {len(shifts)} shift groups"
+        self.cpg = self.head_dim // len(shifts)  # channels per group
+        self.shifts_list = shifts
+        self.max_shift = max(shifts)
         self.q = nn.Linear(d_model, d_model, bias=False)
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-        # Assign shift amounts per head: 0, 1, 2, 4, 8, 16, ...
-        # Head 0 = no shift, rest = powers of 2, cycling if n_head > log2(seq_len)
-        shifts = [0]
-        s = 1
-        for _ in range(n_head - 1):
-            shifts.append(s)
-            s *= 2
-            if s > 128:  # cap and cycle
-                s = 1
-        self.max_shift = max(shifts)
-        # Precompute offsets for gather: offset[h] = max_shift - shift[h]
-        offsets = torch.tensor([self.max_shift - s for s in shifts], dtype=torch.long)
-        self.register_buffer('shifts', torch.tensor(shifts, dtype=torch.long), persistent=False)
-        self.register_buffer('offsets', offsets, persistent=False)
-
     def _shift_kv(self, x: torch.Tensor) -> torch.Tensor:
-        """Shift each head's channels by its assigned amount along the time axis.
-        x: (B, T, H, D).  Shift is causal: position t gets data from t-shift.
-        Positions before the shift amount get zeros (causal padding).
-        Vectorized: group heads by shift amount, pad+slice each group.
+        """Shift channel groups within each head along the time axis.
+        x: (B, T, H, D).  Group i gets shifted by shifts[i] positions causally.
         """
-        B, T, H, D = x.shape
-        max_shift = self.max_shift
-        if max_shift == 0:
+        if self.max_shift == 0:
             return x
-        # Pad time dim at the front: (B, max_shift + T, H, D)
-        x_pad = F.pad(x, (0, 0, 0, 0, max_shift, 0))  # pad dim=1 from left
-        # For head h with shift s, we want x_pad[:, max_shift-s : max_shift-s+T, h, :]
-        # Gather along time dim using advanced indexing
-        # Build index: (H, T) where idx[h, t] = offsets[h] + t
-        t_idx = torch.arange(T, device=x.device)           # (T,)
-        gather_idx = self.offsets.unsqueeze(1) + t_idx.unsqueeze(0)  # (H, T)
-        # x_pad is (B, max_shift+T, H, D) -> permute to (B, H, max_shift+T, D)
-        x_pad = rearrange(x_pad, 'b t h d -> b h t d')
-        # Expand gather_idx for batch and D dims
-        gather_idx = gather_idx.unsqueeze(0).unsqueeze(-1).expand(B, H, T, D)
-        out = x_pad.gather(2, gather_idx)                   # (B, H, T, D)
-        return rearrange(out, 'b h t d -> b t h d')
+        B, T, H, D = x.shape
+        out = torch.zeros_like(x)
+        for i, s in enumerate(self.shifts_list):
+            sl = slice(i * self.cpg, (i + 1) * self.cpg)
+            if s == 0:
+                out[:, :, :, sl] = x[:, :, :, sl]
+            else:
+                out[:, s:, :, sl] = x[:, :T-s, :, sl]
+                # out[:, :s, :, sl] stays zero — no history yet
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
-        with torch.autograd.profiler.record_function("sa/qkv_shift_rope"):
-            q = self.q(x).view(b, t, self.n_head, self.head_dim)
-            k = self.k(x).view(b, t, self.n_head, self.head_dim)
-            v = self.v(x).view(b, t, self.n_head, self.head_dim)
-            # Shift K and V before RoPE
-            k = self._shift_kv(k)
-            v = self._shift_kv(v)
-            cos, sin = self.rotary(q)
-            q = apply_rotary(q, cos, sin)
-            k = apply_rotary(k, cos, sin)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-        with torch.autograd.profiler.record_function("sa/sdpa"):
-            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        q = self.q(x).view(b, t, self.n_head, self.head_dim)
+        k = self.k(x).view(b, t, self.n_head, self.head_dim)
+        v = self.v(x).view(b, t, self.n_head, self.head_dim)
+        k = self._shift_kv(k)
+        v = self._shift_kv(v)
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+        if HAS_FLASH_ATTN:
+            y = flash_attn_func(q, k, v, causal=True)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+        y = y.contiguous().view(b, t, c)
         return self.proj(y)
 
 
