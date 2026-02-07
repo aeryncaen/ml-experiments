@@ -548,6 +548,10 @@ class FusedGatedNeighborBlock(nn.Module):
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
+        # QK norm (per-head RMSNorm before RoPE)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
         # RoPE in expanded head_dim
         self.rotary = Rotary(self.head_dim)
 
@@ -576,7 +580,9 @@ class FusedGatedNeighborBlock(nn.Module):
         k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # RoPE
+        # QK norm then RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         cos, sin = self.rotary(q)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
