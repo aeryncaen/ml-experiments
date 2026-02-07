@@ -507,23 +507,20 @@ class GatedNeighborBlock(nn.Module):
 
 
 class FusedGatedNeighborBlock(nn.Module):
-    """Fused attention+MLP block with data-dependent rotary state.
+    """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
 
     x -> norm -> up_proj(d_model -> inner) -> SiLU -> h_up
              -> Q(inner -> inner)                      |
              -> K(inner -> inner)                      |
              -> V(inner -> inner)                      |
-             -> data-dependent rotation on Q, K        |
+             -> gated neighbor on K                    |
              -> RoPE on Q, K                           |
              -> attention(Q, K, V) -> attn_out         |
-             -> norm(attn_out) * h_up  <---------------+
+             -> norm(attn_out) + h_up  <---------------+
              -> down_proj(inner -> d_model) -> residual
 
-    Data-dependent rotation: each position produces a Δθ per channel-pair
-    per head. Cumulative sum gives accumulated angles. Q and K channel-pairs
-    are rotated by the accumulated angle. The relative rotation θ[t]-θ[s]
-    between query t and key s creates content-dependent selectivity in the
-    dot product — an implicit state space that attention resolves.
+    SiLU after up_proj feeds rich features into QKV. Skip-add from h_up
+    to normed attention output preserves pre-attn features for down_proj.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
@@ -533,8 +530,7 @@ class FusedGatedNeighborBlock(nn.Module):
         self.inner_dim = inner_dim if inner_dim is not None else d_model * expand
         assert self.inner_dim % n_head == 0
         self.head_dim = self.inner_dim // n_head
-        assert self.head_dim % 4 == 0
-        self.quarter = self.head_dim // 4
+        self.half_dim = self.head_dim // 2
 
         self.norm = RMSNorm(d_model)
 
@@ -546,48 +542,27 @@ class FusedGatedNeighborBlock(nn.Module):
         self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
 
-        # Post-attention norm (before skip multiply)
+        # Post-attention norm (before skip add)
         self.attn_norm = RMSNorm(self.inner_dim)
 
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
-        # Fixed RoPE on first quarter of head_dim
-        assert self.quarter % 2 == 0, "quarter must be even for RoPE pairs"
-        self.rotary = Rotary(self.quarter)
+        # RoPE in expanded head_dim
+        self.rotary = Rotary(self.head_dim)
 
-        # Data-dependent rotation on second quarter (quarter // 2 rotation pairs)
-        self.n_rot_pairs = self.quarter // 2
-        self.theta_proj = nn.Linear(d_model, n_head * self.n_rot_pairs, bias=False)
-        nn.init.zeros_(self.theta_proj.weight)
-
-        # Neighbor gate: lerp on third quarter of K channels
-        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.quarter, bias=True)
+        # Neighbor gate: single lerp on K, per-channel per-head
+        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim, bias=True)
         nn.init.zeros_(self.neighbor_gate_proj.weight)
         nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
 
-    def _apply_dd_rope(self, q: torch.Tensor, k: torch.Tensor,
-                       cos_t: torch.Tensor, sin_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply data-dependent rotation to second quarter of Q and K."""
-        Q = self.quarter
-        q_dd = q[..., Q:2*Q]
-        k_dd = k[..., Q:2*Q]
-        nr = self.n_rot_pairs
-        q1, q2 = q_dd[..., :nr], q_dd[..., nr:]
-        k1, k2 = k_dd[..., :nr], k_dd[..., nr:]
-        q_rot = torch.cat([q1 * cos_t - q2 * sin_t, q1 * sin_t + q2 * cos_t], dim=-1)
-        k_rot = torch.cat([k1 * cos_t - k2 * sin_t, k1 * sin_t + k2 * cos_t], dim=-1)
-        q = torch.cat([q[..., :Q], q_rot, q[..., 2*Q:]], dim=-1)
-        k = torch.cat([k[..., :Q], k_rot, k[..., 2*Q:]], dim=-1)
-        return q, k
-
     def _gated_neighbor(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Lerp third quarter of K with previous position."""
-        Q = self.quarter
-        k_cur = k[..., 2*Q:3*Q]
+        half = self.half_dim
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
         k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
         k_mixed = (1 - gate) * k_cur + gate * k_prev
-        return torch.cat([k[..., :2*Q], k_mixed, k[..., 3*Q:]], dim=-1)
+        return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -601,21 +576,14 @@ class FusedGatedNeighborBlock(nn.Module):
         k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # Data-dependent rotation on second quarter of Q and K
-        delta_theta = self.theta_proj(h).view(b, t, self.n_head, self.n_rot_pairs)
-        theta = delta_theta.cumsum(dim=1)
-        cos_t, sin_t = theta.cos(), theta.sin()
-        q, k = self._apply_dd_rope(q, k, cos_t, sin_t)
+        # RoPE
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
 
-        # Gated neighbor mixing on third quarter of K
-        gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.quarter)
+        # Gated neighbor mixing on K
+        gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim)
         k = self._gated_neighbor(k, gate)
-
-        # Fixed RoPE on first quarter only
-        Q = self.quarter
-        cos, sin = self.rotary(q[..., :Q])
-        q = torch.cat([apply_rotary(q[..., :Q], cos, sin), q[..., Q:]], dim=-1)
-        k = torch.cat([apply_rotary(k[..., :Q], cos, sin), k[..., Q:]], dim=-1)
 
         # Attention
         if HAS_FLASH_ATTN:
