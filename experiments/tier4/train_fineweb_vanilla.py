@@ -131,74 +131,140 @@ class ShardStream:
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-class SIRENKernel(nn.Module):
-    """SIREN MLP that maps position -> per-channel kernel weight.  All real, compilable."""
+class Mamba3Mixer(nn.Module):
+    """Mamba-3-style mixer: trapezoidal SSD + data-dependent RoPE on B,C + BC bias.
 
-    def __init__(self, d_model: int, hidden: int = 64, n_layers: int = 2, omega_0: float = 30.0):
+    Implements the structured mask Y = (L_decay @ L_trap) ⊙ C B^T ) X
+    where L_trap is the bidiagonal (β_t, γ_t) trapezoidal conv mask,
+    and B,C get cumulative data-dependent rotary embeddings.
+
+    Uses the SSD (State Space Duality) quadratic form for training —
+    no explicit recurrence, just a masked matmul.
+    """
+
+    def __init__(self, d_model: int, n_head: int, d_state: int = 64):
         super().__init__()
-        self.omega_0 = omega_0
-        layers: list[nn.Module] = []
-        layers.append(nn.Linear(1, hidden, bias=True))
-        for _ in range(n_layers - 1):
-            layers.append(nn.Linear(hidden, hidden, bias=True))
-        self.net = nn.ModuleList(layers)
-        self.out = nn.Linear(hidden, d_model, bias=False)
-        # SIREN init
-        for i, lin in enumerate(self.net):
-            assert isinstance(lin, nn.Linear)
-            fan_in = lin.in_features
-            if i == 0:
-                nn.init.uniform_(lin.weight, -1.0 / fan_in, 1.0 / fan_in)
-            else:
-                bound = math.sqrt(6.0 / fan_in) / omega_0
-                nn.init.uniform_(lin.weight, -bound, bound)
-        # No weight decay on SIREN params
-        for p in self.parameters():
-            p._no_weight_decay = True  # type: ignore[attr-defined]
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head  # p
+        self.d_state = d_state             # n
 
-    def forward(self, L: int, device: torch.device) -> torch.Tensor:
-        # positions normalised to [-1, 1]
-        t = torch.linspace(-1, 1, L, device=device).unsqueeze(-1)  # (L, 1)
-        h = t
-        for i, lin in enumerate(self.net):
-            h = lin(h)
-            h = torch.sin(self.omega_0 * h) if i == 0 else torch.sin(h)
-        return self.out(h).T  # (D, L)
+        # Input projections: x -> (X, B, C, dt, lambda, theta)
+        # X: value, B: input proj, C: output proj, dt: timestep, lambda: trap weight, theta: rotation
+        proj_dim = (
+            d_model          # X  (H * p)
+            + n_head * d_state  # B  (H * n)
+            + n_head * d_state  # C  (H * n)
+            + n_head            # log_dt (H)
+            + n_head            # lambda_logit (H)
+            + n_head * (d_state // 2)  # theta (H * n/2) for data-dependent RoPE
+        )
+        self.in_proj = nn.Linear(d_model, proj_dim, bias=False)
 
+        # BC bias (Mamba-3 §3.4): learnable, head-specific, channel-wise, init=1
+        self.b_bias = nn.Parameter(torch.ones(n_head, d_state))
+        self.c_bias = nn.Parameter(torch.ones(n_head, d_state))
+        self.b_bias._no_weight_decay = True   # type: ignore[attr-defined]
+        self.c_bias._no_weight_decay = True   # type: ignore[attr-defined]
 
-class ShortConvLayer(nn.Module):
-    """SIREN-generated causal conv + RoPE + gating.  All real-valued, fully compilable."""
+        # QK-norm on B,C (Mamba-3 §3.4)
+        self.b_norm = nn.RMSNorm(d_state)
+        self.c_norm = nn.RMSNorm(d_state)
 
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.siren = SIRENKernel(d_model)
-        self.rotary = Rotary(d_model)
-        self.gate_proj = nn.Linear(d_model, d_model, bias=False)
+        # log A (scalar decay per head, like Mamba-2)
+        self.log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
+        self.log_A._no_weight_decay = True    # type: ignore[attr-defined]
+
+        # Output
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
         B, T, D = x.shape
-        # generate kernel from SIREN and convolve via FFT (float32 — FFT doesn't support bf16)
-        k = self.siren(T, x.device)                     # (D, T)
-        u = x.transpose(1, 2)                           # (B, D, T)
-        orig_dtype = u.dtype
-        k = k.float()
-        u = u.float()
-        k_f = torch.fft.rfft(k, n=2 * T)               # (D, T+1)
-        u_f = torch.fft.rfft(u, n=2 * T)               # (B, D, T+1)
-        u = torch.fft.irfft(u_f * k_f, n=2 * T)[..., :T]  # (B, D, T)
-        u = u.to(orig_dtype).transpose(1, 2)            # (B, T, D)
-        # RoPE on conv output
-        cos, sin = self.rotary(u.unsqueeze(2))          # (1, T, 1, D//2)
-        cos = cos.squeeze(2)                            # (1, T, D//2)
-        sin = sin.squeeze(2)
-        d = D // 2
-        u1, u2 = u[..., :d], u[..., d:]
-        u = torch.cat([u1 * cos + u2 * sin, -u1 * sin + u2 * cos], dim=-1)
-        # SiLU gate
-        gate = F.silu(self.gate_proj(x))
-        return self.out_proj(u * gate)
+        H, P, N = self.n_head, self.head_dim, self.d_state
+        Nr = N // 2  # half state dim for RoPE pairs
+
+        # Project input
+        proj = self.in_proj(x)  # (B, T, proj_dim)
+        idx = 0
+        X = proj[..., idx:idx + H * P].view(B, T, H, P);          idx += H * P
+        Bv = proj[..., idx:idx + H * N].view(B, T, H, N);         idx += H * N
+        Cv = proj[..., idx:idx + H * N].view(B, T, H, N);         idx += H * N
+        log_dt = proj[..., idx:idx + H].view(B, T, H);            idx += H
+        lam_logit = proj[..., idx:idx + H].view(B, T, H);         idx += H
+        theta = proj[..., idx:idx + H * Nr].view(B, T, H, Nr);    idx += H * Nr
+
+        # Discretization params
+        dt = F.softplus(log_dt)                                    # (B, T, H)
+        alpha = torch.exp(dt * self.log_A.exp().neg())             # (B, T, H) decay
+        lam = torch.sigmoid(lam_logit)                             # (B, T, H) trap weight
+
+        # QK-norm + BC bias (Mamba-3 §3.4)
+        Bv = self.b_norm(Bv) * self.b_bias                        # (B, T, H, N)
+        Cv = self.c_norm(Cv) * self.c_bias                        # (B, T, H, N)
+
+        # Data-dependent RoPE on B,C (Mamba-3 Prop 3)
+        # Cumulative rotation angles: Θ_t = sum_{i=0}^{t} theta_i
+        cum_theta = theta.cumsum(dim=1)                            # (B, T, H, Nr)
+        cos_th = cum_theta.cos()                                   # (B, T, H, Nr)
+        sin_th = cum_theta.sin()
+
+        # Apply rotation to B and C  (pairs along state dim)
+        def apply_dd_rope(v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+            v1, v2 = v[..., :Nr], v[..., Nr:]
+            return torch.cat([v1 * cos - v2 * sin, v1 * sin + v2 * cos], dim=-1)
+
+        Bv = apply_dd_rope(Bv, cos_th, sin_th)
+        Cv = apply_dd_rope(Cv, cos_th, sin_th)
+
+        # Build decay mask L[i,j] = prod_{k=j+1}^{i} alpha_k  (lower triangular)
+        # Use log-space cumsum for numerical stability
+        log_alpha = alpha.clamp(min=1e-6).log()                    # (B, T, H)
+        log_alpha_cum = log_alpha.cumsum(dim=1)                    # (B, T, H)
+        # L[i,j] = exp(log_alpha_cum[i] - log_alpha_cum[j]) for i >= j
+        # Shape: (B, H, T, T)
+        log_alpha_cum_h = log_alpha_cum.permute(0, 2, 1)           # (B, H, T)
+        decay_mask = (log_alpha_cum_h.unsqueeze(-1) - log_alpha_cum_h.unsqueeze(-2)).exp()
+        causal = torch.tril(torch.ones(T, T, device=x.device))    # (T, T)
+        decay_mask = decay_mask * causal                           # (B, H, T, T)
+
+        # Trapezoidal bidiagonal conv mask (Mamba-3 eq 5)
+        # γ_t = λ_t * dt_t,  β_t = (1-λ_t) * dt_t * α_t
+        gamma = lam * dt                                           # (B, T, H)
+        beta = (1.0 - lam) * dt * alpha                            # (B, T, H)
+        # Build bidiagonal: main diag = γ, sub-diag = β
+        # L_trap[t,t] = γ_t, L_trap[t,t-1] = β_t, else 0
+        # For the SSD product, we apply trap conv to B*X before the masked matmul
+        # BX_t' = γ_t * B_t * X_t + β_t * B_{t-1} * X_{t-1}
+        BX = torch.einsum('bthn,bthp->bthpn', Bv, X)             # (B, T, H, P, N)
+        gamma_e = gamma.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)  # (B, H, T, 1, 1)
+        beta_e = beta.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+        BX_p = BX.permute(0, 2, 1, 3, 4)                          # (B, H, T, P, N)
+        BX_shifted = F.pad(BX_p[:, :, :-1], (0, 0, 0, 0, 1, 0))  # (B, H, T, P, N) shifted right
+        BX_trap = gamma_e * BX_p + beta_e * BX_shifted             # (B, H, T, P, N)
+
+        # SSD quadratic form: Y = decay_mask @ (BX_trap projected through C)
+        # Equivalent to: for each head, Y[t] = sum_{s<=t} L[t,s] * C_t^T @ BX_trap[s]
+        # Y_t = C_t^T @ (sum_s L[t,s] * BX_trap[s])  -- but BX_trap is (P,N), C is (N,)
+        # Actually: output[t] = sum_s decay[t,s] * C_t^T @ BX_trap_s  -- this is per-head (P,)
+        # = C_t^T @ (decay_mask[t,:] @ BX_trap[:])
+        # More efficiently via matmul:
+        # states[t] = sum_s decay[t,s] * BX_trap[s]  shape (P, N)
+        # output[t] = states[t] @ C_t  shape (P,)
+
+        # Batched: states = decay_mask @ BX_trap.reshape(B,H,T,P*N) -> (B,H,T,P*N) -> (B,H,T,P,N)
+        states = torch.matmul(
+            decay_mask,
+            BX_trap.reshape(B, H, T, P * N)
+        ).reshape(B, H, T, P, N)                                  # (B, H, T, P, N)
+
+        # Contract with C: output = einsum('bhtpn,bthn->bthp', states, Cv)
+        # states is (B,H,T,P,N), Cv is (B,T,H,N)
+        Cv_h = Cv.permute(0, 2, 1, 3)                             # (B, H, T, N)
+        Y = torch.einsum('bhtpn,bhtn->bhtp', states, Cv_h)        # (B, H, T, P)
+
+        # Reshape to (B, T, D) and project out
+        Y = Y.permute(0, 2, 1, 3).reshape(B, T, D)                # (B, T, D)
+        return self.out_proj(Y)
 
 
 class RMSNorm(nn.Module):
@@ -300,22 +366,22 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class TransformerConvBlock(nn.Module):
+class TransformerMamba3Block(nn.Module):
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
         self.ln0 = RMSNorm(d_model)
-        self.conv = ShortConvLayer(d_model)
+        self.mamba3 = Mamba3Mixer(d_model, n_head)
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
         self.mlp = MLP(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.autograd.profiler.record_function("tfc/block_conv"):
-            x = x + self.conv(self.ln0(x))
-        with torch.autograd.profiler.record_function("tfc/block_attn"):
+        with torch.autograd.profiler.record_function("tm3/block_mamba3"):
+            x = x + self.mamba3(self.ln0(x))
+        with torch.autograd.profiler.record_function("tm3/block_attn"):
             x = x + self.attn(self.ln1(x))
-        with torch.autograd.profiler.record_function("tfc/block_mlp"):
+        with torch.autograd.profiler.record_function("tm3/block_mlp"):
             x = x + self.mlp(self.ln2(x))
         return x
 
@@ -375,7 +441,7 @@ class GPTTransformerConv(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
-        self.blocks = nn.ModuleList([TransformerConvBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.blocks = nn.ModuleList([TransformerMamba3Block(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
