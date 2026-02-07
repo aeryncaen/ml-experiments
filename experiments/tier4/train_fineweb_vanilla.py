@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.profiler
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -59,6 +60,8 @@ class HParams:
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     compile: bool = _env_bool("TORCH_COMPILE", True)
+    torch_profile: bool = _env_bool("TORCH_PROFILE", False)
+    torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
 
 HP = HParams()
@@ -180,17 +183,19 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
-        q = self.q(x).view(b, t, self.n_head, self.head_dim)
-        k = self.k(x).view(b, t, self.n_head, self.head_dim)
-        v = self.v(x).view(b, t, self.n_head, self.head_dim)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        with torch.autograd.profiler.record_function("tf/attn_qkv_rope"):
+            q = self.q(x).view(b, t, self.n_head, self.head_dim)
+            k = self.k(x).view(b, t, self.n_head, self.head_dim)
+            v = self.v(x).view(b, t, self.n_head, self.head_dim)
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+        with torch.autograd.profiler.record_function("tf/attn_sdpa"):
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.proj(y)
 
@@ -203,7 +208,8 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(hidden, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+        with torch.autograd.profiler.record_function("tf/mlp"):
+            return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
 
 
 class TransformerBlock(nn.Module):
@@ -215,8 +221,10 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        with torch.autograd.profiler.record_function("tf/block_attn"):
+            x = x + self.attn(self.ln1(x))
+        with torch.autograd.profiler.record_function("tf/block_mlp"):
+            x = x + self.mlp(self.ln2(x))
         return x
 
 
@@ -341,6 +349,20 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=HP.lr, betas=(0.9, 0.95), weight_decay=HP.weight_decay)
 
+    profiler = None
+    if HP.torch_profile:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profiler = torch.profiler.profile(
+            activities=activities,
+            record_shapes=False,
+            profile_memory=True,
+            with_stack=False,
+        )
+        profiler.start()
+        print0(rank, f"torch profiler enabled for {HP.torch_profile_steps} train steps")
+
     t0 = time.time()
     for step in range(HP.train_steps + 1):
         if step % HP.val_every == 0 or step == HP.train_steps:
@@ -372,6 +394,17 @@ def main():
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
             print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f} | lr {lr:.3e} | sec/step {dt:.3f}")
+
+        if profiler is not None:
+            profiler.step()
+            if step + 1 >= HP.torch_profile_steps:
+                profiler.stop()
+                if rank == 0:
+                    print("\n=== Torch Profile: CUDA Time ===", flush=True)
+                    print(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=40), flush=True)
+                    print("\n=== Torch Profile: CUDA Memory ===", flush=True)
+                    print(profiler.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=40), flush=True)
+                profiler = None
 
     if world_size > 1:
         dist.barrier()

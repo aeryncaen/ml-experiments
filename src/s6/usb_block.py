@@ -213,7 +213,18 @@ class PostScanAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Force flash-attention path: keep params in fp32 but run QKV attention in fp16.
+        attn_in_dtype = q.dtype
+        if q.is_cuda:
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = out.to(attn_in_dtype)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         out = rearrange(out, 'b h t d -> b t (h d)')
 
         gate = torch.sigmoid(self.attn_gate)
@@ -327,19 +338,21 @@ class USBBlock(nn.Module):
         if do_debug:
             self.last_debug = None
         
-        # Pre-norm
-        x = self.norm(x)
-        
-        # Step 1: Expansion with SiLU
-        x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
-        
-        # Step 2: KV projection
-        k = self.k_proj(x_exp)
-        v = self.v_proj(x_exp)
+        with torch.autograd.profiler.record_function("s6/pre_norm_expand"):
+            # Pre-norm
+            x = self.norm(x)
+            # Step 1: Expansion with SiLU
+            x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
 
-        # Apply RMSNorm (no activation on K/V)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
+        with torch.autograd.profiler.record_function("s6/kv_proj"):
+            # Step 2: KV projection
+            k = self.k_proj(x_exp)
+            v = self.v_proj(x_exp)
+
+        with torch.autograd.profiler.record_function("s6/kv_norm_bias"):
+            # Apply RMSNorm (no activation on K/V)
+            k = self.k_norm(k)
+            v = self.v_norm(v)
 
         # Reshape to heads
         k = rearrange(k, 'b t (h d) -> b t h d', h=config.nheads_total)
@@ -349,23 +362,24 @@ class USBBlock(nn.Module):
         k = k + self.k_bias
         v = v + self.v_bias
         
-        # Step 3: Channel split into 4 groups
-        # Each group gets nheads_per_group heads
-        nph = config.nheads_per_group
-        k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
-        v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
+        with torch.autograd.profiler.record_function("s6/split_and_params"):
+            # Step 3: Channel split into 4 groups
+            # Each group gets nheads_per_group heads
+            nph = config.nheads_per_group
+            k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
+            v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
         
         # Step 4: Scan G1+G2 together; G3 uses a 3-wide conv
         
-        # Get per-head parameters for each scan group
-        params_g1 = self.scan_proj_g1(x_exp)
-        params_g2 = self.scan_proj_g2(x_exp)
-        params_g3 = self.scan_proj_g3(x_exp)
+            # Get per-head parameters for each scan group
+            params_g1 = self.scan_proj_g1(x_exp)
+            params_g2 = self.scan_proj_g2(x_exp)
+            params_g3 = self.scan_proj_g3(x_exp)
         
-        # Apply data-dependent RoPE to K before scanning
-        k_g1 = apply_data_dependent_rope(k_g1, params_g1['rope_freq'])
-        k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
-        k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
+            # Apply data-dependent RoPE to K before scanning
+            k_g1 = apply_data_dependent_rope(k_g1, params_g1['rope_freq'])
+            k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
+            k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
         
         # Compute K·V for each group (mode-dependent)
         # Shape depends on scan_state_modes[i]:
@@ -407,31 +421,32 @@ class USBBlock(nn.Module):
         state_g1_read = None
         state_g2_read = None
 
-        # G1+G2 readout
-        if modes[0] == 'outer':
-            out_g12 = forward_scan_outer_readout_streaming(
-                k=k_g12,
-                v=v_g12,
-                alpha=params_g12['alpha'],
-                delta=params_g12['delta'],
-                epsilon=params_g12['epsilon'],
-                zeta=params_g12['zeta'],
-                gate=gate_g12,
-                init_state=init_g12,
-                scale=scale,
-            )
-        else:
-            assert kv_g12 is not None
-            state_g12 = forward_scan(
-                kv=kv_g12,
-                alpha=params_g12['alpha'],
-                delta=params_g12['delta'],
-                epsilon=params_g12['epsilon'],
-                zeta=params_g12['zeta'],
-                init_state=init_g12,
-            )
-            state_g12_read = None
-            out_g12 = v_g12 + gate_g12 * state_g12
+        with torch.autograd.profiler.record_function("s6/scan_g12"):
+            # G1+G2 readout
+            if modes[0] == 'outer':
+                out_g12 = forward_scan_outer_readout_streaming(
+                    k=k_g12,
+                    v=v_g12,
+                    alpha=params_g12['alpha'],
+                    delta=params_g12['delta'],
+                    epsilon=params_g12['epsilon'],
+                    zeta=params_g12['zeta'],
+                    gate=gate_g12,
+                    init_state=init_g12,
+                    scale=scale,
+                )
+            else:
+                assert kv_g12 is not None
+                state_g12 = forward_scan(
+                    kv=kv_g12,
+                    alpha=params_g12['alpha'],
+                    delta=params_g12['delta'],
+                    epsilon=params_g12['epsilon'],
+                    zeta=params_g12['zeta'],
+                    init_state=init_g12,
+                )
+                state_g12_read = None
+                out_g12 = v_g12 + gate_g12 * state_g12
 
         out_g1, out_g2 = out_g12[..., :nph, :], out_g12[..., nph:, :]
         if modes[0] != 'outer':
@@ -446,8 +461,9 @@ class USBBlock(nn.Module):
             y = self.conv_g3(x_flat)
             return rearrange(y, 'b (h d) t -> b t h d', h=h_)
 
-        conv_g3_out = conv_g3(v_g3)
-        out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
+        with torch.autograd.profiler.record_function("s6/g3_conv"):
+            conv_g3_out = conv_g3(v_g3)
+            out_g3 = v_g3 + params_g3['gate'] * conv_g3_out
         
         # Step 5: Passthrough for G4
         out_g4 = v_g4
@@ -462,15 +478,16 @@ class USBBlock(nn.Module):
         # Step 6b: Post-scan full causal attention
         # Q from post-scan enhanced states; K/V from pre-scan projections (all heads)
         # Standard RoPE on G3+G4 heads; G1+G2 already have dd-rope from scan
-        if self.post_attn is not None:
-            attn_out = self.post_attn(
-                post_scan_states=scan_out_flat,
-                k=k,  # pre-scan K, all heads: (b, t, nheads_total, headdim)
-                v=v,  # pre-scan V, all heads: (b, t, nheads_total, headdim)
-                attention_mask=attention_mask,
-            )
-        else:
-            attn_out = scan_out_flat
+        with torch.autograd.profiler.record_function("s6/post_scan_attn"):
+            if self.post_attn is not None:
+                attn_out = self.post_attn(
+                    post_scan_states=scan_out_flat,
+                    k=k,  # pre-scan K, all heads: (b, t, nheads_total, headdim)
+                    v=v,  # pre-scan V, all heads: (b, t, nheads_total, headdim)
+                    attention_mask=attention_mask,
+                )
+            else:
+                attn_out = scan_out_flat
 
         if do_debug:
             eps = 1e-6
