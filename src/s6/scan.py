@@ -1235,8 +1235,8 @@ def _chunked_scan_bwd_fake(
 
 
 def _chunked_scan_autograd_backward(ctx, grad_out, *_saved_grads):
-    kv, alpha_clamped, delta, epsilon, zeta, init_state = ctx.saved_tensors[:6]
-    s_chunks, la_chunks, cumA, chunk_new_state, prev_states = ctx.saved_tensors[6:]
+    (kv, alpha_clamped, delta, epsilon, zeta, init_state,
+     s_chunks, la_chunks, cumA, chunk_new_state, prev_states) = ctx.saved_tensors
     chunk_size = ctx.chunk_size
     T_orig = ctx.T_orig
     d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state = torch.ops.s6.chunked_scan_bwd(
