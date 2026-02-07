@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.profiler
+from einops import rearrange
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -132,14 +133,12 @@ class ShardStream:
 
 
 class Mamba3Mixer(nn.Module):
-    """Mamba-3-style mixer: trapezoidal SSD + data-dependent RoPE on B,C + BC bias.
+    """Mamba-3-style mixer: chunked SSD with trapezoidal discretization,
+    data-dependent RoPE on B/C, and BC bias.
 
-    Implements the structured mask Y = (L_decay @ L_trap) ⊙ C B^T ) X
-    where L_trap is the bidiagonal (β_t, γ_t) trapezoidal conv mask,
-    and B,C get cumulative data-dependent rotary embeddings.
-
-    Uses the SSD (State Space Duality) quadratic form for training —
-    no explicit recurrence, just a masked matmul.
+    Quadratic form: Y = (decay_mask ⊙ C B^T) X  per chunk.
+    C B^T is (chunk, chunk) via N-contraction — never materializes (P, N) per position.
+    Inter-chunk state passing via sequential scan over chunk boundaries.
     """
 
     def __init__(self, d_model: int, n_head: int, d_state: int = 64):
@@ -150,158 +149,150 @@ class Mamba3Mixer(nn.Module):
         self.d_state = d_state             # n
 
         # Input projections: x -> (X, B, C, dt, lambda, theta)
-        # X: value, B: input proj, C: output proj, dt: timestep, lambda: trap weight, theta: rotation
+        Nr = d_state // 2
         proj_dim = (
-            d_model          # X  (H * p)
+            d_model             # X  (H * p)
             + n_head * d_state  # B  (H * n)
             + n_head * d_state  # C  (H * n)
             + n_head            # log_dt (H)
             + n_head            # lambda_logit (H)
-            + n_head * (d_state // 2)  # theta (H * n/2) for data-dependent RoPE
+            + n_head * Nr       # theta (H * n/2)
         )
         self.in_proj = nn.Linear(d_model, proj_dim, bias=False)
 
-        # BC bias (Mamba-3 §3.4): learnable, head-specific, channel-wise, init=1
+        # BC bias: learnable, head-specific, channel-wise, init=1
         self.b_bias = nn.Parameter(torch.ones(n_head, d_state))
         self.c_bias = nn.Parameter(torch.ones(n_head, d_state))
         self.b_bias._no_weight_decay = True   # type: ignore[attr-defined]
         self.c_bias._no_weight_decay = True   # type: ignore[attr-defined]
 
-        # QK-norm on B,C (Mamba-3 §3.4)
+        # QK-norm on B,C
         self.b_norm = nn.RMSNorm(d_state)
         self.c_norm = nn.RMSNorm(d_state)
 
-        # log A (scalar decay per head, like Mamba-2)
+        # Scalar decay per head
         self.log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
         self.log_A._no_weight_decay = True    # type: ignore[attr-defined]
 
-        # Output
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
         B, T, D = x.shape
         H, P, N = self.n_head, self.head_dim, self.d_state
-        Nr = N // 2  # half state dim for RoPE pairs
-        C = chunk_size
-        assert T % C == 0, f"seq_len {T} must be divisible by chunk_size {C}"
-        n_chunks = T // C
+        Nr = N // 2
+        L = chunk_size
+        assert T % L == 0
+        K = T // L  # number of chunks
 
-        # ---- Project input ----
-        proj = self.in_proj(x)  # (B, T, proj_dim)
-        idx = 0
-        X = proj[..., idx:idx + H * P].view(B, T, H, P);          idx += H * P
-        Bv = proj[..., idx:idx + H * N].view(B, T, H, N);         idx += H * N
-        Cv = proj[..., idx:idx + H * N].view(B, T, H, N);         idx += H * N
-        log_dt = proj[..., idx:idx + H].view(B, T, H);            idx += H
-        lam_logit = proj[..., idx:idx + H].view(B, T, H);         idx += H
-        theta = proj[..., idx:idx + H * Nr].view(B, T, H, Nr);    idx += H * Nr
+        # ---- project ----
+        proj = self.in_proj(x)                                    # (B, T, proj_dim)
+        i = 0
+        X   = proj[..., i:i+H*P];  i += H*P
+        Bv  = proj[..., i:i+H*N];  i += H*N
+        Cv  = proj[..., i:i+H*N];  i += H*N
+        ldt = proj[..., i:i+H];    i += H
+        llam= proj[..., i:i+H];    i += H
+        th  = proj[..., i:i+H*Nr]; i += H*Nr
 
-        # ---- Discretization params ----
-        dt = F.softplus(log_dt)                                    # (B, T, H)
-        alpha = torch.exp(dt * self.log_A.exp().neg())             # (B, T, H) decay ∈ (0,1)
-        lam = torch.sigmoid(lam_logit)                             # (B, T, H) trap weight
+        X   = rearrange(X,   'b t (h p) -> b t h p', h=H)
+        Bv  = rearrange(Bv,  'b t (h n) -> b t h n', h=H)
+        Cv  = rearrange(Cv,  'b t (h n) -> b t h n', h=H)
+        ldt = rearrange(ldt, 'b t h -> b t h')
+        llam= rearrange(llam,'b t h -> b t h')
+        th  = rearrange(th,  'b t (h r) -> b t h r', h=H)
+
+        # ---- discretization ----
+        dt    = F.softplus(ldt)                                   # (B, T, H)
+        alpha = torch.exp(dt * self.log_A.exp().neg())            # (B, T, H)
+        lam   = torch.sigmoid(llam)                               # (B, T, H)
+        gamma = lam * dt                                          # (B, T, H)
+        beta  = (1.0 - lam) * dt * alpha                         # (B, T, H)
 
         # ---- QK-norm + BC bias ----
-        Bv = self.b_norm(Bv) * self.b_bias                        # (B, T, H, N)
-        Cv = self.c_norm(Cv) * self.c_bias                        # (B, T, H, N)
+        Bv = self.b_norm(Bv) * self.b_bias
+        Cv = self.c_norm(Cv) * self.c_bias
 
-        # ---- Data-dependent RoPE on B,C ----
-        cum_theta = theta.cumsum(dim=1)                            # (B, T, H, Nr)
-        cos_th = cum_theta.cos()
-        sin_th = cum_theta.sin()
-        def apply_dd_rope(v: torch.Tensor) -> torch.Tensor:
+        # ---- data-dependent RoPE on B, C ----
+        cum_th = th.cumsum(dim=1)
+        cos_th, sin_th = cum_th.cos(), cum_th.sin()
+        def dd_rope(v: torch.Tensor) -> torch.Tensor:
             v1, v2 = v[..., :Nr], v[..., Nr:]
-            return torch.cat([v1 * cos_th - v2 * sin_th, v1 * sin_th + v2 * cos_th], dim=-1)
-        Bv = apply_dd_rope(Bv)
-        Cv = apply_dd_rope(Cv)
+            return torch.cat([v1*cos_th - v2*sin_th, v1*sin_th + v2*cos_th], dim=-1)
+        Bv = dd_rope(Bv)
+        Cv = dd_rope(Cv)
 
-        # ---- Trapezoidal coefficients ----
-        gamma = lam * dt                                           # (B, T, H)
-        beta = (1.0 - lam) * dt * alpha                            # (B, T, H)
+        # ---- trapezoidal: apply size-2 conv to B before chunking ----
+        # B_trap_t = γ_t * B_t + β_t * B_{t-1}   (and same scaling to X)
+        # But we need to keep B and X separate for the SSD form.
+        # The trap conv applies to the "KV" = B * x product in the recurrence,
+        # but in SSD quadratic form Y = (mask ⊙ C B^T) X, the trap modifies B.
+        # We scale: B_trap_t = γ_t * B_t,  and add β_t * B_{t-1} contribution
+        # For the quadratic form we need to apply trap to both B and X consistently.
+        # Simplest correct way: fold γ into B, β into a shifted-B term.
+        Bv_g = Bv * gamma.unsqueeze(-1)                           # γ_t * B_t
+        Bv_b = Bv * beta.unsqueeze(-1)                            # β_t * B_t (will shift)
+        # Shift Bv_b by 1 position: Bv_b_shifted[t] = β_t * B_{t-1}
+        # Bv_b is (B, T, H, N) — pad dim=1 (time): F.pad pads from last dim, so (0,0, 0,0, 1,0)
+        Bv_b_shifted = F.pad(Bv_b[:, :-1], (0, 0, 0, 0, 1, 0))  # zero at t=0
+        Bv_trap = Bv_g + Bv_b_shifted                             # (B, T, H, N)
+        # Similarly for X: (B, T, H, P)
+        X_g = X * gamma.unsqueeze(-1)
+        X_b = X * beta.unsqueeze(-1)
+        X_b_shifted = F.pad(X_b[:, :-1], (0, 0, 0, 0, 1, 0))
+        X_trap = X_g + X_b_shifted                                # (B, T, H, P)
 
-        # ---- Reshape into chunks: (B, n_chunks, C, ...) ----
-        def chunkify(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, n_chunks, C, *t.shape[2:])
+        # ---- chunk ----
+        Bv_c  = rearrange(Bv_trap, 'b (k l) h n -> b k h l n', l=L)   # (B, K, H, L, N)
+        Cv_c  = rearrange(Cv,      'b (k l) h n -> b k h l n', l=L)
+        X_c   = rearrange(X_trap,  'b (k l) h p -> b k h l p', l=L)
+        al_c  = rearrange(alpha,   'b (k l) h   -> b k h l',   l=L)
 
-        X_c = chunkify(X)           # (B, nc, C, H, P)
-        Bv_c = chunkify(Bv)         # (B, nc, C, H, N)
-        Cv_c = chunkify(Cv)         # (B, nc, C, H, N)
-        alpha_c = chunkify(alpha)    # (B, nc, C, H)
-        gamma_c = chunkify(gamma)    # (B, nc, C, H)
-        beta_c = chunkify(beta)      # (B, nc, C, H)
+        # ---- intra-chunk decay mask (L, L) ----
+        log_al = al_c.clamp(min=1e-6).log()                      # (B, K, H, L)
+        log_cum = log_al.cumsum(dim=-1)                           # (B, K, H, L)
+        # decay[i,j] = exp(cum[i] - cum[j]) for i>=j
+        decay = (log_cum.unsqueeze(-1) - log_cum.unsqueeze(-2)).exp()
+        decay = decay * torch.tril(torch.ones(L, L, device=x.device))  # (B, K, H, L, L)
 
-        # ---- Intra-chunk: trapezoidal BX ----
-        # BX[b,nc,c,h,p,n] = B[b,nc,c,h,n] * X[b,nc,c,h,p]  (outer product)
-        BX = torch.einsum('bschn,bschp->bschpn', Bv_c, X_c)      # (B, nc, C, H, P, N)
+        # ---- intra-chunk SSD: Y_intra = (decay ⊙ C B^T) X ----
+        # C B^T: (B, K, H, L, L) via N-contraction  — this is the key: no (P,N) per position
+        CB = torch.einsum('bkhin,bkhjn->bkhij', Cv_c, Bv_c)      # (B, K, H, L, L)
+        attn = decay * CB                                         # (B, K, H, L, L)
+        Y_intra = torch.einsum('bkhij,bkhjp->bkhip', attn, X_c)  # (B, K, H, L, P)
 
-        # Trapezoidal: BX_trap[c] = γ[c]*BX[c] + β[c]*BX[c-1]
-        # For c=0 in each chunk, BX[c-1] comes from previous chunk's last position
-        # We handle cross-chunk BX below; first do the within-chunk part
-        # Permute to (B, nc, H, C, P, N) for easier indexing
-        BX = BX.permute(0, 1, 3, 2, 4, 5)                         # (B, nc, H, C, P, N)
-        g = gamma_c.permute(0, 1, 3, 2).unsqueeze(-1).unsqueeze(-1)  # (B, nc, H, C, 1, 1)
-        b = beta_c.permute(0, 1, 3, 2).unsqueeze(-1).unsqueeze(-1)
+        # ---- inter-chunk: accumulate (N, P) states across chunks ----
+        # Each chunk's contribution to the state: sum_l decay_to_end[l] * B[l] ⊗ X[l]
+        # = B_c^T @ diag(decay_to_end) @ X_c   — (N, L) @ (L, L) @ (L, P) = (N, P)
+        # decay_to_end[l] = exp(log_cum[L-1] - log_cum[l])
+        decay_to_end = (log_cum[..., -1:] - log_cum).exp()        # (B, K, H, L)
+        # chunk_state[k] = B_c^T @ diag(d2e) @ X_c = einsum('bkhln,bkhl,bkhlp->bkhnp')
+        chunk_state = torch.einsum(
+            'bkhln,bkhl,bkhlp->bkhnp', Bv_c, decay_to_end, X_c
+        )                                                         # (B, K, H, N, P)
+        chunk_decay = log_al.sum(dim=-1).exp()                    # (B, K, H) total decay per chunk
 
-        # Shifted BX: within chunk, BX_shifted[:,c] = BX[:,c-1] for c>0
-        # For c=0, need last position of previous chunk
-        BX_last = BX[:, :, :, -1:, :, :]                          # (B, nc, H, 1, P, N)
-        # Shift: prev chunk's last -> current chunk's position 0
-        BX_prev = F.pad(BX_last[:, :-1], (0, 0, 0, 0, 0, 0, 0, 0, 1, 0))  # (B, nc, H, 1, P, N)
-        BX_shifted = torch.cat([BX_prev, BX[:, :, :, :-1, :, :]], dim=3)    # (B, nc, H, C, P, N)
+        # Sequential scan across K chunks
+        prev_states = torch.zeros(B, K, H, N, P, device=x.device, dtype=x.dtype)
+        h = torch.zeros(B, H, N, P, device=x.device, dtype=x.dtype)
+        for k in range(K):
+            prev_states[:, k] = h
+            h = chunk_decay[:, k, :, None, None] * h + chunk_state[:, k]
 
-        BX_trap = g * BX + b * BX_shifted                          # (B, nc, H, C, P, N)
+        # ---- inter-chunk output contribution ----
+        # For position l in chunk k: Y_inter = C[k,l] @ (decay_from_start[l] * prev_state[k]) @ ... hmm
+        # Actually: Y_inter[k,l] = C[k,l]^T @ (decay_from_start[l] * h_prev[k]) ... but h is (N,P)
+        # So Y_inter[k,l] in R^P = h_prev[k]^T @ (decay[l] * C[k,l])   with h (N,P), C (N,)
+        # = (decay[l] * C[k,l])^T @ h_prev[k]  -> einsum over N -> (P,)
+        decay_from_start = log_cum.exp()                          # (B, K, H, L)
+        # C_scaled = decay_from_start * C
+        C_scaled = Cv_c * decay_from_start.unsqueeze(-1)          # (B, K, H, L, N)
+        Y_inter = torch.einsum(
+            'bkhln,bkhnp->bkhlp', C_scaled, prev_states
+        )                                                         # (B, K, H, L, P)
 
-        # ---- Intra-chunk decay mask: (C, C) per chunk ----
-        log_alpha_c = alpha_c.clamp(min=1e-6).log()                # (B, nc, C, H)
-        log_alpha_c = log_alpha_c.permute(0, 1, 3, 2)              # (B, nc, H, C)
-        log_cum = log_alpha_c.cumsum(dim=-1)                       # (B, nc, H, C)
-        # decay[i,j] = exp(log_cum[i] - log_cum[j]) for i >= j, within chunk
-        decay_intra = (log_cum.unsqueeze(-1) - log_cum.unsqueeze(-2)).exp()  # (B, nc, H, C, C)
-        causal = torch.tril(torch.ones(C, C, device=x.device))
-        decay_intra = decay_intra * causal                         # (B, nc, H, C, C)
-
-        # ---- Intra-chunk SSD matmul ----
-        # states_intra = decay_intra @ BX_trap  -> (B, nc, H, C, P, N)
-        states_intra = torch.matmul(
-            decay_intra,                                           # (B, nc, H, C, C)
-            BX_trap.reshape(B, n_chunks, H, C, P * N)              # (B, nc, H, C, P*N)
-        ).reshape(B, n_chunks, H, C, P, N)
-
-        # ---- Inter-chunk state passing ----
-        # Each chunk produces a final state: h_chunk = sum over chunk of decayed BX_trap
-        # chunk_total_decay = product of all alphas in the chunk = exp(sum log_alpha)
-        chunk_total_decay = log_alpha_c.sum(dim=-1).exp()           # (B, nc, H)
-        # Final state of each chunk = last row of states_intra
-        # But we need the *recurrent* state that accumulates across chunks
-        # h_{chunk} = chunk_total_decay * h_{chunk-1} + states_intra[:, :, :, -1]
-        # states_intra[:,:,:,-1] is the state at the last position from intra-chunk only
-        chunk_state_local = states_intra[:, :, :, -1, :, :]        # (B, nc, H, P, N)
-
-        # Sequential scan across chunks (nc is small, e.g. 32 for T=2048,C=64)
-        states_list = []
-        h = torch.zeros(B, H, P, N, device=x.device, dtype=x.dtype)
-        for i in range(n_chunks):
-            # h is the carry state entering this chunk
-            states_list.append(h)
-            # Update carry: decay all positions in this chunk, then add local contribution
-            h = chunk_total_decay[:, i, :].unsqueeze(-1).unsqueeze(-1) * h + chunk_state_local[:, i]
-        # states_list[i] = carry state entering chunk i, shape (B, H, P, N)
-        prev_states = torch.stack(states_list, dim=1)               # (B, nc, H, P, N)
-
-        # ---- Add inter-chunk contribution ----
-        # For each position (chunk i, pos j), the inter-chunk contribution is:
-        #   decay_from_chunk_start_to_pos_j @ prev_states[i]
-        # decay from chunk start to pos j = exp(log_cum[j])  (cumsum within chunk)
-        decay_from_start = log_cum.exp().unsqueeze(-1).unsqueeze(-1)  # (B, nc, H, C, 1, 1)
-        inter_contrib = decay_from_start * prev_states.unsqueeze(3)   # (B, nc, H, C, P, N)
-        states_total = states_intra + inter_contrib                   # (B, nc, H, C, P, N)
-
-        # ---- Contract with C ----
-        Cv_c_h = Cv_c.permute(0, 1, 3, 2, 4)                      # (B, nc, H, C, N)
-        Y = torch.einsum('bnhcpk,bnhck->bnhcp', states_total, Cv_c_h)  # (B, nc, H, C, P)
-
-        # ---- Reshape to (B, T, D) ----
-        Y = Y.permute(0, 1, 3, 2, 4).reshape(B, T, D)
+        # ---- combine and project out ----
+        Y = Y_intra + Y_inter                                     # (B, K, H, L, P)
+        Y = rearrange(Y, 'b k h l p -> b (k l) (h p)')           # (B, T, D)
         return self.out_proj(Y)
 
 
