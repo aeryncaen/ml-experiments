@@ -604,8 +604,8 @@ class FusedGatedNeighborBlock(nn.Module):
         # Skip-multiply
         y = self.attn_norm(y) * h_up
 
-        # Down-project
-        y = self.down_proj(y)
+        # Down-project (with SiLU)
+        y = self.down_proj(F.silu(y))
 
         return x + y
 
