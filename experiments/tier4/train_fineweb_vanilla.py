@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_s4d | s6
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | transformer_s4d | s6
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -435,6 +435,99 @@ class ShiftAttention(nn.Module):
         return self.proj(y)
 
 
+class GatedNeighborAttention(nn.Module):
+    """Attention with content-gated neighbor accumulation on K.
+
+    Half the channels in each head's K are replaced by a gated mix:
+        k_accum[t] = (1 - g[t]) * k[t] + g[t] * k_accum[t-1]
+    where g is a content-dependent gate (sigmoid of a learned projection).
+
+    Over L layers this builds an exponentially-growing receptive field —
+    equivalent to a 1st-order SSM on the key representation. No scan needed:
+    the recurrence is just a causal 1st-order IIR filter, computed via a
+    simple sequential pass over the time axis (or parallel scan if needed).
+
+    New parameters: one gate projection per layer (d_model -> n_head), tiny.
+    """
+
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.half_dim = self.head_dim // 2  # channels that get gated accumulation
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = Rotary(self.head_dim)
+        # Gate projection: input -> per-head gate scalar
+        self.gate_proj = nn.Linear(d_model, n_head, bias=True)
+        # Init gate bias negative so gate starts near-zero (conservative)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, -2.0)
+
+    def _gated_accumulate(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply gated neighbor accumulation to the second half of K channels.
+
+        k: (B, T, H, D)
+        gate: (B, T, H, 1) — sigmoid already applied
+
+        For the second half of each head's channels:
+            k_out[t] = (1 - g[t]) * k[t] + g[t] * k_out[t-1]
+        First half stays unchanged.
+        """
+        B, T, H, D = k.shape
+        half = self.half_dim
+        k_static = k[:, :, :, :half]       # unchanged half
+        k_rec = k[:, :, :, half:]           # half that gets accumulated
+
+        # Sequential scan — build output list to avoid in-place mutation.
+        # T is seq_len (2048), not a bottleneck vs attention's O(T^2).
+        states = [k_rec[:, 0]]
+        for t in range(1, T):
+            prev = states[t - 1]
+            g = gate[:, t]
+            states.append((1 - g) * k_rec[:, t] + g * prev)
+
+        k_accum = torch.stack(states, dim=1)  # (B, T, H, half)
+        return torch.cat([k_static, k_accum], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        q = self.q(x).view(b, t, self.n_head, self.head_dim)
+        k = self.k(x).view(b, t, self.n_head, self.head_dim)
+        v = self.v(x).view(b, t, self.n_head, self.head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+        # Content-dependent gate for neighbor accumulation
+        gate = torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)  # (B, T, H, 1)
+        k = self._gated_accumulate(k, gate)
+        if HAS_FLASH_ATTN:
+            y = flash_attn_func(q, k, v, causal=True)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+        y = y.contiguous().view(b, t, c)
+        return self.proj(y)
+
+
+class GatedNeighborBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.attn = GatedNeighborAttention(d_model, n_head)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = MLP(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
 class TransformerShiftBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
@@ -594,6 +687,28 @@ class GPTTransformerShift(nn.Module):
         return logits, loss
 
 
+class GPTGatedNeighbor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([GatedNeighborBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTS6(nn.Module):
     def __init__(self):
         super().__init__()
@@ -633,6 +748,8 @@ def build_model() -> nn.Module:
         return GPTTransformerShift()
     if HP.model_type == "transformer_s4d":
         return GPTTransformerConv()
+    if HP.model_type == "transformer_gate":
+        return GPTGatedNeighbor()
     if HP.model_type == "s6":
         return GPTS6()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
