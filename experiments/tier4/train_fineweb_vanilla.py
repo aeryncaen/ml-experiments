@@ -461,8 +461,8 @@ class GatedNeighborAttention(nn.Module):
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
-        # Gate projection: input -> single scalar gate per position
-        self.gate_proj = nn.Linear(d_model, 1, bias=True)
+        # Gate projection: input -> per-head gate per position
+        self.gate_proj = nn.Linear(d_model, n_head, bias=True)
         # Init gate bias negative so gate starts near-zero (conservative)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
@@ -501,8 +501,8 @@ class GatedNeighborAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        # Content-dependent gate for neighbor accumulation — single scalar per position
-        gate = torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)  # (B, T, 1, 1)
+        # Content-dependent gate for neighbor accumulation — per head per position
+        gate = torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)  # (B, T, H, 1)
         k = self._gated_accumulate(k, gate)
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=True)
