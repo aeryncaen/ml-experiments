@@ -149,6 +149,7 @@ class S4DKernel(nn.Module):
         for p in self.parameters():
             p._no_weight_decay = True  # type: ignore[attr-defined]
 
+    @torch.compiler.disable
     def forward(self, L):
         dt = torch.exp(self.log_dt)
         C = torch.view_as_complex(self.C)
