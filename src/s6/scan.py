@@ -312,8 +312,11 @@ if HAS_TRITON:
             prev_s = tl.load(prev_states_ptr + ps_ptr + offs_d * stride_ps_d,
                              mask=d_mask, other=0.0).to(tl.float32)
             d_decay_scalar = tl.sum(d_state * (decay * prev_s))
-            tl.store(d_chunk_decay_ptr + pid_b * stride_dcd_b + c * stride_dcd_nc + pid_h * stride_dcd_h,
-                     d_decay_scalar)
+            dcd_addr = d_chunk_decay_ptr + pid_b * stride_dcd_b + c * stride_dcd_nc + pid_h * stride_dcd_h
+            if pid_d == 0:
+                tl.store(dcd_addr, d_decay_scalar)
+            else:
+                tl.atomic_add(dcd_addr, d_decay_scalar)
 
             # d_state = decay * d_state + d_prev_states[c]
             dps_ptr = pid_b * stride_dps_b + c * stride_dps_nc + pid_h * stride_dps_h
@@ -653,7 +656,7 @@ def _chunked_scan_bwd_triton(dout_flat, cumA_flat, s_flat, prev_states_flat,
 def _state_passing_bwd_triton(d_prev_states, prev_states, chunk_total_decay, B, nchunks, H, D):
     """Launch Triton state passing backward. Returns d_cns, d_td, d_init_state."""
     d_chunk_new_state = torch.empty(B, nchunks, H, D, device=prev_states.device, dtype=torch.float32)
-    d_chunk_decay = torch.empty(B, nchunks, H, device=prev_states.device, dtype=torch.float32)
+    d_chunk_decay = torch.zeros(B, nchunks, H, device=prev_states.device, dtype=torch.float32)
     d_init_state = torch.empty(B, H, D, device=prev_states.device, dtype=torch.float32)
     BLOCK_D = triton.next_power_of_2(D)
     n_d_blocks = (D + BLOCK_D - 1) // BLOCK_D
