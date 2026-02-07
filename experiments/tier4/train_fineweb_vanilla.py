@@ -41,7 +41,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_s4d | s6
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_s4d | s6
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -368,6 +368,99 @@ class SelfAttention(nn.Module):
         return self.proj(y)
 
 
+class ShiftAttention(nn.Module):
+    """Attention with temporal channel shifts on K and V.
+
+    Different heads use different shift amounts (0, 1, 2, 4, 8, ...),
+    so each KV entry carries local temporal context from neighbors.
+    No new parameters. FlashAttention unchanged. Just a reindex.
+    """
+
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = Rotary(self.head_dim)
+
+        # Assign shift amounts per head: 0, 1, 2, 4, 8, 16, ...
+        # Head 0 = no shift, rest = powers of 2, cycling if n_head > log2(seq_len)
+        shifts = [0]
+        s = 1
+        for _ in range(n_head - 1):
+            shifts.append(s)
+            s *= 2
+            if s > 128:  # cap and cycle
+                s = 1
+        self.register_buffer('shifts', torch.tensor(shifts, dtype=torch.long), persistent=False)
+
+    def _shift_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Shift each head's channels by its assigned amount along the time axis.
+        x: (B, T, H, D).  Shift is causal: position t gets data from t-shift.
+        Positions before the shift amount get zeros (causal padding).
+        Vectorized: group heads by shift amount, pad+slice each group.
+        """
+        B, T, H, D = x.shape
+        max_shift = int(self.shifts.max().item())
+        if max_shift == 0:
+            return x
+        # Pad time dim at the front: (B, max_shift + T, H, D)
+        x_pad = F.pad(x, (0, 0, 0, 0, max_shift, 0))  # pad dim=1 from left
+        # For head h with shift s, we want x_pad[:, max_shift-s : max_shift-s+T, h, :]
+        # Gather along time dim using advanced indexing
+        # Build index: (H, T) where idx[h, t] = max_shift - shifts[h] + t
+        offsets = max_shift - self.shifts                  # (H,)
+        t_idx = torch.arange(T, device=x.device)           # (T,)
+        gather_idx = offsets.unsqueeze(1) + t_idx.unsqueeze(0)  # (H, T)
+        # x_pad is (B, max_shift+T, H, D) -> permute to (B, H, max_shift+T, D)
+        x_pad = rearrange(x_pad, 'b t h d -> b h t d')
+        # Expand gather_idx for batch and D dims
+        gather_idx = gather_idx.unsqueeze(0).unsqueeze(-1).expand(B, H, T, D)
+        out = x_pad.gather(2, gather_idx)                   # (B, H, T, D)
+        return rearrange(out, 'b h t d -> b t h d')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        with torch.autograd.profiler.record_function("sa/qkv_shift_rope"):
+            q = self.q(x).view(b, t, self.n_head, self.head_dim)
+            k = self.k(x).view(b, t, self.n_head, self.head_dim)
+            v = self.v(x).view(b, t, self.n_head, self.head_dim)
+            # Shift K and V before RoPE
+            k = self._shift_kv(k)
+            v = self._shift_kv(v)
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+        with torch.autograd.profiler.record_function("sa/sdpa"):
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        return self.proj(y)
+
+
+class TransformerShiftBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.attn = ShiftAttention(d_model, n_head)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = MLP(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("ts/block_attn"):
+            x = x + self.attn(self.ln1(x))
+        with torch.autograd.profiler.record_function("ts/block_mlp"):
+            x = x + self.mlp(self.ln2(x))
+        return x
+
+
 class MLP(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -489,6 +582,28 @@ class GPTTransformerConv(nn.Module):
         return logits, loss
 
 
+class GPTTransformerShift(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([TransformerShiftBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTS6(nn.Module):
     def __init__(self):
         super().__init__()
@@ -524,6 +639,8 @@ class GPTS6(nn.Module):
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
+    if HP.model_type == "transformer_shift":
+        return GPTTransformerShift()
     if HP.model_type == "transformer_s4d":
         return GPTTransformerConv()
     if HP.model_type == "s6":
