@@ -40,7 +40,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | s6
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_s4d | s6
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -129,6 +129,59 @@ class ShardStream:
         x = buf[:-1].to(dtype=torch.int64).view(self.batch_size, self.seq_len)
         y = buf[1:].to(dtype=torch.int64).view(self.batch_size, self.seq_len)
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+
+class S4DKernel(nn.Module):
+    """Generate convolution kernel from diagonal SSM parameters (S4D-Lin)."""
+
+    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1):
+        super().__init__()
+        H = d_model
+        log_dt = torch.rand(H) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        C = torch.randn(H, N // 2, dtype=torch.cfloat)
+        self.C = nn.Parameter(torch.view_as_real(C))
+        self.log_dt = nn.Parameter(log_dt)
+        log_A_real = torch.log(0.5 * torch.ones(H, N // 2))
+        A_imag = math.pi * torch.arange(N // 2).unsqueeze(0).expand(H, -1).float()
+        self.log_A_real = nn.Parameter(log_A_real)
+        self.A_imag = nn.Parameter(A_imag)
+        # No weight decay on SSM params
+        for p in self.parameters():
+            p._no_weight_decay = True  # type: ignore[attr-defined]
+
+    def forward(self, L):
+        dt = torch.exp(self.log_dt)
+        C = torch.view_as_complex(self.C)
+        A = -torch.exp(self.log_A_real) + 1j * self.A_imag
+        dtA = A * dt.unsqueeze(-1)
+        K = dtA.unsqueeze(-1) * torch.arange(L, device=A.device)
+        C = C * (torch.exp(dtA) - 1.0) / A
+        K = 2 * torch.einsum('hn, hnl -> hl', C, torch.exp(K)).real
+        return K
+
+
+class S4DLayer(nn.Module):
+    """Lightweight S4D layer: FFT conv + skip + GELU + linear mix."""
+
+    def __init__(self, d_model, d_state=64):
+        super().__init__()
+        self.d_model = d_model
+        self.kernel = S4DKernel(d_model, N=d_state)
+        self.D = nn.Parameter(torch.randn(d_model))
+        self.D._no_weight_decay = True  # type: ignore[attr-defined]
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        u = x.transpose(-1, -2)  # (B, D, T)
+        L = u.size(-1)
+        k = self.kernel(L)  # (D, L)
+        k_f = torch.fft.rfft(k, n=2 * L)
+        u_f = torch.fft.rfft(u, n=2 * L)
+        y = torch.fft.irfft(u_f * k_f, n=2 * L)[..., :L]  # (B, D, T)
+        y = y + u * self.D.unsqueeze(-1)
+        y = F.gelu(y.transpose(-1, -2))  # (B, T, D)
+        return self.out_proj(y)
 
 
 class RMSNorm(nn.Module):
@@ -230,6 +283,26 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class TransformerS4DBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, d_state: int = 64):
+        super().__init__()
+        self.ln0 = RMSNorm(d_model)
+        self.s4d = S4DLayer(d_model, d_state=d_state)
+        self.ln1 = RMSNorm(d_model)
+        self.attn = SelfAttention(d_model, n_head)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = MLP(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("tf_s4d/block_s4d"):
+            x = x + self.s4d(self.ln0(x))
+        with torch.autograd.profiler.record_function("tf_s4d/block_attn"):
+            x = x + self.attn(self.ln1(x))
+        with torch.autograd.profiler.record_function("tf_s4d/block_mlp"):
+            x = x + self.mlp(self.ln2(x))
+        return x
+
+
 def chunked_cross_entropy(
     hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, chunk_size: int = 1024,
 ) -> torch.Tensor:
@@ -264,6 +337,28 @@ class GPTTransformer(nn.Module):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
         self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
+class GPTTransformerS4D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([TransformerS4DBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
@@ -316,6 +411,8 @@ class GPTS6(nn.Module):
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
+    if HP.model_type == "transformer_s4d":
+        return GPTTransformerS4D()
     if HP.model_type == "s6":
         return GPTS6()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
@@ -364,12 +461,28 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print0(rank, f"parameters={n_params:,}")
 
+    # Build optimizer param groups before compile/DDP wrap
+    decay_params = []
+    no_decay_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or getattr(p, "_no_weight_decay", False):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+    print0(rank, f"optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params")
+    param_groups = [
+        {"params": decay_params, "weight_decay": HP.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
     if HP.compile:
         model = torch.compile(model, dynamic=False)
     if world_size > 1:
         model = DDP(model, device_ids=[device.index])
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=HP.lr, betas=(0.9, 0.95), weight_decay=HP.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95))
 
     profiler = None
     if HP.torch_profile:
@@ -407,7 +520,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if HP.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), HP.grad_clip)
+            torch.nn.utils.clip_grad_norm_(decay_params + no_decay_params, HP.grad_clip)
         optimizer.step()
 
         if step % 20 == 0:
