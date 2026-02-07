@@ -55,7 +55,7 @@ class HParams:
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
     # Fused gate knobs
-    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1248)
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1200)
 
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
@@ -560,6 +560,19 @@ class FusedGatedNeighborBlock(nn.Module):
         self.theta_proj = nn.Linear(d_model, n_head * self.n_pairs, bias=False)
         nn.init.zeros_(self.theta_proj.weight)
 
+        # Neighbor gate: single lerp on half of K channels
+        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.n_pairs, bias=True)
+        nn.init.zeros_(self.neighbor_gate_proj.weight)
+        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+
+    def _gated_neighbor(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        half = self.n_pairs
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
     def _apply_dd_rope(self, q: torch.Tensor, k: torch.Tensor,
                        cos_t: torch.Tensor, sin_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply data-dependent rotation to Q and K channel-pairs."""
@@ -586,6 +599,10 @@ class FusedGatedNeighborBlock(nn.Module):
         theta = delta_theta.cumsum(dim=1)
         cos_t, sin_t = theta.cos(), theta.sin()
         q, k = self._apply_dd_rope(q, k, cos_t, sin_t)
+
+        # Gated neighbor mixing on K (after dd-rotate, before RoPE)
+        gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.n_pairs)
+        k = self._gated_neighbor(k, gate)
 
         # Fixed RoPE (positional encoding, composes with data-dependent rotation)
         cos, sin = self.rotary(q)
