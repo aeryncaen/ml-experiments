@@ -54,8 +54,8 @@ class HParams:
     d_model: int = _env_int("D_MODEL", 768)
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
-    # Fused gate knobs
-    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1248)
+    # Fused gate knobs (0 = use d_model, no expansion)
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
 
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
@@ -523,7 +523,7 @@ class FusedGatedNeighborBlock(nn.Module):
     to normed attention output preserves pre-attn features for down_proj.
     """
 
-    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
+    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
@@ -795,7 +795,8 @@ class GPTFusedGatedNeighbor(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
-        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=HP.fused_inner_dim) for _ in range(HP.n_layer)])
+        inner = HP.fused_inner_dim if HP.fused_inner_dim > 0 else None
+        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=inner) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
