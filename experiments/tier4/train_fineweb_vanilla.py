@@ -131,58 +131,35 @@ class ShardStream:
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-class S4DKernel(nn.Module):
-    """Generate convolution kernel from diagonal SSM parameters (S4D-Lin)."""
+class ShortConvLayer(nn.Module):
+    """Depthwise short conv + RoPE + gating.  All real-valued, fully compilable."""
 
-    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1):
+    def __init__(self, d_model: int, kernel_size: int = 4):
         super().__init__()
-        H = d_model
-        log_dt = torch.rand(H) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        C = torch.randn(H, N // 2, dtype=torch.cfloat)
-        self.C = nn.Parameter(torch.view_as_real(C))
-        self.log_dt = nn.Parameter(log_dt)
-        log_A_real = torch.log(0.5 * torch.ones(H, N // 2))
-        A_imag = math.pi * torch.arange(N // 2).unsqueeze(0).expand(H, -1).float()
-        self.log_A_real = nn.Parameter(log_A_real)
-        self.A_imag = nn.Parameter(A_imag)
-        # No weight decay on SSM params
-        for p in self.parameters():
-            p._no_weight_decay = True  # type: ignore[attr-defined]
-
-    @torch.compiler.disable
-    def forward(self, L):
-        dt = torch.exp(self.log_dt)
-        C = torch.view_as_complex(self.C)
-        A = -torch.exp(self.log_A_real) + 1j * self.A_imag
-        dtA = A * dt.unsqueeze(-1)
-        K = dtA.unsqueeze(-1) * torch.arange(L, device=A.device)
-        C = C * (torch.exp(dtA) - 1.0) / A
-        K = 2 * torch.einsum('hn, hnl -> hl', C, torch.exp(K)).real
-        return K
-
-
-class S4DLayer(nn.Module):
-    """Lightweight S4D layer: FFT conv + skip + GELU + linear mix."""
-
-    def __init__(self, d_model, d_state=64):
-        super().__init__()
-        self.d_model = d_model
-        self.kernel = S4DKernel(d_model, N=d_state)
-        self.D = nn.Parameter(torch.randn(d_model))
-        self.D._no_weight_decay = True  # type: ignore[attr-defined]
+        self.conv = nn.Conv1d(
+            d_model, d_model, kernel_size,
+            padding=kernel_size - 1, groups=d_model, bias=False,
+        )
+        self.rotary = Rotary(d_model)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
-        u = x.transpose(-1, -2)  # (B, D, T)
-        L = u.size(-1)
-        k = self.kernel(L)  # (D, L)
-        k_f = torch.fft.rfft(k, n=2 * L)
-        u_f = torch.fft.rfft(u, n=2 * L)
-        y = torch.fft.irfft(u_f * k_f, n=2 * L)[..., :L]  # (B, D, T)
-        y = y + u * self.D.unsqueeze(-1)
-        y = F.gelu(y.transpose(-1, -2))  # (B, T, D)
-        return self.out_proj(y)
+        B, T, D = x.shape
+        # causal depthwise conv
+        u = x.transpose(1, 2)                          # (B, D, T)
+        u = self.conv(u)[..., :T].transpose(1, 2)      # (B, T, D)
+        # RoPE on conv output
+        cos, sin = self.rotary(u.unsqueeze(2))          # (1, T, 1, D//2)
+        cos = cos.squeeze(2)                            # (1, T, D//2)
+        sin = sin.squeeze(2)
+        d = D // 2
+        u1, u2 = u[..., :d], u[..., d:]
+        u = torch.cat([u1 * cos + u2 * sin, -u1 * sin + u2 * cos], dim=-1)
+        # SiLU gate
+        gate = F.silu(self.gate_proj(x))
+        return self.out_proj(u * gate)
 
 
 class RMSNorm(nn.Module):
@@ -284,22 +261,22 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class TransformerS4DBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, d_state: int = 64):
+class TransformerConvBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int):
         super().__init__()
         self.ln0 = RMSNorm(d_model)
-        self.s4d = S4DLayer(d_model, d_state=d_state)
+        self.conv = ShortConvLayer(d_model)
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
         self.mlp = MLP(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.autograd.profiler.record_function("tf_s4d/block_s4d"):
-            x = x + self.s4d(self.ln0(x))
-        with torch.autograd.profiler.record_function("tf_s4d/block_attn"):
+        with torch.autograd.profiler.record_function("tfc/block_conv"):
+            x = x + self.conv(self.ln0(x))
+        with torch.autograd.profiler.record_function("tfc/block_attn"):
             x = x + self.attn(self.ln1(x))
-        with torch.autograd.profiler.record_function("tf_s4d/block_mlp"):
+        with torch.autograd.profiler.record_function("tfc/block_mlp"):
             x = x + self.mlp(self.ln2(x))
         return x
 
@@ -355,11 +332,11 @@ class GPTTransformer(nn.Module):
         return logits, loss
 
 
-class GPTTransformerS4D(nn.Module):
+class GPTTransformerConv(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
-        self.blocks = nn.ModuleList([TransformerS4DBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.blocks = nn.ModuleList([TransformerConvBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
@@ -413,7 +390,7 @@ def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
     if HP.model_type == "transformer_s4d":
-        return GPTTransformerS4D()
+        return GPTTransformerConv()
     if HP.model_type == "s6":
         return GPTS6()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
