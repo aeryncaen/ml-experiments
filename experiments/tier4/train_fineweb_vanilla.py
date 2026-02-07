@@ -33,7 +33,7 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass
 class HParams:
-    data_path: str = os.environ.get("DATA_PATH", ".")
+    data_path: str = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parent))
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
