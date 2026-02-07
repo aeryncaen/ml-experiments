@@ -213,17 +213,19 @@ class PostScanAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Force flash-attention path: keep params in fp32 but run QKV attention in fp16.
+        # Flash-attention via SDPA. With autocast, inputs are already bf16.
+        # If fp32 (no autocast), cast to bf16 for flash then cast back.
         attn_in_dtype = q.dtype
+        need_cast = q.is_cuda and q.dtype == torch.float32
+        if need_cast:
+            q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
         if q.is_cuda:
-            q = q.to(torch.float16)
-            k = k.to(torch.float16)
-            v = v.to(torch.float16)
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            out = out.to(attn_in_dtype)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if need_cast:
+            out = out.to(attn_in_dtype)
 
         out = rearrange(out, 'b h t d -> b t (h d)')
 
@@ -258,9 +260,8 @@ class USBBlock(nn.Module):
         # Step 1: Expansion
         self.expand = nn.Linear(d_model, d_expanded, bias=False)
         
-        # Step 2: KV projections
-        self.k_proj = nn.Linear(d_expanded, d_expanded, bias=False)
-        self.v_proj = nn.Linear(d_expanded, d_expanded, bias=False)
+        # Step 2: Fused KV projection (single matmul, split after)
+        self.kv_proj = nn.Linear(d_expanded, 2 * d_expanded, bias=False)
 
         # Gated RMSNorm for K, V
         self.k_norm = GatedRMSNorm(d_expanded)
@@ -345,9 +346,9 @@ class USBBlock(nn.Module):
             x_exp = F.silu(self.expand(x))  # (batch, seq_len, d_expanded)
 
         with torch.autograd.profiler.record_function("s6/kv_proj"):
-            # Step 2: KV projection
-            k = self.k_proj(x_exp)
-            v = self.v_proj(x_exp)
+            # Step 2: Fused KV projection (single matmul, split)
+            kv_out = self.kv_proj(x_exp)
+            k, v = kv_out.chunk(2, dim=-1)
 
         with torch.autograd.profiler.record_function("s6/kv_norm_bias"):
             # Apply RMSNorm (no activation on K/V)

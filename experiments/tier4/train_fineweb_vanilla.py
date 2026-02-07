@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -312,7 +314,7 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     loss_sum = torch.zeros(1, device=device)
     for _ in range(HP.val_steps):
         x, y = val_stream.next_batch(device)
-        if device.type == "cuda" and HP.model_type != "s6":
+        if device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
         else:
@@ -376,7 +378,7 @@ def main():
             pg["lr"] = lr
 
         x, y = train_stream.next_batch(device)
-        if device.type == "cuda" and HP.model_type != "s6":
+        if device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
         else:
