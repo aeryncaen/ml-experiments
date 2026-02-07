@@ -542,11 +542,8 @@ class FusedGatedNeighborBlock(nn.Module):
         self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
 
-        # Post-attention norm (before skip add)
+        # Post-attention norm (before skip multiply)
         self.attn_norm = RMSNorm(self.inner_dim)
-
-        # Down-project: inner_dim -> d_model
-        self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
         # QK norm (per-head RMSNorm before RoPE)
         self.q_norm = RMSNorm(self.head_dim)
@@ -603,9 +600,6 @@ class FusedGatedNeighborBlock(nn.Module):
 
         # Skip-multiply
         y = self.attn_norm(y) * h_up
-
-        # Down-project
-        y = self.down_proj(y)
 
         return x + y
 
