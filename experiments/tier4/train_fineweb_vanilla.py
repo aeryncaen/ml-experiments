@@ -548,6 +548,10 @@ class FusedGatedNeighborBlock(nn.Module):
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
+        # Learnable Swish beta (per-channel)
+        self.swish_beta_up = nn.Parameter(torch.ones(self.inner_dim))
+        self.swish_beta_down = nn.Parameter(torch.ones(self.inner_dim))
+
         # QK norm (per-head RMSNorm before RoPE)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
@@ -572,8 +576,9 @@ class FusedGatedNeighborBlock(nn.Module):
         b, t, c = x.shape
         h = self.norm(x)
 
-        # Expand and activate
-        h_up = F.silu(self.up_proj(h))
+        # Expand and activate (Swish with learnable beta)
+        h_up = self.up_proj(h)
+        h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
 
         # QKV from activated expanded space
         q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
@@ -604,8 +609,8 @@ class FusedGatedNeighborBlock(nn.Module):
         # Skip-multiply
         y = self.attn_norm(y) * h_up
 
-        # Down-project (with SiLU)
-        y = self.down_proj(F.silu(y))
+        # Down-project (with Swish)
+        y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
 
         return x + y
 
