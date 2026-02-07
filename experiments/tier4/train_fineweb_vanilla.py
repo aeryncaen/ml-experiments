@@ -264,7 +264,11 @@ class RMSNorm(nn.Module):
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: int = 10000):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer(
+            "inv_freq",
+            1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)),
+            persistent=False,
+        )
         self.seq_len_cached = 0
         self.cos_cached = None
         self.sin_cached = None
@@ -273,8 +277,9 @@ class Rotary(nn.Module):
         t = x.shape[1]
         if self.cos_cached is None or t != self.seq_len_cached:
             self.seq_len_cached = t
-            tt = torch.arange(t, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(tt, self.inv_freq)
+            inv_freq = self.inv_freq.to(device=x.device)
+            tt = torch.arange(t, device=x.device, dtype=inv_freq.dtype)
+            freqs = torch.outer(tt, inv_freq)
             self.cos_cached = freqs.cos()[None, :, None, :]
             self.sin_cached = freqs.sin()[None, :, None, :]
         return self.cos_cached, self.sin_cached
