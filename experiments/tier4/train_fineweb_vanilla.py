@@ -597,8 +597,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Gated multiply: attention output modulated by working state
-        y = self.attn_norm(y) * h_up
+        # Gated multiply: learned gate controls how much attention integrates
+        y = torch.sigmoid(self.attn_gate) * self.attn_norm(y) * h_up
 
         return x + y
 
