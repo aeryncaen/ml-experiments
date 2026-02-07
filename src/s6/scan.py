@@ -879,9 +879,10 @@ class ChunkedScanFn(torch.autograd.Function):
 
         out_full = out.reshape(B, T_padded, H, D)[:, :T]
 
-        # Save cumA (from Triton fwd kernel) so backward doesn't need aten::cumsum
+        # Save minimal tensors — recompute s_chunks, cumA, chunk_total_decay in backward
+        # s_chunks (256 MB at B=32) is the biggest win to drop
         ctx.save_for_backward(kv, alpha_clamped, delta, epsilon, zeta, init_state,
-                              s_chunks, la_chunks, cumA, chunk_total_decay, chunk_new_state, prev_states)
+                              la_chunks, chunk_new_state, prev_states)
         ctx.chunk_size = chunk_size
         ctx.nchunks = nchunks
         ctx.T_padded = T_padded
@@ -895,12 +896,23 @@ class ChunkedScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        kv, alpha, delta, epsilon, zeta, init_state, \
-            s_chunks, la_chunks, cumA, chunk_total_decay, chunk_new_state, prev_states = ctx.saved_tensors
+        (kv, alpha, delta, epsilon, zeta, init_state,
+         la_chunks, chunk_new_state, prev_states) = ctx.saved_tensors
         B, H, D = ctx.B, ctx.H, ctx.D
         T, T_padded = ctx.T, ctx.T_padded
         nchunks, chunk_size = ctx.nchunks, ctx.chunk_size
         use_triton = ctx.use_triton
+
+        # Recompute s_chunks from saved inputs (avoids saving 256 MB tensor)
+        s = _tridiag_conv(kv, zeta, epsilon, delta)
+        s_f = s.float()
+        if T_padded > T:
+            s_f = F.pad(s_f, (0, 0, 0, 0, 0, T_padded - T))
+        s_chunks = s_f.view(B, nchunks, chunk_size, H, D)
+
+        # Recompute cumA from la_chunks
+        cumA = la_chunks.cumsum(dim=2)
+        chunk_total_decay = cumA[:, :, -1, :]
 
         if not use_triton:
             ds, d_log_alpha, d_init_state = _chunked_scan_bwd(
@@ -1033,11 +1045,11 @@ def _chunked_scan_fwd_op(
     zeta: torch.Tensor,
     init_state: torch.Tensor,
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward pass of chunked scan, returning output + saved tensors for backward.
     
-    Triton path: cumsum computed inside kernels (no aten::cumsum hotspot).
+    Saves minimal tensors — s_chunks and cumA recomputed in backward.
     """
     B, T, H, D = kv.shape
     device = kv.device
@@ -1100,10 +1112,9 @@ def _chunked_scan_fwd_op(
 
     out_full = out.reshape(B, T_padded, H, D)[:, :T].to(kv.dtype)
 
-    # Save cumA so backward doesn't need aten::cumsum (was 18% of CUDA time)
+    # Save minimal tensors — recompute s_chunks and cumA in backward
     # clone alpha_clamped and init_state to avoid aliasing inputs (custom_op requirement)
-    # chunk_total_decay is cumA[:,:,-1,:] — derive it in backward from cumA to avoid alias
-    return (out_full, alpha_clamped.clone(), s_chunks, la_chunks, cumA.contiguous(),
+    return (out_full, alpha_clamped.clone(), la_chunks,
             chunk_new_state, prev_states, init_state.detach().clone())
 
 
@@ -1116,22 +1127,20 @@ def _chunked_scan_fwd_fake(
     zeta: torch.Tensor,
     init_state: torch.Tensor,
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor]:
     """Shape inference for Dynamo tracing."""
     B, T, H, D = kv.shape
     nchunks = (T + chunk_size - 1) // chunk_size
 
     out = kv.new_empty(B, T, H, D)
     alpha_clamped = alpha.new_empty(B, T, H)
-    s_chunks = kv.new_empty(B, nchunks, chunk_size, H, D, dtype=torch.float32)
     la_chunks = alpha.new_empty(B, nchunks, chunk_size, H, dtype=torch.float32)
-    cumA = alpha.new_empty(B, nchunks, chunk_size, H, dtype=torch.float32)
     chunk_new_state = kv.new_empty(B, nchunks, H, D, dtype=torch.float32)
     prev_states = kv.new_empty(B, nchunks, H, D, dtype=torch.float32)
     init_state_saved = init_state.new_empty(*init_state.shape)
 
-    return (out, alpha_clamped, s_chunks, la_chunks, cumA,
+    return (out, alpha_clamped, la_chunks,
             chunk_new_state, prev_states, init_state_saved)
 
 
@@ -1144,22 +1153,28 @@ def _chunked_scan_bwd_op(
     epsilon: torch.Tensor,
     zeta: torch.Tensor,
     init_state: torch.Tensor,
-    s_chunks: torch.Tensor,
     la_chunks: torch.Tensor,
-    cumA: torch.Tensor,
     chunk_new_state: torch.Tensor,
     prev_states: torch.Tensor,
     chunk_size: int,
     T_orig: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward of chunked scan. cumA passed from forward (no aten::cumsum)."""
+    """Backward of chunked scan. Recomputes s_chunks and cumA to save memory."""
     B, T, H, D = kv.shape
     device = dout.device
     use_triton = HAS_TRITON and device.type == 'cuda'
-    nchunks = s_chunks.shape[1]
+    nchunks = la_chunks.shape[1]
     T_padded = nchunks * chunk_size
 
-    # cumA passed from forward — derive chunk_total_decay
+    # Recompute s_chunks from saved inputs
+    s = _tridiag_conv(kv, zeta, epsilon, delta)
+    s_f = s.float()
+    if T_padded > T:
+        s_f = F.pad(s_f, (0, 0, 0, 0, 0, T_padded - T))
+    s_chunks = s_f.view(B, nchunks, chunk_size, H, D)
+
+    # Recompute cumA from la_chunks
+    cumA = la_chunks.cumsum(dim=2)
     chunk_total_decay = cumA[:, :, -1, :]
 
     if not use_triton:
@@ -1221,7 +1236,7 @@ def _chunked_scan_bwd_op(
 @_chunked_scan_bwd_op.register_fake
 def _chunked_scan_bwd_fake(
     dout, kv, alpha_clamped, delta, epsilon, zeta, init_state,
-    s_chunks, la_chunks, cumA, chunk_new_state, prev_states,
+    la_chunks, chunk_new_state, prev_states,
     chunk_size, T_orig,
 ):
     B, T, H, D = kv.shape
@@ -1236,12 +1251,12 @@ def _chunked_scan_bwd_fake(
 
 def _chunked_scan_autograd_backward(ctx, grad_out, *_saved_grads):
     (kv, alpha_clamped, delta, epsilon, zeta, init_state,
-     s_chunks, la_chunks, cumA, chunk_new_state, prev_states) = ctx.saved_tensors
+     la_chunks, chunk_new_state, prev_states) = ctx.saved_tensors
     chunk_size = ctx.chunk_size
     T_orig = ctx.T_orig
     d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state = torch.ops.s6.chunked_scan_bwd(
         grad_out, kv, alpha_clamped, delta, epsilon, zeta, init_state,
-        s_chunks, la_chunks, cumA, chunk_new_state, prev_states,
+        la_chunks, chunk_new_state, prev_states,
         chunk_size, T_orig,
     )
     return d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state, None
@@ -1249,9 +1264,9 @@ def _chunked_scan_autograd_backward(ctx, grad_out, *_saved_grads):
 
 def _chunked_scan_setup_context(ctx, inputs, output):
     kv, alpha, delta, epsilon, zeta, init_state, chunk_size = inputs
-    out, alpha_clamped, s_chunks, la_chunks, cumA, chunk_new_state, prev_states, init_saved = output
+    out, alpha_clamped, la_chunks, chunk_new_state, prev_states, init_saved = output
     ctx.save_for_backward(kv, alpha_clamped, delta, epsilon, zeta, init_saved,
-                          s_chunks, la_chunks, cumA, chunk_new_state, prev_states)
+                          la_chunks, chunk_new_state, prev_states)
     ctx.chunk_size = chunk_size
     ctx.T_orig = kv.shape[1]
 
