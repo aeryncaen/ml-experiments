@@ -796,7 +796,7 @@ class GPTFusedGatedNeighbor(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
+        x = F.silu(self.wte(idx))
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
