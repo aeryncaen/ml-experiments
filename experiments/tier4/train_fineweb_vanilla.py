@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | transformer_s4d | s6
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -505,6 +505,7 @@ class GatedNeighborAttention(nn.Module):
 
 
 class GatedNeighborBlock(nn.Module):
+    """Separate attn + MLP block using GatedNeighborAttention."""
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
@@ -516,6 +517,98 @@ class GatedNeighborBlock(nn.Module):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
+
+
+class FusedGatedNeighborBlock(nn.Module):
+    """Fused attention+MLP block: project up, neighbor-enrich K, attend, gate, project down.
+
+    Like Mamba puts its scan inside an MLP-like expand/contract structure,
+    this puts neighbor-enriched attention inside the MLP:
+        x -> norm -> up-project (2*expand) -> split into QKV + gate
+                  -> chained neighbor mix on K
+                  -> attention in expanded space
+                  -> SiLU gate
+                  -> down-project -> residual
+
+    One norm, one residual. No separate attention and MLP blocks.
+    """
+
+    def __init__(self, d_model: int, n_head: int, expand: int = 2):
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_head
+        self.inner_dim = d_model * expand
+        assert self.inner_dim % n_head == 0
+        self.head_dim = self.inner_dim // n_head
+        self.half_dim = self.head_dim // 2
+
+        self.norm = RMSNorm(d_model)
+
+        # Up-project: input -> Q, K, V, gate (all in expanded space)
+        # Q + K + V + gate = 4 * inner_dim
+        self.up_proj = nn.Linear(d_model, 4 * self.inner_dim, bias=False)
+
+        # Down-project: inner_dim -> d_model
+        self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
+
+        # RoPE in expanded head_dim
+        self.rotary = Rotary(self.head_dim)
+
+        # Neighbor gates: chained double-lerp on K, per-channel per-head
+        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim * 2, bias=True)
+        nn.init.zeros_(self.neighbor_gate_proj.weight)
+        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+
+    def _chained_neighbor(self, k: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
+        half = self.half_dim
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev1 = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_prev2 = F.pad(k_cur[:, :-2], (0, 0, 0, 0, 2, 0))
+        k_mid = (1 - g1) * k_cur + g1 * k_prev1
+        k_out = (1 - g2) * k_mid + g2 * k_prev2
+        return torch.cat([k_static, k_out], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        h = self.norm(x)
+
+        # Up-project into Q, K, V, gate — all in expanded space
+        qkvg = self.up_proj(h)
+        q, k, v, gate = qkvg.split(self.inner_dim, dim=-1)
+
+        q = q.view(b, t, self.n_head, self.head_dim)
+        k = k.view(b, t, self.n_head, self.head_dim)
+        v = v.view(b, t, self.n_head, self.head_dim)
+
+        # RoPE
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        # Chained neighbor mixing on K
+        raw = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim * 2)
+        g1 = raw[:, :, :, :self.half_dim]
+        g2 = raw[:, :, :, self.half_dim:]
+        k = self._chained_neighbor(k, g1, g2)
+
+        # Attention
+        if HAS_FLASH_ATTN:
+            y = flash_attn_func(q, k, v, causal=True)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+
+        y = y.contiguous().view(b, t, self.inner_dim)
+
+        # SiLU gate (like Mamba/SwiGLU) — gate branch modulates attention output
+        y = y * F.silu(gate)
+
+        # Down-project
+        y = self.down_proj(y)
+
+        return x + y
 
 
 class TransformerShiftBlock(nn.Module):
@@ -699,6 +792,28 @@ class GPTGatedNeighbor(nn.Module):
         return logits, loss
 
 
+class GPTFusedGatedNeighbor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTS6(nn.Module):
     def __init__(self):
         super().__init__()
@@ -740,6 +855,8 @@ def build_model() -> nn.Module:
         return GPTTransformerConv()
     if HP.model_type == "transformer_gate":
         return GPTGatedNeighbor()
+    if HP.model_type == "fused_gate":
+        return GPTFusedGatedNeighbor()
     if HP.model_type == "s6":
         return GPTS6()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
