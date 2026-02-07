@@ -436,64 +436,50 @@ class ShiftAttention(nn.Module):
 
 
 class GatedNeighborAttention(nn.Module):
-    """Attention with multi-tap content-gated neighbor mixing on K.
+    """Attention with chained gated neighbor mixing on K.
 
-    K channels are split into groups. Group 0 stays untouched. Groups 1..N
-    each get a gated mix with a different causal neighbor (t-1, t-2, t-4):
-        k_out[t, group_i] = (1 - g_i[t]) * k[t] + g_i[t] * k[t - tap_i]
-    Gate is per-channel per-head, content-dependent.
+    Half the channels in each head's K get two sequential lerps:
+        k_mid[t] = (1 - g1[t]) * k[t] + g1[t] * k[t-1]
+        k_out[t] = (1 - g2[t]) * k_mid[t] + g2[t] * k[t-2]
+    This gives a 3-position receptive field (t, t-1, t-2) in the same
+    channels via chained mixing. Gates are per-channel per-head.
+    First half of channels stays untouched.
     """
-
-    TAPS = (0, 1, 2, 4)  # group 0 = identity, groups 1-3 = gated neighbors
 
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.head_dim = d_model // n_head
-        self.num_taps = len(self.TAPS)
-        self.num_gated = sum(1 for t in self.TAPS if t > 0)  # taps that need gates
-        assert self.head_dim % self.num_taps == 0
-        self.cpg = self.head_dim // self.num_taps  # channels per group
+        self.half_dim = self.head_dim // 2
 
         self.q = nn.Linear(d_model, d_model, bias=False)
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
-        # Gate projection: one gate per gated-tap per channel per head
-        self.gate_proj = nn.Linear(d_model, n_head * self.cpg * self.num_gated, bias=True)
+        # Two gates per channel: g1 for t-1, g2 for t-2
+        self.gate_proj = nn.Linear(d_model, n_head * self.half_dim * 2, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
-    def _multi_tap_neighbor(self, k: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
-        """Multi-tap gated neighbor mixing on K.
+    def _chained_neighbor(self, k: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
+        """Chained double-lerp on the second half of K channels.
 
         k: (B, T, H, D)
-        gates: (B, T, H, cpg * num_gated) — sigmoid applied, per-channel
+        g1, g2: (B, T, H, half_dim) — sigmoid applied
 
-        Each group i with tap s > 0:
-            k_out[t, group_i] = (1 - g_i[t]) * k[t, group_i] + g_i[t] * k[t-s, group_i]
-        Group 0 (tap=0) passes through unchanged.
+        k_mid = (1-g1)*k[t] + g1*k[t-1]
+        k_out = (1-g2)*k_mid + g2*k[t-2]
         """
-        cpg = self.cpg
-        chunks = []
-        gate_idx = 0
-        for tap in self.TAPS:
-            sl = slice(gate_idx * cpg if tap == 0 else None)  # dummy, overwritten below
-            group_start = len(chunks) * cpg
-            group_end = group_start + cpg
-            k_cur = k[:, :, :, group_start:group_end]
-
-            if tap == 0:
-                chunks.append(k_cur)
-            else:
-                g = gates[:, :, :, gate_idx * cpg:(gate_idx + 1) * cpg]
-                k_prev = F.pad(k_cur[:, :-tap], (0, 0, 0, 0, tap, 0))
-                chunks.append((1 - g) * k_cur + g * k_prev)
-                gate_idx += 1
-
-        return torch.cat(chunks, dim=-1)
+        half = self.half_dim
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev1 = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))  # t-1
+        k_prev2 = F.pad(k_cur[:, :-2], (0, 0, 0, 0, 2, 0))  # t-2
+        k_mid = (1 - g1) * k_cur + g1 * k_prev1
+        k_out = (1 - g2) * k_mid + g2 * k_prev2
+        return torch.cat([k_static, k_out], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -503,9 +489,11 @@ class GatedNeighborAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        # Content-dependent gates for multi-tap neighbor mixing on K
-        gates = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.cpg * self.num_gated)
-        k = self._multi_tap_neighbor(k, gates)
+        # Two sets of per-channel gates for chained neighbor mixing on K
+        raw = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim * 2)
+        g1 = raw[:, :, :, :self.half_dim]
+        g2 = raw[:, :, :, self.half_dim:]
+        k = self._chained_neighbor(k, g1, g2)
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=True)
         else:
