@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from src.s6 import USBBlock, USBConfig
+from s6 import USBBlock, USBConfig
 
 
 def _env_bool(name: str, default: bool) -> bool:
