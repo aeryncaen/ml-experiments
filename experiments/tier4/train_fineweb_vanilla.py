@@ -595,8 +595,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip-multiply then activate
-        y = F.silu(self.attn_norm(y) * h_up)
+        # Skip-multiply
+        y = self.attn_norm(y) * h_up
 
         # Down-project
         y = self.down_proj(y)
