@@ -597,10 +597,10 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # SSM-style integration: attention enriches the working state
-        h_up = h_up + torch.sigmoid(self.attn_gate) * self.attn_norm(y)
+        # Gated multiply: attention output modulated by working state
+        y = self.attn_norm(y) * h_up
 
-        return x + h_up
+        return x + y
 
 
 class TransformerShiftBlock(nn.Module):
