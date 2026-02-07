@@ -467,31 +467,22 @@ class GatedNeighborAttention(nn.Module):
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
-    def _gated_accumulate(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply gated neighbor accumulation to the second half of K channels.
+    def _gated_neighbor(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Gate in the shifted neighbor for the second half of K channels.
 
         k: (B, T, H, D)
         gate: (B, T, H, half_dim) — sigmoid already applied, per-channel
 
         For the second half of each head's channels:
-            k_out[t] = (1 - g[t]) * k[t] + g[t] * k_out[t-1]
-        First half stays unchanged.
+            k_out[t] = (1 - g[t]) * k[t] + g[t] * k[t-1]
+        First half stays unchanged. No scan — just a pad and lerp.
         """
-        B, T, H, D = k.shape
         half = self.half_dim
-        k_static = k[:, :, :, :half]       # unchanged half
-        k_rec = k[:, :, :, half:]           # half that gets accumulated
-
-        # Sequential scan — build output list to avoid in-place mutation.
-        # T is seq_len (2048), not a bottleneck vs attention's O(T^2).
-        states = [k_rec[:, 0]]
-        for t in range(1, T):
-            prev = states[t - 1]
-            g = gate[:, t]
-            states.append((1 - g) * k_rec[:, t] + g * prev)
-
-        k_accum = torch.stack(states, dim=1)  # (B, T, H, half)
-        return torch.cat([k_static, k_accum], dim=-1)
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))  # shift by 1, zero at t=0
+        k_mixed = torch.lerp(k_cur, k_prev, gate)
+        return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -503,7 +494,7 @@ class GatedNeighborAttention(nn.Module):
         k = apply_rotary(k, cos, sin)
         # Content-dependent gate for neighbor accumulation — per channel per head
         gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim)  # (B, T, H, half_dim)
-        k = self._gated_accumulate(k, gate)
+        k = self._gated_neighbor(k, gate)
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=True)
         else:
