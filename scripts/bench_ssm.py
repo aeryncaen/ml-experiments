@@ -399,11 +399,12 @@ class ShiftAttnBlock(nn.Module):
 
 
 class GatedNeighborAttnBlock(nn.Module):
-    """Attention with content-gated neighbor mixing on K + SwiGLU MLP.
+    """Attention with chained gated neighbor mixing on K + SwiGLU MLP.
 
-    Half each head's K channels get mixed with the previous position via a
-    learned content-dependent gate: k_out[t] = (1-g)*k[t] + g*k[t-1].
-    Gate is per-channel per-head. Over layers, builds exponential receptive field.
+    Half each head's K channels get two sequential lerps:
+        k_mid[t] = (1-g1[t])*k[t] + g1[t]*k[t-1]
+        k_out[t] = (1-g2[t])*k_mid[t] + g2[t]*k[t-2]
+    Gates are per-channel per-head, content-dependent.
     """
     def __init__(self, d_model, n_heads=4, ffn_mult=4):
         super().__init__()
@@ -417,8 +418,8 @@ class GatedNeighborAttnBlock(nn.Module):
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Gate projection: per-channel per-head
-        self.gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        # Two gates per channel: g1 for t-1, g2 for t-2
+        self.gate_proj = nn.Linear(d_model, n_heads * self.half_dim * 2, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
@@ -444,14 +445,16 @@ class GatedNeighborAttnBlock(nn.Module):
         x1, x2 = x[..., :d], x[..., d:]
         return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
 
-    def _gated_neighbor(self, k, gate):
-        """Gate in shifted neighbor for second half of K channels."""
+    def _chained_neighbor(self, k, g1, g2):
+        """Chained double-lerp on second half of K channels."""
         half = self.half_dim
         k_static = k[:, :, :, :half]
         k_cur = k[:, :, :, half:]
-        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
-        k_mixed = (1 - gate) * k_cur + gate * k_prev
-        return torch.cat([k_static, k_mixed], dim=-1)
+        k_prev1 = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_prev2 = F.pad(k_cur[:, :-2], (0, 0, 0, 0, 2, 0))
+        k_mid = (1 - g1) * k_cur + g1 * k_prev1
+        k_out = (1 - g2) * k_mid + g2 * k_prev2
+        return torch.cat([k_static, k_out], dim=-1)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -460,8 +463,10 @@ class GatedNeighborAttnBlock(nn.Module):
         v = self.v(x).view(B, T, self.n_heads, self.head_dim)
         q = self._rope(q)
         k = self._rope(k)
-        gate = torch.sigmoid(self.gate_proj(x)).view(B, T, self.n_heads, self.half_dim)
-        k = self._gated_neighbor(k, gate)
+        raw = torch.sigmoid(self.gate_proj(x)).view(B, T, self.n_heads, self.half_dim * 2)
+        g1 = raw[:, :, :, :self.half_dim]
+        g2 = raw[:, :, :, self.half_dim:]
+        k = self._chained_neighbor(k, g1, g2)
         # SDPA path
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
