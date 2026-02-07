@@ -12,8 +12,12 @@ Run on CPU: python -m s6.test_triton_vs_python --cpu
 import argparse
 import torch
 
+import time
+
 from .scan import (
     _forward_scan_chunked_autograd,
+    forward_scan_chunked,
+    forward_scan_elementwise_streaming,
     ChunkedScanFn,
 )
 
@@ -136,19 +140,132 @@ def test_backward_match_random_dout(device):
     print("  All backward match (random dout): PASSED")
 
 
+# ---------------------------------------------------------------------------
+# Speed benchmarks
+# ---------------------------------------------------------------------------
+
+def _sync(device):
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+
+def _bench_fn(fn, warmup=5, repeats=20, device="cpu"):
+    """Time a callable, returning median ms."""
+    for _ in range(warmup):
+        fn()
+    _sync(device)
+
+    times = []
+    for _ in range(repeats):
+        _sync(device)
+        t0 = time.perf_counter()
+        fn()
+        _sync(device)
+        times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return times[len(times) // 2]
+
+
+def bench_speed(device, seq_lengths=(256, 1024, 4096), chunk_sizes=(64,),
+                B=4, H=8, D=64):
+    """Benchmark forward and forward+backward for chunked vs streaming scan."""
+    print("\n" + "=" * 60)
+    print("Speed benchmarks")
+    print("=" * 60)
+    print(f"  Device={device}  B={B}  H={H}  D={D}  warmup=5  repeats=20")
+    print(f"  Chunk sizes: {chunk_sizes}")
+    print()
+
+    # Header
+    print(f"  {'T':>5}  {'C':>3}  {'Method':<20}  {'Fwd (ms)':>10}  {'Fwd+Bwd (ms)':>13}")
+    print(f"  {'-----':>5}  {'---':>3}  {'--------------------':<20}  {'----------':>10}  {'-------------':>13}")
+
+    for T in seq_lengths:
+        for C in chunk_sizes:
+            if C > T:
+                continue
+
+            kv_base, alpha_base, delta_base, epsilon_base, zeta_base, init_base = \
+                _make_inputs(B, T, H, D, device)
+
+            # --- Chunked scan ---
+            def _chunked_fwd():
+                kv = kv_base.detach().requires_grad_(True)
+                alpha = alpha_base.detach().requires_grad_(True)
+                delta = delta_base.detach().requires_grad_(True)
+                epsilon = epsilon_base.detach().requires_grad_(True)
+                zeta = zeta_base.detach().requires_grad_(True)
+                init_s = init_base.detach().requires_grad_(True)
+                return forward_scan_chunked(kv, alpha, delta, epsilon, zeta, init_s, C)
+
+            def _chunked_fwd_bwd():
+                kv = kv_base.detach().requires_grad_(True)
+                alpha = alpha_base.detach().requires_grad_(True)
+                delta = delta_base.detach().requires_grad_(True)
+                epsilon = epsilon_base.detach().requires_grad_(True)
+                zeta = zeta_base.detach().requires_grad_(True)
+                init_s = init_base.detach().requires_grad_(True)
+                out = forward_scan_chunked(kv, alpha, delta, epsilon, zeta, init_s, C)
+                out.sum().backward()
+
+            fwd_chunked = _bench_fn(_chunked_fwd, device=device)
+            fwd_bwd_chunked = _bench_fn(_chunked_fwd_bwd, device=device)
+            print(f"  {T:5d}  {C:3d}  {'chunked':<20}  {fwd_chunked:10.2f}  {fwd_bwd_chunked:13.2f}")
+
+            # --- Streaming scan (skip for long sequences — too slow) ---
+            if T <= 1024:
+                def _streaming_fwd():
+                    kv = kv_base.detach().requires_grad_(True)
+                    alpha = alpha_base.detach().requires_grad_(True)
+                    delta = delta_base.detach().requires_grad_(True)
+                    epsilon = epsilon_base.detach().requires_grad_(True)
+                    zeta = zeta_base.detach().requires_grad_(True)
+                    init_s = init_base.detach().requires_grad_(True)
+                    return forward_scan_elementwise_streaming(kv, alpha, delta, epsilon, zeta, init_s)
+
+                def _streaming_fwd_bwd():
+                    kv = kv_base.detach().requires_grad_(True)
+                    alpha = alpha_base.detach().requires_grad_(True)
+                    delta = delta_base.detach().requires_grad_(True)
+                    epsilon = epsilon_base.detach().requires_grad_(True)
+                    zeta = zeta_base.detach().requires_grad_(True)
+                    init_s = init_base.detach().requires_grad_(True)
+                    out = forward_scan_elementwise_streaming(kv, alpha, delta, epsilon, zeta, init_s)
+                    out.sum().backward()
+
+                fwd_stream = _bench_fn(_streaming_fwd, device=device)
+                fwd_bwd_stream = _bench_fn(_streaming_fwd_bwd, device=device)
+                print(f"  {T:5d}  {'':>3}  {'streaming':<20}  {fwd_stream:10.2f}  {fwd_bwd_stream:13.2f}")
+            else:
+                print(f"  {T:5d}  {'':>3}  {'streaming':<20}  {'(skipped)':>10}  {'(skipped)':>13}")
+
+            # Speedup
+            if T <= 1024:
+                fwd_speedup = fwd_stream / fwd_chunked
+                bwd_speedup = fwd_bwd_stream / fwd_bwd_chunked
+                print(f"  {T:5d}  {'':>3}  {'speedup':<20}  {fwd_speedup:9.1f}x  {bwd_speedup:12.1f}x")
+            print()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu", action="store_true", help="Run on CPU instead of CUDA")
+    parser.add_argument("--bench-only", action="store_true", help="Run only speed benchmarks")
+    parser.add_argument("--no-bench", action="store_true", help="Skip speed benchmarks")
     args = parser.parse_args()
 
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     print(f"Device: {device}")
     print("=" * 60)
 
-    test_forward_match(device)
-    test_backward_match(device)
-    test_backward_match_random_dout(device)
+    if not args.bench_only:
+        test_forward_match(device)
+        test_backward_match(device)
+        test_backward_match_random_dout(device)
 
-    print("\n" + "=" * 60)
-    print("All validation tests PASSED!")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("All validation tests PASSED!")
+        print("=" * 60)
+
+    if not args.no_bench:
+        bench_speed(device)
