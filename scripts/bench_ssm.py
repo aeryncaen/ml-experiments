@@ -398,6 +398,81 @@ class ShiftAttnBlock(nn.Module):
         return h + h2
 
 
+class GatedNeighborAttnBlock(nn.Module):
+    """Attention with content-gated neighbor mixing on K + SwiGLU MLP.
+
+    Half each head's K channels get mixed with the previous position via a
+    learned content-dependent gate: k_out[t] = (1-g)*k[t] + g*k[t-1].
+    Gate is per-channel per-head. Over layers, builds exponential receptive field.
+    """
+    def __init__(self, d_model, n_heads=4, ffn_mult=4):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.half_dim = self.head_dim // 2
+
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+        # Gate projection: per-channel per-head
+        self.gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, -2.0)
+
+        # RoPE frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # SwiGLU MLP
+        hidden = int(d_model * ffn_mult)
+        self.mlp_norm = nn.RMSNorm(d_model)
+        self.w1 = nn.Linear(d_model, hidden, bias=False)
+        self.w2 = nn.Linear(d_model, hidden, bias=False)
+        self.w3 = nn.Linear(hidden, d_model, bias=False)
+
+    def _rope(self, x):
+        """Apply rotary embeddings. x: (B, T, H, D)."""
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _gated_neighbor(self, k, gate):
+        """Gate in shifted neighbor for second half of K channels."""
+        half = self.half_dim
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        q = self.q(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.n_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.n_heads, self.head_dim)
+        q = self._rope(q)
+        k = self._rope(k)
+        gate = torch.sigmoid(self.gate_proj(x)).view(B, T, self.n_heads, self.half_dim)
+        k = self._gated_neighbor(k, gate)
+        # SDPA path
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.proj(y)
+        # SwiGLU MLP
+        m = self.mlp_norm(x + h)
+        h2 = self.w3(F.silu(self.w1(m)) * self.w2(m))
+        return h + h2
+
+
 class DS1Wrapper(nn.Module):
     def __init__(self, dim, state_dim=64, mimo_rank=4, n_iters=2, **kwargs):
         super().__init__()
@@ -1102,6 +1177,9 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # ShiftAttn: standard attention with temporal channel-group shifts on K,V
     try_add('ShiftAttn', lambda: ShiftAttnBlock(d_model=dim, n_heads=4, shifts=(0, 1, 2, 4), ffn_mult=4))
+
+    # GatedNeighbor: attention with content-gated neighbor mixing on K
+    try_add('GatedNeighbor', lambda: GatedNeighborAttnBlock(d_model=dim, n_heads=4, ffn_mult=4))
 
     return models
 
