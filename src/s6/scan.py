@@ -36,21 +36,28 @@ if HAS_TRITON:
     @triton.jit
     def _chunk_scan_fwd_kernel(
         # Pointers
-        s_ptr, cumA_ptr, prev_states_ptr, out_ptr,
+        s_ptr, log_alpha_ptr, prev_states_ptr, out_ptr, cumA_out_ptr,
         # Dimensions
         chunk_size: tl.constexpr, D: tl.constexpr, nchunks,
         # Strides for s: (BNH, C, D) -- flattened
         stride_s_bnh, stride_s_c, stride_s_d,
-        # Strides for cumA: (BNH, C)
-        stride_ca_bnh, stride_ca_c,
+        # Strides for log_alpha: (BNH, C)
+        stride_la_bnh, stride_la_c,
         # Strides for prev_states: (BNH, D)
         stride_ps_bnh, stride_ps_d,
         # Strides for out: (BNH, C, D)
         stride_o_bnh, stride_o_c, stride_o_d,
+        # Strides for cumA_out: (BNH, C) -- written only by pid_d==0
+        stride_cao_bnh, stride_cao_c,
         # Block sizes
         BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr,
+        STORE_CUMA: tl.constexpr,  # whether to write cumA to output
     ):
-        """Fused intra-chunk decay-mask matmul + inter-chunk state contribution."""
+        """Fused intra-chunk decay-mask matmul + inter-chunk state contribution.
+        
+        Computes cumsum of log_alpha in-kernel (eliminates aten::cumsum hotspot).
+        Optionally writes cumA to output for use in backward pass.
+        """
         pid_bnh = tl.program_id(0)
         pid_d = tl.program_id(1)
 
@@ -58,10 +65,18 @@ if HAS_TRITON:
         offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
         d_mask = offs_d < D
 
-        # Load cumA
-        ca_base = pid_bnh * stride_ca_bnh
-        cumA = tl.load(cumA_ptr + ca_base + offs_c * stride_ca_c,
-                       mask=offs_c < chunk_size, other=0.0).to(tl.float32)
+        # Load log_alpha and compute cumsum in-register
+        la_base = pid_bnh * stride_la_bnh
+        log_alpha = tl.load(log_alpha_ptr + la_base + offs_c * stride_la_c,
+                            mask=offs_c < chunk_size, other=0.0).to(tl.float32)
+        cumA = tl.cumsum(log_alpha, axis=0)
+
+        # Optionally store cumA for backward (only one D-block needs to do this)
+        if STORE_CUMA:
+            if pid_d == 0:
+                cao_base = pid_bnh * stride_cao_bnh
+                tl.store(cumA_out_ptr + cao_base + offs_c * stride_cao_c,
+                         cumA, mask=offs_c < chunk_size)
 
         # Decay mask: M[i,j] = exp(cumA[i] - cumA[j]) for j <= i
         decay = tl.exp(cumA[:, None] - cumA[None, :])
@@ -94,14 +109,14 @@ if HAS_TRITON:
     @triton.jit
     def _chunk_scan_bwd_kernel(
         # Pointers
-        dout_ptr, cumA_ptr, s_ptr, prev_states_ptr,
+        dout_ptr, log_alpha_ptr, s_ptr, prev_states_ptr,
         ds_ptr, d_decay_mask_ptr, d_prev_states_ptr,
         # Dimensions
         chunk_size: tl.constexpr, D: tl.constexpr,
         # Strides for dout/ds: (BNH, C, D)
         stride_do_bnh, stride_do_c, stride_do_d,
-        # Strides for cumA: (BNH, C)
-        stride_ca_bnh, stride_ca_c,
+        # Strides for log_alpha: (BNH, C)
+        stride_la_bnh, stride_la_c,
         # Strides for s: (BNH, C, D)
         stride_s_bnh, stride_s_c, stride_s_d,
         # Strides for prev_states: (BNH, D)
@@ -119,6 +134,7 @@ if HAS_TRITON:
         Backward through intra-chunk scan.
         Mirrors _chunked_scan_bwd steps 2-5 for one (bnh, d_block).
 
+        Computes cumsum of log_alpha in-kernel (fused, no aten::cumsum).
         Computes:
           ds_flat = decay_mask^T @ d_intra_flat
           d_decay_mask = d_intra_flat @ s_flat^T  (partial — accumulated across D blocks)
@@ -132,10 +148,11 @@ if HAS_TRITON:
         d_mask = offs_d < D
         c_mask = offs_c < chunk_size
 
-        # Load cumA -> build decay mask
-        ca_base = pid_bnh * stride_ca_bnh
-        cumA = tl.load(cumA_ptr + ca_base + offs_c * stride_ca_c,
-                       mask=c_mask, other=0.0).to(tl.float32)
+        # Load log_alpha -> compute cumsum -> build decay mask
+        la_base = pid_bnh * stride_la_bnh
+        log_alpha = tl.load(log_alpha_ptr + la_base + offs_c * stride_la_c,
+                            mask=c_mask, other=0.0).to(tl.float32)
+        cumA = tl.cumsum(log_alpha, axis=0)
         decay = tl.exp(cumA[:, None] - cumA[None, :])
         causal = offs_c[:, None] >= offs_c[None, :]
         M = tl.where(causal, decay, 0.0)
@@ -180,15 +197,15 @@ if HAS_TRITON:
 
     @triton.jit
     def _d_cumA_from_decay_mask_kernel(
-        d_decay_mask_ptr, decay_mask_ptr, d_cumA_ptr,
+        d_decay_mask_ptr, log_alpha_ptr, d_cumA_ptr,
         chunk_size: tl.constexpr,
         stride_ddm_bnh, stride_ddm_i, stride_ddm_j,
-        stride_dm_bnh, stride_dm_i, stride_dm_j,
+        stride_la_bnh, stride_la_c,
         stride_dca_bnh, stride_dca_c,
         BLOCK_C: tl.constexpr,
     ):
         """
-        d_cumA[i] from decay_mask:
+        Recomputes decay_mask from log_alpha (fused cumsum), then:
           d_cumA[i] = sum_j (d_dm * dm)[i,j]  -  sum_j (d_dm * dm)[j,i]
         (row sum minus col sum of elementwise product)
         """
@@ -197,15 +214,20 @@ if HAS_TRITON:
         c_mask = offs_c < chunk_size
 
         ddm_base = pid_bnh * stride_ddm_bnh
-        dm_base = pid_bnh * stride_dm_bnh
 
-        # Load d_decay_mask and decay_mask: (C, C)
+        # Recompute cumA and decay_mask from log_alpha (no need to load pre-computed)
+        la_base = pid_bnh * stride_la_bnh
+        log_alpha = tl.load(log_alpha_ptr + la_base + offs_c * stride_la_c,
+                            mask=c_mask, other=0.0).to(tl.float32)
+        cumA = tl.cumsum(log_alpha, axis=0)
+        decay_diff = cumA[:, None] - cumA[None, :]
+        causal = offs_c[:, None] >= offs_c[None, :]
+        dm = tl.where(causal, tl.exp(decay_diff), 0.0)
+
+        # Load d_decay_mask: (C, C)
         ddm = tl.load(d_decay_mask_ptr + ddm_base
                       + offs_c[:, None] * stride_ddm_i + offs_c[None, :] * stride_ddm_j,
                       mask=c_mask[:, None] & c_mask[None, :], other=0.0).to(tl.float32)
-        dm = tl.load(decay_mask_ptr + dm_base
-                     + offs_c[:, None] * stride_dm_i + offs_c[None, :] * stride_dm_j,
-                     mask=c_mask[:, None] & c_mask[None, :], other=0.0).to(tl.float32)
 
         prod = ddm * dm  # (C, C)
         d_cumA = tl.sum(prod, axis=1) - tl.sum(prod, axis=0)  # (C,)
@@ -570,22 +592,34 @@ def _chunked_scan_bwd(dout, s_chunks, cumA, chunk_total_decay, chunk_new_state,
 # Triton launcher wrappers
 # ---------------------------------------------------------------------------
 
-def _chunked_scan_fwd_triton(s_flat, cumA_flat, prev_states_flat, chunk_size, D, BNH):
-    """Launch Triton forward kernel. Returns out_flat (BNH, C, D)."""
+def _chunked_scan_fwd_triton(s_flat, log_alpha_flat, prev_states_flat, chunk_size, D, BNH,
+                              store_cumA=False):
+    """Launch Triton forward kernel with fused cumsum.
+    
+    Takes log_alpha (not cumA) — computes prefix sum inside the kernel.
+    If store_cumA=True, also writes cumA to an output buffer (for backward).
+    Returns out_flat (BNH, C, D), and optionally cumA_flat (BNH, C).
+    """
     out_flat = torch.empty_like(s_flat)
+    cumA_flat = torch.empty(BNH, chunk_size, device=s_flat.device, dtype=torch.float32) if store_cumA else s_flat.new_empty(0)
     BLOCK_D = triton.next_power_of_2(D)
     BLOCK_C = triton.next_power_of_2(chunk_size)
     n_d_blocks = (D + BLOCK_D - 1) // BLOCK_D
     grid = (BNH, n_d_blocks)
     _chunk_scan_fwd_kernel[grid](
-        s_flat, cumA_flat, prev_states_flat, out_flat,
+        s_flat, log_alpha_flat, prev_states_flat, out_flat, cumA_flat,
         chunk_size, D, BNH,
         s_flat.stride(0), s_flat.stride(1), s_flat.stride(2),
-        cumA_flat.stride(0), cumA_flat.stride(1),
+        log_alpha_flat.stride(0), log_alpha_flat.stride(1),
         prev_states_flat.stride(0), prev_states_flat.stride(1),
         out_flat.stride(0), out_flat.stride(1), out_flat.stride(2),
+        cumA_flat.stride(0) if store_cumA else 0,
+        cumA_flat.stride(1) if store_cumA else 0,
         BLOCK_C=BLOCK_C, BLOCK_D=BLOCK_D,
+        STORE_CUMA=store_cumA,
     )
+    if store_cumA:
+        return out_flat, cumA_flat
     return out_flat
 
 
@@ -609,10 +643,11 @@ def _state_passing_fwd_triton(chunk_new_state, chunk_total_decay, init_state, B,
     return prev_states
 
 
-def _chunked_scan_bwd_triton(dout_flat, cumA_flat, s_flat, prev_states_flat,
-                              decay_mask, chunk_size, D, BNH):
+def _chunked_scan_bwd_triton(dout_flat, log_alpha_flat, s_flat, prev_states_flat,
+                              chunk_size, D, BNH):
     """
     Launch Triton backward kernels for intra-chunk.
+    All kernels compute cumsum from log_alpha in-kernel (no aten::cumsum).
     Returns ds_flat (BNH, C, D), d_cumA_from_intra (BNH, C), d_prev_states (BNH, D).
     """
     BLOCK_D = triton.next_power_of_2(D)
@@ -625,11 +660,11 @@ def _chunked_scan_bwd_triton(dout_flat, cumA_flat, s_flat, prev_states_flat,
 
     grid = (BNH, n_d_blocks)
     _chunk_scan_bwd_kernel[grid](
-        dout_flat, cumA_flat, s_flat, prev_states_flat,
+        dout_flat, log_alpha_flat, s_flat, prev_states_flat,
         ds_flat, d_decay_mask, d_prev_states_flat,
         chunk_size, D,
         dout_flat.stride(0), dout_flat.stride(1), dout_flat.stride(2),
-        cumA_flat.stride(0), cumA_flat.stride(1),
+        log_alpha_flat.stride(0), log_alpha_flat.stride(1),
         s_flat.stride(0), s_flat.stride(1), s_flat.stride(2),
         prev_states_flat.stride(0), prev_states_flat.stride(1),
         ds_flat.stride(0), ds_flat.stride(1), ds_flat.stride(2),
@@ -638,14 +673,14 @@ def _chunked_scan_bwd_triton(dout_flat, cumA_flat, s_flat, prev_states_flat,
         BLOCK_C=BLOCK_C, BLOCK_D=BLOCK_D,
     )
 
-    # d_cumA from decay mask: row_sum - col_sum of (d_decay_mask * decay_mask)
+    # d_cumA from decay mask: recomputes decay_mask from log_alpha inside kernel
     d_cumA_from_intra = torch.empty(BNH, chunk_size, device=s_flat.device, dtype=torch.float32)
     grid2 = (BNH,)
     _d_cumA_from_decay_mask_kernel[grid2](
-        d_decay_mask, decay_mask, d_cumA_from_intra,
+        d_decay_mask, log_alpha_flat, d_cumA_from_intra,
         chunk_size,
         d_decay_mask.stride(0), d_decay_mask.stride(1), d_decay_mask.stride(2),
-        decay_mask.stride(0), decay_mask.stride(1), decay_mask.stride(2),
+        log_alpha_flat.stride(0), log_alpha_flat.stride(1),
         d_cumA_from_intra.stride(0), d_cumA_from_intra.stride(1),
         BLOCK_C=BLOCK_C,
     )
@@ -709,19 +744,23 @@ class ChunkedScanFn(torch.autograd.Function):
 
         s_chunks = s_f.view(B, nchunks, chunk_size, H, D)
         la_chunks = log_alpha.view(B, nchunks, chunk_size, H)
-        cumA = la_chunks.cumsum(dim=2)
-        chunk_total_decay = cumA[:, :, -1, :]
 
         BNH = B * nchunks * H
-        cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+        la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
         s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
 
         if use_triton:
-            # Intra-chunk via Triton (without prev_states yet — need state passing first)
-            # Step 1: compute intra_flat without inter (prev_states=0 placeholder)
+            # Intra-chunk via Triton with fused cumsum
+            # First call: store cumA (needed for chunk_total_decay + state passing)
             zero_prev = torch.zeros(BNH, D, device=device, dtype=torch.float32)
-            intra_flat = _chunked_scan_fwd_triton(s_flat, cumA_flat, zero_prev, chunk_size, D, BNH)
+            intra_flat, cumA_flat = _chunked_scan_fwd_triton(
+                s_flat, la_flat, zero_prev, chunk_size, D, BNH, store_cumA=True)
+            cumA = cumA_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
+            chunk_total_decay = cumA[:, :, -1, :]
         else:
+            cumA = la_chunks.cumsum(dim=2)
+            chunk_total_decay = cumA[:, :, -1, :]
+            cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
             causal = torch.tril(torch.ones(chunk_size, chunk_size, device=device, dtype=torch.bool))
             decay_diff = cumA_flat[:, :, None] - cumA_flat[:, None, :]
             decay_mask = torch.where(causal, decay_diff.exp(), torch.zeros_like(decay_diff))
@@ -741,21 +780,20 @@ class ChunkedScanFn(torch.autograd.Function):
                 prev_states[:, c] = state
                 state = chunk_total_decay[:, c].exp()[..., None] * state + chunk_new_state[:, c]
 
-        # Inter-chunk + combine
-        inter = prev_states[:, :, None, :, :] * cumA[..., None].exp()
-
         if use_triton:
-            # Re-run fwd kernel with real prev_states to get full output
-            prev_states_flat = prev_states.view(B, nchunks, H, D).permute(0, 1, 2, 3).reshape(BNH, D).contiguous()
-            out_flat = _chunked_scan_fwd_triton(s_flat, cumA_flat, prev_states_flat, chunk_size, D, BNH)
+            # Re-run fwd kernel with real prev_states (no need to store cumA again)
+            prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+            out_flat = _chunked_scan_fwd_triton(s_flat, la_flat, prev_states_flat, chunk_size, D, BNH)
             out = out_flat.view(B, nchunks, H, chunk_size, D).permute(0, 1, 3, 2, 4)
         else:
+            inter = prev_states[:, :, None, :, :] * cumA[..., None].exp()
             out = intra + inter
 
         out_full = out.reshape(B, T_padded, H, D)[:, :T]
 
+        # Save la_chunks instead of cumA — backward Triton kernels recompute cumA from log_alpha
         ctx.save_for_backward(kv, alpha_clamped, delta, epsilon, zeta, init_state,
-                              s_chunks, cumA, chunk_total_decay, chunk_new_state, prev_states)
+                              s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states)
         ctx.chunk_size = chunk_size
         ctx.nchunks = nchunks
         ctx.T_padded = T_padded
@@ -770,21 +808,27 @@ class ChunkedScanFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         kv, alpha, delta, epsilon, zeta, init_state, \
-            s_chunks, cumA, chunk_total_decay, chunk_new_state, prev_states = ctx.saved_tensors
+            s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states = ctx.saved_tensors
         B, H, D = ctx.B, ctx.H, ctx.D
         T, T_padded = ctx.T, ctx.T_padded
         nchunks, chunk_size = ctx.nchunks, ctx.chunk_size
         use_triton = ctx.use_triton
 
         if not use_triton:
+            # CPU path still uses cumA (computed here)
+            cumA = la_chunks.cumsum(dim=2)
             ds, d_log_alpha, d_init_state = _chunked_scan_bwd(
                 dout, s_chunks, cumA, chunk_total_decay, chunk_new_state,
                 prev_states, init_state, nchunks, chunk_size,
                 T, T_padded, B, H, D)
         else:
-            # === Triton backward ===
+            # === Triton backward (cumsum fused into kernels) ===
             device = dout.device
             BNH = B * nchunks * H
+
+            # Recompute cumA from la_chunks for the inter-chunk gradient
+            # (small tensor, only (B, nchunks, C, H) — not the 18% hotspot)
+            cumA = la_chunks.cumsum(dim=2)
 
             # Pad dout
             dout_f = dout.float()
@@ -809,20 +853,15 @@ class ChunkedScanFn(torch.autograd.Function):
             d_intra = dout_chunks.clone()
             d_intra[:, :, -1, :, :] = d_intra[:, :, -1, :, :] + d_chunk_new_state
 
-            # Step 2 reverse: intra_flat = decay_mask @ s_flat => Triton bwd kernel
+            # Step 2 reverse: Triton bwd kernels (cumsum fused — pass log_alpha, not cumA)
             d_intra_flat = d_intra.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
-            cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+            la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
             s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
             prev_states_flat = prev_states.reshape(BNH, D).contiguous()
 
-            # Build decay_mask for d_cumA kernel (needed by _d_cumA_from_decay_mask_kernel)
-            causal = torch.tril(torch.ones(chunk_size, chunk_size, device=device, dtype=torch.bool))
-            decay_diff = cumA_flat[:, :, None] - cumA_flat[:, None, :]
-            decay_mask = torch.where(causal, decay_diff.exp(), torch.zeros_like(decay_diff))
-
             ds_flat, d_cumA_from_intra_flat, _ = _chunked_scan_bwd_triton(
-                d_intra_flat, cumA_flat, s_flat, prev_states_flat,
-                decay_mask, chunk_size, D, BNH)
+                d_intra_flat, la_flat, s_flat, prev_states_flat,
+                chunk_size, D, BNH)
 
             # Step 1 reverse: combine d_cumA
             d_cumA_from_intra = d_cumA_from_intra_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
@@ -878,12 +917,256 @@ def forward_scan_chunked(
         3. Inter-chunk state carry
 
     On CPU: autograd handles backward through differentiable PyTorch ops.
-    On CUDA: ChunkedScanFn with custom backward (Python _chunked_scan_bwd,
-             ready to swap in Triton kernels).
+    On CUDA: ChunkedScanFn with custom backward via torch.library.custom_op
+             (compile-friendly — Dynamo sees it as an opaque leaf, no graph break).
     """
     if kv.is_cuda:
-        return ChunkedScanFn.apply(kv, alpha, delta, epsilon, zeta, init_state, chunk_size)
+        # Use torch.library.custom_op path — compile-friendly (no graph break)
+        out, *_ = torch.ops.s6.chunked_scan_fwd(kv, alpha, delta, epsilon, zeta, init_state, chunk_size)
+        return out
     return _forward_scan_chunked_autograd(kv, alpha, delta, epsilon, zeta, init_state, chunk_size)
+
+
+# ---------------------------------------------------------------------------
+# torch.library.custom_op registration for torch.compile compatibility
+# ---------------------------------------------------------------------------
+# Registers ChunkedScanFn forward/backward as opaque custom ops so that
+# torch.compile (Dynamo) doesn't graph-break on the scan. Everything before
+# and after the scan gets compiled by Inductor into fused kernels.
+#
+# Pattern from modded-nanogpt: @torch.library.custom_op + register_fake +
+# register_autograd.
+# ---------------------------------------------------------------------------
+
+@torch.library.custom_op("s6::chunked_scan_fwd", mutates_args=())
+def _chunked_scan_fwd_op(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    delta: torch.Tensor,
+    epsilon: torch.Tensor,
+    zeta: torch.Tensor,
+    init_state: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass of chunked scan, returning output + saved tensors for backward.
+    
+    Triton path: cumsum computed inside kernels (no aten::cumsum hotspot).
+    """
+    B, T, H, D = kv.shape
+    device = kv.device
+    use_triton = HAS_TRITON and device.type == 'cuda'
+
+    s = _tridiag_conv(kv, zeta, epsilon, delta)
+    alpha_clamped = alpha.clamp(min=1e-6)
+    s_f = s.float()
+    log_alpha = alpha_clamped.float().log()
+
+    nchunks = (T + chunk_size - 1) // chunk_size
+    T_padded = nchunks * chunk_size
+    if T_padded > T:
+        s_f = F.pad(s_f, (0, 0, 0, 0, 0, T_padded - T))
+        log_alpha = F.pad(log_alpha, (0, 0, 0, T_padded - T))
+
+    s_chunks = s_f.view(B, nchunks, chunk_size, H, D)
+    la_chunks = log_alpha.view(B, nchunks, chunk_size, H)
+
+    BNH = B * nchunks * H
+    la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+    s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
+
+    if use_triton:
+        # Fused cumsum inside Triton kernel
+        zero_prev = torch.zeros(BNH, D, device=device, dtype=torch.float32)
+        intra_flat, cumA_flat = _chunked_scan_fwd_triton(
+            s_flat, la_flat, zero_prev, chunk_size, D, BNH, store_cumA=True)
+        cumA = cumA_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
+        chunk_total_decay = cumA[:, :, -1, :]
+    else:
+        cumA = la_chunks.cumsum(dim=2)
+        chunk_total_decay = cumA[:, :, -1, :]
+        cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+        causal = torch.tril(torch.ones(chunk_size, chunk_size, device=device, dtype=torch.bool))
+        decay_diff = cumA_flat[:, :, None] - cumA_flat[:, None, :]
+        decay_mask = torch.where(causal, decay_diff.exp(), torch.zeros_like(decay_diff))
+        intra_flat = torch.bmm(decay_mask, s_flat)
+
+    intra = intra_flat.view(B, nchunks, H, chunk_size, D).permute(0, 1, 3, 2, 4)
+    chunk_new_state = intra[:, :, -1, :, :].contiguous()
+
+    if use_triton:
+        prev_states = _state_passing_fwd_triton(
+            chunk_new_state, chunk_total_decay, init_state.float(), B, nchunks, H, D)
+    else:
+        prev_states = torch.zeros(B, nchunks, H, D, device=device, dtype=torch.float32)
+        state = init_state.float()
+        for c in range(nchunks):
+            prev_states[:, c] = state
+            state = chunk_total_decay[:, c].exp()[..., None] * state + chunk_new_state[:, c]
+
+    if use_triton:
+        prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+        out_flat = _chunked_scan_fwd_triton(s_flat, la_flat, prev_states_flat, chunk_size, D, BNH)
+        out = out_flat.view(B, nchunks, H, chunk_size, D).permute(0, 1, 3, 2, 4)
+    else:
+        inter = prev_states[:, :, None, :, :] * cumA[..., None].exp()
+        out = intra + inter
+
+    out_full = out.reshape(B, T_padded, H, D)[:, :T].to(kv.dtype)
+
+    # Save la_chunks (not cumA) — backward kernels recompute cumA from log_alpha
+    return (out_full, alpha_clamped, s_chunks, la_chunks, chunk_total_decay,
+            chunk_new_state, prev_states, init_state.detach())
+
+
+@_chunked_scan_fwd_op.register_fake
+def _chunked_scan_fwd_fake(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    delta: torch.Tensor,
+    epsilon: torch.Tensor,
+    zeta: torch.Tensor,
+    init_state: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shape inference for Dynamo tracing."""
+    B, T, H, D = kv.shape
+    nchunks = (T + chunk_size - 1) // chunk_size
+
+    out = kv.new_empty(B, T, H, D)
+    alpha_clamped = alpha.new_empty(B, T, H)
+    s_chunks = kv.new_empty(B, nchunks, chunk_size, H, D, dtype=torch.float32)
+    la_chunks = alpha.new_empty(B, nchunks, chunk_size, H, dtype=torch.float32)
+    chunk_total_decay = alpha.new_empty(B, nchunks, H, dtype=torch.float32)
+    chunk_new_state = kv.new_empty(B, nchunks, H, D, dtype=torch.float32)
+    prev_states = kv.new_empty(B, nchunks, H, D, dtype=torch.float32)
+    init_state_saved = init_state.new_empty(*init_state.shape)
+
+    return (out, alpha_clamped, s_chunks, la_chunks, chunk_total_decay,
+            chunk_new_state, prev_states, init_state_saved)
+
+
+@torch.library.custom_op("s6::chunked_scan_bwd", mutates_args=())
+def _chunked_scan_bwd_op(
+    dout: torch.Tensor,
+    kv: torch.Tensor,
+    alpha_clamped: torch.Tensor,
+    delta: torch.Tensor,
+    epsilon: torch.Tensor,
+    zeta: torch.Tensor,
+    init_state: torch.Tensor,
+    s_chunks: torch.Tensor,
+    la_chunks: torch.Tensor,
+    chunk_total_decay: torch.Tensor,
+    chunk_new_state: torch.Tensor,
+    prev_states: torch.Tensor,
+    chunk_size: int,
+    T_orig: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward of chunked scan. Triton kernels compute cumsum from log_alpha in-kernel."""
+    B, T, H, D = kv.shape
+    device = dout.device
+    use_triton = HAS_TRITON and device.type == 'cuda'
+    nchunks = s_chunks.shape[1]
+    T_padded = nchunks * chunk_size
+
+    # Recompute cumA from la_chunks (small, needed for inter-chunk grad)
+    cumA = la_chunks.cumsum(dim=2)
+
+    if not use_triton:
+        ds, d_log_alpha, d_init_state = _chunked_scan_bwd(
+            dout, s_chunks, cumA, chunk_total_decay, chunk_new_state,
+            prev_states, init_state, nchunks, chunk_size,
+            T, T_padded, B, H, D)
+    else:
+        BNH = B * nchunks * H
+        dout_f = dout.float()
+        if T_padded > T:
+            dout_f = F.pad(dout_f, (0, 0, 0, 0, 0, T_padded - T))
+        dout_chunks = dout_f.view(B, nchunks, chunk_size, H, D)
+
+        exp_cumA = cumA[..., None].exp()
+        d_prev_states_from_inter = (dout_chunks * exp_cumA).sum(dim=2)
+        inter_vals = prev_states[:, :, None, :, :] * exp_cumA
+        d_cumA_from_inter = (dout_chunks * inter_vals).sum(dim=-1)
+
+        d_chunk_new_state, d_chunk_total_decay, d_init_state = _state_passing_bwd_triton(
+            d_prev_states_from_inter, prev_states, chunk_total_decay, B, nchunks, H, D)
+
+        d_intra = dout_chunks.clone()
+        d_intra[:, :, -1, :, :] = d_intra[:, :, -1, :, :] + d_chunk_new_state
+
+        # Triton bwd kernels: pass log_alpha (cumsum fused inside)
+        d_intra_flat = d_intra.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
+        la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+        s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
+        prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+
+        ds_flat, d_cumA_from_intra_flat, _ = _chunked_scan_bwd_triton(
+            d_intra_flat, la_flat, s_flat, prev_states_flat,
+            chunk_size, D, BNH)
+
+        d_cumA_from_intra = d_cumA_from_intra_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
+        d_cumA = d_cumA_from_intra + d_cumA_from_inter
+        d_cumA_td = torch.zeros_like(d_cumA)
+        d_cumA_td[:, :, -1, :] = d_chunk_total_decay
+        d_cumA = d_cumA + d_cumA_td
+
+        d_log_alpha = d_cumA.flip(dims=[2]).cumsum(dim=2).flip(dims=[2])
+
+        ds = ds_flat.view(B, nchunks, H, chunk_size, D).permute(0, 1, 3, 2, 4)
+        ds = ds.reshape(B, T_padded, H, D)[:, :T]
+        d_log_alpha = d_log_alpha.reshape(B, T_padded, H)[:, :T]
+
+    d_alpha = d_log_alpha / alpha_clamped
+    d_kv, d_zeta, d_epsilon, d_delta = _tridiag_conv_backward(ds, kv, zeta, epsilon, delta)
+
+    return d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state
+
+
+@_chunked_scan_bwd_op.register_fake
+def _chunked_scan_bwd_fake(
+    dout, kv, alpha_clamped, delta, epsilon, zeta, init_state,
+    s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states,
+    chunk_size, T_orig,
+):
+    B, T, H, D = kv.shape
+    d_kv = kv.new_empty(B, T, H, D)
+    d_alpha = alpha_clamped.new_empty(B, T, H)
+    d_delta = delta.new_empty(B, T, H)
+    d_epsilon = epsilon.new_empty(B, T, H)
+    d_zeta = zeta.new_empty(B, T, H)
+    d_init_state = init_state.new_empty(*init_state.shape)
+    return d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state
+
+
+def _chunked_scan_autograd_backward(ctx, grad_out, *_saved_grads):
+    kv, alpha_clamped, delta, epsilon, zeta, init_state = ctx.saved_tensors[:6]
+    s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states = ctx.saved_tensors[6:]
+    chunk_size = ctx.chunk_size
+    T_orig = ctx.T_orig
+    d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state = torch.ops.s6.chunked_scan_bwd(
+        grad_out, kv, alpha_clamped, delta, epsilon, zeta, init_state,
+        s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states,
+        chunk_size, T_orig,
+    )
+    return d_kv, d_alpha, d_delta, d_epsilon, d_zeta, d_init_state, None
+
+
+def _chunked_scan_setup_context(ctx, inputs, output):
+    kv, alpha, delta, epsilon, zeta, init_state, chunk_size = inputs
+    out, alpha_clamped, s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states, init_saved = output
+    ctx.save_for_backward(kv, alpha_clamped, delta, epsilon, zeta, init_saved,
+                          s_chunks, la_chunks, chunk_total_decay, chunk_new_state, prev_states)
+    ctx.chunk_size = chunk_size
+    ctx.T_orig = kv.shape[1]
+
+
+_chunked_scan_fwd_op.register_autograd(
+    _chunked_scan_autograd_backward,
+    setup_context=_chunked_scan_setup_context,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -10,10 +10,16 @@ from typing import Optional, Tuple
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    """Rotate paired dims: (a, b) -> (-b, a) for each adjacent pair.
+    
+    Uses interleaved convention (modded-nanogpt Yarn pattern) with view+flip
+    to avoid materializing a new tensor via cat.
+    """
+    # (..., d) -> (..., d/2, 2) -> flip pairs -> negate first of each pair
+    x_pairs = x.view(*x.shape[:-1], x.shape[-1] // 2, 2).flip(-1)
+    signs = x.new_ones(2)
+    signs[0] = -1
+    return (x_pairs * signs).view(x.shape)
 
 
 def _compute_rope_freqs(
@@ -38,8 +44,8 @@ def _compute_rope_freqs(
     # Outer product: (seq_len,) x (headdim/2,) -> (seq_len, headdim/2)
     freqs = torch.outer(t, inv_freq)
     
-    # Duplicate for full headdim: (seq_len, headdim)
-    freqs = torch.cat([freqs, freqs], dim=-1)
+    # Duplicate for full headdim (interleaved): [f0, f0, f1, f1, ...]
+    freqs = freqs.unsqueeze(-1).expand(*freqs.shape, 2).reshape(freqs.shape[0], -1)
     
     cos = freqs.cos().to(dtype)
     sin = freqs.sin().to(dtype)
@@ -106,9 +112,9 @@ def _compute_paired_rope_freqs(
     Returns:
         cos, sin: (seq_len, headdim * 2) each - doubled for merged head pairs
     """
-    # Frequency bands (same as standard RoPE)
+    # Frequency bands (same as standard RoPE), interleaved duplication
     inv_freq = 1.0 / (base ** (torch.arange(0, headdim, 2, device=device, dtype=torch.float32) / headdim))
-    inv_freq = torch.cat([inv_freq, inv_freq], dim=-1)  # (headdim,)
+    inv_freq = inv_freq.unsqueeze(-1).expand(*inv_freq.shape, 2).reshape(-1)  # (headdim,) interleaved
     
     # Position indices - even and odd interleaved
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
@@ -119,7 +125,7 @@ def _compute_paired_rope_freqs(
     freqs_even = torch.outer(t_even, inv_freq)  # (seq_len, headdim)
     freqs_odd = torch.outer(t_odd, inv_freq)  # (seq_len, headdim)
     
-    # Concatenate: first half even, second half odd -> (seq_len, headdim * 2)
+    # Stack even/odd: (seq_len, headdim * 2) — first headdim even, second headdim odd
     freqs = torch.cat([freqs_even, freqs_odd], dim=-1)
     
     cos = freqs.cos().to(dtype)
@@ -196,8 +202,9 @@ def apply_data_dependent_rope(
     # Shape: (batch, seq_len, nheads, headdim // 2)
     angles = torch.cumsum(freqs, dim=1)
     
-    # Duplicate for full headdim: (batch, seq_len, nheads, headdim)
-    angles = torch.cat([angles, angles], dim=-1)
+    # Duplicate for full headdim using expand+reshape (no copy) instead of cat
+    # angles: (B, T, H, D/2) -> (B, T, H, D)
+    angles = angles.unsqueeze(-1).expand(*angles.shape, 2).reshape(*angles.shape[:-1], -1)
     
     cos = angles.cos()
     sin = angles.sin()

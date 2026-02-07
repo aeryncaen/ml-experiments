@@ -202,13 +202,11 @@ class PostScanAttention(nn.Module):
         q = rearrange(q, 'b t (h d) -> b t h d', h=nh)
 
         # Apply standard RoPE to G3+G4 heads only (last nr heads)
-        q_scan = q[..., :nh - nr, :]          # G1+G2: already have dd-rope
-        q_rope = apply_rope(q[..., nh - nr:, :], seq_len)  # G3+G4: need RoPE
-        q = torch.cat([q_scan, q_rope], dim=-2)
-
-        k_scan = k[..., :nh - nr, :]
-        k_rope = apply_rope(k[..., nh - nr:, :], seq_len)
-        k = torch.cat([k_scan, k_rope], dim=-2)
+        # Clone to avoid in-place on input, then apply RoPE to the G3+G4 slice
+        q = q.clone()
+        q[..., nh - nr:, :] = apply_rope(q[..., nh - nr:, :], seq_len)
+        k = k.clone()
+        k[..., nh - nr:, :] = apply_rope(k[..., nh - nr:, :], seq_len)
 
         # q, k, v are (b, t, h, d) — flash_attn_func's native layout
         attn_in_dtype = q.dtype
@@ -416,7 +414,8 @@ class USBBlock(nn.Module):
         # Step 5: Passthrough for G4
         out_g4 = v_g4
 
-        # Step 6: Concatenate scan outputs from all groups
+        # Step 6: Reassemble scan outputs into contiguous head dimension
+        # out_g12, out_g3, out_g4 are slices of the same head dim; stack without cat
         scan_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         scan_out_flat = rearrange(scan_out, 'b t h d -> b t (h d)')
         scan_out_flat = self.readout_norm(scan_out_flat)
