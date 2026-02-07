@@ -202,8 +202,9 @@ class Mamba3Mixer(nn.Module):
         th  = rearrange(th,  'b t (h r) -> b t h r', h=H)
 
         # ---- discretization ----
-        dt    = F.softplus(ldt)                                   # (B, T, H)
-        alpha = torch.exp(dt * self.log_A.exp().neg())            # (B, T, H)
+        dt    = F.softplus(ldt).clamp(max=2.0)                    # (B, T, H)
+        A_neg = self.log_A.exp().neg()                            # (H,) guaranteed negative
+        alpha = torch.exp(dt * A_neg).clamp(max=0.999)            # (B, T, H) strict <1
         lam   = torch.sigmoid(llam)                               # (B, T, H)
         gamma = lam * dt                                          # (B, T, H)
         beta  = (1.0 - lam) * dt * alpha                         # (B, T, H)
