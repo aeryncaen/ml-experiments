@@ -16,6 +16,12 @@ from einops import rearrange, repeat
 from .scan import forward_scan_chunked
 from .rope import apply_rope, apply_data_dependent_rope
 
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 
 @dataclass
 class USBConfig:
@@ -209,25 +215,24 @@ class PostScanAttention(nn.Module):
         k_rope = apply_rope(k[..., nh - nr:, :], seq_len)
         k = torch.cat([k_scan, k_rope], dim=-2)
 
-        q = q.transpose(1, 2)  # (b, h, t, d)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Flash-attention via SDPA. With autocast, inputs are already bf16.
-        # If fp32 (no autocast), cast to bf16 for flash then cast back.
+        # q, k, v are (b, t, h, d) — flash_attn_func's native layout
         attn_in_dtype = q.dtype
-        need_cast = q.is_cuda and q.dtype == torch.float32
+        need_cast = q.is_cuda and q.dtype not in (torch.float16, torch.bfloat16)
         if need_cast:
             q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
-        if q.is_cuda:
-            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        if HAS_FLASH_ATTN and q.is_cuda:
+            out = flash_attn_func(q, k, v, causal=True)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # CPU fallback via SDPA (needs b, h, t, d layout)
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+            out = out.transpose(1, 2)
+
         if need_cast:
             out = out.to(attn_in_dtype)
 
-        out = rearrange(out, 'b h t d -> b t (h d)')
+        out = rearrange(out, 'b t h d -> b t (h d)')
 
         gate = torch.sigmoid(self.attn_gate)
         return gate * self.out_proj(out)
