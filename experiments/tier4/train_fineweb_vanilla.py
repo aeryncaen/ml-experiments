@@ -520,17 +520,17 @@ class GatedNeighborBlock(nn.Module):
 
 
 class FusedGatedNeighborBlock(nn.Module):
-    """Fused attention+MLP block: project up, neighbor-enrich K, attend, gate, project down.
+    """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
 
-    Like Mamba puts its scan inside an MLP-like expand/contract structure,
-    this puts neighbor-enriched attention inside the MLP:
-        x -> norm -> up-project (2*expand) -> split into QKV + gate
-                  -> chained neighbor mix on K
-                  -> attention in expanded space
-                  -> SiLU gate
-                  -> down-project -> residual
+    x -> norm -> project directly to Q, K, V (expanded) + neighbor gates
+             -> activate V with SiLU (V is the nonlinearity)
+             -> chained neighbor mix on K
+             -> RoPE on Q, K
+             -> attention(Q, K, SiLU(V))
+             -> down-project -> residual
 
-    One norm, one residual. No separate attention and MLP blocks.
+    One norm, one residual, one down-proj. V activation replaces the
+    post-attention gate — the nonlinearity lives inside the values.
     """
 
     def __init__(self, d_model: int, n_head: int, expand: int = 2):
@@ -544,9 +544,10 @@ class FusedGatedNeighborBlock(nn.Module):
 
         self.norm = RMSNorm(d_model)
 
-        # Up-project: input -> Q, K, V, gate (all in expanded space)
-        # Q + K + V + gate = 4 * inner_dim
-        self.up_proj = nn.Linear(d_model, 4 * self.inner_dim, bias=False)
+        # Direct projections from d_model into expanded QKV
+        self.q_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, self.inner_dim, bias=False)
 
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
@@ -573,13 +574,13 @@ class FusedGatedNeighborBlock(nn.Module):
         b, t, c = x.shape
         h = self.norm(x)
 
-        # Up-project into Q, K, V, gate — all in expanded space
-        qkvg = self.up_proj(h)
-        q, k, v, gate = qkvg.split(self.inner_dim, dim=-1)
+        # Project directly into expanded Q, K, V
+        q = self.q_proj(h).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h)
 
-        q = q.view(b, t, self.n_head, self.head_dim)
-        k = k.view(b, t, self.n_head, self.head_dim)
-        v = v.view(b, t, self.n_head, self.head_dim)
+        # Activate V — the nonlinearity lives in the values
+        v = F.silu(v).view(b, t, self.n_head, self.head_dim)
 
         # RoPE
         cos, sin = self.rotary(q)
@@ -601,9 +602,6 @@ class FusedGatedNeighborBlock(nn.Module):
             y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
-
-        # SiLU gate (like Mamba/SwiGLU) — gate branch modulates attention output
-        y = y * F.silu(gate)
 
         # Down-project
         y = self.down_proj(y)
