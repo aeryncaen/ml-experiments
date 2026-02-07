@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .scan import forward_scan, forward_scan_outer_readout_streaming
+from .scan import forward_scan_elementwise_streaming
 from .rope import apply_rope, apply_data_dependent_rope
 
 
@@ -386,6 +386,11 @@ class USBBlock(nn.Module):
         # - elementwise: (batch, seq_len, nheads, headdim)
         # - outer: (batch, seq_len, nheads, headdim, headdim) = k ⊗ v
         modes = config.scan_state_modes
+        if any(m != 'elementwise' for m in modes):
+            raise RuntimeError(
+                "USBBlock currently enforces elementwise scan mode only. "
+                "Set scan_state_modes=('elementwise','elementwise','elementwise')."
+            )
         
         # Combine G1+G2 for a single scan
         k_g12 = torch.cat([k_g1, k_g2], dim=-2)
@@ -399,16 +404,9 @@ class USBBlock(nn.Module):
             'zeta': torch.cat([params_g1['zeta'], params_g2['zeta']], dim=-1),
         }
 
-        kv_g12 = None
-        state_g12 = None
-
-        if modes[0] == 'outer':
-            init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
-            init_g12 = repeat(init_g12, 'h d1 d2 -> b h d1 d2', b=batch)
-        else:
-            kv_g12 = k_g12 * v_g12
-            init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
-            init_g12 = repeat(init_g12, 'h d -> b h d', b=batch)
+        kv_g12 = k_g12 * v_g12
+        init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
+        init_g12 = repeat(init_g12, 'h d -> b h d', b=batch)
 
         # Gate state injection back into hiddens (mode-dependent readout)
         # h_t = h_t + gate_t * state_read_t
@@ -422,36 +420,18 @@ class USBBlock(nn.Module):
         state_g2_read = None
 
         with torch.autograd.profiler.record_function("s6/scan_g12"):
-            # G1+G2 readout
-            if modes[0] == 'outer':
-                out_g12 = forward_scan_outer_readout_streaming(
-                    k=k_g12,
-                    v=v_g12,
-                    alpha=params_g12['alpha'],
-                    delta=params_g12['delta'],
-                    epsilon=params_g12['epsilon'],
-                    zeta=params_g12['zeta'],
-                    gate=gate_g12,
-                    init_state=init_g12,
-                    scale=scale,
-                )
-            else:
-                assert kv_g12 is not None
-                state_g12 = forward_scan(
-                    kv=kv_g12,
-                    alpha=params_g12['alpha'],
-                    delta=params_g12['delta'],
-                    epsilon=params_g12['epsilon'],
-                    zeta=params_g12['zeta'],
-                    init_state=init_g12,
-                )
-                state_g12_read = None
-                out_g12 = v_g12 + gate_g12 * state_g12
+            state_g12 = forward_scan_elementwise_streaming(
+                kv=kv_g12,
+                alpha=params_g12['alpha'],
+                delta=params_g12['delta'],
+                epsilon=params_g12['epsilon'],
+                zeta=params_g12['zeta'],
+                init_state=init_g12,
+            )
+            out_g12 = v_g12 + gate_g12 * state_g12
 
         out_g1, out_g2 = out_g12[..., :nph, :], out_g12[..., nph:, :]
-        if modes[0] != 'outer':
-            assert state_g12 is not None
-            state_g1, state_g2 = state_g12[..., :nph, ...], state_g12[..., nph:, ...]
+        state_g1, state_g2 = state_g12[..., :nph, ...], state_g12[..., nph:, ...]
         
         # G3 readout: depthwise conv over sequence (causal)
         def conv_g3(x_heads: torch.Tensor) -> torch.Tensor:

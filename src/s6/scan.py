@@ -76,6 +76,45 @@ def forward_scan_outer_readout_streaming(
     return out.to(out_dtype)
 
 
+def forward_scan_elementwise_streaming(
+    kv: torch.Tensor,
+    alpha: torch.Tensor,
+    delta: torch.Tensor,
+    epsilon: torch.Tensor,
+    zeta: torch.Tensor,
+    init_state: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Memory-safe elementwise streaming recurrence.
+
+    state_t = alpha_t * state_{t-1} + delta_t * kv_{t-2} + epsilon_t * kv_{t-1} + zeta_t * kv_t
+    """
+    b, t, h, d = kv.shape
+    out_dtype = kv.dtype
+
+    kvf = kv.float()
+    af = torch.clamp(alpha.float(), min=1e-6)
+    df = delta.float()
+    ef = epsilon.float()
+    zf = zeta.float()
+
+    state = init_state.float()  # (b, h, d)
+    kv_tm1 = torch.zeros_like(state)
+    kv_tm2 = torch.zeros_like(state)
+    outs = []
+
+    for i in range(t):
+        kv_t = kvf[:, i]
+        s_t = zf[:, i][..., None] * kv_t + ef[:, i][..., None] * kv_tm1 + df[:, i][..., None] * kv_tm2
+        state = af[:, i][..., None] * state + s_t
+        outs.append(state)
+        kv_tm2 = kv_tm1
+        kv_tm1 = kv_t
+
+    out = torch.stack(outs, dim=1)
+    return out.to(out_dtype)
+
+
 def forward_scan(
     kv: torch.Tensor,
     alpha: torch.Tensor,
