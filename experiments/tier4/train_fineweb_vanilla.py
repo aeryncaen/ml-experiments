@@ -284,7 +284,7 @@ class GPTS6(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
-            x = block(x)
+            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
