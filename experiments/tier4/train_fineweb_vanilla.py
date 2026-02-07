@@ -230,6 +230,26 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def chunked_cross_entropy(
+    hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Compute cross-entropy without materializing full (B*T, vocab) logits.
+
+    Processes chunk_size tokens at a time through the LM head and loss,
+    avoiding the ~6 GB logits tensor at batch 32 / seqlen 2048 / vocab 50k.
+    """
+    B, T, D = hidden.shape
+    hidden_flat = hidden.reshape(-1, D)       # (B*T, D)
+    targets_flat = targets.reshape(-1)        # (B*T,)
+    total_tokens = B * T
+    loss_sum = hidden.new_zeros(())
+    for start in range(0, total_tokens, chunk_size):
+        end = min(start + chunk_size, total_tokens)
+        logits_chunk = F.linear(hidden_flat[start:end], weight)  # (chunk, vocab)
+        loss_sum = loss_sum + F.cross_entropy(logits_chunk, targets_flat[start:end], reduction="sum")
+    return loss_sum / total_tokens
+
+
 def _init_weights(m: nn.Module):
     if isinstance(m, nn.Linear):
         nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -252,13 +272,13 @@ class GPTTransformer(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
-            x = block(x)
+            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
         x = self.ln_f(x)
-        logits = self.lm_head(x)
-        loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-        return logits, loss
+            loss = chunked_cross_entropy(x, self.lm_head.weight, targets)
+            return None, loss
+        logits = self.lm_head(x)
+        return logits, None
 
 
 class GPTS6(nn.Module):
@@ -286,11 +306,11 @@ class GPTS6(nn.Module):
         for block in self.blocks:
             x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
         x = self.ln_f(x)
-        logits = self.lm_head(x)
-        loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-        return logits, loss
+            loss = chunked_cross_entropy(x, self.lm_head.weight, targets)
+            return None, loss
+        logits = self.lm_head(x)
+        return logits, None
 
 
 def build_model() -> nn.Module:
