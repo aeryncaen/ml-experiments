@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .scan import forward_scan_elementwise_streaming
+from .scan import forward_scan_chunked
 from .rope import apply_rope, apply_data_dependent_rope
 
 
@@ -420,7 +420,7 @@ class USBBlock(nn.Module):
         state_g2_read = None
 
         with torch.autograd.profiler.record_function("s6/scan_g12"):
-            state_g12 = forward_scan_elementwise_streaming(
+            state_g12 = forward_scan_chunked(
                 kv=kv_g12,
                 alpha=params_g12['alpha'],
                 delta=params_g12['delta'],
