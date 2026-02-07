@@ -396,7 +396,11 @@ class ShiftAttention(nn.Module):
             s *= 2
             if s > 128:  # cap and cycle
                 s = 1
+        self.max_shift = max(shifts)
+        # Precompute offsets for gather: offset[h] = max_shift - shift[h]
+        offsets = torch.tensor([self.max_shift - s for s in shifts], dtype=torch.long)
         self.register_buffer('shifts', torch.tensor(shifts, dtype=torch.long), persistent=False)
+        self.register_buffer('offsets', offsets, persistent=False)
 
     def _shift_kv(self, x: torch.Tensor) -> torch.Tensor:
         """Shift each head's channels by its assigned amount along the time axis.
@@ -405,17 +409,16 @@ class ShiftAttention(nn.Module):
         Vectorized: group heads by shift amount, pad+slice each group.
         """
         B, T, H, D = x.shape
-        max_shift = int(self.shifts.max().item())
+        max_shift = self.max_shift
         if max_shift == 0:
             return x
         # Pad time dim at the front: (B, max_shift + T, H, D)
         x_pad = F.pad(x, (0, 0, 0, 0, max_shift, 0))  # pad dim=1 from left
         # For head h with shift s, we want x_pad[:, max_shift-s : max_shift-s+T, h, :]
         # Gather along time dim using advanced indexing
-        # Build index: (H, T) where idx[h, t] = max_shift - shifts[h] + t
-        offsets = max_shift - self.shifts                  # (H,)
+        # Build index: (H, T) where idx[h, t] = offsets[h] + t
         t_idx = torch.arange(T, device=x.device)           # (T,)
-        gather_idx = offsets.unsqueeze(1) + t_idx.unsqueeze(0)  # (H, T)
+        gather_idx = self.offsets.unsqueeze(1) + t_idx.unsqueeze(0)  # (H, T)
         # x_pad is (B, max_shift+T, H, D) -> permute to (B, H, max_shift+T, D)
         x_pad = rearrange(x_pad, 'b t h d -> b h t d')
         # Expand gather_idx for batch and D dims
