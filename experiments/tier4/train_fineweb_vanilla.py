@@ -517,12 +517,10 @@ class FusedGatedNeighborBlock(nn.Module):
              -> RoPE on Q, K                           |
              -> attention(Q, K, V) -> attn_out         |
              -> norm(attn_out) + h_up  <---------------+
-             -> SiLU
              -> down_proj(inner -> d_model) -> residual
 
-    Activated on both ends: SiLU after up_proj feeds rich features into
-    QKV projections. Skip from h_up adds to normed attention output,
-    then second SiLU before down_proj.
+    SiLU after up_proj feeds rich features into QKV. Skip-add from h_up
+    to normed attention output preserves pre-attn features for down_proj.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
@@ -597,8 +595,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip add + second activation
-        y = F.silu(self.attn_norm(y) + h_up)
+        # Skip add
+        y = self.attn_norm(y) + h_up
 
         # Down-project
         y = self.down_proj(y)
