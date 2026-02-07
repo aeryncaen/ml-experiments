@@ -573,7 +573,7 @@ class FusedGatedNeighborBlock(nn.Module):
         h = self.norm(x)
 
         # Expand and activate
-        h_up = F.relu(self.up_proj(h)).square()
+        h_up = F.silu(self.up_proj(h))
 
         # QKV from activated expanded space
         q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
