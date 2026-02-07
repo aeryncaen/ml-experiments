@@ -131,15 +131,47 @@ class ShardStream:
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-class ShortConvLayer(nn.Module):
-    """Depthwise short conv + RoPE + gating.  All real-valued, fully compilable."""
+class SIRENKernel(nn.Module):
+    """SIREN MLP that maps position -> per-channel kernel weight.  All real, compilable."""
 
-    def __init__(self, d_model: int, kernel_size: int = 4):
+    def __init__(self, d_model: int, hidden: int = 64, n_layers: int = 2, omega_0: float = 30.0):
         super().__init__()
-        self.conv = nn.Conv1d(
-            d_model, d_model, kernel_size,
-            padding=kernel_size - 1, groups=d_model, bias=False,
-        )
+        self.omega_0 = omega_0
+        layers: list[nn.Module] = []
+        layers.append(nn.Linear(1, hidden, bias=True))
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(hidden, hidden, bias=True))
+        self.net = nn.ModuleList(layers)
+        self.out = nn.Linear(hidden, d_model, bias=False)
+        # SIREN init
+        for i, lin in enumerate(self.net):
+            assert isinstance(lin, nn.Linear)
+            fan_in = lin.in_features
+            if i == 0:
+                nn.init.uniform_(lin.weight, -1.0 / fan_in, 1.0 / fan_in)
+            else:
+                bound = math.sqrt(6.0 / fan_in) / omega_0
+                nn.init.uniform_(lin.weight, -bound, bound)
+        # No weight decay on SIREN params
+        for p in self.parameters():
+            p._no_weight_decay = True  # type: ignore[attr-defined]
+
+    def forward(self, L: int, device: torch.device) -> torch.Tensor:
+        # positions normalised to [-1, 1]
+        t = torch.linspace(-1, 1, L, device=device).unsqueeze(-1)  # (L, 1)
+        h = t
+        for i, lin in enumerate(self.net):
+            h = lin(h)
+            h = torch.sin(self.omega_0 * h) if i == 0 else torch.sin(h)
+        return self.out(h).T  # (D, L)
+
+
+class ShortConvLayer(nn.Module):
+    """SIREN-generated causal conv + RoPE + gating.  All real-valued, fully compilable."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.siren = SIRENKernel(d_model)
         self.rotary = Rotary(d_model)
         self.gate_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
@@ -147,9 +179,13 @@ class ShortConvLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
         B, T, D = x.shape
-        # causal depthwise conv
-        u = x.transpose(1, 2)                          # (B, D, T)
-        u = self.conv(u)[..., :T].transpose(1, 2)      # (B, T, D)
+        # generate kernel from SIREN and convolve via FFT
+        k = self.siren(T, x.device)                     # (D, T)
+        k_f = torch.fft.rfft(k, n=2 * T)               # (D, T+1)
+        u = x.transpose(1, 2)                           # (B, D, T)
+        u_f = torch.fft.rfft(u, n=2 * T)               # (B, D, T+1)
+        u = torch.fft.irfft(u_f * k_f, n=2 * T)[..., :T]  # (B, D, T)
+        u = u.transpose(1, 2)                           # (B, T, D)
         # RoPE on conv output
         cos, sin = self.rotary(u.unsqueeze(2))          # (1, T, 1, D//2)
         cos = cos.squeeze(2)                            # (1, T, D//2)
