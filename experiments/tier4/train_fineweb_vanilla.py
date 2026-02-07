@@ -55,7 +55,7 @@ class HParams:
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
     # Fused gate knobs
-    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1248)
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 2064)
 
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
@@ -509,19 +509,15 @@ class GatedNeighborBlock(nn.Module):
 class FusedGatedNeighborBlock(nn.Module):
     """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
 
-    x -> norm -> up_proj(d_model -> inner) -> SiLU -> h_up
-             -> Q_proj(inner -> inner)                  |
-             -> K_proj(inner -> inner)                  |
-             -> V_proj(inner -> inner)                  |
-             -> gated neighbor on K                     |
-             -> RoPE on Q, K                            |
-             -> attention(Q, K, V) = attn_out           |
-             -> attn_out * h_up  <----------------------+
+    x -> norm -> Q(d_model -> inner), K(d_model -> inner), V(d_model -> inner)
+             -> gated neighbor on K
+             -> RoPE on Q, K
+             -> attention(Q, K, V)
+             -> norm(attn_out) -> SiLU
              -> down_proj(inner -> d_model) -> residual
 
-    The activated up-projected features skip past attention and gate
-    the attention output. This gives the down_proj a nonlinear input
-    and lets pre-attention features flow through to post-attention.
+    Post-attention activation: the nonlinearity processes what attention
+    found before compressing back to d_model.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
@@ -535,15 +531,12 @@ class FusedGatedNeighborBlock(nn.Module):
 
         self.norm = RMSNorm(d_model)
 
-        # Shared expansion: d_model -> inner_dim
-        self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        # Direct QKV projections from d_model into expanded space
+        self.q_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, self.inner_dim, bias=False)
 
-        # QKV projections from expanded space
-        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-
-        # Post-attention norm (before skip multiply)
+        # Post-attention norm + activation before down_proj
         self.attn_norm = RMSNorm(self.inner_dim)
 
         # Down-project: inner_dim -> d_model
@@ -569,13 +562,10 @@ class FusedGatedNeighborBlock(nn.Module):
         b, t, c = x.shape
         h = self.norm(x)
 
-        # Expand and activate — shared nonlinear representation
-        h_up = F.silu(self.up_proj(h))
-
-        # QKV from activated expanded space
-        q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
-        k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
-        v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        # QKV from d_model into expanded space
+        q = self.q_proj(h).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h).view(b, t, self.n_head, self.head_dim)
 
         # RoPE
         cos, sin = self.rotary(q)
@@ -596,8 +586,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip: gate attention output with pre-attn activated features
-        y = self.attn_norm(y) * h_up
+        # Post-attention: norm then activate
+        y = F.silu(self.attn_norm(y))
 
         # Down-project
         y = self.down_proj(y)
