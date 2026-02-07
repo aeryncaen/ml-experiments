@@ -55,7 +55,7 @@ class HParams:
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
     # Fused gate knobs
-    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1200)
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1248)
 
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
@@ -551,13 +551,16 @@ class FusedGatedNeighborBlock(nn.Module):
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
-        # Fixed RoPE for positional encoding
-        self.rotary = Rotary(self.head_dim)
+        # Fixed RoPE only on first quarter of head_dim (half of static half)
+        self.rope_dim = self.n_pairs // 2  # head_dim // 4
+        assert self.rope_dim > 0
+        self.rotary = Rotary(self.rope_dim)
 
-        # Data-dependent rotation: produces Δθ per channel-pair per head
+        # Data-dependent rotation: produces Δθ per channel-pair in the dynamic half
         # Applied to both Q and K via cumsum — relative rotation creates
         # content-dependent selectivity in the dot product
-        self.theta_proj = nn.Linear(d_model, n_head * self.n_pairs, bias=False)
+        self.n_rot_pairs = self.n_pairs // 2  # rotation pairs in dynamic half
+        self.theta_proj = nn.Linear(d_model, n_head * self.n_rot_pairs, bias=False)
         nn.init.zeros_(self.theta_proj.weight)
 
         # Neighbor gate: single lerp on half of K channels
@@ -575,12 +578,18 @@ class FusedGatedNeighborBlock(nn.Module):
 
     def _apply_dd_rope(self, q: torch.Tensor, k: torch.Tensor,
                        cos_t: torch.Tensor, sin_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply data-dependent rotation to Q and K channel-pairs."""
-        q1, q2 = q[..., :self.n_pairs], q[..., self.n_pairs:]
-        k1, k2 = k[..., :self.n_pairs], k[..., self.n_pairs:]
-        q_rot = torch.cat([q1 * cos_t - q2 * sin_t, q1 * sin_t + q2 * cos_t], dim=-1)
-        k_rot = torch.cat([k1 * cos_t - k2 * sin_t, k1 * sin_t + k2 * cos_t], dim=-1)
-        return q_rot, k_rot
+        """Apply data-dependent rotation to the dynamic half of Q and K."""
+        half = self.n_pairs
+        # Static half untouched, dynamic half gets rotation
+        q_s, q_d = q[..., :half], q[..., half:]
+        k_s, k_d = k[..., :half], k[..., half:]
+        # Rotate dynamic half as channel-pairs
+        n_rot = half // 2
+        q1, q2 = q_d[..., :n_rot], q_d[..., n_rot:]
+        k1, k2 = k_d[..., :n_rot], k_d[..., n_rot:]
+        q_d_rot = torch.cat([q1 * cos_t - q2 * sin_t, q1 * sin_t + q2 * cos_t], dim=-1)
+        k_d_rot = torch.cat([k1 * cos_t - k2 * sin_t, k1 * sin_t + k2 * cos_t], dim=-1)
+        return torch.cat([q_s, q_d_rot], dim=-1), torch.cat([k_s, k_d_rot], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -594,8 +603,8 @@ class FusedGatedNeighborBlock(nn.Module):
         k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # Data-dependent rotation on Q and K
-        delta_theta = self.theta_proj(h).view(b, t, self.n_head, self.n_pairs)
+        # Data-dependent rotation on dynamic half of Q and K
+        delta_theta = self.theta_proj(h).view(b, t, self.n_head, self.n_rot_pairs)
         theta = delta_theta.cumsum(dim=1)
         cos_t, sin_t = theta.cos(), theta.sin()
         q, k = self._apply_dd_rope(q, k, cos_t, sin_t)
@@ -604,10 +613,11 @@ class FusedGatedNeighborBlock(nn.Module):
         gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.n_pairs)
         k = self._gated_neighbor(k, gate)
 
-        # Fixed RoPE (positional encoding, composes with data-dependent rotation)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        # Fixed RoPE on first quarter of head channels only
+        rd = self.rope_dim
+        cos, sin = self.rotary(q[..., :rd])
+        q = torch.cat([apply_rotary(q[..., :rd], cos, sin), q[..., rd:]], dim=-1)
+        k = torch.cat([apply_rotary(k[..., :rd], cos, sin), k[..., rd:]], dim=-1)
 
         # Attention
         if HAS_FLASH_ATTN:
