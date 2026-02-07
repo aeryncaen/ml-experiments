@@ -494,8 +494,8 @@ class GatedNeighborAttention(nn.Module):
         k = apply_rotary(k, cos, sin)
         # Content-dependent gate for neighbor accumulation — per channel per head
         gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim)  # (B, T, H, half_dim)
+        q = self._gated_neighbor(q, gate)
         k = self._gated_neighbor(k, gate)
-        v = self._gated_neighbor(v, gate)
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=True)
         else:
