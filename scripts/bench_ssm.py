@@ -320,6 +320,84 @@ class MHABlock(nn.Module):
         return h
 
 
+class ShiftAttnBlock(nn.Module):
+    """Shift-Attention + SwiGLU MLP.  Channel-group shifts on K,V within each head.
+    
+    Each head's d_head channels are split into groups, each shifted by a different
+    causal offset (0, 1, 2, 4). Attention sees chimera KV entries encoding a
+    temporal neighborhood. Zero new parameters vs standard MHA+MLP.
+    """
+    def __init__(self, d_model, n_heads=4, shifts=(0, 1, 2, 4), ffn_mult=4):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        assert self.head_dim % len(shifts) == 0
+        self.cpg = self.head_dim // len(shifts)
+        self.shifts = shifts
+        self.max_shift = max(shifts)
+
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+        # RoPE frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # SwiGLU MLP
+        hidden = int(d_model * ffn_mult)
+        self.mlp_norm = nn.RMSNorm(d_model)
+        self.w1 = nn.Linear(d_model, hidden, bias=False)
+        self.w2 = nn.Linear(d_model, hidden, bias=False)
+        self.w3 = nn.Linear(hidden, d_model, bias=False)
+
+    def _rope(self, x):
+        """Apply rotary embeddings. x: (B, T, H, D)."""
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (T, D/2)
+        cos = freqs.cos()[None, :, None, :]    # (1, T, 1, D/2)
+        sin = freqs.sin()[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _shift_kv(self, x):
+        """Shift channel groups within each head. x: (B, T, H, D)."""
+        if self.max_shift == 0:
+            return x
+        B, T, H, D = x.shape
+        out = torch.zeros_like(x)
+        for i, s in enumerate(self.shifts):
+            sl = slice(i * self.cpg, (i + 1) * self.cpg)
+            if s == 0:
+                out[:, :, :, sl] = x[:, :, :, sl]
+            else:
+                out[:, s:, :, sl] = x[:, :T-s, :, sl]
+        return out
+
+    def forward(self, x):
+        B, T, D = x.shape
+        q = self.q(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.n_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.n_heads, self.head_dim)
+        k = self._shift_kv(k)
+        v = self._shift_kv(v)
+        q = self._rope(q)
+        k = self._rope(k)
+        # SDPA path (no flash_attn dependency in bench_ssm)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.proj(y)
+        # SwiGLU MLP
+        m = self.mlp_norm(x + h)
+        h2 = self.w3(F.silu(self.w1(m)) * self.w2(m))
+        return h + h2
+
+
 class DS1Wrapper(nn.Module):
     def __init__(self, dim, state_dim=64, mimo_rank=4, n_iters=2, **kwargs):
         super().__init__()
@@ -1021,6 +1099,9 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0))
+
+    # ShiftAttn: standard attention with temporal channel-group shifts on K,V
+    try_add('ShiftAttn', lambda: ShiftAttnBlock(d_model=dim, n_heads=4, shifts=(0, 1, 2, 4), ffn_mult=4))
 
     return models
 
