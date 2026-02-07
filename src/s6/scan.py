@@ -350,6 +350,70 @@ if HAS_TRITON:
         tl.store(d_init_state_ptr + pid_b * stride_dis_b + pid_h * stride_dis_h + offs_d * stride_dis_d,
                  d_state, mask=d_mask)
 
+    @triton.jit
+    def _inter_chunk_bwd_kernel(
+        # Pointers
+        dout_ptr, cumA_ptr, prev_states_ptr,
+        d_prev_states_ptr, d_cumA_inter_ptr,
+        # Dimensions
+        chunk_size: tl.constexpr, D: tl.constexpr,
+        # Strides for dout: (BNH, C, D)
+        stride_do_bnh, stride_do_c, stride_do_d,
+        # Strides for cumA: (BNH, C)
+        stride_ca_bnh, stride_ca_c,
+        # Strides for prev_states: (BNH, D)
+        stride_ps_bnh, stride_ps_d,
+        # Strides for d_prev_states: (BNH, D)
+        stride_dps_bnh, stride_dps_d,
+        # Strides for d_cumA_inter: (BNH, C)
+        stride_dca_bnh, stride_dca_c,
+        # Block sizes
+        BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Fused inter-chunk backward: computes d_prev_states and d_cumA_from_inter
+        without materializing (BNH, C, D)-sized intermediates.
+
+        d_prev_states[bnh, d] = sum_c dout[bnh, c, d] * exp(cumA[bnh, c])
+        d_cumA_inter[bnh, c] = sum_d dout[bnh, c, d] * prev_states[bnh, d] * exp(cumA[bnh, c])
+        """
+        pid_bnh = tl.program_id(0)
+
+        offs_c = tl.arange(0, BLOCK_C)
+        offs_d = tl.arange(0, BLOCK_D)
+        c_mask = offs_c < chunk_size
+        d_mask = offs_d < D
+
+        # Load cumA and compute exp(cumA) — (BLOCK_C,)
+        ca_base = pid_bnh * stride_ca_bnh
+        cumA = tl.load(cumA_ptr + ca_base + offs_c * stride_ca_c,
+                       mask=c_mask, other=0.0).to(tl.float32)
+        exp_ca = tl.exp(cumA)  # (BLOCK_C,)
+
+        # Load prev_states — (BLOCK_D,)
+        ps_base = pid_bnh * stride_ps_bnh
+        prev_s = tl.load(prev_states_ptr + ps_base + offs_d * stride_ps_d,
+                         mask=d_mask, other=0.0).to(tl.float32)
+
+        # Load dout — (BLOCK_C, BLOCK_D)
+        do_base = pid_bnh * stride_do_bnh
+        dout = tl.load(dout_ptr + do_base + offs_c[:, None] * stride_do_c + offs_d[None, :] * stride_do_d,
+                       mask=c_mask[:, None] & d_mask[None, :],
+                       other=0.0).to(tl.float32)
+
+        # d_prev_states[d] = sum_c dout[c, d] * exp_ca[c]
+        d_prev = tl.sum(dout * exp_ca[:, None], axis=0)  # (BLOCK_D,)
+        dps_base = pid_bnh * stride_dps_bnh
+        tl.store(d_prev_states_ptr + dps_base + offs_d * stride_dps_d,
+                 d_prev, mask=d_mask)
+
+        # d_cumA_inter[c] = sum_d dout[c, d] * prev_s[d] * exp_ca[c]
+        #                 = exp_ca[c] * sum_d dout[c, d] * prev_s[d]
+        dot_dp = tl.sum(dout * prev_s[None, :], axis=1)  # (BLOCK_C,)
+        d_cumA = exp_ca * dot_dp  # (BLOCK_C,)
+        dca_base = pid_bnh * stride_dca_bnh
+        tl.store(d_cumA_inter_ptr + dca_base + offs_c * stride_dca_c,
+                 d_cumA, mask=c_mask)
+
 
 # ---------------------------------------------------------------------------
 # Core logic: PyTorch (works everywhere, used on CPU and as Triton fallback)
@@ -711,6 +775,30 @@ def _state_passing_bwd_triton(d_prev_states, prev_states, chunk_total_decay, B, 
     return d_chunk_new_state, d_chunk_decay, d_init_state
 
 
+def _inter_chunk_bwd_triton(dout_flat, cumA_flat, prev_states_flat, chunk_size, D, BNH):
+    """Fused inter-chunk backward. Eliminates 3 large (BNH,C,D) intermediates.
+    
+    Returns d_prev_states_flat (BNH, D) and d_cumA_inter_flat (BNH, C).
+    """
+    d_prev_states = torch.empty(BNH, D, device=dout_flat.device, dtype=torch.float32)
+    d_cumA_inter = torch.empty(BNH, chunk_size, device=dout_flat.device, dtype=torch.float32)
+    BLOCK_D = triton.next_power_of_2(D)
+    BLOCK_C = triton.next_power_of_2(chunk_size)
+    grid = (BNH,)
+    _inter_chunk_bwd_kernel[grid](
+        dout_flat, cumA_flat, prev_states_flat,
+        d_prev_states, d_cumA_inter,
+        chunk_size, D,
+        dout_flat.stride(0), dout_flat.stride(1), dout_flat.stride(2),
+        cumA_flat.stride(0), cumA_flat.stride(1),
+        prev_states_flat.stride(0), prev_states_flat.stride(1),
+        d_prev_states.stride(0), d_prev_states.stride(1),
+        d_cumA_inter.stride(0), d_cumA_inter.stride(1),
+        BLOCK_C=BLOCK_C, BLOCK_D=BLOCK_D,
+    )
+    return d_prev_states, d_cumA_inter
+
+
 # ---------------------------------------------------------------------------
 # Autograd Function with Triton (CUDA) / Python (CPU) backward
 # ---------------------------------------------------------------------------
@@ -832,14 +920,16 @@ class ChunkedScanFn(torch.autograd.Function):
                 dout_f = F.pad(dout_f, (0, 0, 0, 0, 0, T_padded - T))
             dout_chunks = dout_f.view(B, nchunks, chunk_size, H, D)
 
-            # Step 6+5 reverse: d_inter = d_intra = dout_chunks
-            # d_prev_states from inter: sum_i dout[i] * exp(cumA[i])
-            exp_cumA = cumA[..., None].exp()
-            d_prev_states_from_inter = (dout_chunks * exp_cumA).sum(dim=2)  # (B, nc, H, D)
+            # Step 6+5 reverse: fused inter-chunk backward (eliminates 3 large intermediates)
+            # Flatten to (BNH, C, D) / (BNH, C) / (BNH, D) for Triton kernel
+            dout_flat = dout_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
+            cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+            prev_states_flat = prev_states.reshape(BNH, D).contiguous()
 
-            # d_cumA from inter
-            inter_vals = prev_states[:, :, None, :, :] * exp_cumA
-            d_cumA_from_inter = (dout_chunks * inter_vals).sum(dim=-1)  # (B, nc, C, H)
+            d_prev_flat, d_cumA_inter_flat = _inter_chunk_bwd_triton(
+                dout_flat, cumA_flat, prev_states_flat, chunk_size, D, BNH)
+            d_prev_states_from_inter = d_prev_flat.view(B, nchunks, H, D)
+            d_cumA_from_inter = d_cumA_inter_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
 
             # Step 4 reverse: state passing backward
             d_chunk_new_state, d_chunk_total_decay, d_init_state = _state_passing_bwd_triton(
@@ -853,7 +943,7 @@ class ChunkedScanFn(torch.autograd.Function):
             d_intra_flat = d_intra.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
             la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
             s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
-            prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+            # prev_states_flat already computed above for inter-chunk bwd
 
             ds_flat, d_cumA_from_intra_flat, _ = _chunked_scan_bwd_triton(
                 d_intra_flat, la_flat, s_flat, prev_states_flat,
@@ -1084,10 +1174,15 @@ def _chunked_scan_bwd_op(
             dout_f = F.pad(dout_f, (0, 0, 0, 0, 0, T_padded - T))
         dout_chunks = dout_f.view(B, nchunks, chunk_size, H, D)
 
-        exp_cumA = cumA[..., None].exp()
-        d_prev_states_from_inter = (dout_chunks * exp_cumA).sum(dim=2)
-        inter_vals = prev_states[:, :, None, :, :] * exp_cumA
-        d_cumA_from_inter = (dout_chunks * inter_vals).sum(dim=-1)
+        # Fused inter-chunk backward (eliminates 3 large intermediates)
+        dout_flat = dout_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
+        cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
+        prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+
+        d_prev_flat, d_cumA_inter_flat = _inter_chunk_bwd_triton(
+            dout_flat, cumA_flat, prev_states_flat, chunk_size, D, BNH)
+        d_prev_states_from_inter = d_prev_flat.view(B, nchunks, H, D)
+        d_cumA_from_inter = d_cumA_inter_flat.view(B, nchunks, H, chunk_size).permute(0, 1, 3, 2)
 
         d_chunk_new_state, d_chunk_total_decay, d_init_state = _state_passing_bwd_triton(
             d_prev_states_from_inter, prev_states, chunk_total_decay, B, nchunks, H, D)
@@ -1099,7 +1194,7 @@ def _chunked_scan_bwd_op(
         d_intra_flat = d_intra.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
         la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, chunk_size).contiguous()
         s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, chunk_size, D).contiguous()
-        prev_states_flat = prev_states.reshape(BNH, D).contiguous()
+        # prev_states_flat already computed above for inter-chunk bwd
 
         ds_flat, d_cumA_from_intra_flat, _ = _chunked_scan_bwd_triton(
             d_intra_flat, la_flat, s_flat, prev_states_flat,

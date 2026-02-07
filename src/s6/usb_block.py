@@ -145,7 +145,7 @@ class PerHeadProjections(nn.Module):
         dt = F.softplus(dt_raw)
         simpson_bias = torch.tensor([0.0, math.log(4.0), 0.0], device=x.device, dtype=x.dtype)
         simpson_weights = F.softmax(simpson_logits + simpson_bias, dim=-1)
-        delta = simpson_weights[..., 0] * dt * alpha.pow(2)
+        delta = simpson_weights[..., 0] * dt * (alpha * alpha)
         epsilon = simpson_weights[..., 1] * dt * alpha
         zeta = simpson_weights[..., 2] * dt
         gate = torch.sigmoid(gate_raw)  # (0, 1) per dimension
