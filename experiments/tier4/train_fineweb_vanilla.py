@@ -595,8 +595,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip: gate attention output with pre-attn activated features
-        y = self.attn_norm(y) * h_up
+        # Skip-multiply then activate
+        y = F.silu(self.attn_norm(y) * h_up)
 
         # Down-project
         y = self.down_proj(y)
