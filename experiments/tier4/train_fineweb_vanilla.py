@@ -523,14 +523,15 @@ class FusedGatedNeighborBlock(nn.Module):
     to normed attention output preserves pre-attn features for down_proj.
     """
 
-    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1):
+    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
         self.inner_dim = inner_dim if inner_dim is not None else d_model * expand
         assert self.inner_dim % n_head == 0
         self.head_dim = self.inner_dim // n_head
-        self.half_dim = self.head_dim // 2
+        self.sub_dim = self.head_dim // 2  # Q/K split dim for diff attention
+        self.half_dim = self.sub_dim // 2  # neighbor gate split within sub_dim
 
         self.norm = RMSNorm(d_model)
 
@@ -541,6 +542,16 @@ class FusedGatedNeighborBlock(nn.Module):
         self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
         self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+
+        # Differential attention lambda (per-layer)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+        self.lambda_q1 = nn.Parameter(torch.randn(self.sub_dim) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.sub_dim) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.sub_dim) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.sub_dim) * 0.1)
+
+        # Per-head RMSNorm after diff attention
+        self.head_norm = RMSNorm(self.head_dim)
 
         # Post-attention norm (before skip add)
         self.attn_norm = RMSNorm(self.inner_dim)
@@ -553,11 +564,11 @@ class FusedGatedNeighborBlock(nn.Module):
         self.swish_beta_down = nn.Parameter(torch.ones(self.inner_dim))
 
         # QK norm (per-head RMSNorm before RoPE)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+        self.q_norm = RMSNorm(self.sub_dim)
+        self.k_norm = RMSNorm(self.sub_dim)
 
-        # RoPE in expanded head_dim
-        self.rotary = Rotary(self.head_dim)
+        # RoPE on sub_dim (applied to both Q1/Q2, K1/K2)
+        self.rotary = Rotary(self.sub_dim)
 
         # Neighbor gate: single lerp on K, per-channel per-head
         self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim, bias=True)
@@ -580,29 +591,45 @@ class FusedGatedNeighborBlock(nn.Module):
         h_up = self.up_proj(h)
         h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
 
-        # QKV from activated expanded space
-        q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
-        k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        # QKV from activated expanded space — split Q,K into two sub-heads
+        q = self.q_proj(h_up).view(b, t, self.n_head, 2, self.sub_dim)
+        k = self.k_proj(h_up).view(b, t, self.n_head, 2, self.sub_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # QK norm then RoPE
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]  # (b, t, n_head, sub_dim)
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
 
-        # Gated neighbor mixing on K
+        # QK norm then RoPE on each sub-head
+        q1, q2 = self.q_norm(q1), self.q_norm(q2)
+        k1, k2 = self.k_norm(k1), self.k_norm(k2)
+        cos, sin = self.rotary(q1)
+        q1 = apply_rotary(q1, cos, sin)
+        q2 = apply_rotary(q2, cos, sin)
+        k1 = apply_rotary(k1, cos, sin)
+        k2 = apply_rotary(k2, cos, sin)
+
+        # Gated neighbor mixing on K (both sub-heads share the same gate)
         gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim)
-        k = self._gated_neighbor(k, gate)
+        k1 = self._gated_neighbor(k1, gate)
+        k2 = self._gated_neighbor(k2, gate)
 
-        # Attention
+        # Compute lambda
+        lam = (torch.exp(self.lambda_q1 * self.lambda_k1).sum()
+             - torch.exp(self.lambda_q2 * self.lambda_k2).sum()
+             + self.lambda_init)
+
+        # Differential attention: attn1 - lambda * attn2
         if HAS_FLASH_ATTN:
-            y = flash_attn_func(q, k, v, causal=True)
+            a1 = flash_attn_func(q1, k1, v, causal=True)
+            a2 = flash_attn_func(q2, k2, v, causal=True)
         else:
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            y = y.transpose(1, 2)
+            q1t, k1t, q2t, k2t = q1.transpose(1, 2), k1.transpose(1, 2), q2.transpose(1, 2), k2.transpose(1, 2)
+            vt = v.transpose(1, 2)
+            a1 = F.scaled_dot_product_attention(q1t, k1t, vt, is_causal=True).transpose(1, 2)
+            a2 = F.scaled_dot_product_attention(q2t, k2t, vt, is_causal=True).transpose(1, 2)
+
+        # Diff + per-head norm + scale
+        y = (1 - self.lambda_init) * self.head_norm(a1 - lam * a2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
@@ -801,7 +828,7 @@ class GPTFusedGatedNeighbor(nn.Module):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
         inner = HP.fused_inner_dim if HP.fused_inner_dim > 0 else None
-        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=inner) for _ in range(HP.n_layer)])
+        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=inner, layer_idx=i) for i in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
