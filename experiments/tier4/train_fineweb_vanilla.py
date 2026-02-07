@@ -436,13 +436,11 @@ class ShiftAttention(nn.Module):
 
 
 class GatedNeighborAttention(nn.Module):
-    """Attention with chained gated neighbor mixing on K.
+    """Attention with gated neighbor mixing on K.
 
-    Half the channels in each head's K get two sequential lerps:
-        k_mid[t] = (1 - g1[t]) * k[t] + g1[t] * k[t-1]
-        k_out[t] = (1 - g2[t]) * k_mid[t] + g2[t] * k[t-2]
-    This gives a 3-position receptive field (t, t-1, t-2) in the same
-    channels via chained mixing. Gates are per-channel per-head.
+    Half the channels in each head's K get a single lerp with t-1:
+        k_out[t] = (1 - g[t]) * k[t] + g[t] * k[t-1]
+    Gate is per-channel per-head, content-dependent.
     First half of channels stays untouched.
     """
 
@@ -458,28 +456,17 @@ class GatedNeighborAttention(nn.Module):
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
-        # Two gates per channel: g1 for t-1, g2 for t-2
-        self.gate_proj = nn.Linear(d_model, n_head * self.half_dim * 2, bias=True)
+        self.gate_proj = nn.Linear(d_model, n_head * self.half_dim, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
-    def _chained_neighbor(self, k: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
-        """Chained double-lerp on the second half of K channels.
-
-        k: (B, T, H, D)
-        g1, g2: (B, T, H, half_dim) — sigmoid applied
-
-        k_mid = (1-g1)*k[t] + g1*k[t-1]
-        k_out = (1-g2)*k_mid + g2*k[t-2]
-        """
+    def _gated_neighbor(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         half = self.half_dim
         k_static = k[:, :, :, :half]
         k_cur = k[:, :, :, half:]
-        k_prev1 = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))  # t-1
-        k_prev2 = F.pad(k_cur[:, :-2], (0, 0, 0, 0, 2, 0))  # t-2
-        k_mid = (1 - g1) * k_cur + g1 * k_prev1
-        k_out = (1 - g2) * k_mid + g2 * k_prev2
-        return torch.cat([k_static, k_out], dim=-1)
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -489,11 +476,8 @@ class GatedNeighborAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        # Two sets of per-channel gates for chained neighbor mixing on K
-        raw = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim * 2)
-        g1 = raw[:, :, :, :self.half_dim]
-        g2 = raw[:, :, :, self.half_dim:]
-        k = self._chained_neighbor(k, g1, g2)
+        gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim)
+        k = self._gated_neighbor(k, gate)
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=True)
         else:
@@ -555,20 +539,18 @@ class FusedGatedNeighborBlock(nn.Module):
         # RoPE in expanded head_dim
         self.rotary = Rotary(self.head_dim)
 
-        # Neighbor gates: chained double-lerp on K, per-channel per-head
-        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim * 2, bias=True)
+        # Neighbor gate: single lerp on K, per-channel per-head
+        self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim, bias=True)
         nn.init.zeros_(self.neighbor_gate_proj.weight)
         nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
 
-    def _chained_neighbor(self, k: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
+    def _gated_neighbor(self, k: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         half = self.half_dim
         k_static = k[:, :, :, :half]
         k_cur = k[:, :, :, half:]
-        k_prev1 = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
-        k_prev2 = F.pad(k_cur[:, :-2], (0, 0, 0, 0, 2, 0))
-        k_mid = (1 - g1) * k_cur + g1 * k_prev1
-        k_out = (1 - g2) * k_mid + g2 * k_prev2
-        return torch.cat([k_static, k_out], dim=-1)
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -587,11 +569,9 @@ class FusedGatedNeighborBlock(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # Chained neighbor mixing on K
-        raw = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim * 2)
-        g1 = raw[:, :, :, :self.half_dim]
-        g2 = raw[:, :, :, self.half_dim:]
-        k = self._chained_neighbor(k, g1, g2)
+        # Gated neighbor mixing on K
+        gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim)
+        k = self._gated_neighbor(k, gate)
 
         # Attention
         if HAS_FLASH_ATTN:
