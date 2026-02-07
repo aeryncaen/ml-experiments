@@ -660,7 +660,7 @@ class FusedGatedNeighborBlock(nn.Module):
                 y = y.transpose(1, 2)
 
             # Reshape back: (b, t*2, n2, hd) -> (b, t, n_head, hd)
-            y = y.view(b, t, self.n_head, self.head_dim)
+            y = y.contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             # Standard RoPE
             cos, sin = self.rotary(q)
