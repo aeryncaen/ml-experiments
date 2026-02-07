@@ -57,10 +57,23 @@ class HParams:
     geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
     geo_prebias_mtp_weights: str = os.environ.get("GEO_PREBIAS_MTP_WEIGHTS", "1.0,0.5,0.25")
     geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.75)
+    geo_prebias_rank: int = _env_int("GEO_PREBIAS_RANK", 0)
     geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
     geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias_vanilla"))
     geo_prebias_force_recompute: bool = _env_bool("GEO_PREBIAS_FORCE_RECOMPUTE", False)
+
+    # optional attention geo-bias settings
+    geo_attn_bias_enable: bool = _env_bool("GEO_ATTN_BIAS_ENABLE", False)
+    geo_attn_bias_blend: float = _env_float("GEO_ATTN_BIAS_BLEND", 0.3125)
+    geo_attn_bias_rank: int = _env_int("GEO_ATTN_BIAS_RANK", 1)
+
+    geo_attn_corr_bias_enable: bool = _env_bool("GEO_ATTN_CORR_BIAS_ENABLE", False)
+    geo_attn_corr_blend: float = _env_float("GEO_ATTN_CORR_BLEND", 1.0)
+    geo_attn_corr_rank: int = _env_int("GEO_ATTN_CORR_RANK", 1)
+    geo_attn_corr_layers: int = _env_int("GEO_ATTN_CORR_LAYERS", 0)
+    geo_attn_corr_horizons: str = os.environ.get("GEO_ATTN_CORR_HORIZONS", "1,2,3")
+    geo_attn_corr_horizon_weights: str = os.environ.get("GEO_ATTN_CORR_HORIZON_WEIGHTS", "1.0,0.5,0.25")
 
 
 HP = HParams()
@@ -131,6 +144,84 @@ class ShardStream:
 def _parse_mtp_weights(spec: str) -> list[float]:
     vals = [float(p.strip()) for p in spec.split(",") if p.strip()]
     return vals if vals else [1.0]
+
+
+def _parse_int_list_csv(spec: str) -> list[int]:
+    vals = [x.strip() for x in spec.split(",") if x.strip()]
+    return [int(x) for x in vals]
+
+
+def _parse_float_list_csv(spec: str) -> list[float]:
+    vals = [x.strip() for x in spec.split(",") if x.strip()]
+    return [float(x) for x in vals]
+
+
+def _apply_basis_rank(basis: np.ndarray, rank: int) -> np.ndarray:
+    if rank <= 0:
+        return basis.astype(np.float32)
+    m, n = basis.shape
+    r = min(rank, m, n)
+    if r >= min(m, n):
+        return basis.astype(np.float32)
+    u, s, vh = np.linalg.svd(basis.astype(np.float64), full_matrices=False)
+    out = (u[:, :r] * s[:r]) @ vh[:r, :]
+    return out.astype(np.float32)
+
+
+def _compute_model_projector(geo_basis: np.ndarray, d_model: int, k: int) -> np.ndarray:
+    b = geo_basis[:, :d_model].astype(np.float64)
+    cov = b.T @ b
+    _, eigvecs = np.linalg.eigh(cov)
+    k_eff = max(1, min(k, d_model))
+    u = eigvecs[:, -k_eff:]
+    p = u @ u.T
+    return p.astype(np.float32)
+
+
+def _compute_weighted_shift_operator(tokens: np.ndarray, vocab_size: int, horizons: list[int], horizon_weights: list[float]) -> np.ndarray:
+    counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    if len(tokens) < 2:
+        return counts
+    for h, w in zip(horizons, horizon_weights):
+        if h <= 0 or w == 0.0 or len(tokens) <= h:
+            continue
+        a = tokens[:-h]
+        b = tokens[h:]
+        np.add.at(counts, (a, b), w)
+    sym = 0.5 * (counts + counts.T)
+    total = np.sum(sym)
+    if total > 0:
+        sym = sym / total
+    return sym
+
+
+def _compute_attn_corr_projector(
+    tokens: np.ndarray,
+    vocab_size: int,
+    geo_basis: np.ndarray,
+    d_model: int,
+    rank: int,
+    horizons: list[int],
+    horizon_weights: list[float],
+    eps: float = 1e-8,
+) -> np.ndarray:
+    op = _compute_weighted_shift_operator(tokens, vocab_size, horizons, horizon_weights)
+    p_tok = np.sum(op, axis=1, keepdims=True)
+    denom = p_tok @ p_tok.T
+    pmi = np.log(op + eps) - np.log(denom + eps)
+    pmi = 0.5 * (pmi + pmi.T)
+
+    b = np.zeros((vocab_size, d_model), dtype=np.float64)
+    k = min(d_model, geo_basis.shape[1])
+    b[:, :k] = geo_basis[:, :k].astype(np.float64)
+
+    c = b.T @ pmi @ b
+    c = 0.5 * (c + c.T)
+    _, eigvecs = np.linalg.eigh(c)
+    k_eff = max(1, min(rank, d_model))
+    u = eigvecs[:, -k_eff:]
+    p = u @ u.T
+    return p.astype(np.float32)
 
 
 def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, chunk_tokens: int = 5_000_000, eps: float = 1e-8) -> np.ndarray:
@@ -235,6 +326,7 @@ def load_or_compute_geo_basis(vocab_size: int, width: int) -> np.ndarray:
     if not train_files:
         raise RuntimeError(f"No train files matched: {HP.train_files}")
     sig = _basis_signature(train_files, vocab_size, width, HP.geo_prebias_method, HP.geo_prebias_max_tokens, HP.geo_prebias_mtp_weights)
+    sig = f"{sig}_r{int(HP.geo_prebias_rank)}"
     cache_dir = Path(HP.geo_prebias_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"basis_{sig}.npy"
@@ -247,6 +339,7 @@ def load_or_compute_geo_basis(vocab_size: int, width: int) -> np.ndarray:
         basis = _compute_kl_bucket_mtp_basis(tokens, vocab_size, width, _parse_mtp_weights(HP.geo_prebias_mtp_weights), chunk_tokens=HP.geo_prebias_chunk_tokens)
     else:
         raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {HP.geo_prebias_method}")
+    basis = _apply_basis_rank(basis, int(HP.geo_prebias_rank))
     np.save(cache_file, basis)
     return basis
 
@@ -314,7 +407,8 @@ class SelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.proj(y)
 
@@ -391,7 +485,8 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     loss_sum = torch.zeros(1, device=device)
     for _ in range(HP.val_steps):
         x, y = val_stream.next_batch(device)
-        _, loss = model(x, y)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(x, y)
         loss_sum += loss
     loss_sum /= HP.val_steps
     if world_size > 1:
@@ -405,6 +500,7 @@ def main():
     torch.manual_seed(1337 + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
     print0(rank, f"model: layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}")
@@ -413,11 +509,17 @@ def main():
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
 
     model = GPT().to(device)
+    basis_np_local = None
 
     if HP.geo_prebias_enable:
         if rank == 0:
-            print0(rank, f"geo_prebias on: method={HP.geo_prebias_method} blend={HP.geo_prebias_blend} mtp={HP.geo_prebias_mtp_weights}")
+            print0(
+                rank,
+                f"geo_prebias on: method={HP.geo_prebias_method} blend={HP.geo_prebias_blend} "
+                f"rank={HP.geo_prebias_rank} mtp={HP.geo_prebias_mtp_weights}",
+            )
             basis_np = load_or_compute_geo_basis(HP.vocab_size, HP.d_model)
+            basis_np_local = basis_np
             basis_t = torch.from_numpy(basis_np).to(device=device, dtype=model.wte.weight.dtype)
         else:
             basis_t = torch.zeros((HP.vocab_size, HP.d_model), device=device, dtype=model.wte.weight.dtype)
@@ -427,6 +529,74 @@ def main():
         with torch.no_grad():
             model.wte.weight.mul_(1.0 - alpha).add_(basis_t, alpha=alpha)
         print0(rank, "applied geo prebias to embedding/lm_head")
+
+    # Optional attention projector biasing
+    if HP.geo_attn_bias_enable or HP.geo_attn_corr_bias_enable:
+        if basis_np_local is None:
+            if rank == 0:
+                basis_np_local = load_or_compute_geo_basis(HP.vocab_size, HP.d_model)
+                basis_t = torch.from_numpy(basis_np_local).to(device=device, dtype=model.wte.weight.dtype)
+            else:
+                basis_t = torch.zeros((HP.vocab_size, HP.d_model), device=device, dtype=model.wte.weight.dtype)
+            if world_size > 1:
+                dist.broadcast(basis_t, src=0)
+            if basis_np_local is None:
+                basis_np_local = basis_t.float().cpu().numpy()
+
+        p_attn_t = None
+        if HP.geo_attn_bias_enable:
+            if rank == 0:
+                p_attn = _compute_model_projector(basis_np_local, HP.d_model, HP.geo_attn_bias_rank)
+                p_attn_t = torch.from_numpy(p_attn).to(device=device, dtype=model.wte.weight.dtype)
+            else:
+                p_attn_t = torch.zeros((HP.d_model, HP.d_model), device=device, dtype=model.wte.weight.dtype)
+            if world_size > 1:
+                dist.broadcast(p_attn_t, src=0)
+
+        p_corr_t = None
+        corr_layers = HP.geo_attn_corr_layers if HP.geo_attn_corr_layers > 0 else max(1, int(round(0.75 * HP.n_layer)))
+        if HP.geo_attn_corr_bias_enable:
+            if rank == 0:
+                horizons = _parse_int_list_csv(HP.geo_attn_corr_horizons)
+                h_weights = _parse_float_list_csv(HP.geo_attn_corr_horizon_weights)
+                tokens_np = _collect_train_tokens(HP.train_files, HP.geo_prebias_max_tokens)
+                p_corr = _compute_attn_corr_projector(
+                    tokens_np,
+                    HP.vocab_size,
+                    basis_np_local,
+                    HP.d_model,
+                    HP.geo_attn_corr_rank,
+                    horizons,
+                    h_weights,
+                )
+                p_corr_t = torch.from_numpy(p_corr).to(device=device, dtype=model.wte.weight.dtype)
+            else:
+                p_corr_t = torch.zeros((HP.d_model, HP.d_model), device=device, dtype=model.wte.weight.dtype)
+            if world_size > 1:
+                dist.broadcast(p_corr_t, src=0)
+
+        with torch.no_grad():
+            if p_attn_t is not None:
+                b = float(HP.geo_attn_bias_blend)
+                for blk in model.blocks:
+                    blk.attn.q.weight.copy_((1.0 - b) * blk.attn.q.weight + b * (blk.attn.q.weight @ p_attn_t))
+                    blk.attn.k.weight.copy_((1.0 - b) * blk.attn.k.weight + b * (blk.attn.k.weight @ p_attn_t))
+                    blk.attn.v.weight.copy_((1.0 - b) * blk.attn.v.weight + b * (blk.attn.v.weight @ p_attn_t))
+                    blk.attn.proj.weight.copy_((1.0 - b) * blk.attn.proj.weight + b * (blk.attn.proj.weight @ p_attn_t))
+
+            if p_corr_t is not None:
+                b_corr = float(HP.geo_attn_corr_blend)
+                n_layers = max(0, min(corr_layers, len(model.blocks)))
+                for li in range(n_layers):
+                    blk = model.blocks[li]
+                    blk.attn.q.weight.copy_((1.0 - b_corr) * blk.attn.q.weight + b_corr * (blk.attn.q.weight @ p_corr_t))
+                    blk.attn.k.weight.copy_((1.0 - b_corr) * blk.attn.k.weight + b_corr * (blk.attn.k.weight @ p_corr_t))
+
+        print0(
+            rank,
+            f"applied attn geo bias: attn={HP.geo_attn_bias_enable}/blend={HP.geo_attn_bias_blend}/rank={HP.geo_attn_bias_rank} "
+            f"corr={HP.geo_attn_corr_bias_enable}/blend={HP.geo_attn_corr_blend}/rank={HP.geo_attn_corr_rank}/layers={corr_layers}",
+        )
 
     if HP.compile:
         model = torch.compile(model, dynamic=False)
@@ -448,7 +618,8 @@ def main():
             pg["lr"] = lr
 
         x, y = train_stream.next_batch(device)
-        _, loss = model(x, y)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if HP.grad_clip > 0:
