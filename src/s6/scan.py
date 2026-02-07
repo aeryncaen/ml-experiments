@@ -10,7 +10,6 @@ Supports two modes:
 """
 
 import torch
-from typing import List
 
 
 def forward_scan(
@@ -62,23 +61,24 @@ def forward_scan(
     kv_tm2 = torch.cat([torch.zeros_like(kv[:, :2]), kv[:, :-2]], dim=1)
     s = zeta_e * kv + epsilon_e * kv_tm1 + delta_e * kv_tm2
 
-    # Collect states in a list to avoid inplace ops
-    state_list: List[torch.Tensor] = []
-    state_tm1 = init_state
+    # Mask-form scan (vectorized):
+    # state_t = p_t * (init_state + sum_{j<=t} s_j / p_j), where p_t = prod_{i<=t} alpha_i
+    # This is equivalent to the recurrence but avoids Python loops.
+    alpha_safe = torch.clamp(alpha, min=1e-8)
+    p = torch.cumprod(alpha_safe, dim=1)  # (b, t, h)
 
     if outer_mode:
-        coef_dims = (slice(None), slice(None), None, None)
+        p_e = p[..., None, None]
     else:
-        coef_dims = (slice(None), slice(None), None)
+        p_e = p[..., None]
 
-    for t in range(seq_len):
-        alpha_t = alpha[:, t][coef_dims]
-        state_t = alpha_t * state_tm1 + s[:, t]
-        state_list.append(state_t)
-        state_tm1 = state_t
-    
-    # Stack along seq dimension
-    return torch.stack(state_list, dim=1)
+    u = s / p_e
+    u_cum = torch.cumsum(u, dim=1)
+    state = p_e * u_cum
+
+    # init_state contribution: prod(alpha_0..alpha_t) * init_state
+    state = state + p_e * init_state.unsqueeze(1)
+    return state
 
 
 def backward_scan(
@@ -130,24 +130,24 @@ def backward_scan(
     kv_tp2 = torch.cat([kv[:, 2:], torch.zeros_like(kv[:, :2])], dim=1)
     s = zeta_e * kv + epsilon_e * kv_tp1 + delta_e * kv_tp2
 
-    # Collect states in a list (will be reversed)
-    state_list: List[torch.Tensor] = []
-    state_tp1 = init_state
+    # Reverse-time mask form, then flip back.
+    alpha_rev = torch.flip(alpha, dims=[1])
+    s_rev = torch.flip(s, dims=[1])
+
+    alpha_safe = torch.clamp(alpha_rev, min=1e-8)
+    p = torch.cumprod(alpha_safe, dim=1)  # (b, t, h)
 
     if outer_mode:
-        coef_dims = (slice(None), slice(None), None, None)
+        p_e = p[..., None, None]
     else:
-        coef_dims = (slice(None), slice(None), None)
+        p_e = p[..., None]
 
-    for t in range(seq_len - 1, -1, -1):
-        alpha_t = alpha[:, t][coef_dims]
-        state_t = alpha_t * state_tp1 + s[:, t]
-        state_list.append(state_t)
-        state_tp1 = state_t
-    
-    # Reverse and stack (we collected in reverse order)
-    state_list.reverse()
-    return torch.stack(state_list, dim=1)
+    u = s_rev / p_e
+    u_cum = torch.cumsum(u, dim=1)
+    state_rev = p_e * u_cum
+    state_rev = state_rev + p_e * init_state.unsqueeze(1)
+
+    return torch.flip(state_rev, dims=[1])
 
 
 def centered_scan(

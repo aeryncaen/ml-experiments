@@ -301,6 +301,7 @@ class USBBlock(nn.Module):
         self.init_state_g3._no_weight_decay = True  # type: ignore[attr-defined]
         
         # Step 7: Down-projection
+        self.readout_norm = GatedRMSNorm(d_expanded)
         self.down_proj = nn.Linear(d_expanded, d_model, bias=False)
         
         # Pre-norm for the block
@@ -321,7 +322,6 @@ class USBBlock(nn.Module):
         """
         batch, seq_len, _ = x.shape
         config = self.config
-        residual = x
 
         do_debug = self.debug and self.debug_active
         if do_debug:
@@ -470,12 +470,15 @@ class USBBlock(nn.Module):
         # Step 6: Concatenate scan outputs from all groups
         scan_out = torch.cat([out_g1, out_g2, out_g3, out_g4], dim=-2)
         scan_out_flat = rearrange(scan_out, 'b t h d -> b t (h d)')
+        scan_out_flat = self.readout_norm(scan_out_flat)
+        # Residual in expanded space from layer input path
+        scan_out_flat = scan_out_flat + x_exp
 
         # Step 6b: Post-scan full causal attention
         # Q from post-scan enhanced states; K/V from pre-scan projections (all heads)
         # Standard RoPE on G3+G4 heads; G1+G2 already have dd-rope from scan
         if self.post_attn is not None:
-            attn_out = scan_out_flat + self.post_attn(
+            attn_out = self.post_attn(
                 post_scan_states=scan_out_flat,
                 k=k,  # pre-scan K, all heads: (b, t, nheads_total, headdim)
                 v=v,  # pre-scan V, all heads: (b, t, nheads_total, headdim)
@@ -570,8 +573,5 @@ class USBBlock(nn.Module):
         
         # Step 7: Down-projection
         out = self.down_proj(attn_out)
-        
-        # Residual connection
-        out = out + residual
-        
+
         return out

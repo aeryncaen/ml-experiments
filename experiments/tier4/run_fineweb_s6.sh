@@ -2,5 +2,5 @@
 set -euo pipefail
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
-export MODEL_TYPE=transformer
+export MODEL_TYPE=s6
 exec torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" "experiments/tier4/train_fineweb_vanilla.py" "$@"
