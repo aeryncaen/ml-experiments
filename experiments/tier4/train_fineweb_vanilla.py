@@ -55,7 +55,7 @@ class HParams:
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
     # Fused gate knobs
-    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 2064)
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 1248)
 
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
@@ -509,15 +509,18 @@ class GatedNeighborBlock(nn.Module):
 class FusedGatedNeighborBlock(nn.Module):
     """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
 
-    x -> norm -> project directly to Q, K, V (expanded) + neighbor gates
-             -> activate V with SiLU (V is the nonlinearity)
-             -> chained neighbor mix on K
+    x -> norm -> up_proj(d_model -> inner) -> SiLU
+             -> Q_proj(inner -> inner)
+             -> K_proj(inner -> inner)
+             -> V_proj(inner -> inner)   # no activation on V
+             -> gated neighbor on K
              -> RoPE on Q, K
-             -> attention(Q, K, SiLU(V))
-             -> down-project -> residual
+             -> attention(Q, K, V)
+             -> down_proj(inner -> d_model) -> residual
 
-    One norm, one residual, one down-proj. V activation replaces the
-    post-attention gate — the nonlinearity lives inside the values.
+    The nonlinearity lives in the shared up-projected representation.
+    Attention operates in the expanded space. V stays linear after the
+    shared activation — the "thinking" happens in the higher-dim space.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
@@ -531,10 +534,13 @@ class FusedGatedNeighborBlock(nn.Module):
 
         self.norm = RMSNorm(d_model)
 
-        # Direct projections from d_model into expanded QKV
-        self.q_proj = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        # Shared expansion: d_model -> inner_dim
+        self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+
+        # QKV projections from expanded space
+        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
 
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
@@ -559,13 +565,13 @@ class FusedGatedNeighborBlock(nn.Module):
         b, t, c = x.shape
         h = self.norm(x)
 
-        # Project directly into expanded Q, K, V
-        q = self.q_proj(h).view(b, t, self.n_head, self.head_dim)
-        k = self.k_proj(h).view(b, t, self.n_head, self.head_dim)
-        v = self.v_proj(h)
+        # Expand and activate — shared nonlinear representation
+        h_up = F.silu(self.up_proj(h))
 
-        # Activate V — the nonlinearity lives in the values
-        v = F.silu(v).view(b, t, self.n_head, self.head_dim)
+        # QKV from activated expanded space
+        q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
         # RoPE
         cos, sin = self.rotary(q)
