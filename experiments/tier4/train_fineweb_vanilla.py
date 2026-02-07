@@ -507,20 +507,18 @@ class GatedNeighborBlock(nn.Module):
 
 
 class FusedGatedNeighborBlock(nn.Module):
-    """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
+    """Fused attention+MLP block with SSM-style self-integration.
 
-    x -> norm -> up_proj(d_model -> inner) -> SiLU -> h_up
-             -> Q(inner -> inner)                      |
-             -> K(inner -> inner)                      |
-             -> V(inner -> inner)                      |
-             -> gated neighbor on K                    |
-             -> RoPE on Q, K                           |
-             -> attention(Q, K, V) -> attn_out         |
-             -> norm(attn_out) + h_up  <---------------+
-             -> down_proj(inner -> d_model) -> residual
+    x -> norm -> up_proj(d_model -> d_model) -> SiLU -> h_up
+             -> Q, K, V from h_up
+             -> gated neighbor on K, RoPE on Q/K
+             -> attention(Q, K, V) -> attn_out
+             -> h_up += attn_gate * norm(attn_out)      # integrate
+             -> x + h_up                                 # residual
 
-    SiLU after up_proj feeds rich features into QKV. Skip-add from h_up
-    to normed attention output preserves pre-attn features for down_proj.
+    Attention is a readout that integrates back into the working state.
+    Like an SSM: h_up is the state, attention enriches it, the enriched
+    state updates the residual stream directly. No down_proj needed.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1):
@@ -542,8 +540,9 @@ class FusedGatedNeighborBlock(nn.Module):
         self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
 
-        # Post-attention norm (before skip multiply)
+        # Post-attention norm and integration gate
         self.attn_norm = RMSNorm(self.inner_dim)
+        self.attn_gate = nn.Parameter(torch.full((1,), -2.0))
 
         # QK norm (per-head RMSNorm before RoPE)
         self.q_norm = RMSNorm(self.head_dim)
@@ -598,10 +597,10 @@ class FusedGatedNeighborBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip-multiply
-        y = self.attn_norm(y) * h_up
+        # SSM-style integration: attention enriches the working state
+        h_up = h_up + torch.sigmoid(self.attn_gate) * self.attn_norm(y)
 
-        return x + y
+        return x + h_up
 
 
 class TransformerShiftBlock(nn.Module):
