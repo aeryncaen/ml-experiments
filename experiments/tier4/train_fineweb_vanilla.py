@@ -179,13 +179,16 @@ class ShortConvLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
         B, T, D = x.shape
-        # generate kernel from SIREN and convolve via FFT
+        # generate kernel from SIREN and convolve via FFT (float32 — FFT doesn't support bf16)
         k = self.siren(T, x.device)                     # (D, T)
-        k_f = torch.fft.rfft(k, n=2 * T)               # (D, T+1)
         u = x.transpose(1, 2)                           # (B, D, T)
+        orig_dtype = u.dtype
+        k = k.float()
+        u = u.float()
+        k_f = torch.fft.rfft(k, n=2 * T)               # (D, T+1)
         u_f = torch.fft.rfft(u, n=2 * T)               # (B, D, T+1)
         u = torch.fft.irfft(u_f * k_f, n=2 * T)[..., :T]  # (B, D, T)
-        u = u.transpose(1, 2)                           # (B, T, D)
+        u = u.to(orig_dtype).transpose(1, 2)            # (B, T, D)
         # RoPE on conv output
         cos, sin = self.rotary(u.unsqueeze(2))          # (1, T, 1, D//2)
         cos = cos.squeeze(2)                            # (1, T, D//2)
