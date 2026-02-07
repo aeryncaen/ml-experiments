@@ -353,6 +353,19 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
 
+        # Important: nn.Embedding defaults are too large for tied lm_head logits.
+        # Use GPT-style small init to keep initial CE in a sane range.
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
