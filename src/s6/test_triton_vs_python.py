@@ -329,6 +329,20 @@ def test_triton_kernels(device):
     cumA_flat = cumA.permute(0, 1, 3, 2).reshape(BNH, C).contiguous()
     s_flat = s_chunks.permute(0, 1, 3, 2, 4).reshape(BNH, C, D).contiguous()
 
+    # Flatten log_alpha for Triton (new API takes log_alpha, not cumA)
+    la_flat = la_chunks.permute(0, 1, 3, 2).reshape(BNH, C).contiguous()
+
+    # --- 0. Diagnostic: verify Triton cumsum matches Python cumsum ---
+    zero_prev = torch.zeros(BNH, D, device=device, dtype=torch.float32)
+    _, cumA_triton = _chunked_scan_fwd_triton(s_flat, la_flat, zero_prev, C, D, BNH, store_cumA=True)
+    passed_cumA, info_cumA = _compare("cumA (triton vs python)", cumA_flat, cumA_triton)
+    print(info_cumA)
+    if not passed_cumA:
+        print(f"    Python cumA[0,:5]:  {cumA_flat[0,:5].tolist()}")
+        print(f"    Triton cumA[0,:5]:  {cumA_triton[0,:5].tolist()}")
+        print(f"    la_flat[0,:5]:      {la_flat[0,:5].tolist()}")
+    all_passed = all_passed and passed_cumA
+
     # --- 1. Intra-chunk forward (zero prev_states) ---
     # Python reference
     causal = torch.tril(torch.ones(C, C, device=device, dtype=torch.bool))
@@ -336,12 +350,17 @@ def test_triton_kernels(device):
     decay_mask = torch.where(causal, decay_diff.exp(), torch.zeros_like(decay_diff))
     intra_flat_py = torch.bmm(decay_mask, s_flat)
 
-    # Triton
-    zero_prev = torch.zeros(BNH, D, device=device, dtype=torch.float32)
-    intra_flat_tr = _chunked_scan_fwd_triton(s_flat, cumA_flat, zero_prev, C, D, BNH)
+    # Triton (now takes log_alpha, computes cumsum internally)
+    intra_flat_tr = _chunked_scan_fwd_triton(s_flat, la_flat, zero_prev, C, D, BNH)
 
     passed, info = _compare("intra-chunk fwd (zero prev)", intra_flat_py, intra_flat_tr)
     print(info)
+    if not passed:
+        # Check first element in detail
+        print(f"    intra_py[0,0,:4]:  {intra_flat_py[0,0,:4].tolist()}")
+        print(f"    intra_tr[0,0,:4]:  {intra_flat_tr[0,0,:4].tolist()}")
+        print(f"    intra_py[0,-1,:4]: {intra_flat_py[0,-1,:4].tolist()}")
+        print(f"    intra_tr[0,-1,:4]: {intra_flat_tr[0,-1,:4].tolist()}")
     all_passed = all_passed and passed
 
     # --- 2. State passing forward ---
@@ -368,7 +387,8 @@ def test_triton_kernels(device):
     out_flat_py = torch.bmm(decay_mask, s_flat) + \
         (cumA_flat[:, :, None].exp() * prev_states_flat[:, None, :])
 
-    out_flat_tr = _chunked_scan_fwd_triton(s_flat, cumA_flat, prev_states_flat, C, D, BNH)
+    # Triton (takes log_alpha, computes cumsum internally)
+    out_flat_tr = _chunked_scan_fwd_triton(s_flat, la_flat, prev_states_flat, C, D, BNH)
 
     passed, info = _compare("full fwd (with prev)", out_flat_py, out_flat_tr)
     print(info)
@@ -385,10 +405,10 @@ def test_triton_kernels(device):
     d_dm_times_dm_py = d_decay_mask_py * decay_mask
     d_cumA_intra_py = d_dm_times_dm_py.sum(dim=2) - d_dm_times_dm_py.sum(dim=1)
 
-    # Triton
+    # Triton (takes log_alpha, computes cumsum + decay_mask internally)
     ds_tr, d_cumA_intra_tr, _ = _chunked_scan_bwd_triton(
-        dout_flat, cumA_flat, s_flat, prev_states_flat,
-        decay_mask, C, D, BNH)
+        dout_flat, la_flat, s_flat, prev_states_flat,
+        C, D, BNH)
 
     passed, info = _compare("bwd ds_flat", ds_py, ds_tr)
     print(info)
