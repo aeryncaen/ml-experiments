@@ -48,7 +48,7 @@ class HParams:
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
     s6_expansion_factor: int = _env_int("S6_EXPANSION_FACTOR", 2)
     s6_post_scan_attention: bool = _env_bool("S6_POST_SCAN_ATTENTION", True)
-    s6_scan_state_modes: str = os.environ.get("S6_SCAN_STATE_MODES", "outer,outer,elementwise")
+    s6_scan_state_modes: str = os.environ.get("S6_SCAN_STATE_MODES", "elementwise,elementwise,elementwise")
 
     train_steps: int = _env_int("TRAIN_STEPS", 2000)
     batch_size: int = _env_int("BATCH_SIZE", 8)
@@ -304,7 +304,7 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     loss_sum = torch.zeros(1, device=device)
     for _ in range(HP.val_steps):
         x, y = val_stream.next_batch(device)
-        if device.type == "cuda":
+        if device.type == "cuda" and HP.model_type != "s6":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
         else:
@@ -354,7 +354,7 @@ def main():
             pg["lr"] = lr
 
         x, y = train_stream.next_batch(device)
-        if device.type == "cuda":
+        if device.type == "cuda" and HP.model_type != "s6":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
         else:
