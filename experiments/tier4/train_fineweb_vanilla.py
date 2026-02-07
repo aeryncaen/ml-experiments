@@ -539,8 +539,8 @@ class FusedGatedNeighborBlock(nn.Module):
 
         # QKV projections from expanded space
         self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
 
         # Post-attention norm (before skip add)
         self.attn_norm = RMSNorm(self.inner_dim)
