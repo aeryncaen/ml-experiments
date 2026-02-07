@@ -509,18 +509,19 @@ class GatedNeighborBlock(nn.Module):
 class FusedGatedNeighborBlock(nn.Module):
     """Fused attention+MLP block. No separate MLP — one expand/contract cycle.
 
-    x -> norm -> up_proj(d_model -> inner) -> SiLU
-             -> Q_proj(inner -> inner)
-             -> K_proj(inner -> inner)
-             -> V_proj(inner -> inner)   # no activation on V
-             -> gated neighbor on K
-             -> RoPE on Q, K
-             -> attention(Q, K, V)
+    x -> norm -> up_proj(d_model -> inner) -> SiLU -> h_up
+             -> Q_proj(inner -> inner)                  |
+             -> K_proj(inner -> inner)                  |
+             -> V_proj(inner -> inner)                  |
+             -> gated neighbor on K                     |
+             -> RoPE on Q, K                            |
+             -> attention(Q, K, V) = attn_out           |
+             -> attn_out * h_up  <----------------------+
              -> down_proj(inner -> d_model) -> residual
 
-    The nonlinearity lives in the shared up-projected representation.
-    Attention operates in the expanded space. V stays linear after the
-    shared activation — the "thinking" happens in the higher-dim space.
+    The activated up-projected features skip past attention and gate
+    the attention output. This gives the down_proj a nonlinear input
+    and lets pre-attention features flow through to post-attention.
     """
 
     def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
@@ -541,6 +542,9 @@ class FusedGatedNeighborBlock(nn.Module):
         self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+
+        # Post-attention norm (before skip multiply)
+        self.attn_norm = RMSNorm(self.inner_dim)
 
         # Down-project: inner_dim -> d_model
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
@@ -591,6 +595,9 @@ class FusedGatedNeighborBlock(nn.Module):
             y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
+
+        # Skip: gate attention output with pre-attn activated features
+        y = self.attn_norm(y) * h_up
 
         # Down-project
         y = self.down_proj(y)
