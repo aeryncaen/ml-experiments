@@ -481,7 +481,7 @@ class GatedNeighborAttention(nn.Module):
         k_static = k[:, :, :, :half]
         k_cur = k[:, :, :, half:]
         k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))  # shift by 1, zero at t=0
-        k_mixed = torch.lerp(k_cur, k_prev, gate)
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
         return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
