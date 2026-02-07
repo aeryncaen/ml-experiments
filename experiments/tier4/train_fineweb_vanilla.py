@@ -272,13 +272,13 @@ class GPTTransformer(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
-            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            x = block(x)
         x = self.ln_f(x)
-        if targets is not None:
-            loss = chunked_cross_entropy(x, self.lm_head.weight, targets)
-            return None, loss
         logits = self.lm_head(x)
-        return logits, None
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
 
 
 class GPTS6(nn.Module):
