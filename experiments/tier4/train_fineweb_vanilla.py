@@ -474,15 +474,14 @@ class GatedNeighborAttention(nn.Module):
         gate: (B, T, H, half_dim) — sigmoid already applied, per-channel
 
         For the second half of each head's channels:
-            k_out[t] = k[t] + g[t] * k[t-1]
-        Additive: keep full current value, add gated neighbor.
+            k_out[t] = (1 - g[t]) * k[t] + g[t] * k[t-1]
         First half stays unchanged.
         """
         half = self.half_dim
         k_static = k[:, :, :, :half]
         k_cur = k[:, :, :, half:]
         k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
-        k_mixed = k_cur + gate * k_prev
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
         return torch.cat([k_static, k_mixed], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
