@@ -340,6 +340,43 @@ class Rotary(nn.Module):
         return self.cos_cached, self.sin_cached
 
 
+class PairedRotary(nn.Module):
+    """Rotary for paired heads: even/odd position encodings for 2*dim width.
+
+    When applied to a tensor of last dim = 2*head_dim, the first head_dim
+    channels get even-position encodings and the second head_dim channels
+    get odd-position encodings. After reshape to 2T length, this gives
+    adjacent heads interleaved positional identity.
+    """
+
+    def __init__(self, dim: int, base: int = 10000):
+        super().__init__()
+        self.dim = dim  # head_dim (half of the paired width)
+        self.register_buffer(
+            "inv_freq",
+            1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)),
+            persistent=False,
+        )
+        self.seq_len_cached = 0
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x: torch.Tensor):
+        t = x.shape[1]
+        if self.cos_cached is None or t != self.seq_len_cached:
+            self.seq_len_cached = t
+            inv_freq = self.inv_freq.to(device=x.device)
+            tt = torch.arange(t, device=x.device, dtype=inv_freq.dtype)
+            t_even = 2 * tt
+            t_odd = 2 * tt + 1
+            freqs_even = torch.outer(t_even, inv_freq)
+            freqs_odd = torch.outer(t_odd, inv_freq)
+            # Concat along last dim: [even_cos | odd_cos], [even_sin | odd_sin]
+            self.cos_cached = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
+            self.sin_cached = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
+        return self.cos_cached, self.sin_cached
+
+
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
@@ -523,10 +560,11 @@ class FusedGatedNeighborBlock(nn.Module):
     to normed attention output preserves pre-attn features for down_proj.
     """
 
-    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1):
+    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 1, paired: bool = False):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
+        self.paired = paired
         self.inner_dim = inner_dim if inner_dim is not None else d_model * expand
         assert self.inner_dim % n_head == 0
         self.head_dim = self.inner_dim // n_head
@@ -556,8 +594,12 @@ class FusedGatedNeighborBlock(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-        # RoPE in expanded head_dim
-        self.rotary = Rotary(self.head_dim)
+        # RoPE — paired mode uses PairedRotary with 2*head_dim width
+        if paired:
+            assert n_head % 2 == 0, "paired heads requires even n_head"
+            self.rotary = PairedRotary(self.head_dim)
+        else:
+            self.rotary = Rotary(self.head_dim)
 
         # Neighbor gate: single lerp on K, per-channel per-head
         self.neighbor_gate_proj = nn.Linear(d_model, n_head * self.half_dim, bias=True)
@@ -585,24 +627,53 @@ class FusedGatedNeighborBlock(nn.Module):
         k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # QK norm then RoPE
+        # QK norm
         q = self.q_norm(q)
         k = self.k_norm(k)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
 
-        # Gated neighbor mixing on K
+        # Gated neighbor mixing on K (before pairing)
         gate = torch.sigmoid(self.neighbor_gate_proj(h)).view(b, t, self.n_head, self.half_dim)
         k = self._gated_neighbor(k, gate)
 
-        # Attention
-        if HAS_FLASH_ATTN:
-            y = flash_attn_func(q, k, v, causal=True)
+        if self.paired:
+            # Merge adjacent head pairs: (b, t, n_head, hd) -> (b, t, n_head//2, hd*2)
+            n2 = self.n_head // 2
+            q = q.view(b, t, n2, self.head_dim * 2)
+            k = k.view(b, t, n2, self.head_dim * 2)
+
+            # Paired RoPE (even/odd positions for each half)
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+
+            # Unmerge to doubled sequence: (b, t, n2, hd*2) -> (b, t*2, n2, hd)
+            q = q.view(b, t * 2, n2, self.head_dim)
+            k = k.view(b, t * 2, n2, self.head_dim)
+            v = v.reshape(b, t * 2, n2, self.head_dim)
+
+            # Attention on interleaved 2T sequence
+            if HAS_FLASH_ATTN:
+                y = flash_attn_func(q, k, v, causal=True)
+            else:
+                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                y = y.transpose(1, 2)
+
+            # Reshape back: (b, t*2, n2, hd) -> (b, t, n_head, hd)
+            y = y.view(b, t, self.n_head, self.head_dim)
         else:
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            y = y.transpose(1, 2)
+            # Standard RoPE
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+
+            # Attention
+            if HAS_FLASH_ATTN:
+                y = flash_attn_func(q, k, v, causal=True)
+            else:
+                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
@@ -801,7 +872,12 @@ class GPTFusedGatedNeighbor(nn.Module):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
         inner = HP.fused_inner_dim if HP.fused_inner_dim > 0 else None
-        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=inner) for _ in range(HP.n_layer)])
+        paired_str = os.environ.get("PAIRED_HEAD_LAYERS", "0,2,5,9")
+        paired_layers = set(int(x) for x in paired_str.split(",") if x.strip()) if paired_str.strip() else set()
+        self.blocks = nn.ModuleList([
+            FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=inner, paired=(i in paired_layers))
+            for i in range(HP.n_layer)
+        ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
