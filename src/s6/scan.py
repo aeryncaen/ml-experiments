@@ -1015,8 +1015,9 @@ def _chunked_scan_fwd_op(
     out_full = out.reshape(B, T_padded, H, D)[:, :T].to(kv.dtype)
 
     # Save la_chunks (not cumA) — backward kernels recompute cumA from log_alpha
-    return (out_full, alpha_clamped, s_chunks, la_chunks, chunk_total_decay,
-            chunk_new_state, prev_states, init_state.detach())
+    # clone alpha_clamped and init_state to avoid aliasing inputs (custom_op requirement)
+    return (out_full, alpha_clamped.clone(), s_chunks, la_chunks, chunk_total_decay,
+            chunk_new_state, prev_states, init_state.detach().clone())
 
 
 @_chunked_scan_fwd_op.register_fake
