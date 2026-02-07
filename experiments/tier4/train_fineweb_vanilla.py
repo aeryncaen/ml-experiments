@@ -54,6 +54,9 @@ class HParams:
     d_model: int = _env_int("D_MODEL", 768)
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
+    # Fused gate knobs
+    fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 2064)
+
     # S6 knobs
     s6_headdim: int = _env_int("S6_HEADDIM", 64)
     s6_expansion_factor: int = _env_int("S6_EXPANSION_FACTOR", 2)
@@ -517,11 +520,11 @@ class FusedGatedNeighborBlock(nn.Module):
     post-attention gate — the nonlinearity lives inside the values.
     """
 
-    def __init__(self, d_model: int, n_head: int, expand: int = 2):
+    def __init__(self, d_model: int, n_head: int, inner_dim: int | None = None, expand: int = 2):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
-        self.inner_dim = d_model * expand
+        self.inner_dim = inner_dim if inner_dim is not None else d_model * expand
         assert self.inner_dim % n_head == 0
         self.head_dim = self.inner_dim // n_head
         self.half_dim = self.head_dim // 2
@@ -774,7 +777,7 @@ class GPTFusedGatedNeighbor(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
-        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+        self.blocks = nn.ModuleList([FusedGatedNeighborBlock(HP.d_model, HP.n_head, inner_dim=HP.fused_inner_dim) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
