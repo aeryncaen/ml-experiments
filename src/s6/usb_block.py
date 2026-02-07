@@ -68,14 +68,9 @@ class GatedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def forward(self, x: torch.Tensor, gate: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # RMSNorm
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = x * rms * self.weight
-        
-        # Optional gating
+        x = F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
         if gate is not None:
             x = x * F.silu(gate)
-        
         return x
 
 
@@ -276,10 +271,11 @@ class USBBlock(nn.Module):
         self.k_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         self.v_bias = nn.Parameter(torch.ones(nheads_total, headdim))
         
-        # Per-head projections for scan groups (G1, G2, G3)
+        # Per-head projections for scan groups
+        # G1+G2 fused into one projection (2*nheads_per_group heads) — avoids 6 torch.cat calls
+        # G3 separate (uses depthwise conv, not scan)
         # G4 is passthrough, no scan parameters needed
-        self.scan_proj_g1 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
-        self.scan_proj_g2 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
+        self.scan_proj_g12 = PerHeadProjections(d_expanded, 2 * nheads_per_group, headdim)
         self.scan_proj_g3 = PerHeadProjections(d_expanded, nheads_per_group, headdim)
 
         # G3 depthwise conv (k=3) replacing centered scan (causal)
@@ -369,61 +365,26 @@ class USBBlock(nn.Module):
         v = v + self.v_bias
         
         with torch.autograd.profiler.record_function("s6/split_and_params"):
-            # Step 3: Channel split into 4 groups
-            # Each group gets nheads_per_group heads
+            # Step 3: Channel split — G1+G2 stay together (contiguous heads 0..2*nph)
             nph = config.nheads_per_group
-            k_g1, k_g2, k_g3, k_g4 = k[..., :nph, :], k[..., nph:2*nph, :], k[..., 2*nph:3*nph, :], k[..., 3*nph:, :]
-            v_g1, v_g2, v_g3, v_g4 = v[..., :nph, :], v[..., nph:2*nph, :], v[..., 2*nph:3*nph, :], v[..., 3*nph:, :]
+            nph2 = 2 * nph  # G1+G2 combined head count
+            k_g12 = k[..., :nph2, :]       # (b, t, 2*nph, d)
+            v_g12 = v[..., :nph2, :]
+            k_g3  = k[..., nph2:nph2+nph, :]
+            v_g3  = v[..., nph2:nph2+nph, :]
+            v_g4  = v[..., nph2+nph:, :]
         
-        # Step 4: Scan G1+G2 together; G3 uses a 3-wide conv
-        
-            # Get per-head parameters for each scan group
-            params_g1 = self.scan_proj_g1(x_exp)
-            params_g2 = self.scan_proj_g2(x_exp)
+            # Fused G1+G2 scan params (single projection, 2*nph heads)
+            params_g12 = self.scan_proj_g12(x_exp)
             params_g3 = self.scan_proj_g3(x_exp)
         
             # Apply data-dependent RoPE to K before scanning
-            k_g1 = apply_data_dependent_rope(k_g1, params_g1['rope_freq'])
-            k_g2 = apply_data_dependent_rope(k_g2, params_g2['rope_freq'])
+            k_g12 = apply_data_dependent_rope(k_g12, params_g12['rope_freq'])
             k_g3 = apply_data_dependent_rope(k_g3, params_g3['rope_freq'])
-        
-        # Compute K·V for each group (mode-dependent)
-        # Shape depends on scan_state_modes[i]:
-        # - elementwise: (batch, seq_len, nheads, headdim)
-        # - outer: (batch, seq_len, nheads, headdim, headdim) = k ⊗ v
-        modes = config.scan_state_modes
-        if any(m != 'elementwise' for m in modes):
-            raise RuntimeError(
-                "USBBlock currently enforces elementwise scan mode only. "
-                "Set scan_state_modes=('elementwise','elementwise','elementwise')."
-            )
-        
-        # Combine G1+G2 for a single scan
-        k_g12 = torch.cat([k_g1, k_g2], dim=-2)
-        v_g12 = torch.cat([v_g1, v_g2], dim=-2)
-        gate_g12 = torch.cat([params_g1['gate'], params_g2['gate']], dim=-2)
-
-        params_g12 = {
-            'alpha': torch.cat([params_g1['alpha'], params_g2['alpha']], dim=-1),
-            'delta': torch.cat([params_g1['delta'], params_g2['delta']], dim=-1),
-            'epsilon': torch.cat([params_g1['epsilon'], params_g2['epsilon']], dim=-1),
-            'zeta': torch.cat([params_g1['zeta'], params_g2['zeta']], dim=-1),
-        }
 
         kv_g12 = k_g12 * v_g12
         init_g12 = torch.cat([self.init_state_g1, self.init_state_g2], dim=0)
-        init_g12 = repeat(init_g12, 'h d -> b h d', b=batch)
-
-        # Gate state injection back into hiddens (mode-dependent readout)
-        # h_t = h_t + gate_t * state_read_t
-        # For outer mode: query with k to retrieve v (k-based readout)
-        # For elementwise mode: state is already the right shape
-        scale = config.headdim ** -0.5
-
-        state_g1 = None
-        state_g2 = None
-        state_g1_read = None
-        state_g2_read = None
+        init_g12 = init_g12.unsqueeze(0).expand(batch, -1, -1)
 
         with torch.autograd.profiler.record_function("s6/scan_g12"):
             state_g12 = forward_scan_chunked(
@@ -434,10 +395,11 @@ class USBBlock(nn.Module):
                 zeta=params_g12['zeta'],
                 init_state=init_g12,
             )
-            out_g12 = v_g12 + gate_g12 * state_g12
+            out_g12 = v_g12 + params_g12['gate'] * state_g12
 
         out_g1, out_g2 = out_g12[..., :nph, :], out_g12[..., nph:, :]
-        state_g1, state_g2 = state_g12[..., :nph, ...], state_g12[..., nph:, ...]
+        state_g1 = state_g12[..., :nph, ...]
+        state_g2 = state_g12[..., nph:, ...]
         
         # G3 readout: depthwise conv over sequence (causal)
         def conv_g3(x_heads: torch.Tensor) -> torch.Tensor:
@@ -531,19 +493,14 @@ class USBBlock(nn.Module):
                 }
 
             debug = {
-                'g1': _param_block(params_g1),
-                'g2': _param_block(params_g2),
+                'g12': _param_block(params_g12),
                 'g3': _param_block(params_g3),
                 'rms': {
-                    'k_g1': _rms(k_g1),
-                    'v_g1': _rms(v_g1),
+                    'k_g12': _rms(k_g12),
+                    'v_g12': _rms(v_g12),
                     'state_g1': _rms(state_g1),
-                    'state_read_g1': _rms(state_g1_read) if state_g1_read is not None else 0.0,
                     'out_g1': _rms(out_g1),
-                    'k_g2': _rms(k_g2),
-                    'v_g2': _rms(v_g2),
                     'state_g2': _rms(state_g2),
-                    'state_read_g2': _rms(state_g2_read) if state_g2_read is not None else 0.0,
                     'out_g2': _rms(out_g2),
                     'v_g3': _rms(v_g3),
                     'conv_g3': _rms(conv_g3_out),
@@ -552,8 +509,8 @@ class USBBlock(nn.Module):
                     'attn_out': _rms(attn_out),
                 },
                 'seq_rms': {
-                    'g1': _seq_rms(state_g1, modes[0] == 'outer'),
-                    'g2': _seq_rms(state_g2, modes[1] == 'outer'),
+                    'g1': _seq_rms(state_g1, False),
+                    'g2': _seq_rms(state_g2, False),
                 },
             }
 
