@@ -1222,8 +1222,9 @@ class StackedModel(nn.Module):
 
 class ChorusModel(nn.Module):
     """Chorus: n_voices wide × n_layers tall.
-    All voices sing, judge scores their outputs, weighted merge.
-    No router, no top-k — every voice contributes.
+    Hard top-1 routing per sample — each sample assigned to one voice.
+    All voices run (for simplicity), but only the selected voice's output is used.
+    Straight-through estimator for gradient flow through the routing decision.
     """
     def __init__(self, make_layer, n_layers, dim, n_voices=4):
         super().__init__()
@@ -1234,9 +1235,9 @@ class ChorusModel(nn.Module):
             nn.ModuleList([make_layer() for _ in range(n_voices)])
             for _ in range(n_layers)
         ])
-        # Per-layer pre-norm and judge
+        # Per-layer pre-norm and router
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
-        self.judges = nn.ModuleList([nn.Linear(dim, 1, bias=False) for _ in range(n_layers)])
+        self.routers = nn.ModuleList([nn.Linear(dim, n_voices, bias=False) for _ in range(n_layers)])
         # Learned layer weighting for final output
         self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))  # +1 for input
         self.final_norm = RMSNorm(dim)
@@ -1245,18 +1246,23 @@ class ChorusModel(nn.Module):
         B, T, D = x.shape
         layer_outputs = [x]
 
-        for norm, voices, judge in zip(self.norms, self.voices, self.judges):
+        for norm, router, voices in zip(self.norms, self.routers, self.voices):
             h = norm(x)
+
+            # Router: per-sample voice selection
+            h_pool = h.mean(dim=1)  # (B, D)
+            logits = router(h_pool)  # (B, n_voices)
+            soft = F.softmax(logits, dim=-1)  # (B, n_voices)
+
+            # Hard top-1 with straight-through
+            idx = logits.argmax(dim=-1)  # (B,)
+            hard = F.one_hot(idx, self.n_voices).float()  # (B, n_voices)
+            weights = hard - soft.detach() + soft  # forward: hard, backward: soft
 
             # All voices sing
             voice_outs = torch.stack([v(h) for v in voices], dim=2)  # (B, T, n_voices, D)
 
-            # Judge scores each voice output (pool over seq, score, softmax)
-            pooled = voice_outs.mean(dim=1)  # (B, n_voices, D)
-            scores = judge(pooled).squeeze(-1)  # (B, n_voices)
-            weights = F.softmax(scores, dim=-1)  # (B, n_voices)
-
-            # Weighted merge
+            # Select (hard one-hot in forward, soft gradient in backward)
             out = (voice_outs * weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
             x = x + out
             layer_outputs.append(x)
