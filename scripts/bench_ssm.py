@@ -580,13 +580,16 @@ MIXED_VOCAB = 64  # 0-31: normal tokens, 32-63: marked tokens (selective_copy)
 def gen_mixed(B, L, device='cpu'):
     """Generate a mixed batch: each sample in the batch is drawn from a random subtask.
     Unified vocab=64 (0-31 normal, 32-63 marked). All samples have shape (L,).
-    Returns (input, target) both (B, L). Target uses ignore_index=-100 for
-    positions without a prediction target (selective_copy non-output positions)."""
+    Returns (input, target, task_ids) where task_ids is (B,) with index into MIXED_SUBTASKS.
+    Target uses ignore_index=-100 for positions without a prediction target."""
     inp = torch.zeros(B, L, dtype=torch.long, device=device)
     tgt = torch.full((B, L), -100, dtype=torch.long, device=device)
+    task_ids = torch.zeros(B, dtype=torch.long, device=device)
 
     for b in range(B):
-        task = random.choice(MIXED_SUBTASKS)
+        tid = random.randint(0, len(MIXED_SUBTASKS) - 1)
+        task = MIXED_SUBTASKS[tid]
+        task_ids[b] = tid
         if task == 'delay':
             x, t = gen_delay(1, L, vocab_size=32, device=device)
             inp[b] = x[0]
@@ -614,7 +617,7 @@ def gen_mixed(B, L, device='cpu'):
             inp[b] = x[0]
             tgt[b] = t[0]
 
-    return inp, tgt
+    return inp, tgt, task_ids
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +997,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         else:  # mixed
             assert embed is not None and head is not None
             assert vocab_size is not None
-            inp, tgt = batch
+            inp, tgt, task_ids = batch
             y = head(model(embed(inp)))
             logits_flat = y.reshape(-1, vocab_size)
             tgt_flat = tgt.reshape(-1)
@@ -1011,13 +1014,42 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         model.eval()
         val_accs = []
         val_losses = []
+        per_task_correct = {t: 0 for t in MIXED_SUBTASKS} if task_name == 'mixed' else None
+        per_task_total = {t: 0 for t in MIXED_SUBTASKS} if task_name == 'mixed' else None
         with torch.no_grad():
             for batch in val_data:
                 loss, acc = _forward(batch)
                 val_losses.append(loss.item())
                 val_accs.append(acc)
+                # Per-task breakdown for mixed
+                if task_name == 'mixed' and per_task_correct is not None and per_task_total is not None:
+                    inp, tgt, task_ids = batch
+                    y = head(model(embed(inp)))  # (B, L, V)
+                    B_cur = inp.shape[0]
+                    for tid_idx, subtask in enumerate(MIXED_SUBTASKS):
+                        mask_b = task_ids == tid_idx  # (B,)
+                        if not mask_b.any():
+                            continue
+                        y_sub = y[mask_b]       # (n, L, V)
+                        tgt_sub = tgt[mask_b]   # (n, L)
+                        logits_flat = y_sub.reshape(-1, vocab_size)
+                        tgt_flat = tgt_sub.reshape(-1)
+                        valid = tgt_flat != -100
+                        if valid.any():
+                            per_task_correct[subtask] += (logits_flat[valid].argmax(-1) == tgt_flat[valid]).sum().item()
+                            per_task_total[subtask] += valid.sum().item()
         model.train()
-        return sum(val_losses) / len(val_losses), sum(val_accs) / len(val_accs)
+        avg_loss = sum(val_losses) / len(val_losses)
+        avg_acc = sum(val_accs) / len(val_accs)
+        if per_task_correct is not None and per_task_total is not None:
+            subtask_accs = {}
+            for t in MIXED_SUBTASKS:
+                if per_task_total[t] > 0:
+                    subtask_accs[t] = per_task_correct[t] / per_task_total[t]
+                else:
+                    subtask_accs[t] = 0.0
+            return avg_loss, avg_acc, subtask_accs
+        return avg_loss, avg_acc, None
 
     mem_baseline = 0
     if device == 'cuda':
@@ -1056,6 +1088,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     best_epoch = 0
     best_val_acc = 0.0
     best_val_loss = float('inf')
+    best_subtask_accs = None
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
@@ -1154,7 +1187,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         train_acc = sum(epoch_accs) / len(epoch_accs)
         
         # Evaluate on validation set
-        val_loss, val_acc = _eval_val()
+        val_loss, val_acc, subtask_accs = _eval_val()
         final_epoch = epoch + 1
         
         # Track best
@@ -1162,8 +1195,13 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             best_epoch = final_epoch
             best_val_acc = val_acc
             best_val_loss = val_loss
+            best_subtask_accs = subtask_accs
         
-        epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
+        if subtask_accs is not None:
+            parts = " ".join(f"{t[:3]}={a:.0%}" for t, a in subtask_accs.items())
+            epoch_pbar.set_postfix_str(f"val_loss={val_loss:.4f} val_acc={val_acc:.1%} | {parts}")
+        else:
+            epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
         # Early stopping: converged
         if val_acc >= early_stop_acc:
@@ -1212,6 +1250,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         'peak_mem_mb': peak_mem,
         'converged': best_val_acc >= early_stop_acc,
         'stop_reason': stop_reason,
+        'subtask_accs': best_subtask_accs,
     }
 
 
@@ -1413,9 +1452,12 @@ if __name__ == '__main__':
                            act_explode=args.act_explode,
                            usb_debug_every=args.usb_debug_every)
             tqdm.write(f"{name:<10} {task:<16} {r['initial']:>8.4f} {r['final']:>8.4f} {r['acc']:>7.1%} {r['best_epoch']:>6} {r['epochs']:>7} {r['wall_s']:>8.1f} {r['stop_reason']:>10}")
+            if r.get('subtask_accs'):
+                parts = "  ".join(f"{t}: {a:.1%}" for t, a in r['subtask_accs'].items())
+                tqdm.write(f"{'':>10} subtasks: {parts}")
             
             # Store result
-            all_results.append({
+            result_entry = {
                 'model': name,
                 'task': task,
                 'params': param_count,
@@ -1428,7 +1470,11 @@ if __name__ == '__main__':
                 'peak_mem_mb': r['peak_mem_mb'],
                 'converged': r['converged'],
                 'stop_reason': r['stop_reason'],
-            })
+            }
+            if r.get('subtask_accs'):
+                for t, a in r['subtask_accs'].items():
+                    result_entry[f'acc_{t}'] = a
+            all_results.append(result_entry)
         del task_data
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1436,11 +1482,12 @@ if __name__ == '__main__':
     # Write CSV if requested
     if args.csv:
         import csv
+        fieldnames = [
+            'model', 'task', 'params', 'initial_loss', 'final_loss', 
+            'val_acc', 'best_epoch', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'stop_reason'
+        ] + [f'acc_{t}' for t in MIXED_SUBTASKS]
         with open(args.csv, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'model', 'task', 'params', 'initial_loss', 'final_loss', 
-                'val_acc', 'best_epoch', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'stop_reason'
-            ])
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(all_results)
         print(f"\nResults written to {args.csv}")
@@ -1452,8 +1499,14 @@ if __name__ == '__main__':
     # Group by task for clearer presentation
     for task in tasks:
         print(f"### {task}\n")
-        print("| Model | Params | Val Acc | Best @ | Epochs | Stop Reason | Time |")
-        print("|:------|-------:|--------:|-------:|-------:|:------------|-----:|")
+        if task == 'mixed':
+            subtask_hdrs = " | ".join(f"{t}" for t in MIXED_SUBTASKS)
+            print(f"| Model | Params | Val Acc | {subtask_hdrs} | Best @ | Epochs | Stop | Time |")
+            sep_cols = " | ".join("------:" for _ in MIXED_SUBTASKS)
+            print(f"|:------|-------:|--------:| {sep_cols} |-------:|-------:|:-----|-----:|")
+        else:
+            print("| Model | Params | Val Acc | Best @ | Epochs | Stop Reason | Time |")
+            print("|:------|-------:|--------:|-------:|-------:|:------------|-----:|")
         
         task_results = [r for r in all_results if r['task'] == task]
         # Sort by val_acc descending
@@ -1468,7 +1521,11 @@ if __name__ == '__main__':
             stop = r.get('stop_reason', 'MAX_EPOCH')
             wall_s = r.get('wall_s', 0)
             
-            print(f"| {r['model']} | {r['params']:,} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
+            if task == 'mixed':
+                sub_cols = " | ".join(f"{r.get(f'acc_{t}', 0):.1%}" for t in MIXED_SUBTASKS)
+                print(f"| {r['model']} | {r['params']:,} | {acc_str} | {sub_cols} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
+            else:
+                print(f"| {r['model']} | {r['params']:,} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
         
         print()
     
