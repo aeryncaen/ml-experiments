@@ -854,6 +854,10 @@ class GPTGatedNeighbor(nn.Module):
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        # Re-apply gate init after _init_weights (which overwrites it)
+        for block in self.blocks:
+            nn.init.zeros_(block.attn.gate_proj.weight)
+            nn.init.constant_(block.attn.gate_proj.bias, -2.0)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
@@ -882,6 +886,10 @@ class GPTFusedGatedNeighbor(nn.Module):
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        # Re-apply gate init after _init_weights (which overwrites it)
+        for block in self.blocks:
+            nn.init.zeros_(block.neighbor_gate_proj.weight)
+            nn.init.constant_(block.neighbor_gate_proj.bias, -2.0)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)

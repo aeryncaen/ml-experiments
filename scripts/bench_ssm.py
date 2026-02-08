@@ -551,13 +551,27 @@ class FusedGateBlock(nn.Module):
         x1, x2 = x[..., :d], x[..., d:]
         return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
 
-    def _gated_neighbor(self, k, gate):
+    def _gated_accumulate(self, k, gate):
+        """Cumulative lerp (EMA scan) on the second half of K channels.
+
+        k:    (B, S, H, head_dim)  — S is T or 2T depending on pairing
+        gate: (B, S, H, half_dim)  — per-channel per-head forget gate
+        Returns k with second half of channels replaced by accumulated values.
+        """
         half = self.half_dim
         k_static = k[:, :, :, :half]
-        k_cur = k[:, :, :, half:]
-        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
-        k_mixed = (1 - gate) * k_cur + gate * k_prev
-        return torch.cat([k_static, k_mixed], dim=-1)
+        k_dyn = k[:, :, :, half:]           # (B, S, H, half_dim)
+        # Cumulative scan: k_acc[t] = (1-g[t]) * k[t] + g[t] * k_acc[t-1]
+        # Sequential scan — S is small (32 or 64)
+        acc = torch.zeros_like(k_dyn[:, :1])  # (B, 1, H, half_dim)
+        parts = []
+        for s in range(k_dyn.shape[1]):
+            g = gate[:, s:s+1]               # (B, 1, H, half_dim)
+            cur = k_dyn[:, s:s+1]            # (B, 1, H, half_dim)
+            acc = (1 - g) * cur + g * acc
+            parts.append(acc)
+        k_acc = torch.cat(parts, dim=1)      # (B, S, H, half_dim)
+        return torch.cat([k_static, k_acc], dim=-1)
 
     def forward(self, x):
         b, t, d = x.shape
@@ -575,10 +589,6 @@ class FusedGateBlock(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Neighbor gate on K (before pairing)
-        gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
-        k = self._gated_neighbor(k, gate)
-
         if self.paired:
             n2 = self.n_head // 2
             q = q.view(b, t, n2, self.head_dim * 2)
@@ -588,12 +598,20 @@ class FusedGateBlock(nn.Module):
             q = q.view(b, t * 2, n2, self.head_dim)
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
+            # Gate on interleaved 2T stream — accumulation crosses head pairs
+            gate_raw = torch.sigmoid(self.neighbor_gate_proj(x))  # (B, T, n_head * half_dim)
+            gate_raw = gate_raw.view(b, t, n2, self.half_dim * 2)  # (B, T, n2, half_dim*2)
+            gate = gate_raw.reshape(b, t * 2, n2, self.half_dim)   # (B, 2T, n2, half_dim)
+            k = self._gated_accumulate(k, gate)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             q = self._rope(q)
             k = self._rope(k)
+            # Gate on T stream
+            gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
+            k = self._gated_accumulate(k, gate)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2)
