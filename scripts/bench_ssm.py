@@ -1518,13 +1518,35 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
             f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='blend')")
 
-    # ULB (Universal Learning Block) — generalized FusedGateBlock from src/ulb/
-    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp'))")
-    try_add('ULBBlendPConv2', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2'))")
-    try_add('ULBBlendPConv3', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3'))")
+    # ULB (Universal Learning Block) ablation family
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+
+    # Q-mix ablations (same as base otherwise)
+    try_add('ULBBlendPQNone', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='none', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='none', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBBlendPConv2', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBBlendPConv3', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3', k_lerp=True, swish_mode='learnable'))")
+
+    # K-lerp ablation
+    try_add('ULBBlendPNoK', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=False, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=False, swish_mode='learnable'))")
+
+    # Attention-path ablations
+    try_add('ULBSoftmaxP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='softmax', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='softmax', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBSilu2P', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='silu2', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='silu2', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+
+    # Activation ablation
+    try_add('ULBBlendPSiLU', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='silu')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='silu'))")
+
+    # Paired-head ablation
+    try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
 
     return models
 
@@ -1566,6 +1588,8 @@ if __name__ == '__main__':
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
+    parser.add_argument('--seed', type=int, default=SEED,
+                        help='Random seed for data pregeneration and model init')
     args = parser.parse_args()
 
     print(f"Device: {DEVICE}")
@@ -1580,6 +1604,7 @@ if __name__ == '__main__':
     n_train = args.train_batches
     n_val = args.val_batches
     B, L = args.batch_size, args.seq_len
+    run_seed = args.seed
 
     requested = args.models  # None means all available
     match_params = not args.no_match_params
@@ -1603,7 +1628,7 @@ if __name__ == '__main__':
         cfg = getattr(m, '_bench_config', '<unknown>')
         print(f"{name:<12} {count_params(m):>10,} {n_layers:>8}  {cfg}")
 
-    print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}")
+    print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}, seed={run_seed}")
     print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
     print("\nTraining config:")
     print("- Optimizer: Adam")
@@ -1632,17 +1657,17 @@ if __name__ == '__main__':
         task_n_train = n_train * len(ALL_TASKS) if task == 'mixed' else n_train
         task_n_val = n_val * len(ALL_TASKS) if task == 'mixed' else n_val
         print(f"\nPregenerating {task} data...")
-        task_data = pregen_task_data(task, task_n_train, task_n_val, B, L, SEED, device=DEVICE)
+        task_data = pregen_task_data(task, task_n_train, task_n_val, B, L, run_seed, device=DEVICE)
         print(f"  {len(task_data['train'])} train + {len(task_data['val'])} val batches ready on {DEVICE}")
         
         model_pbar = tqdm(all_names, desc="Models", position=1, leave=False)
         for name in model_pbar:
             model_pbar.set_description(f"Model: {name}")
-            random.seed(SEED)
-            np.random.seed(SEED)
-            torch.manual_seed(SEED)
+            random.seed(run_seed)
+            np.random.seed(run_seed)
+            torch.manual_seed(run_seed)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(SEED)
+                torch.cuda.manual_seed_all(run_seed)
             model = make_models(dim, n_layers=n_layers, requested_models=[name], match_params=match_params,
                                 n_experts=args.n_experts, top_k=args.top_k, moe=args.moe)[name]
             param_count = count_params(model)

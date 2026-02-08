@@ -71,7 +71,9 @@ class ULBConfig:
     k_lerp_bias: float = -2.0
     q_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
-    q_mix: Literal['lerp', 'conv2', 'conv3'] = 'lerp'
+    q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
+    k_lerp: bool = True
+    swish_mode: Literal['learnable', 'silu'] = 'learnable'
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
@@ -124,8 +126,14 @@ class ULBBlock(nn.Module):
         self.v_proj = nn.Linear(inner, inner, bias=True)
 
         # --- Learnable Swish ---
-        self.swish_up = LearnableSwish(inner)
-        self.swish_down = LearnableSwish(inner)
+        if config.swish_mode == 'learnable':
+            self.swish_up = LearnableSwish(inner)
+            self.swish_down = LearnableSwish(inner)
+        elif config.swish_mode == 'silu':
+            self.swish_up = nn.SiLU()
+            self.swish_down = nn.SiLU()
+        else:
+            raise ValueError(f"Unknown swish_mode: {config.swish_mode}")
 
         # --- Post-attention norm (before skip-multiply) ---
         self.attn_norm = nn.RMSNorm(inner)
@@ -139,11 +147,15 @@ class ULBBlock(nn.Module):
         # --- Temporal lerps ---
         quarter_dim = head_dim // 4
         half_dim = head_dim // 2
-        self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        self.k_lerp: CausalLerp | None = None
+        if config.k_lerp:
+            self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         self.q_lerp: AcausalLerp | None = None
         self.q_conv: QTemporalConv | None = None
         if config.q_mix == 'lerp':
             self.q_lerp = AcausalLerp(d, n_heads, half_dim, init_bias=config.q_lerp_bias)
+        elif config.q_mix == 'none':
+            pass
         elif config.q_mix == 'conv2':
             self.q_conv = QTemporalConv(n_heads, half_dim, kernel_size=2)
         elif config.q_mix == 'conv3':
@@ -206,7 +218,8 @@ class ULBBlock(nn.Module):
         k = self.k_norm(k) * self.k_bias
 
         # --- Temporal lerps (before RoPE) ---
-        k = self.k_lerp(k, x)
+        if self.k_lerp is not None:
+            k = self.k_lerp(k, x)
         if self.q_lerp is not None:
             q = self.q_lerp(q, x)
         elif self.q_conv is not None:
