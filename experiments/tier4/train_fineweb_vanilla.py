@@ -683,7 +683,7 @@ class FusedGatedNeighborBlock(nn.Module):
         # Down-project (with Swish)
         y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
 
-        return x + y
+        return y
 
 
 class TransformerShiftBlock(nn.Module):
@@ -886,7 +886,7 @@ class GPTFusedGatedNeighbor(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
-            x = block(x)
+            x = x + block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
