@@ -1220,108 +1220,51 @@ class StackedModel(nn.Module):
         return self.final_norm(x)
 
 
-class MoEStackedModel(nn.Module):
-    """MoE grid: n_experts wide × n_layers tall.
-    
-    v1 (original): each layer routes itself — router picks experts, weighted sum of outputs.
-    v2 (sender-routed): previous layer's output decides next layer's routing.
-       Merge weights computed AFTER expert outputs are available.
+class ChorusModel(nn.Module):
+    """Chorus: n_voices wide × n_layers tall.
+    All voices sing, judge scores their outputs, weighted merge.
+    No router, no top-k — every voice contributes.
     """
-    def __init__(self, make_layer, n_layers, dim, n_experts=4, top_k=2, version=1):
+    def __init__(self, make_layer, n_layers, dim, n_voices=4):
         super().__init__()
         self.n_layers = n_layers
-        self.n_experts = n_experts
-        self.top_k = top_k
-        self.version = version
-        # Grid of experts: [layer][expert]
-        self.experts = nn.ModuleList([
-            nn.ModuleList([make_layer() for _ in range(n_experts)])
+        self.n_voices = n_voices
+        # Grid of voices: [layer][voice]
+        self.voices = nn.ModuleList([
+            nn.ModuleList([make_layer() for _ in range(n_voices)])
             for _ in range(n_layers)
         ])
-        # Per-layer pre-norm
+        # Per-layer pre-norm and judge
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
+        self.judges = nn.ModuleList([nn.Linear(dim, 1, bias=False) for _ in range(n_layers)])
+        # Learned layer weighting for final output
+        self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))  # +1 for input
         self.final_norm = RMSNorm(dim)
 
-        if version == 1:
-            # v1: per-layer router decides own experts, blind weighting
-            self.routers = nn.ModuleList([nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)])
-            self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))
-        elif version == 2:
-            # v2: sender-routed — layer l's output routes to layer l+1
-            # Layer 0 routing comes from input content
-            # n_layers routers: router[l] uses layer l's output to pick layer l+1 experts
-            # (router[0] uses input to pick layer 0 experts)
-            self.routers = nn.ModuleList([nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)])
-            # Per-layer merge scorer: looks at expert outputs to decide weights
-            self.merge_scorers = nn.ModuleList([nn.Linear(dim, 1, bias=False) for _ in range(n_layers)])
-            # Learned layer weighting for final output
-            self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))
-
-    def _v1_forward(self, x):
-        B, T, D = x.shape
-        layer_outputs = [x]
-
-        for norm, router, experts in zip(self.norms, self.routers, self.experts):
-            h = norm(x)
-            h_pool = h.mean(dim=1)
-            logits = router(h_pool)
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)
-            topk_weights = F.softmax(topk_vals, dim=-1)
-
-            expert_outs = torch.stack([e(h) for e in experts], dim=2)
-            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)
-            selected = expert_outs.gather(2, idx_expanded)
-            out = (selected * topk_weights[:, None, :, None]).sum(dim=2)
-            x = x + out
-            layer_outputs.append(x)
-
-        w = F.softmax(self.layer_weights, dim=0)
-        x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
-        return self.final_norm(x)
-
-    def _v2_forward(self, x):
-        B, T, D = x.shape
-        layer_outputs = [x]
-
-        # Initial routing decision from input content
-        route_signal = x.mean(dim=1)  # (B, D)
-
-        for l, (norm, experts) in enumerate(zip(self.norms, self.experts)):
-            h = norm(x)
-
-            # Routing: decided by previous layer's output (or input for layer 0)
-            logits = self.routers[l](route_signal)  # (B, n_experts)
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
-
-            # Run all experts, gather top-k per sample
-            expert_outs = torch.stack([e(h) for e in experts], dim=2)  # (B, T, n_experts, D)
-            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)  # (B, T, top_k, D)
-            selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
-
-            # Merge: score each expert output AFTER computation
-            # Pool each expert's output, score it, add router logits for gradient flow
-            selected_pooled = selected.mean(dim=1)  # (B, top_k, D)
-            output_scores = self.merge_scorers[l](selected_pooled).squeeze(-1)  # (B, top_k)
-            # Gather the router logits for selected experts — gives router gradient signal
-            router_scores = topk_vals  # (B, top_k) — already the top-k logits
-            scores = output_scores + router_scores
-            merge_weights = F.softmax(scores, dim=-1)  # (B, top_k)
-
-            out = (selected * merge_weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
-            x = x + out
-            layer_outputs.append(x)
-
-            # This layer's output becomes routing signal for next layer
-            route_signal = x.mean(dim=1)  # (B, D)
-
-        w = F.softmax(self.layer_weights, dim=0)
-        x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
-        return self.final_norm(x)
-
     def forward(self, x):
-        if self.version == 2:
-            return self._v2_forward(x)
-        return self._v1_forward(x)
+        B, T, D = x.shape
+        layer_outputs = [x]
+
+        for norm, voices, judge in zip(self.norms, self.voices, self.judges):
+            h = norm(x)
+
+            # All voices sing
+            voice_outs = torch.stack([v(h) for v in voices], dim=2)  # (B, T, n_voices, D)
+
+            # Judge scores each voice output (pool over seq, score, softmax)
+            pooled = voice_outs.mean(dim=1)  # (B, n_voices, D)
+            scores = judge(pooled).squeeze(-1)  # (B, n_voices)
+            weights = F.softmax(scores, dim=-1)  # (B, n_voices)
+
+            # Weighted merge
+            out = (voice_outs * weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
+            x = x + out
+            layer_outputs.append(x)
+
+        # Learned layer weighting
+        w = F.softmax(self.layer_weights, dim=0)
+        x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
+        return self.final_norm(x)
 
 
 def _stack(make_layer, n_layers, dim):
@@ -1329,9 +1272,9 @@ def _stack(make_layer, n_layers, dim):
     return StackedModel(make_layer, n_layers, dim)
 
 
-def _stack_moe(make_layer, n_layers, dim, n_experts=4, top_k=2, version=1):
-    """Wrap with MoE stacking."""
-    return MoEStackedModel(make_layer, n_layers, dim, n_experts=n_experts, top_k=top_k, version=version)
+def _stack_chorus(make_layer, n_layers, dim, n_voices=4):
+    """Wrap with Chorus stacking."""
+    return ChorusModel(make_layer, n_layers, dim, n_voices=n_voices)
 
 
 def _count_stacked_params(make_fn, n_layers, dim):
@@ -1482,25 +1425,15 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True):
     try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
 
-    # MoE v1: 4 experts × n_layers, top-2 routing, blind weighting
-    if _wanted('FusedGateBlendP_MoE'):
+    # Chorus: 4 voices × n_layers, all sing, judge merges
+    if _wanted('BlendP_Chorus'):
         try:
-            models['FusedGateBlendP_MoE'] = _stack_moe(
+            models['BlendP_Chorus'] = _stack_chorus(
                 lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
-                n_layers, dim, n_experts=4, top_k=2, version=1,
+                n_layers, dim, n_voices=4,
             )
         except Exception as e:
-            print(f"  Warning: FusedGateBlendP_MoE failed to initialize ({e})")
-
-    # MoE v2: sender-routed, merge weights from expert outputs
-    if _wanted('FusedGateBlendP_MoE2'):
-        try:
-            models['FusedGateBlendP_MoE2'] = _stack_moe(
-                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
-                n_layers, dim, n_experts=4, top_k=2, version=2,
-            )
-        except Exception as e:
-            print(f"  Warning: FusedGateBlendP_MoE2 failed to initialize ({e})")
+            print(f"  Warning: BlendP_Chorus failed to initialize ({e})")
 
     return models
 
