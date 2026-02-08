@@ -814,7 +814,7 @@ def _make_activation_hook(name, store, active_flag):
     return hook
 
 
-def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, device='cpu',
+def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, device='cpu',
                preloaded_data=None, early_stop_acc=0.99, grad_log_every=50,
                grad_explode=1e3, grad_vanish=1e-6, act_log_every=50,
                act_explode=1e3, usb_debug_every=0):
@@ -961,11 +961,12 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     
     n_train = len(train_data)
 
-    # Linear warmup: 1 epoch of steps, from lr/10 to lr
+    # Linear warmup: 1 epoch of steps, from 1e-5 to lr
     warmup_steps = n_train
+    warmup_ratio = 1e-5 / lr if lr > 0 else 0.1
     def warmup_fn(step):
         if step < warmup_steps:
-            return 0.1 + 0.9 * step / warmup_steps
+            return warmup_ratio + (1.0 - warmup_ratio) * step / warmup_steps
         return 1.0
     scheduler = optim.lr_scheduler.LambdaLR(opt, warmup_fn)
     total_steps = 0
@@ -1335,7 +1336,7 @@ if __name__ == '__main__':
             if args.compile:
                 model = torch.compile(model, mode=args.compile_mode)
             
-            r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-3, B=B, L=L, device=DEVICE,
+            r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-4, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data, early_stop_acc=args.early_stop_acc,
                            grad_log_every=args.grad_log_every,
                            grad_explode=args.grad_explode,
