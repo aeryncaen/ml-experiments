@@ -1702,40 +1702,45 @@ if __name__ == '__main__':
         print(f"\nResults written to {args.csv}")
 
     # Print markdown summary table
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 120)
     print("## Benchmark Results\n")
-    
+    print(f"Global setup: dim={dim}, layers={n_layers}, B={B}, L={L}, max_epochs={max_epochs}, train_batches={n_train}, val_batches={n_val}")
+    print()
+
     # Group by task for clearer presentation
     for task in tasks:
         print(f"### {task}\n")
         if task == 'mixed':
             subtask_hdrs = " | ".join(f"{t}" for t in ALL_TASKS)
-            print(f"| Model | Params | Val Acc | {subtask_hdrs} | Best @ | Epochs | Stop | Time |")
+            print(f"| Rank | Model | Params | Init Loss | Best Loss | Val Acc | Min Subtask | {subtask_hdrs} | Best @ | Epochs | Stop | Time |")
             sep_cols = " | ".join("------:" for _ in ALL_TASKS)
-            print(f"|:------|-------:|--------:| {sep_cols} |-------:|-------:|:-----|-----:|")
+            print(f"|----:|:------|-------:|----------:|----------:|--------:|------------:| {sep_cols} |-------:|-------:|:-----|-----:|")
         else:
-            print("| Model | Params | Val Acc | Best @ | Epochs | Stop Reason | Time |")
-            print("|:------|-------:|--------:|-------:|-------:|:------------|-----:|")
-        
+            print("| Rank | Model | Params | Init Loss | Best Loss | Val Acc | Best @ | Epochs | Stop | Time |")
+            print("|----:|:------|-------:|----------:|----------:|--------:|-------:|-------:|:-----|-----:|")
+
         task_results = [r for r in all_results if r['task'] == task]
-        # Sort by val_acc descending
         task_results.sort(key=lambda x: x['val_acc'], reverse=True)
-        
-        for r in task_results:
+
+        for rank, r in enumerate(task_results, start=1):
             acc_str = f"{r['val_acc']:.1%}"
             if r['converged']:
                 acc_str = f"**{acc_str}**"
-            
+
             best_epoch = r.get('best_epoch', r['epochs'])
             stop = r.get('stop_reason', 'MAX_EPOCH')
             wall_s = r.get('wall_s', 0)
-            
+            init_loss = r.get('initial_loss', float('nan'))
+            best_loss = r.get('final_loss', float('nan'))
+
             if task == 'mixed':
-                sub_cols = " | ".join(f"{r.get(f'acc_{t}', 0):.1%}" for t in ALL_TASKS)
-                print(f"| {r['model']} | {r['params']:,} | {acc_str} | {sub_cols} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
+                sub_vals = [r.get(f'acc_{t}', 0.0) for t in ALL_TASKS]
+                min_sub = min(sub_vals) if sub_vals else 0.0
+                sub_cols = " | ".join(f"{a:.1%}" for a in sub_vals)
+                print(f"| {rank} | {r['model']} | {r['params']:,} | {init_loss:.4f} | {best_loss:.4f} | {acc_str} | {min_sub:.1%} | {sub_cols} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
             else:
-                print(f"| {r['model']} | {r['params']:,} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
-        
+                print(f"| {rank} | {r['model']} | {r['params']:,} | {init_loss:.4f} | {best_loss:.4f} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
+
         print()
     
     # Legend
