@@ -1199,6 +1199,8 @@ def _count_layer_params(make_fn):
     m = make_fn()
     n = sum(p.numel() for p in m.parameters())
     del m
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return n
 
 
@@ -1212,15 +1214,20 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
     layer_target = (target_params - stacking_overhead) // n_layers
 
     best_knob, best_diff = lo, float('inf')
+    iters = 0
     while lo <= hi:
         mid = (lo + hi) // 2
+        iters += 1
+        print(f"    _find_knob: iter={iters} lo={lo} hi={hi} mid={mid}", flush=True)
         try:
             layer_n = _count_layer_params(make_fn_factory(mid))
-        except Exception:
+        except Exception as e:
+            print(f"    _find_knob: mid={mid} failed: {e}", flush=True)
             hi = mid - 1
             continue
         total_n = layer_n * n_layers + stacking_overhead
         diff = abs(total_n - target_params)
+        print(f"    _find_knob: mid={mid} -> {total_n:,} params (diff={diff:,})", flush=True)
         if diff < best_diff:
             best_diff = diff
             best_knob = mid
@@ -1230,6 +1237,7 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
             hi = mid - 1
         else:
             break
+    print(f"    _find_knob: chose knob={best_knob} ({iters} iters)", flush=True)
     return best_knob
 
 
@@ -1253,8 +1261,11 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True):
         except Exception:
             pass  # FusedGateBlock not available, skip matching
     
+    def _wanted(name):
+        return requested_models is None or name in requested_models
+
     def try_add(name, make_fn):
-        if requested_models is not None and name not in requested_models:
+        if not _wanted(name):
             return
         try:
             models[name] = _stack(make_fn, n_layers, dim)
@@ -1267,21 +1278,21 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True):
     try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True))
 
     # S4D: auto-size d_state to match target
-    if target_params:
+    if target_params and _wanted('S4D'):
         s4d_dstate = _find_knob(lambda k: lambda: S4D(d_model=dim, d_state=k), n_layers, dim, target_params)
     else:
         s4d_dstate = 144
     try_add('S4D', lambda: S4D(d_model=dim, d_state=s4d_dstate))
 
     # S5: auto-size state_width to match target
-    if target_params:
+    if target_params and _wanted('S5'):
         s5_sw = _find_knob(lambda k: lambda: S5Wrapper(width=dim, state_width=k), n_layers, dim, target_params)
     else:
         s5_sw = 140
     try_add('S5', lambda: S5Wrapper(width=dim, state_width=s5_sw))
 
     # Mamba: auto-size d_state to match target (expand=1 fixed)
-    if target_params:
+    if target_params and _wanted('Mamba'):
         mamba_dstate = _find_knob(lambda k: lambda: MambaWrapper(d_model=dim, d_state=k, d_conv=4, expand=1), n_layers, dim, target_params)
     else:
         mamba_dstate = 72
