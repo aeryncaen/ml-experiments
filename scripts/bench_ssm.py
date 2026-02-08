@@ -1442,12 +1442,12 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         s5_sw = 140
     try_add('S5', lambda: S5Wrapper(width=dim, state_width=s5_sw))
 
-    # Mamba: auto-size d_state to match target (expand=1 fixed)
+    # Mamba: auto-size d_state to match target (expand=2 default)
     if target_params and _wanted('Mamba'):
-        mamba_dstate = _find_knob(lambda k: lambda: MambaWrapper(d_model=dim, d_state=k, d_conv=4, expand=1), n_layers, dim, target_params)
+        mamba_dstate = _find_knob(lambda k: lambda: MambaWrapper(d_model=dim, d_state=k, d_conv=4, expand=2), n_layers, dim, target_params)
     else:
         mamba_dstate = 72
-    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=mamba_dstate, d_conv=4, expand=1))
+    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=mamba_dstate, d_conv=4, expand=2))
 
     # USB: Full MHA with directional scans (elementwise state - good for state tracking)
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
