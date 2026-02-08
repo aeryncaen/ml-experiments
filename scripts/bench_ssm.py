@@ -1293,10 +1293,15 @@ class MoEStackedModel(nn.Module):
             logits = self.routers[l](route_signal)  # (B, n_experts)
             topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
 
-            # Run selected experts
-            expert_outs = torch.stack([e(h) for e in experts], dim=2)  # (B, T, n_experts, D)
-            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)
-            selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
+            # Sparse dispatch: only run each expert on samples routed to it
+            selected = torch.zeros(B, T, self.top_k, D, device=x.device)
+            for k_slot in range(self.top_k):
+                expert_ids = topk_idx[:, k_slot]  # (B,) — which expert for this slot
+                for e_id in range(self.n_experts):
+                    mask = (expert_ids == e_id)  # (B,) bool
+                    if mask.any():
+                        batch_idx = mask.nonzero(as_tuple=True)[0]
+                        selected[batch_idx, :, k_slot, :] = experts[e_id](h[batch_idx])
 
             # Merge: score each expert output AFTER computation
             # Pool each expert's output, score it, add router logits for gradient flow
