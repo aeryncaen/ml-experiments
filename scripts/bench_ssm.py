@@ -410,42 +410,22 @@ class FusedGateBlock(nn.Module):
         return weights @ v
 
     def _blend_attention(self, q, k, v, gate):
-        """Gated blend of normalized softmax and normalized SiLU² attention.
+        """Output-level lerp between softmax and normalized SiLU² attention.
         gate: (B, H, T, 1) — per-position, per-head blend ratio (sigmoid).
-        weights = (1 - gate) * norm(softmax) + gate * norm(silu²)
+        y = (1 - gate) * softmax_attn(q,k,v) + gate * silu2_attn(q,k,v)
         """
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        logits = (q @ k.transpose(-2, -1)) * scale
-        T = logits.shape[-1]
-        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
-        # Normalized softmax
-        softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
-        w_softmax = torch.softmax(softmax_logits, dim=-1)
-        # Normalized silu²
-        w_silu2 = F.silu(logits) ** 2 * causal_mask
-        w_silu2 = w_silu2 / (w_silu2.sum(dim=-1, keepdim=True) + 1e-6)
-        # Convex combination
-        weights = (1 - gate) * w_softmax + gate * w_silu2
-        return weights @ v
+        y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y_silu2 = self._silu2_attention(q, k, v)
+        return (1 - gate) * y_softmax + gate * y_silu2
 
     def _blend_relu2_attention(self, q, k, v, gate):
-        """Gated blend of normalized softmax and normalized ReLU² attention.
+        """Output-level lerp between softmax and normalized ReLU² attention.
         gate: (B, H, T, 1) — per-position, per-head blend ratio (sigmoid).
-        weights = (1 - gate) * norm(softmax) + gate * norm(relu²)
+        y = (1 - gate) * softmax_attn(q,k,v) + gate * relu2_attn(q,k,v)
         """
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        logits = (q @ k.transpose(-2, -1)) * scale
-        T = logits.shape[-1]
-        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
-        # Normalized softmax
-        softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
-        w_softmax = torch.softmax(softmax_logits, dim=-1)
-        # Normalized relu²
-        w_relu2 = F.relu(logits) ** 2 * causal_mask
-        w_relu2 = w_relu2 / (w_relu2.sum(dim=-1, keepdim=True) + 1e-6)
-        # Convex combination
-        weights = (1 - gate) * w_softmax + gate * w_relu2
-        return weights @ v
+        y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y_relu2 = self._relu2_attention(q, k, v)
+        return (1 - gate) * y_softmax + gate * y_relu2
 
     def _attend(self, q, k, v, blend_gate=None):
         """Dispatch to the configured attention mode."""
