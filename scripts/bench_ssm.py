@@ -212,11 +212,12 @@ class FusedGateBlock(nn.Module):
     Matches the fused_gate architecture from train_fineweb_vanilla.py.
     """
 
-    def __init__(self, d_model, n_heads=4, paired=False):
+    def __init__(self, d_model, n_heads=4, paired=False, attn_mode='softmax'):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_heads
         self.paired = paired
+        self.attn_mode = attn_mode
         self.inner_dim = d_model  # no expansion
         assert self.inner_dim % n_heads == 0
         self.head_dim = self.inner_dim // n_heads
@@ -378,6 +379,19 @@ class FusedGateBlock(nn.Module):
 
         return torch.cat([h0, h1], dim=-1)
 
+    def _silu2_attention(self, q, k, v):
+        """SiLU² attention: replace softmax with silu(logits)².
+        q, k, v: (B, H, T, D) — standard SDPA layout.
+        Returns: (B, H, T, D)
+        """
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        logits = (q @ k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        # Causal mask: zero out future positions
+        T = logits.shape[-1]
+        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        weights = F.silu(logits) ** 2 * causal_mask
+        return weights @ v
+
     def _k_causal_lerp(self, k, gate):
         """1-step causal lerp on last quarter of K channels.
         k:    (B, T, H, head_dim)
@@ -443,13 +457,19 @@ class FusedGateBlock(nn.Module):
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if self.attn_mode == 'silu2':
+                y = self._silu2_attention(q, k, v)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             q = self._hybrid_rope(q, dd_angles)
             k = self._hybrid_rope(k, dd_angles)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if self.attn_mode == 'silu2':
+                y = self._silu2_attention(q, k, v)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
@@ -1167,6 +1187,10 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # FusedGatePaired: same but with paired head attention
     try_add('FusedGatePaired', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True))
+
+    # SiLU² attention variants
+    try_add('FusedGateSilu2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='silu2'))
+    try_add('FusedGateSilu2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='silu2'))
 
     return models
 
