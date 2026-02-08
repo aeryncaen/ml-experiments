@@ -541,7 +541,7 @@ class DS1Wrapper(nn.Module):
 # Unified vocab: 64 tokens (0-31 normal, 32-63 marked for selective_copy)
 # All generators return (input, target) both (B, L) with ignore_index=-100 where needed.
 VOCAB_SIZE = 64
-ALL_TASKS = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
+ALL_TASKS = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith', 'chain_trace', 'freq_count']
 
 
 def gen_delay(B, L, device='cpu'):
@@ -605,6 +605,214 @@ def gen_induction(B, L, device='cpu'):
     return inp, tgt
 
 
+def gen_chain_trace(B, L, num_chains=3, num_hops=3, device='cpu'):
+    """Multi-hop pointer chasing with randomly shuffled bindings.
+
+    Each sample contains `num_chains` independent chains of `num_hops` links:
+        chain 0: a0 -> a1 -> a2 -> ... -> a_{num_hops}
+        chain 1: b0 -> b1 -> b2 -> ... -> b_{num_hops}
+        ...
+
+    Bindings are encoded as adjacent token pairs [key, value] placed at random
+    positions throughout the sequence body. The last `num_chains` positions are
+    queries: input is the chain start token, target is the chain terminal token.
+    All non-query positions have target = -100.
+
+    Uses tokens 0-31. All chain nodes are distinct within a sample.
+    """
+    n_nodes_per_chain = num_hops + 1  # start + num_hops intermediates/terminal
+    total_nodes = num_chains * n_nodes_per_chain
+    n_bindings = num_chains * num_hops  # each link is one binding pair
+    body_len = L - num_chains  # sequence body (before query section)
+    binding_slots = n_bindings * 2  # each binding takes 2 positions
+
+    assert total_nodes <= 32, f"Need {total_nodes} distinct nodes but vocab only has 32"
+    assert binding_slots <= body_len, f"Need {binding_slots} slots for bindings but body is {body_len}"
+
+    inp = torch.zeros(B, L, dtype=torch.long, device=device)
+    tgt = torch.full((B, L), -100, dtype=torch.long, device=device)
+
+    for b in range(B):
+        # Sample distinct node tokens for all chains
+        all_nodes = torch.randperm(32, device=device)[:total_nodes]
+        chains = all_nodes.view(num_chains, n_nodes_per_chain)
+        # chains[c] = [start, hop1, hop2, ..., terminal]
+
+        # Build binding pairs: (key, value) for each link
+        bindings = []
+        for c in range(num_chains):
+            for h in range(num_hops):
+                bindings.append((chains[c, h].item(), chains[c, h + 1].item()))
+        # Shuffle bindings randomly
+        random.shuffle(bindings)
+
+        # Place bindings in the body, fill rest with random noise
+        body = torch.randint(0, 32, (body_len,), device=device)
+        # Choose random positions for binding pairs (non-overlapping)
+        pair_starts = torch.randperm(body_len - 1, device=device)[:n_bindings]
+        # Sort so we can place them without overlap issues — use slot-based placement instead
+        # Simpler approach: allocate first n_bindings*2 slots, then shuffle all body positions
+        body_tokens = torch.randint(0, 32, (body_len,), device=device)
+        # Overwrite first binding_slots positions with bindings, then permute
+        for i, (k, v) in enumerate(bindings):
+            body_tokens[i * 2] = k
+            body_tokens[i * 2 + 1] = v
+        # Random permutation of body preserving pair adjacency:
+        # Shuffle at the pair level for binding slots, then interleave with noise
+        n_noise = body_len - binding_slots
+        noise = torch.randint(0, 32, (n_noise,), device=device)
+        # Build chunks: each binding is a 2-token chunk, each noise is a 1-token chunk
+        chunks = []
+        for i in range(n_bindings):
+            chunks.append(body_tokens[i * 2: i * 2 + 2])
+        for i in range(n_noise):
+            chunks.append(noise[i:i + 1])
+        # Shuffle chunks
+        chunk_order = list(range(len(chunks)))
+        random.shuffle(chunk_order)
+        body = torch.cat([chunks[i] for i in chunk_order])
+
+        inp[b, :body_len] = body
+
+        # Query section: last num_chains positions
+        for c in range(num_chains):
+            qpos = body_len + c
+            inp[b, qpos] = chains[c, 0]          # chain start token
+            tgt[b, qpos] = chains[c, -1]          # chain terminal token
+
+    return inp, tgt
+
+
+def gen_freq_count(B, L, n_targets=3, freq_thresh=5, n_vocab_subset=16, device='cpu'):
+    """Frequency counting: identify tokens that appear >= freq_thresh times.
+
+    The sequence body contains tokens from a subset of [0, n_vocab_subset).
+    `n_targets` tokens are guaranteed to appear exactly `freq_thresh` times.
+    Other tokens appear fewer times (0 to freq_thresh-2).
+
+    The last `n_targets` positions are queries: input is a special marker (the
+    target token itself), target is the count bucket (0 = below threshold,
+    1 = at/above threshold). Wait — simpler: the last n_targets positions
+    have input = target_token and target = target_token, so the model must
+    learn to "echo back" only the frequent tokens.
+
+    Actually, cleaner design: the last `n_targets` positions present candidate
+    tokens and the model must predict 1 if freq >= thresh, 0 if not. But that's
+    binary classification, not token prediction.
+
+    Cleanest design matching our conventions: body has tokens, then query section
+    presents candidate tokens. Target at query positions is the candidate token
+    if it was frequent (>= thresh), or a fixed "no" token otherwise.
+
+    Even cleaner: last `n_targets * 2` positions alternate between frequent and
+    infrequent candidates. Target = the token itself if frequent, -100 otherwise.
+
+    Simplest design that matches existing conventions:
+    - Body: L - n_targets positions of random tokens from [0, n_vocab_subset)
+      with n_targets tokens each planted exactly freq_thresh times
+    - Query: last n_targets positions. Input = each target token.
+      Target = that same token (model must echo it back, confirming it's frequent).
+    - We also include n_targets distractor queries interspersed? No — keep it simple.
+    - Actually, to make it non-trivial: query section has 2*n_targets positions,
+      alternating frequent and infrequent tokens. Target = token if frequent, -100 if not.
+
+    Let's go with: query section has `n_targets` positions, each presenting a
+    frequent token. Target = the token. The model must learn that only tokens
+    appearing many times in the body are valid answers. Non-frequent distractors
+    would just get -100.
+
+    To make this harder and test real counting, let's present BOTH frequent and
+    infrequent tokens as queries:
+    - n_queries = 2 * n_targets  (half frequent, half infrequent)
+    - For frequent queries: target = 1 (binary "yes, frequent")
+    - For infrequent queries: target = 0 (binary "no, not frequent")
+
+    This is a binary classification at each query position. Tokens {0,1} as targets.
+    """
+    n_queries = 2 * n_targets
+    body_len = L - n_queries
+
+    assert n_targets <= n_vocab_subset, "More targets than vocab subset"
+    assert freq_thresh * n_targets <= body_len, (
+        f"Can't plant {n_targets} tokens {freq_thresh} times each in body of {body_len}")
+    assert n_vocab_subset <= 32, "Vocab subset must fit in [0, 32)"
+
+    inp = torch.zeros(B, L, dtype=torch.long, device=device)
+    tgt = torch.full((B, L), -100, dtype=torch.long, device=device)
+
+    for b in range(B):
+        # Pick target tokens (will be frequent) and distractor tokens (infrequent)
+        all_tokens = torch.randperm(n_vocab_subset, device=device)
+        freq_tokens = all_tokens[:n_targets]
+        # Pick n_targets infrequent tokens from the remainder
+        remaining = all_tokens[n_targets:]
+        infr_tokens = remaining[:n_targets]
+
+        # Build body: start with random tokens from vocab subset
+        body = torch.randint(0, n_vocab_subset, (body_len,), device=device)
+
+        # Remove any accidental occurrences of freq_tokens and infr_tokens
+        # to control counts precisely. Replace them with random non-target tokens.
+        safe_tokens = []
+        for t in range(n_vocab_subset):
+            if t not in freq_tokens and t not in infr_tokens:
+                safe_tokens.append(t)
+        if len(safe_tokens) == 0:
+            # Edge case: all tokens are either freq or infr. Use freq_thresh-1
+            # for infrequent tokens and just be careful.
+            safe_tokens = infr_tokens.tolist()
+
+        # Replace all target/distractor occurrences in body with safe noise
+        mask_freq = torch.zeros(body_len, dtype=torch.bool, device=device)
+        mask_infr = torch.zeros(body_len, dtype=torch.bool, device=device)
+        for ft in freq_tokens:
+            mask_freq |= (body == ft)
+        for it in infr_tokens:
+            mask_infr |= (body == it)
+        replace_mask = mask_freq | mask_infr
+        n_replace = replace_mask.sum().item()
+        if n_replace > 0:
+            replacements = torch.tensor(
+                [safe_tokens[i % len(safe_tokens)] for i in range(n_replace)],
+                device=device, dtype=torch.long)
+            body[replace_mask] = replacements
+
+        # Plant frequent tokens exactly freq_thresh times each
+        # and infrequent tokens exactly (freq_thresh - 2) times each (or 1 if thresh < 3)
+        infr_count = max(1, freq_thresh - 2)
+        total_plants = n_targets * freq_thresh + n_targets * infr_count
+        assert total_plants <= body_len, (
+            f"Not enough body space for planting: need {total_plants}, have {body_len}")
+
+        plant_positions = torch.randperm(body_len, device=device)[:total_plants]
+        pos_idx = 0
+        for ft in freq_tokens:
+            for _ in range(freq_thresh):
+                body[plant_positions[pos_idx]] = ft
+                pos_idx += 1
+        for it in infr_tokens:
+            for _ in range(infr_count):
+                body[plant_positions[pos_idx]] = it
+                pos_idx += 1
+
+        inp[b, :body_len] = body
+
+        # Query section: interleave frequent and infrequent tokens, shuffled
+        query_tokens = torch.cat([freq_tokens, infr_tokens])
+        query_labels = torch.cat([
+            torch.ones(n_targets, dtype=torch.long, device=device),    # 1 = frequent
+            torch.zeros(n_targets, dtype=torch.long, device=device),   # 0 = not frequent
+        ])
+        perm = torch.randperm(n_queries, device=device)
+        query_tokens = query_tokens[perm]
+        query_labels = query_labels[perm]
+
+        inp[b, body_len:] = query_tokens
+        tgt[b, body_len:] = query_labels
+
+    return inp, tgt
+
+
 def gen_mixed(B, L, device='cpu'):
     """Mixed batch: each sample drawn from a random task.
     Returns (input, target, task_ids) where task_ids is (B,) index into ALL_TASKS."""
@@ -619,6 +827,7 @@ def gen_mixed(B, L, device='cpu'):
         _g = {
             'delay': gen_delay, 'selective_copy': gen_selective_copy,
             'induction': gen_induction, 'parity': gen_parity, 'mod_arith': gen_mod_arith,
+            'chain_trace': gen_chain_trace, 'freq_count': gen_freq_count,
         }
         x, t = _g[task](1, L, device=device)
         inp[b] = x[0]
@@ -659,6 +868,8 @@ def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, devi
             'parity': lambda: gen_parity(B, L, device='cpu'),
             'mod_arith': lambda: gen_mod_arith(B, L, device='cpu'),
             'induction': lambda: gen_induction(B, L, device='cpu'),
+            'chain_trace': lambda: gen_chain_trace(B, L, device='cpu'),
+            'freq_count': lambda: gen_freq_count(B, L, device='cpu'),
             'mixed': lambda: gen_mixed(B, L, device='cpu'),
         }
         def gen_batch(task_name):

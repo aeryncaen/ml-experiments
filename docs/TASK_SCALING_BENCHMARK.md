@@ -54,12 +54,26 @@ Tasks that require maintaining and updating a running state.
 | **parity** | bench_ssm | Cumulative XOR (binary state) | binary input |
 | **mod_arith** | bench_ssm | Cumulative sum mod base (multi-valued state) | mod_base=5 |
 
-### Summary: 8 tasks, 3 families
+### Family D: RULER-Inspired (Multi-Hop & Aggregation)
+
+Pure synthetic distillations of RULER task categories. No language, no pretraining — just the computational primitives.
+
+| Task | Source | What it tests | Key params |
+|------|--------|---------------|------------|
+| **chain_trace** | bench_ssm (RULER variable_tracking) | Multi-hop pointer chasing through shuffled binding chains | num_chains=3, num_hops=3, vocab=32 |
+| **freq_count** | bench_ssm (RULER common_words_extraction) | Global frequency counting — classify tokens as frequent/infrequent | n_targets=3, freq_thresh=5, vocab_subset=16 |
+
+**chain_trace**: Sequence body contains `[key, value]` binding pairs for N chains of M hops each (e.g., a→b, b→c, c→d), randomly shuffled among noise tokens. Query section presents chain start tokens; target is the chain terminal. Bindings are in arbitrary order — the model must resolve transitive dependencies regardless of presentation order. This tests multi-hop composition, a capability axis not covered by any other task.
+
+**freq_count**: Sequence body contains tokens from a vocab subset with controlled frequencies. Some tokens appear exactly `freq_thresh` times (frequent), others appear fewer times (infrequent). Query section presents both frequent and infrequent candidate tokens; target is binary (1=frequent, 0=infrequent). Tests global aggregation / counting over the full context.
+
+### Summary: 10 tasks, 4 families
 
 ```
-Family A (Recall):    delay, selective_copy, MQAR, forgetting_MQAR
-Family B (Pattern):   induction, compositional_MQAR
-Family C (State):     parity, mod_arith
+Family A (Recall):     delay, selective_copy, MQAR, forgetting_MQAR
+Family B (Pattern):    induction, compositional_MQAR
+Family C (State):      parity, mod_arith
+Family D (RULER):      chain_trace, freq_count
 ```
 
 ---
@@ -163,25 +177,27 @@ For each (model, tier, task_set, seed):
 
 ## Evaluation Sets
 
-### Tier 1: Single Task (8 runs per model per seed)
-Each of the 8 tasks trained independently.
+### Tier 1: Single Task (10 runs per model per seed)
+Each of the 10 tasks trained independently.
 
-### Tier 2: Multi-Task Family (3 runs per model per seed)
+### Tier 2: Multi-Task Family (4 runs per model per seed)
 - **Family A** (4 tasks): delay + selective_copy + MQAR + forgetting_MQAR
 - **Family B** (2 tasks): induction + compositional_MQAR
 - **Family C** (2 tasks): parity + mod_arith
+- **Family D** (2 tasks): chain_trace + freq_count
 
-### Tier 3: Multi-Family Set (2 runs per model per seed)
-- **All recall + pattern** (6 tasks): Family A + Family B
-- **Full set** (8 tasks): Family A + Family B + Family C
+### Tier 3: Multi-Family Set (3 runs per model per seed)
+- **Recall + Pattern** (6 tasks): Family A + Family B
+- **Recall + RULER** (6 tasks): Family A + Family D
+- **Full set** (10 tasks): Family A + Family B + Family C + Family D
 
 ### Total runs per model
-- Tier 1: 8 tasks × 3 seeds = 24
-- Tier 2: 3 families × 3 seeds = 9
-- Tier 3: 2 sets × 3 seeds = 6
-- **Total: 39 runs per model**
+- Tier 1: 10 tasks × 3 seeds = 30
+- Tier 2: 4 families × 3 seeds = 12
+- Tier 3: 3 sets × 3 seeds = 9
+- **Total: 51 runs per model**
 
-With 8+ models × 39 runs = 312+ training runs at 1 layer. At ~2 min/run on RTX 6000, that's ~10 hours. Multi-layer scaling (2, 4 layers) triples this to ~30 hours.
+With 8+ models × 51 runs = 408+ training runs at 1 layer. At ~2 min/run on RTX 6000, that's ~14 hours. Multi-layer scaling (2, 4 layers) triples this to ~42 hours.
 
 ---
 
@@ -233,6 +249,8 @@ ULBBlendP,tier2,family_a,42,forgetting_MQAR,0.82,3.46,0.42,50
 ## Implementation Plan
 
 ### Phase 1: New task generators
+- [x] `gen_chain_trace(B, L, num_chains, num_hops, device)` — multi-hop pointer chasing, shuffled bindings
+- [x] `gen_freq_count(B, L, n_targets, freq_thresh, n_vocab_subset, device)` — global frequency counting
 - [ ] `gen_mqar(B, L, kv_pairs, power_a=0.01, device)` — base MQAR with vocab=64 split
 - [ ] `gen_forgetting_mqar(B, L, kv_pairs, num_updates, device)` — MQAR with value overwrites
 - [ ] `gen_compositional_mqar(B, L, kv_pairs, device)` — compound-key MQAR
@@ -242,7 +260,7 @@ ULBBlendP,tier2,family_a,42,forgetting_MQAR,0.82,3.46,0.42,50
 - [ ] Support tier-2 family groupings and tier-3 multi-family sets
 
 ### Phase 3: Runner script
-- [ ] `scripts/run_task_scaling_benchmark.py` — drives all 39×N runs
+- [ ] `scripts/run_task_scaling_benchmark.py` — drives all 51×N runs
 - [ ] Per-run CSV output with full config columns
 - [ ] Aggregate JSON summarizer
 - [ ] Dry-run mode (print plan, don't execute)
@@ -260,4 +278,5 @@ ULBBlendP,tier2,family_a,42,forgetting_MQAR,0.82,3.46,0.42,50
 2. **Sequence length scaling**: Should we also sweep L=64, 128, 256 to test length generalization, or fix L=128?
 3. **kv_pairs as difficulty dial**: For MQAR tasks, should each kv_pairs setting be a separate "task" in the mix, or one MQAR task with variable kv_pairs per sample?
 4. **Compositional MQAR vocab pressure**: With 3-way vocab split (21/21/22), we have at most 4×4=16 compound keys for kv_pairs=16. Is this enough range?
-5. **Additional families**: Should we add a Family D (e.g., sorting, majority, sequence reversal) for broader coverage in later versions?
+5. **chain_trace difficulty tuning**: Default num_chains=3, num_hops=3 uses 12 distinct nodes out of 32 vocab. With deeper chains or more chains, vocab pressure increases. Max feasible: 32/(num_hops+1) chains.
+6. **freq_count threshold sensitivity**: freq_thresh=5 with n_targets=3 plants 15 frequent + 9 infrequent tokens in the body. Should threshold scale with L?
