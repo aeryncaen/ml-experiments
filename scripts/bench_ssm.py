@@ -891,16 +891,46 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             inp, tgt, task_ids = batch
         else:
             inp, tgt = batch
-        y = head(model(embed(inp)))
-        logits_flat = y.reshape(-1, vocab_size)
-        tgt_flat = tgt.reshape(-1)
-        loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
-        with torch.no_grad():
-            mask = tgt_flat != -100
-            if mask.any():
-                acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
-            else:
-                acc = 0.0
+        B_cur = inp.shape[0]
+        y = head(model(embed(inp)))  # (B, L, V)
+
+        if task_name == 'mixed' and B_cur > 1:
+            # Hard mining: per-sample loss, weight hard samples more
+            per_sample_loss = torch.zeros(B_cur, device=inp.device)
+            per_sample_correct = torch.zeros(B_cur, device=inp.device)
+            per_sample_count = torch.zeros(B_cur, device=inp.device)
+            for i in range(B_cur):
+                logits_i = y[i]  # (L, V)
+                tgt_i = tgt[i]   # (L,)
+                valid = tgt_i != -100
+                if valid.any():
+                    per_sample_loss[i] = F.cross_entropy(logits_i[valid], tgt_i[valid])
+                    per_sample_count[i] = valid.sum()
+                    with torch.no_grad():
+                        per_sample_correct[i] = (logits_i[valid].argmax(-1) == tgt_i[valid]).float().mean()
+            with torch.no_grad():
+                loss_vals = per_sample_loss.detach()
+                lo_v, hi_v = loss_vals.min(), loss_vals.max()
+                if hi_v > lo_v:
+                    ranks = (loss_vals - lo_v) / (hi_v - lo_v)  # 0=easy, 1=hard
+                    weights = 0.5 + 1.5 * ranks  # [0.5, 2.0]
+                else:
+                    weights = torch.ones_like(loss_vals)
+                weights = weights / weights.mean()
+            loss = (per_sample_loss * weights).mean()
+            with torch.no_grad():
+                valid_mask = per_sample_count > 0
+                acc = per_sample_correct[valid_mask].mean().item() if valid_mask.any() else 0.0
+        else:
+            logits_flat = y.reshape(-1, vocab_size)
+            tgt_flat = tgt.reshape(-1)
+            loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
+            with torch.no_grad():
+                mask = tgt_flat != -100
+                if mask.any():
+                    acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+                else:
+                    acc = 0.0
         return loss, acc
 
     def _eval_val():
