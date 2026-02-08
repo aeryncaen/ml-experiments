@@ -886,7 +886,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     train_data = preloaded_data['train']
     val_data = preloaded_data['val']
 
-    def _forward(batch, hard_mine=True):
+    def _forward(batch):
         if task_name == 'mixed':
             inp, tgt, task_ids = batch
         else:
@@ -894,8 +894,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         B_cur = inp.shape[0]
         y = head(model(embed(inp)))  # (B, L, V)
 
-        if hard_mine and B_cur > 1:
-            # Per-sample loss for hard mining
+        if task_name == 'mixed' and B_cur > 1:
+            # Hard mining: per-sample loss, weight hard samples more
             per_sample_loss = torch.zeros(B_cur, device=inp.device)
             per_sample_correct = torch.zeros(B_cur, device=inp.device)
             per_sample_count = torch.zeros(B_cur, device=inp.device)
@@ -908,17 +908,15 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                     per_sample_count[i] = valid.sum()
                     with torch.no_grad():
                         per_sample_correct[i] = (logits_i[valid].argmax(-1) == tgt_i[valid]).float().mean()
-            # Weight: normalize per-sample loss to [0,1] range, then bias toward hard samples
             with torch.no_grad():
                 loss_vals = per_sample_loss.detach()
                 lo_v, hi_v = loss_vals.min(), loss_vals.max()
                 if hi_v > lo_v:
-                    # Rank-based weight: hardest sample gets weight ~2, easiest ~0.5
-                    ranks = ((loss_vals - lo_v) / (hi_v - lo_v))  # 0=easy, 1=hard
+                    ranks = (loss_vals - lo_v) / (hi_v - lo_v)  # 0=easy, 1=hard
                     weights = 0.5 + 1.5 * ranks  # [0.5, 2.0]
                 else:
                     weights = torch.ones_like(loss_vals)
-                weights = weights / weights.mean()  # normalize so mean weight = 1
+                weights = weights / weights.mean()
             loss = (per_sample_loss * weights).mean()
             with torch.no_grad():
                 valid_mask = per_sample_count > 0
