@@ -511,8 +511,8 @@ class FusedGateBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip-multiply
-        y = self.attn_norm(y) * h_up
+        # Skip-add
+        y = self.attn_norm(y) + h_up
 
         # Down-project with Swish
         y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
