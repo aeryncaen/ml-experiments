@@ -750,9 +750,10 @@ class FusedGateKVBlock(nn.Module):
 class FusedGatePreSeqBlock(nn.Module):
     """Variant: 1-step gated neighbor lerp on h_up (pre-QKV) instead of on K.
     No scan — the sequence itself is blended before projection into Q/K/V.
+    blend_frac controls what fraction of inner_dim channels are blended (default 0.5).
     """
 
-    def __init__(self, d_model, n_heads=4, paired=False):
+    def __init__(self, d_model, n_heads=4, paired=False, blend_frac=0.5):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_heads
@@ -760,7 +761,9 @@ class FusedGatePreSeqBlock(nn.Module):
         self.inner_dim = d_model
         assert self.inner_dim % n_heads == 0
         self.head_dim = self.inner_dim // n_heads
-        self.half_dim = self.head_dim // 2
+        self.blend_dim = int(self.inner_dim * blend_frac)
+        assert self.blend_dim > 0
+        self.static_dim = self.inner_dim - self.blend_dim
 
         self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
@@ -780,9 +783,8 @@ class FusedGatePreSeqBlock(nn.Module):
             inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
 
-        # Gate for pre-sequence blending (operates on inner_dim, not head-split)
-        # Half the channels get blended with previous position
-        self.neighbor_gate_proj = nn.Linear(d_model, self.inner_dim // 2, bias=True)
+        # Gate for pre-sequence blending (operates on blend_dim channels)
+        self.neighbor_gate_proj = nn.Linear(d_model, self.blend_dim, bias=True)
         nn.init.zeros_(self.neighbor_gate_proj.weight)
         nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
 
@@ -813,11 +815,10 @@ class FusedGatePreSeqBlock(nn.Module):
         h_up = self.up_proj(x)
         h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
 
-        # Blend h_up with previous position (second half of channels)
-        half_inner = self.inner_dim // 2
-        gate = torch.sigmoid(self.neighbor_gate_proj(x))  # (B, T, inner_dim//2)
-        h_static = h_up[:, :, :half_inner]
-        h_cur = h_up[:, :, half_inner:]
+        # Blend h_up with previous position (last blend_dim channels)
+        gate = torch.sigmoid(self.neighbor_gate_proj(x))  # (B, T, blend_dim)
+        h_static = h_up[:, :, :self.static_dim]
+        h_cur = h_up[:, :, self.static_dim:]
         h_prev = F.pad(h_cur[:, :-1], (0, 0, 1, 0))
         h_blended = (1 - gate) * h_cur + gate * h_prev
         h_up_mixed = torch.cat([h_static, h_blended], dim=-1)
@@ -1587,6 +1588,12 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # FusedGateKVP_q4: same but paired
     try_add('FusedGateKVP_q4', lambda: FusedGateKVBlock(d_model=dim, n_heads=4, paired=True, blend_frac=0.25))
+
+    # FusedGatePreSeq_q4: pre-sequence blend on 1/4 of channels
+    try_add('FusedGatePreSeq_q4', lambda: FusedGatePreSeqBlock(d_model=dim, n_heads=4, paired=False, blend_frac=0.25))
+
+    # FusedGatePreSeqP_q4: same but paired
+    try_add('FusedGatePreSeqP_q4', lambda: FusedGatePreSeqBlock(d_model=dim, n_heads=4, paired=True, blend_frac=0.25))
 
     return models
 
