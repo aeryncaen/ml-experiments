@@ -278,7 +278,7 @@ class FusedGateBlock(nn.Module):
         if attn_mode == 'blend':
             self.blend_gate_proj = nn.Linear(d_model, n_heads, bias=True)
             nn.init.zeros_(self.blend_gate_proj.weight)
-            nn.init.constant_(self.blend_gate_proj.bias, -4.0)
+            nn.init.constant_(self.blend_gate_proj.bias, 0.0)
             self.silu2_norm = nn.RMSNorm(self.head_dim)
 
     @staticmethod
