@@ -628,11 +628,12 @@ class FusedGateBlock(nn.Module):
 
 
 class FusedGateKVBlock(nn.Module):
-    """Variant: 1-step gated neighbor lerp on both K and V (same gate, same half channels).
+    """Variant: 1-step gated neighbor lerp on both K and V (same gate, same blend channels).
     No scan — just single-step lookback on K and V.
+    blend_frac controls what fraction of head_dim channels are blended (default 0.5 = half).
     """
 
-    def __init__(self, d_model, n_heads=4, paired=False):
+    def __init__(self, d_model, n_heads=4, paired=False, blend_frac=0.5):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_heads
@@ -640,7 +641,9 @@ class FusedGateKVBlock(nn.Module):
         self.inner_dim = d_model
         assert self.inner_dim % n_heads == 0
         self.head_dim = self.inner_dim // n_heads
-        self.half_dim = self.head_dim // 2
+        self.blend_dim = int(self.head_dim * blend_frac)
+        assert self.blend_dim > 0, f"blend_frac={blend_frac} too small for head_dim={self.head_dim}"
+        self.static_dim = self.head_dim - self.blend_dim
 
         self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
         self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
@@ -660,7 +663,7 @@ class FusedGateKVBlock(nn.Module):
             inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
 
-        self.neighbor_gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        self.neighbor_gate_proj = nn.Linear(d_model, n_heads * self.blend_dim, bias=True)
         nn.init.zeros_(self.neighbor_gate_proj.weight)
         nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
 
@@ -687,17 +690,17 @@ class FusedGateKVBlock(nn.Module):
         return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
 
     def _gated_neighbor_kv(self, k, v, gate):
-        """1-step lerp on second half of both K and V channels."""
-        half = self.half_dim
+        """1-step lerp on last blend_dim channels of both K and V."""
+        sd = self.static_dim
         # K
-        k_static = k[:, :, :, :half]
-        k_cur = k[:, :, :, half:]
+        k_static = k[:, :, :, :sd]
+        k_cur = k[:, :, :, sd:]
         k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
         k_mixed = (1 - gate) * k_cur + gate * k_prev
         k_out = torch.cat([k_static, k_mixed], dim=-1)
         # V
-        v_static = v[:, :, :, :half]
-        v_cur = v[:, :, :, half:]
+        v_static = v[:, :, :, :sd]
+        v_cur = v[:, :, :, sd:]
         v_prev = F.pad(v_cur[:, :-1], (0, 0, 0, 0, 1, 0))
         v_mixed = (1 - gate) * v_cur + gate * v_prev
         v_out = torch.cat([v_static, v_mixed], dim=-1)
@@ -716,7 +719,7 @@ class FusedGateKVBlock(nn.Module):
         k = self.k_norm(k)
 
         # 1-step neighbor on K and V (before RoPE/pairing)
-        gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
+        gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.blend_dim)
         k, v = self._gated_neighbor_kv(k, v, gate)
 
         if self.paired:
@@ -1578,6 +1581,12 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # FusedGatePreSeqP: same but paired
     try_add('FusedGatePreSeqP', lambda: FusedGatePreSeqBlock(d_model=dim, n_heads=4, paired=True))
+
+    # FusedGateKV_q4: KV blend on only 1/4 of head_dim (75% clean channels)
+    try_add('FusedGateKV_q4', lambda: FusedGateKVBlock(d_model=dim, n_heads=4, paired=False, blend_frac=0.25))
+
+    # FusedGateKVP_q4: same but paired
+    try_add('FusedGateKVP_q4', lambda: FusedGateKVBlock(d_model=dim, n_heads=4, paired=True, blend_frac=0.25))
 
     return models
 
