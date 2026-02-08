@@ -1198,8 +1198,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             best_subtask_accs = subtask_accs
         
         if subtask_accs is not None:
-            parts = " ".join(f"{t[:3]}={a:.0%}" for t, a in subtask_accs.items())
-            epoch_pbar.set_postfix_str(f"val_loss={val_loss:.4f} val_acc={val_acc:.1%} | {parts}")
+            _short = {'delay': 'D', 'selective_copy': 'S', 'induction': 'I', 'parity': 'P', 'mod_arith': 'M'}
+            parts = " ".join(f"{_short[t]}={a:.0%}" for t, a in subtask_accs.items())
+            epoch_pbar.set_postfix_str(f"L={val_loss:.3f} A={val_acc:.0%} {parts}")
         else:
             epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
