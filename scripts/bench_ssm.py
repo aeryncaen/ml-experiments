@@ -1200,19 +1200,22 @@ def count_params(model):
 
 
 class StackedModel(nn.Module):
-    """Stack N identical layers with pre-norm residual connections + embed residual."""
+    """Stack N identical layers with pre-norm residual connections + content-dependent embed residual."""
     def __init__(self, make_layer, n_layers, dim):
         super().__init__()
         self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
-        # Per-layer learnable scale for embedding residual (init zero = no-op)
-        self.embed_alpha = nn.Parameter(torch.zeros(n_layers))
+        # Per-layer content-dependent embed gate: hidden queries embed (init near-zero)
+        self.embed_gates = nn.ModuleList([nn.Linear(dim, dim, bias=True) for _ in range(n_layers)])
+        for gate in self.embed_gates:
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, -2.0)
 
     def forward(self, x):
         x0 = x
-        for i, (norm, layer) in enumerate(zip(self.norms, self.layers)):
-            x = x + layer(norm(x)) + self.embed_alpha[i] * x0
+        for norm, layer, gate in zip(self.norms, self.layers, self.embed_gates):
+            x = x + layer(norm(x)) + torch.sigmoid(gate(x)) * x0
         return self.final_norm(x)
 
 
