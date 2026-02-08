@@ -5,8 +5,7 @@ SSM-equivalent capabilities (state tracking, pattern matching) purely through
 attention preprocessing, with zero sequential scan.
 
 Architecture (forward pass):
-    h_up = up_proj(x)
-    h_up = learnable_swish_up(h_up)
+    h_up = sub_expert_route(x, up_projs, swish_ups)  # per-token routed
 
     q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up)
     q = q_norm(q) * q_bias       # per-head RMSNorm + post-norm bias
@@ -22,7 +21,7 @@ Architecture (forward pass):
     y = attend(q, k, v)          # softmax, silu2, or blend
 
     y = attn_norm(y) * h_up      # skip-MULTIPLY (not skip-add)
-    y = down_proj(learnable_swish_down(y))
+    y = sub_expert_route(y, down_projs, swish_downs)  # per-token routed
     return y                      # caller does x = x + block(x)
 
 Key design decisions (preserved from FusedGateBlock):
@@ -33,6 +32,8 @@ Key design decisions (preserved from FusedGateBlock):
     - No expansion — inner_dim = d_model
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
+    - Up/down projections are per-token routed sub-experts (default 4, top-2).
+      Each sub-expert has its own linear + learned swish. Pointwise routing.
 """
 
 from dataclasses import dataclass, field
@@ -62,6 +63,11 @@ class ULBConfig:
         k_lerp_bias:     Initial bias for K causal lerp gate (default -2.0).
         q_lerp_bias:     Initial bias for Q acausal lerp gates (default -2.0).
         blend_gate_bias: Initial bias for blend attention gate (default -1.1, ~25% silu2).
+        n_sub_experts:   Number of sub-expert linear pairs for up/down projections.
+                         Each sub-expert has its own linear + learned swish.
+                         Routed per-token (pointwise, so no causality issue).
+                         Default 4.
+        sub_top_k:       How many sub-experts to activate per token (default 2).
     """
     d_model: int = 128
     n_heads: int = 4
@@ -74,6 +80,8 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
+    n_sub_experts: int = 4
+    sub_top_k: int = 2
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
@@ -116,24 +124,31 @@ class ULBBlock(nn.Module):
         n_heads = config.n_heads
         head_dim = config.head_dim
 
-        # --- Projections ---
-        self.up_proj = nn.Linear(d, inner, bias=False)
-        self.down_proj = nn.Linear(inner, d, bias=False)
+        # --- Sub-expert routed projections ---
+        # Per-token routed up/down projection pairs, each with its own
+        # learned activation. Pointwise, so no causality issue.
+        n_sub = config.n_sub_experts
+        self.n_sub = n_sub
+        self.sub_top_k = config.sub_top_k
+
+        self.up_projs = nn.ModuleList([nn.Linear(d, inner, bias=False) for _ in range(n_sub)])
+        self.down_projs = nn.ModuleList([nn.Linear(inner, d, bias=False) for _ in range(n_sub)])
+        self.up_router = nn.Linear(d, n_sub, bias=False)
+        self.down_router = nn.Linear(inner, n_sub, bias=False)
+
+        if config.swish_mode == 'learnable':
+            self.swish_ups = nn.ModuleList([LearnableSwish(inner) for _ in range(n_sub)])
+            self.swish_downs = nn.ModuleList([LearnableSwish(inner) for _ in range(n_sub)])
+        elif config.swish_mode == 'silu':
+            self.swish_ups = nn.ModuleList([nn.SiLU() for _ in range(n_sub)])
+            self.swish_downs = nn.ModuleList([nn.SiLU() for _ in range(n_sub)])
+        else:
+            raise ValueError(f"Unknown swish_mode: {config.swish_mode}")
 
         # QKV: KV have bias, Q does not
         self.q_proj = nn.Linear(inner, inner, bias=False)
         self.k_proj = nn.Linear(inner, inner, bias=True)
         self.v_proj = nn.Linear(inner, inner, bias=True)
-
-        # --- Learnable Swish ---
-        if config.swish_mode == 'learnable':
-            self.swish_up = LearnableSwish(inner)
-            self.swish_down = LearnableSwish(inner)
-        elif config.swish_mode == 'silu':
-            self.swish_up = nn.SiLU()
-            self.swish_down = nn.SiLU()
-        else:
-            raise ValueError(f"Unknown swish_mode: {config.swish_mode}")
 
         # --- Post-attention norm (before skip-multiply) ---
         self.attn_norm = nn.RMSNorm(inner)
@@ -174,6 +189,33 @@ class ULBBlock(nn.Module):
             self.blend_attn = BlendAttention(
                 d, n_heads, head_dim, init_bias=config.blend_gate_bias)
 
+    def _sub_expert_forward(self, x: torch.Tensor, router: nn.Linear,
+                            projs: nn.ModuleList, activations: nn.ModuleList,
+                            ) -> torch.Tensor:
+        """Per-token routed sub-expert projection.
+
+        Args:
+            x: (B, T, D_in)
+            router: Linear(D_in, n_sub)
+            projs: list of n_sub Linear(D_in, D_out)
+            activations: list of n_sub activation modules
+
+        Returns:
+            (B, T, D_out) — weighted sum of top-k sub-expert outputs.
+        """
+        logits = router(x)  # (B, T, n_sub)
+        topk_vals, topk_idx = logits.topk(self.sub_top_k, dim=-1)  # (B, T, k)
+        topk_weights = F.softmax(topk_vals, dim=-1)  # (B, T, k)
+
+        # Run all sub-experts, gather top-k
+        expert_outs = torch.stack(
+            [act(proj(x)) for proj, act in zip(projs, activations)],
+            dim=2)  # (B, T, n_sub, D_out)
+        D_out = expert_outs.shape[-1]
+        idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D_out)  # (B, T, k, D_out)
+        selected = expert_outs.gather(2, idx_expanded)  # (B, T, k, D_out)
+        return (selected * topk_weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D_out)
+
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 blend_gate: torch.Tensor | None = None) -> torch.Tensor:
         """Dispatch to the configured attention mode.
@@ -205,8 +247,8 @@ class ULBBlock(nn.Module):
         n_heads = cfg.n_heads
         head_dim = cfg.head_dim
 
-        # --- Up-project and activate ---
-        h_up = self.swish_up(self.up_proj(x))
+        # --- Up-project and activate (sub-expert routed) ---
+        h_up = self._sub_expert_forward(x, self.up_router, self.up_projs, self.swish_ups)
 
         # --- QKV projections ---
         q = self.q_proj(h_up).view(b, t, n_heads, head_dim)
@@ -267,7 +309,7 @@ class ULBBlock(nn.Module):
         # --- Skip-multiply (NOT skip-add) ---
         y = self.attn_norm(y) * h_up
 
-        # --- Down-project with Swish ---
-        y = self.down_proj(self.swish_down(y))
+        # --- Down-project with Swish (sub-expert routed) ---
+        y = self._sub_expert_forward(y, self.down_router, self.down_projs, self.swish_downs)
 
         return y
