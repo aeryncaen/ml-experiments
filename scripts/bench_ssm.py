@@ -1194,24 +1194,39 @@ def _count_stacked_params(make_fn, n_layers, dim):
     return n
 
 
+def _count_layer_params(make_fn):
+    """Count params of a single layer (fast, no stacking)."""
+    m = make_fn()
+    n = sum(p.numel() for p in m.parameters())
+    del m
+    return n
+
+
 def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
     """Binary search for the integer knob value that gets closest to target_params.
-    make_fn_factory(knob) should return a make_fn (callable that creates one layer)."""
+    make_fn_factory(knob) should return a make_fn (callable that creates one layer).
+    Uses single-layer param counting + overhead formula for speed."""
+    # Compute stacking overhead once: norms per layer + final norm
+    norm_params_per_layer = dim  # RMSNorm has dim params
+    stacking_overhead = (n_layers + 1) * norm_params_per_layer  # n_layers norms + final_norm
+    layer_target = (target_params - stacking_overhead) // n_layers
+
     best_knob, best_diff = lo, float('inf')
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
-            n = _count_stacked_params(make_fn_factory(mid), n_layers, dim)
+            layer_n = _count_layer_params(make_fn_factory(mid))
         except Exception:
             hi = mid - 1
             continue
-        diff = abs(n - target_params)
+        total_n = layer_n * n_layers + stacking_overhead
+        diff = abs(total_n - target_params)
         if diff < best_diff:
             best_diff = diff
             best_knob = mid
-        if n < target_params:
+        if total_n < target_params:
             lo = mid + 1
-        elif n > target_params:
+        elif total_n > target_params:
             hi = mid - 1
         else:
             break
