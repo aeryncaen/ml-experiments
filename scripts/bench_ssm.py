@@ -1135,14 +1135,14 @@ def make_models(dim, n_layers=1, requested_models=None):
     # DS1++: DS1 + signed sparse attention
     try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True))
 
-    # S4D: ~50K params/layer
-    try_add('S4D', lambda: S4D(d_model=dim, d_state=320))
+    # S4D: ~27K params/layer (d_state=144 → 27,008 params)
+    try_add('S4D', lambda: S4D(d_model=dim, d_state=144))
 
-    # S5: ~50K params/layer
-    try_add('S5', lambda: S5Wrapper(width=dim, state_width=256))
+    # S5: ~27K params/layer (state_width=140 → 27,352 params)
+    try_add('S5', lambda: S5Wrapper(width=dim, state_width=140))
 
-    # Mamba: ~51K params/layer
-    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=64, d_conv=4, expand=2))
+    # Mamba: ~27K params/layer (expand=1, d_state=72 → 27,200 params)
+    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=72, d_conv=4, expand=1))
 
     # USB: Full MHA with directional scans (elementwise state - good for state tracking)
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
