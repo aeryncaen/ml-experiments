@@ -386,56 +386,65 @@ class FusedGateBlock(nn.Module):
         return torch.cat([h0, h1], dim=-1)
 
     def _silu2_attention(self, q, k, v):
-        """SiLU² attention: replace softmax with silu(logits)².
+        """Normalized SiLU² attention: silu(logits)², row-normalized.
         q, k, v: (B, H, T, D) — standard SDPA layout.
-        Returns: (B, H, T, D)
         """
         scale = 1.0 / math.sqrt(q.shape[-1])
-        logits = (q @ k.transpose(-2, -1)) * scale  # (B, H, T, T)
-        # Causal mask: zero out future positions
+        logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
         causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
         weights = F.silu(logits) ** 2 * causal_mask
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         return weights @ v
 
     def _relu2_attention(self, q, k, v):
-        """ReLU² attention: replace softmax with relu(logits)².
+        """Normalized ReLU² attention: relu(logits)², row-normalized.
         q, k, v: (B, H, T, D) — standard SDPA layout.
-        Returns: (B, H, T, D)
         """
         scale = 1.0 / math.sqrt(q.shape[-1])
         logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
         causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
         weights = F.relu(logits) ** 2 * causal_mask
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         return weights @ v
 
     def _blend_attention(self, q, k, v, gate):
-        """Softmax + content-dependent SiLU² correction.
-        gate: (B, H, T, 1) — per-position, per-head blend ratio.
+        """Gated blend of normalized softmax and normalized SiLU² attention.
+        gate: (B, H, T, 1) — per-position, per-head blend ratio (sigmoid).
+        weights = (1 - gate) * norm(softmax) + gate * norm(silu²)
         """
         scale = 1.0 / math.sqrt(q.shape[-1])
         logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
         causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        # Normalized softmax
         softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
         w_softmax = torch.softmax(softmax_logits, dim=-1)
+        # Normalized silu²
         w_silu2 = F.silu(logits) ** 2 * causal_mask
-        weights = w_softmax + gate * w_silu2
+        w_silu2 = w_silu2 / (w_silu2.sum(dim=-1, keepdim=True) + 1e-6)
+        # Convex combination
+        weights = (1 - gate) * w_softmax + gate * w_silu2
         return weights @ v
 
     def _blend_relu2_attention(self, q, k, v, gate):
-        """Softmax + content-dependent ReLU² correction.
-        gate: (B, H, T, 1) — per-position, per-head blend ratio.
+        """Gated blend of normalized softmax and normalized ReLU² attention.
+        gate: (B, H, T, 1) — per-position, per-head blend ratio (sigmoid).
+        weights = (1 - gate) * norm(softmax) + gate * norm(relu²)
         """
         scale = 1.0 / math.sqrt(q.shape[-1])
         logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
         causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        # Normalized softmax
         softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
         w_softmax = torch.softmax(softmax_logits, dim=-1)
+        # Normalized relu²
         w_relu2 = F.relu(logits) ** 2 * causal_mask
-        weights = w_softmax + gate * w_relu2
+        w_relu2 = w_relu2 / (w_relu2.sum(dim=-1, keepdim=True) + 1e-6)
+        # Convex combination
+        weights = (1 - gate) * w_softmax + gate * w_relu2
         return weights @ v
 
     def _attend(self, q, k, v, blend_gate=None):
