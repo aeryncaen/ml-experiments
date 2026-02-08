@@ -168,6 +168,7 @@ from ds_moe.model import DS1, RMSNorm
 # ---------------------------------------------------------------------------
 from s6.usb_block import USBBlock, USBConfig
 from ideal.stack import IdealWrapper
+from ulb import ULBBlock, ULBConfig
 
 
 class USBWrapper(nn.Module):
@@ -1484,6 +1485,9 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # Blend: output-level lerp between softmax and silu², content-dependent gate
     try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
+
+    # ULB (Universal Learning Block) — generalized FusedGateBlock from src/ulb/
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')))
 
     return models
 
