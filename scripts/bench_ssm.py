@@ -190,11 +190,17 @@ class USBWrapper(nn.Module):
 
 
 class MHABlock(nn.Module):
-    """Causal conv3 → causal MHA."""
-    def __init__(self, d_model, n_heads=4, se_reduction=4):
+    """Causal conv3 → causal MHA → SwiGLU MLP."""
+    def __init__(self, d_model, n_heads=4, mlp_inner=0):
         super().__init__()
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0, groups=d_model, bias=True)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.has_mlp = mlp_inner > 0
+        if self.has_mlp:
+            self.mlp_norm = RMSNorm(d_model)
+            self.gate_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.up_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.down_proj = nn.Linear(mlp_inner, d_model, bias=False)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -202,6 +208,9 @@ class MHABlock(nn.Module):
         h = self.conv(h).transpose(1, 2)
         mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
         h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
+        if self.has_mlp:
+            r = self.mlp_norm(h)
+            h = h + self.down_proj(F.silu(self.gate_proj(r)) * self.up_proj(r))
         return h
 
 
@@ -953,14 +962,18 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     
     n_train = len(train_data)
 
-    # Linear warmup: 1 epoch of steps, from lr/10 to lr
+    # Cosine annealing with linear warmup: 1 epoch warmup from lr/10, then cosine decay to lr/100
     warmup_steps = n_train
-    warmup_ratio = 0.1
-    def warmup_fn(step):
+    total_training_steps = n_train * max_epochs
+    warmup_ratio = 0.1    # start at lr * 0.1
+    min_ratio = 0.01      # decay to lr * 0.01
+    def lr_schedule(step):
         if step < warmup_steps:
             return warmup_ratio + (1.0 - warmup_ratio) * step / warmup_steps
-        return 1.0
-    scheduler = optim.lr_scheduler.LambdaLR(opt, warmup_fn)
+        # Cosine decay from 1.0 to min_ratio over remaining steps
+        progress = (step - warmup_steps) / max(1, total_training_steps - warmup_steps)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+    scheduler = optim.lr_scheduler.LambdaLR(opt, lr_schedule)
     total_steps = 0
     initial_loss = None
 
@@ -1173,12 +1186,57 @@ def _stack(make_layer, n_layers, dim):
     return StackedModel(make_layer, n_layers, dim)
 
 
-def make_models(dim, n_layers=1, requested_models=None):
-    """Build models with configurable depth. Param counts are per-layer (~50-57K).
+def _count_stacked_params(make_fn, n_layers, dim):
+    """Count params of a StackedModel without keeping it around."""
+    m = _stack(make_fn, n_layers, dim)
+    n = sum(p.numel() for p in m.parameters())
+    del m
+    return n
+
+
+def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
+    """Binary search for the integer knob value that gets closest to target_params.
+    make_fn_factory(knob) should return a make_fn (callable that creates one layer)."""
+    best_knob, best_diff = lo, float('inf')
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            n = _count_stacked_params(make_fn_factory(mid), n_layers, dim)
+        except Exception:
+            hi = mid - 1
+            continue
+        diff = abs(n - target_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_knob = mid
+        if n < target_params:
+            lo = mid + 1
+        elif n > target_params:
+            hi = mid - 1
+        else:
+            break
+    return best_knob
+
+
+def make_models(dim, n_layers=1, requested_models=None, match_params=True):
+    """Build models with configurable depth.
     
+    If match_params=True, auto-size SSM/MHA internal dimensions to match FusedGateBlendP param count.
     If requested_models is provided, only build those models (skips unavailable ones with warning).
     """
     models = {}
+    
+    # Compute reference param count from FusedGateBlendP
+    target_params = None
+    if match_params:
+        try:
+            target_params = _count_stacked_params(
+                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
+                n_layers, dim
+            )
+            print(f"  Auto-sizing to match FusedGateBlendP: {target_params:,} params")
+        except Exception:
+            pass  # FusedGateBlock not available, skip matching
     
     def try_add(name, make_fn):
         if requested_models is not None and name not in requested_models:
@@ -1193,14 +1251,26 @@ def make_models(dim, n_layers=1, requested_models=None):
     # DS1++: DS1 + signed sparse attention
     try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True))
 
-    # S4D: ~27K params/layer (d_state=144 → 27,008 params)
-    try_add('S4D', lambda: S4D(d_model=dim, d_state=144))
+    # S4D: auto-size d_state to match target
+    if target_params:
+        s4d_dstate = _find_knob(lambda k: lambda: S4D(d_model=dim, d_state=k), n_layers, dim, target_params)
+    else:
+        s4d_dstate = 144
+    try_add('S4D', lambda: S4D(d_model=dim, d_state=s4d_dstate))
 
-    # S5: ~27K params/layer (state_width=140 → 27,352 params)
-    try_add('S5', lambda: S5Wrapper(width=dim, state_width=140))
+    # S5: auto-size state_width to match target
+    if target_params:
+        s5_sw = _find_knob(lambda k: lambda: S5Wrapper(width=dim, state_width=k), n_layers, dim, target_params)
+    else:
+        s5_sw = 140
+    try_add('S5', lambda: S5Wrapper(width=dim, state_width=s5_sw))
 
-    # Mamba: ~27K params/layer (expand=1, d_state=72 → 27,200 params)
-    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=72, d_conv=4, expand=1))
+    # Mamba: auto-size d_state to match target (expand=1 fixed)
+    if target_params:
+        mamba_dstate = _find_knob(lambda k: lambda: MambaWrapper(d_model=dim, d_state=k, d_conv=4, expand=1), n_layers, dim, target_params)
+    else:
+        mamba_dstate = 72
+    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=mamba_dstate, d_conv=4, expand=1))
 
     # USB: Full MHA with directional scans (elementwise state - good for state tracking)
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
@@ -1214,8 +1284,12 @@ def make_models(dim, n_layers=1, requested_models=None):
     try_add('USB_hybrid', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
                                               scan_state_modes=('outer', 'outer', 'elementwise')))
 
-    # MHA: ~19K params/layer (QuadConv + MHA only, no MLP/Mamba to scale)
-    try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4))
+    # MHA: conv + attention + SwiGLU MLP, auto-size mlp_inner to match target
+    if target_params:
+        mha_mlp = _find_knob(lambda k: lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=k), n_layers, dim, target_params)
+    else:
+        mha_mlp = 0
+    try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp))
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0))
@@ -1267,6 +1341,8 @@ if __name__ == '__main__':
                         help='Specific models to test (default: all)')
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
                         help='Specific tasks to test (default: all)')
+    parser.add_argument('--no-match-params', action='store_true',
+                        help='Disable auto-sizing SSMs to match FusedGateBlendP param count')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
     args = parser.parse_args()
@@ -1285,7 +1361,8 @@ if __name__ == '__main__':
     B, L = args.batch_size, args.seq_len
 
     requested = args.models  # None means all available
-    models_info = make_models(dim, n_layers=n_layers, requested_models=requested)
+    match_params = not args.no_match_params
+    models_info = make_models(dim, n_layers=n_layers, requested_models=requested, match_params=match_params)
     all_names = list(models_info.keys())
     
     if not all_names:
@@ -1332,7 +1409,7 @@ if __name__ == '__main__':
             torch.manual_seed(SEED)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
-            model = make_models(dim, n_layers=n_layers, requested_models=[name])[name]
+            model = make_models(dim, n_layers=n_layers, requested_models=[name], match_params=match_params)[name]
             param_count = count_params(model)
             
             # Optionally compile the model
