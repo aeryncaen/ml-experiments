@@ -895,32 +895,28 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         y = head(model(embed(inp)))  # (B, L, V)
 
         if hard_mine and B_cur > 1:
-            # Hard mining: per-sample loss, weight hard samples more
-            per_sample_loss = torch.zeros(B_cur, device=inp.device)
-            per_sample_correct = torch.zeros(B_cur, device=inp.device)
-            per_sample_count = torch.zeros(B_cur, device=inp.device)
-            for i in range(B_cur):
-                logits_i = y[i]  # (L, V)
-                tgt_i = tgt[i]   # (L,)
-                valid = tgt_i != -100
-                if valid.any():
-                    per_sample_loss[i] = F.cross_entropy(logits_i[valid], tgt_i[valid])
-                    per_sample_count[i] = valid.sum()
-                    with torch.no_grad():
-                        per_sample_correct[i] = (logits_i[valid].argmax(-1) == tgt_i[valid]).float().mean()
+            # Hard mining (vectorized): per-sample loss, weight hard samples more
+            L_cur = tgt.shape[1]
+            # Per-position loss: (B, L)
+            per_pos_loss = F.cross_entropy(
+                y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
+            ).reshape(B_cur, L_cur)
+            valid_mask = tgt != -100  # (B, L)
+            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)  # (B,)
+            per_sample_loss = per_pos_loss.sum(dim=1) / valid_count  # (B,)
+            # Weights: rank by loss, hard=2x, easy=0.5x
             with torch.no_grad():
-                loss_vals = per_sample_loss.detach()
-                lo_v, hi_v = loss_vals.min(), loss_vals.max()
+                lo_v, hi_v = per_sample_loss.min(), per_sample_loss.max()
                 if hi_v > lo_v:
-                    ranks = (loss_vals - lo_v) / (hi_v - lo_v)  # 0=easy, 1=hard
-                    weights = 0.5 + 1.5 * ranks  # [0.5, 2.0]
+                    ranks = (per_sample_loss.detach() - lo_v) / (hi_v - lo_v)
+                    weights = 0.5 + 1.5 * ranks
                 else:
-                    weights = torch.ones_like(loss_vals)
+                    weights = torch.ones(B_cur, device=inp.device)
                 weights = weights / weights.mean()
+                preds = y.argmax(dim=-1)  # (B, L)
+                correct = ((preds == tgt) & valid_mask).float().sum(dim=1)
+                acc = (correct / valid_count).mean().item()
             loss = (per_sample_loss * weights).mean()
-            with torch.no_grad():
-                valid_mask = per_sample_count > 0
-                acc = per_sample_correct[valid_mask].mean().item() if valid_mask.any() else 0.0
         else:
             logits_flat = y.reshape(-1, vocab_size)
             tgt_flat = tgt.reshape(-1)
