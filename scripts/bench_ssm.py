@@ -308,15 +308,18 @@ class LearnedAttnActMLP(nn.Module):
 
 
 class MHABlock(nn.Module):
-    """QuadConv → MHA."""
+    """Causal conv3 → causal MHA."""
     def __init__(self, d_model, n_heads=4, se_reduction=4):
         super().__init__()
-        self.quad_conv = QuadConvMix(d_model, k=3, reduction=se_reduction)
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0, groups=d_model, bias=True)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
 
     def forward(self, x):
-        h = self.quad_conv(x)
-        h, _ = self.attn(h, h, h)
+        B, T, D = x.shape
+        h = F.pad(x.transpose(1, 2), (2, 0))
+        h = self.conv(h).transpose(1, 2)
+        mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
         return h
 
 
