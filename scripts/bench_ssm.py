@@ -274,6 +274,10 @@ class FusedGateBlock(nn.Module):
         nn.init.zeros_(self.q_gate_bwd_proj.weight)
         nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
+        # SiLU² blend parameter (only used when attn_mode='blend')
+        if attn_mode == 'blend':
+            self.silu2_alpha = nn.Parameter(torch.tensor(0.0))  # init at 0 → starts as pure softmax
+
     @staticmethod
     def _apply_rotary(x, cos, sin):
         """Apply rotary embedding. x: (..., 2*n_pairs), cos/sin: (..., n_pairs)."""
@@ -392,6 +396,33 @@ class FusedGateBlock(nn.Module):
         weights = F.silu(logits) ** 2 * causal_mask
         return weights @ v
 
+    def _blend_attention(self, q, k, v):
+        """Softmax + learnable SiLU² correction.
+        weights = softmax(logits) + alpha * silu(logits)² * causal_mask
+        Starts as pure softmax (alpha=0), learns to add sparse corrections.
+        """
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        logits = (q @ k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        T = logits.shape[-1]
+        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        # Softmax branch (needs -inf mask for causality)
+        softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
+        w_softmax = torch.softmax(softmax_logits, dim=-1)
+        # SiLU² branch
+        w_silu2 = F.silu(logits) ** 2 * causal_mask
+        # Blend
+        weights = w_softmax + self.silu2_alpha * w_silu2
+        return weights @ v
+
+    def _attend(self, q, k, v):
+        """Dispatch to the configured attention mode."""
+        if self.attn_mode == 'silu2':
+            return self._silu2_attention(q, k, v)
+        elif self.attn_mode == 'blend':
+            return self._blend_attention(q, k, v)
+        else:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
     def _k_causal_lerp(self, k, gate):
         """1-step causal lerp on last quarter of K channels.
         k:    (B, T, H, head_dim)
@@ -457,19 +488,13 @@ class FusedGateBlock(nn.Module):
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            if self.attn_mode == 'silu2':
-                y = self._silu2_attention(q, k, v)
-            else:
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = self._attend(q, k, v)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             q = self._hybrid_rope(q, dd_angles)
             k = self._hybrid_rope(k, dd_angles)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            if self.attn_mode == 'silu2':
-                y = self._silu2_attention(q, k, v)
-            else:
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = self._attend(q, k, v)
             y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
@@ -1191,6 +1216,10 @@ def make_models(dim, n_layers=1, requested_models=None):
     # SiLU² attention variants
     try_add('FusedGateSilu2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='silu2'))
     try_add('FusedGateSilu2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='silu2'))
+
+    # Blend: softmax + learnable silu² correction (alpha init 0 → starts as pure softmax)
+    try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
+    try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
 
     return models
 
