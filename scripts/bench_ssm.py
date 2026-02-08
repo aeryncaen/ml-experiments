@@ -962,11 +962,11 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     
     n_train = len(train_data)
 
-    # Cosine annealing with linear warmup: 1 epoch warmup from lr/10, then cosine decay to lr/100
+    # Cosine annealing with linear warmup: 1 epoch warmup from lr/10, then cosine decay to lr/20
     warmup_steps = n_train
     total_training_steps = n_train * max_epochs
     warmup_ratio = 0.1    # start at lr * 0.1
-    min_ratio = 0.01      # decay to lr * 0.01
+    min_ratio = 0.05      # decay to lr * 0.05
     def lr_schedule(step):
         if step < warmup_steps:
             return warmup_ratio + (1.0 - warmup_ratio) * step / warmup_steps
