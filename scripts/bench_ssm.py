@@ -478,6 +478,137 @@ class GatedNeighborAttnBlock(nn.Module):
         return h + h2
 
 
+class FusedGateBlock(nn.Module):
+    """Fused attention+MLP: up_proj → swish → QKV → attn → skip-multiply → swish → down_proj.
+
+    No internal residual — caller adds residual. No internal pre-norm — caller pre-norms.
+    Matches the fused_gate architecture from train_fineweb_vanilla.py.
+    """
+
+    def __init__(self, d_model, n_heads=4, paired=False):
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_heads
+        self.paired = paired
+        self.inner_dim = d_model  # no expansion
+        assert self.inner_dim % n_heads == 0
+        self.head_dim = self.inner_dim // n_heads
+        self.half_dim = self.head_dim // 2
+
+        # up/down projections
+        self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
+
+        # QKV (KV have bias)
+        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+
+        # Learnable Swish beta (per-channel)
+        self.swish_beta_up = nn.Parameter(torch.ones(self.inner_dim))
+        self.swish_beta_down = nn.Parameter(torch.ones(self.inner_dim))
+
+        # Post-attention norm (before skip-multiply)
+        self.attn_norm = nn.RMSNorm(self.inner_dim)
+
+        # QK norm
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+        # RoPE
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        if paired:
+            assert n_heads % 2 == 0
+            inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
+
+        # Neighbor gate: single lerp on half of K channels
+        self.neighbor_gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        nn.init.zeros_(self.neighbor_gate_proj.weight)
+        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+
+    def _rope(self, x):
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _paired_rope(self, x):
+        """Even/odd position encodings for paired head dim (2*head_dim width)."""
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq_paired.dtype)
+        t_even, t_odd = 2 * t, 2 * t + 1
+        freqs_even = torch.outer(t_even, self.inv_freq_paired)
+        freqs_odd = torch.outer(t_odd, self.inv_freq_paired)
+        cos = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
+        sin = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _gated_neighbor(self, k, gate):
+        half = self.half_dim
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
+    def forward(self, x):
+        b, t, d = x.shape
+
+        # Expand and activate
+        h_up = self.up_proj(x)
+        h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
+
+        # QKV
+        q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
+
+        # QK norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # Neighbor gate on K (before pairing)
+        gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
+        k = self._gated_neighbor(k, gate)
+
+        if self.paired:
+            n2 = self.n_head // 2
+            q = q.view(b, t, n2, self.head_dim * 2)
+            k = k.view(b, t, n2, self.head_dim * 2)
+            q = self._paired_rope(q)
+            k = self._paired_rope(k)
+            q = q.view(b, t * 2, n2, self.head_dim)
+            k = k.view(b, t * 2, n2, self.head_dim)
+            v = v.reshape(b, t * 2, n2, self.head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
+        else:
+            q = self._rope(q)
+            k = self._rope(k)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+
+        y = y.contiguous().view(b, t, self.inner_dim)
+
+        # Skip-multiply
+        y = self.attn_norm(y) * h_up
+
+        # Down-project with Swish
+        y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
+
+        return y
+
+
 class DS1Wrapper(nn.Module):
     def __init__(self, dim, state_dim=64, mimo_rank=4, n_iters=2, **kwargs):
         super().__init__()
@@ -1185,6 +1316,12 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # GatedNeighbor: attention with content-gated neighbor mixing on K
     try_add('GatedNeighbor', lambda: GatedNeighborAttnBlock(d_model=dim, n_heads=4, ffn_mult=4))
+
+    # FusedGate: fused attention+MLP block (up → swish → attn → skip-mul → swish → down)
+    try_add('FusedGate', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False))
+
+    # FusedGatePaired: same but with paired head attention
+    try_add('FusedGatePaired', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True))
 
     return models
 
