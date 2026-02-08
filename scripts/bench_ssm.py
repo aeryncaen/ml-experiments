@@ -1243,8 +1243,8 @@ class StackedModel(nn.Module):
 class MoEStackedModel(nn.Module):
     """MoE grid: n_experts wide × n_layers tall.
     
-    v1: each layer routes itself per-position (causal-compatible routing).
-    v2: sender-routed per-position; merge weights computed after expert outputs.
+    v1: each layer routes itself via mean-pooled hidden state.
+    v2: sender-routed; merge weights computed after expert outputs.
     """
     def __init__(self, make_layer, n_layers, dim, n_experts=4, top_k=2, version=1):
         super().__init__()
@@ -1262,14 +1262,11 @@ class MoEStackedModel(nn.Module):
         self.final_norm = RMSNorm(dim)
 
         if version == 1:
-            # v1: per-layer router decides own experts, blind weighting
+            # v1: per-layer router on mean-pooled hidden state, blind weighting
             self.routers = nn.ModuleList([nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)])
             self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))
         elif version == 2:
-            # v2: sender-routed — layer l's output routes to layer l+1
-            # Layer 0 routing comes from input content
-            # n_layers routers: router[l] uses layer l's output to pick layer l+1 experts
-            # (router[0] uses input to pick layer 0 experts)
+            # v2: sender-routed — layer l's mean-pooled output routes to layer l+1
             self.routers = nn.ModuleList([nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)])
             # Per-layer merge scorer: looks at expert outputs to decide weights
             self.merge_scorers = nn.ModuleList([nn.Linear(dim, 1, bias=False) for _ in range(n_layers)])
@@ -1282,15 +1279,16 @@ class MoEStackedModel(nn.Module):
 
         for norm, router, experts in zip(self.norms, self.routers, self.experts):
             h = norm(x)
-            # Causal-compatible routing: per-position logits from local representation
-            logits = router(h)  # (B, T, n_experts)
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, T, top_k)
-            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, T, top_k)
+            # Route per-sample: pool over sequence, then select experts
+            h_pool = h.mean(dim=1)  # (B, D)
+            logits = router(h_pool)  # (B, n_experts)
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
+            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
 
             expert_outs = torch.stack([e(h) for e in experts], dim=2)  # (B, T, n_experts, D)
-            idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, T, top_k, D)
+            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)  # (B, T, top_k, D)
             selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
-            out = (selected * topk_weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
+            out = (selected * topk_weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
             x = x + out
             layer_outputs.append(x)
 
@@ -1302,33 +1300,34 @@ class MoEStackedModel(nn.Module):
         B, T, D = x.shape
         layer_outputs = [x]
 
-        # Initial routing decision from input content (per-position)
-        route_signal = x  # (B, T, D)
+        # Initial routing decision from input content
+        route_signal = x.mean(dim=1)  # (B, D)
 
         for l, (norm, experts) in enumerate(zip(self.norms, self.experts)):
             h = norm(x)
 
-            # Routing: decided by previous layer's output (or input for layer 0)
-            logits = self.routers[l](route_signal)  # (B, T, n_experts)
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, T, top_k)
+            # Routing: decided by previous layer's mean-pooled output (or input for layer 0)
+            logits = self.routers[l](route_signal)  # (B, n_experts)
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
 
-            # Run all experts, gather top-k per position
+            # Run all experts, gather top-k per sample
             expert_outs = torch.stack([e(h) for e in experts], dim=2)  # (B, T, n_experts, D)
-            idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, T, top_k, D)
+            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)  # (B, T, top_k, D)
             selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
 
-            # Merge: score each expert output AFTER computation (per-position)
-            output_scores = self.merge_scorers[l](selected).squeeze(-1)  # (B, T, top_k)
-            router_scores = topk_vals  # (B, T, top_k)
+            # Merge: score each expert output AFTER computation
+            selected_pooled = selected.mean(dim=1)  # (B, top_k, D)
+            output_scores = self.merge_scorers[l](selected_pooled).squeeze(-1)  # (B, top_k)
+            router_scores = topk_vals  # (B, top_k)
             scores = output_scores + router_scores
-            merge_weights = F.softmax(scores, dim=-1)  # (B, T, top_k)
+            merge_weights = F.softmax(scores, dim=-1)  # (B, top_k)
 
-            out = (selected * merge_weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
+            out = (selected * merge_weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
             x = x + out
             layer_outputs.append(x)
 
             # This layer's output becomes routing signal for next layer
-            route_signal = x  # (B, T, D)
+            route_signal = x.mean(dim=1)  # (B, D)
 
         w = F.softmax(self.layer_weights, dim=0)
         x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
