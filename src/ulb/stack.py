@@ -85,7 +85,7 @@ class MoEStackedULB(nn.Module):
 
     def __init__(self, make_layer: Callable[[], nn.Module], n_layers: int, dim: int,
                  n_experts: int = 4, top_k: int = 2, version: Literal[1, 2] = 1,
-                 router_mode: Literal['topk', 'relu'] = 'topk', relu_lb: bool = True):
+                 router_mode: Literal['topk', 'relu'] = 'relu', relu_lb: bool = True):
         super().__init__()
         self.n_layers = n_layers
         self.n_experts = n_experts

@@ -1300,22 +1300,22 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
 def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False):
     """Build models with configurable depth.
     
-    If match_params=True, auto-size SSM/MHA internal dimensions to match FusedGateBlendP param count.
+    If match_params=True, auto-size SSM/MHA internal dimensions to match ULBBlendP param count.
     If requested_models is provided, only build those models (skips unavailable ones with warning).
     """
     models = {}
     
-    # Compute reference param count from FusedGateBlendP
+    # Compute reference param count from ULBBlendP
     target_params = None
     if match_params:
         try:
             target_params = _count_stacked_params(
-                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
+                lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')),
                 n_layers, dim
             )
-            print(f"  Auto-sizing to match FusedGateBlendP: {target_params:,} params")
+            print(f"  Auto-sizing to match ULBBlendP: {target_params:,} params")
         except Exception:
-            pass  # FusedGateBlock not available, skip matching
+            pass  # ULBBlock not available, skip matching
     
     def _wanted(name):
         return requested_models is None or name in requested_models
@@ -1474,7 +1474,7 @@ if __name__ == '__main__':
     parser.add_argument('--tasks', type=str, nargs='+', default=None,
                         help='Specific tasks to test (default: all)')
     parser.add_argument('--no-match-params', action='store_true',
-                        help='Disable auto-sizing SSMs to match FusedGateBlendP param count')
+                        help='Disable auto-sizing SSMs to match ULBBlendP param count')
     parser.add_argument('--moe', action='store_true', help='Use MoE stacking for all models')
     parser.add_argument('--n-experts', type=int, default=4, help='Number of MoE experts per layer')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
