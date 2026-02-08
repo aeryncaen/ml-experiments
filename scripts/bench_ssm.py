@@ -960,6 +960,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
     t0 = time.perf_counter()
     
     n_train = len(train_data)
+
+    # Linear warmup: 1 epoch of steps, from lr/10 to lr
+    warmup_steps = n_train
+    def warmup_fn(step):
+        if step < warmup_steps:
+            return 0.1 + 0.9 * step / warmup_steps
+        return 1.0
+    scheduler = optim.lr_scheduler.LambdaLR(opt, warmup_fn)
     total_steps = 0
     initial_loss = None
 
@@ -1061,6 +1069,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-3, B=32, L=32, devic
                         f"max_param={max_name} nan={stats['has_nan']} inf={stats['has_inf']}"
                     )
             opt.step()
+            scheduler.step()
             
             epoch_losses.append(loss.item())
             epoch_accs.append(acc)
