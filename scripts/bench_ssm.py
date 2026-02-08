@@ -1142,7 +1142,12 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
         # Early stopping: converged
-        if val_acc >= early_stop_acc:
+        # Mixed task: all subtasks must exceed threshold
+        if subtask_accs is not None:
+            converged = all(a >= early_stop_acc for a in subtask_accs.values())
+        else:
+            converged = val_acc >= early_stop_acc
+        if converged:
             stop_reason = "CONVERGED"
             break
         
@@ -1186,7 +1191,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         'steps': total_steps,
         'wall_s': wall,
         'peak_mem_mb': peak_mem,
-        'converged': best_val_acc >= early_stop_acc,
+        'converged': (all(a >= early_stop_acc for a in best_subtask_accs.values())
+                      if best_subtask_accs is not None
+                      else best_val_acc >= early_stop_acc),
         'stop_reason': stop_reason,
         'subtask_accs': best_subtask_accs,
     }
