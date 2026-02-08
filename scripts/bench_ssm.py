@@ -579,11 +579,30 @@ def gen_mod_arith(B, L, mod_base=5, device='cpu'):
 
 
 def gen_induction(B, L, device='cpu'):
-    """Repeated pattern, predict next token. Input/target both (B, L)."""
-    half = (L + 2) // 2  # enough so 2*half >= L+1
-    pattern = torch.randint(0, 32, (B, half), device=device)
-    seq = torch.cat([pattern, pattern], dim=1)  # (B, 2*half)
-    return seq[:, :L], seq[:, 1:L + 1]
+    """Two-copy repeated pattern with variable length, predict next token.
+
+    Each sample: random pattern of length plen (L//3 to 2L//3), copied
+    twice. Window always starts at position 0 of the double-pattern.
+    Variable pattern length means the repeat boundary is at a different
+    position each sample, preventing positional shortcuts.
+
+    ALL positions scored. First copy is unpredictable. Causal ceiling
+    is ~50%. Breaking past 50% requires acausal information flow.
+    """
+    inp = torch.zeros(B, L, dtype=torch.long, device=device)
+    tgt = torch.zeros(B, L, dtype=torch.long, device=device)
+    lo = L // 3          # shortest pattern
+    hi = 2 * L // 3      # longest pattern
+    lo = max(lo, (L + 2) // 2)  # must have 2*plen >= L+1
+    if hi < lo:
+        hi = lo
+    for b in range(B):
+        plen = torch.randint(lo, hi + 1, (1,)).item()
+        pattern = torch.randint(0, 32, (plen,), device=device)
+        seq = torch.cat([pattern, pattern])  # 2*plen >= L+1
+        inp[b] = seq[:L]
+        tgt[b] = seq[1:L + 1]
+    return inp, tgt
 
 
 def gen_mixed(B, L, device='cpu'):
