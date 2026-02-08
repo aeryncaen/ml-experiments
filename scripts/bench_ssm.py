@@ -1092,7 +1092,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
-    epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False, ncols=100)
+    epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
@@ -1100,7 +1100,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         epoch_losses = []
         epoch_accs = []
         
-        step_pbar = tqdm(train_indices, desc=f"Epoch {epoch+1}", leave=False, ncols=80)
+        step_pbar = tqdm(train_indices, desc=f"Epoch {epoch+1}", leave=False)
         for idx in step_pbar:
             batch = train_data[idx]
             track_usb = usb_debug_every and (total_steps % usb_debug_every == 0)
