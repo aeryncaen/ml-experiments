@@ -1424,8 +1424,11 @@ if __name__ == '__main__':
     task_pbar = tqdm(tasks, desc="Tasks", position=0)
     for task in task_pbar:
         task_pbar.set_description(f"Task: {task}")
+        # Mixed task: 5x more batches so each subtask sees ~same samples/epoch as individual tasks
+        task_n_train = n_train * len(MIXED_SUBTASKS) if task == 'mixed' else n_train
+        task_n_val = n_val * len(MIXED_SUBTASKS) if task == 'mixed' else n_val
         print(f"\nPregenerating {task} data...")
-        task_data = pregen_task_data(task, n_train, n_val, B, L, SEED, device=DEVICE)
+        task_data = pregen_task_data(task, task_n_train, task_n_val, B, L, SEED, device=DEVICE)
         print(f"  {len(task_data['train'])} train + {len(task_data['val'])} val batches ready on {DEVICE}")
         
         model_pbar = tqdm(all_names, desc="Models", position=1, leave=False)
