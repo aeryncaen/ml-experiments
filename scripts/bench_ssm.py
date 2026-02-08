@@ -1200,28 +1200,78 @@ def count_params(model):
 
 
 class StackedModel(nn.Module):
-    """Stack N identical layers with pre-norm residual connections + content-dependent embed residual."""
+    """Stack N identical layers with pre-norm residual connections."""
     def __init__(self, make_layer, n_layers, dim):
         super().__init__()
         self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
-        # Per-layer content-dependent embed gate: hidden queries embed (init near-zero)
-        self.embed_gates = nn.ModuleList([nn.Linear(dim, dim, bias=True) for _ in range(n_layers)])
-        for gate in self.embed_gates:
-            nn.init.zeros_(gate.weight)
-            nn.init.constant_(gate.bias, -2.0)
 
     def forward(self, x):
-        x0 = x
-        for norm, layer, gate in zip(self.norms, self.layers, self.embed_gates):
-            x = x + layer(norm(x)) + torch.sigmoid(gate(x)) * x0
+        for norm, layer in zip(self.norms, self.layers):
+            x = x + layer(norm(x))
+        return self.final_norm(x)
+
+
+class MoEStackedModel(nn.Module):
+    """MoE grid: n_experts wide × n_layers tall, top-k routing, learned layer weighting."""
+    def __init__(self, make_layer, n_layers, dim, n_experts=4, top_k=2):
+        super().__init__()
+        self.n_layers = n_layers
+        self.n_experts = n_experts
+        self.top_k = top_k
+        # Grid of experts: [layer][expert]
+        self.experts = nn.ModuleList([
+            nn.ModuleList([make_layer() for _ in range(n_experts)])
+            for _ in range(n_layers)
+        ])
+        # Per-layer pre-norm and router
+        self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
+        self.routers = nn.ModuleList([nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)])
+        # Learned layer weighting for output (init uniform)
+        self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))  # +1 for input
+        self.final_norm = RMSNorm(dim)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        layer_outputs = [x]  # include input in layer weighting
+
+        for norm, router, experts in zip(self.norms, self.routers, self.experts):
+            h = norm(x)
+            # Router: (B, T, n_experts)
+            logits = router(h)
+            # Top-k selection
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, T, top_k)
+            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, T, top_k)
+
+            # Run selected experts and weighted sum
+            # Gather expert outputs — run all experts, mask later (simpler for small n_experts)
+            expert_outs = torch.stack([e(h) for e in experts], dim=-2)  # (B, T, n_experts, D)
+
+            # Gather top-k expert outputs
+            idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, T, top_k, D)
+            selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
+
+            # Weighted sum
+            out = (selected * topk_weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
+            x = x + out
+            layer_outputs.append(x)
+
+        # Learned layer weighting
+        w = F.softmax(self.layer_weights, dim=0)  # (n_layers + 1,)
+        x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
+
         return self.final_norm(x)
 
 
 def _stack(make_layer, n_layers, dim):
     """Always wrap with pre-norm residual stacking."""
     return StackedModel(make_layer, n_layers, dim)
+
+
+def _stack_moe(make_layer, n_layers, dim, n_experts=4, top_k=2):
+    """Wrap with MoE stacking."""
+    return MoEStackedModel(make_layer, n_layers, dim, n_experts=n_experts, top_k=top_k)
 
 
 def _count_stacked_params(make_fn, n_layers, dim):
@@ -1371,6 +1421,16 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True):
     # Blend: output-level lerp between softmax and silu², content-dependent gate
     try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
+
+    # MoE variant: 4 experts × n_layers, top-2 routing
+    if _wanted('FusedGateBlendP_MoE'):
+        try:
+            models['FusedGateBlendP_MoE'] = _stack_moe(
+                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
+                n_layers, dim, n_experts=4, top_k=2,
+            )
+        except Exception as e:
+            print(f"  Warning: FusedGateBlendP_MoE failed to initialize ({e})")
 
     return models
 
