@@ -274,9 +274,11 @@ class FusedGateBlock(nn.Module):
         nn.init.zeros_(self.q_gate_bwd_proj.weight)
         nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
-        # Blend parameter (used when attn_mode='blend' or 'blend_relu2')
+        # Blend gate: per-position, per-head, content-dependent (init → ~0 → starts as pure softmax)
         if attn_mode in ('blend', 'blend_relu2'):
-            self.blend_alpha = nn.Parameter(torch.tensor(0.0))  # init at 0 → starts as pure softmax
+            self.blend_gate_proj = nn.Linear(d_model, n_heads, bias=True)
+            nn.init.zeros_(self.blend_gate_proj.weight)
+            nn.init.constant_(self.blend_gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12
 
     @staticmethod
     def _apply_rotary(x, cos, sin):
@@ -408,8 +410,10 @@ class FusedGateBlock(nn.Module):
         weights = F.relu(logits) ** 2 * causal_mask
         return weights @ v
 
-    def _blend_attention(self, q, k, v):
-        """Softmax + learnable SiLU² correction."""
+    def _blend_attention(self, q, k, v, gate):
+        """Softmax + content-dependent SiLU² correction.
+        gate: (B, H, T, 1) — per-position, per-head blend ratio.
+        """
         scale = 1.0 / math.sqrt(q.shape[-1])
         logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
@@ -417,11 +421,13 @@ class FusedGateBlock(nn.Module):
         softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
         w_softmax = torch.softmax(softmax_logits, dim=-1)
         w_silu2 = F.silu(logits) ** 2 * causal_mask
-        weights = w_softmax + self.blend_alpha * w_silu2
+        weights = w_softmax + gate * w_silu2
         return weights @ v
 
-    def _blend_relu2_attention(self, q, k, v):
-        """Softmax + learnable ReLU² correction."""
+    def _blend_relu2_attention(self, q, k, v, gate):
+        """Softmax + content-dependent ReLU² correction.
+        gate: (B, H, T, 1) — per-position, per-head blend ratio.
+        """
         scale = 1.0 / math.sqrt(q.shape[-1])
         logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
@@ -429,19 +435,19 @@ class FusedGateBlock(nn.Module):
         softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
         w_softmax = torch.softmax(softmax_logits, dim=-1)
         w_relu2 = F.relu(logits) ** 2 * causal_mask
-        weights = w_softmax + self.blend_alpha * w_relu2
+        weights = w_softmax + gate * w_relu2
         return weights @ v
 
-    def _attend(self, q, k, v):
+    def _attend(self, q, k, v, blend_gate=None):
         """Dispatch to the configured attention mode."""
         if self.attn_mode == 'silu2':
             return self._silu2_attention(q, k, v)
         elif self.attn_mode == 'relu2':
             return self._relu2_attention(q, k, v)
         elif self.attn_mode == 'blend':
-            return self._blend_attention(q, k, v)
+            return self._blend_attention(q, k, v, blend_gate)
         elif self.attn_mode == 'blend_relu2':
-            return self._blend_relu2_attention(q, k, v)
+            return self._blend_relu2_attention(q, k, v, blend_gate)
         else:
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -500,6 +506,13 @@ class FusedGateBlock(nn.Module):
         # Data-dependent rotation angles (shared for Q and K)
         dd_angles = self._dd_rope_angles(x)
 
+        # Blend gate: per-position, per-head (only computed for blend modes)
+        blend_gate = None
+        if self.attn_mode in ('blend', 'blend_relu2'):
+            # (B, T, H) → (B, H, T, 1) for broadcasting over key positions
+            blend_gate = torch.sigmoid(self.blend_gate_proj(x))  # (B, T, H)
+            blend_gate = blend_gate.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
+
         if self.paired:
             n2 = self.n_head // 2
             q = q.view(b, t, n2, self.head_dim * 2)
@@ -510,13 +523,18 @@ class FusedGateBlock(nn.Module):
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = self._attend(q, k, v)
+            if blend_gate is not None:
+                # Paired doubles T: interleave gate for even/odd positions
+                # (B, H, T, 1) → (B, n2, 2T, 1) by repeating each position for both sub-heads
+                bg = blend_gate.view(b, n2, 2, t, 1)  # (B, n2, 2_heads, T, 1)
+                blend_gate = bg.permute(0, 1, 3, 2, 4).reshape(b, n2, t * 2, 1)  # interleave
+            y = self._attend(q, k, v, blend_gate)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             q = self._hybrid_rope(q, dd_angles)
             k = self._hybrid_rope(k, dd_angles)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = self._attend(q, k, v)
+            y = self._attend(q, k, v, blend_gate)
             y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
