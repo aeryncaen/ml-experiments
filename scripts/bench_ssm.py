@@ -528,32 +528,36 @@ class DS1Wrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Task generators
 # ---------------------------------------------------------------------------
-def gen_delay(B, L, vocab_size=32, delay=1, device='cpu'):
-    """Token input, target is same sequence shifted by `delay` positions."""
-    x = torch.randint(0, vocab_size, (B, L), device=device)
-    target = torch.zeros_like(x)
-    target[:, delay:] = x[:, :L - delay]
+# Unified vocab: 64 tokens (0-31 normal, 32-63 marked for selective_copy)
+# All generators return (input, target) both (B, L) with ignore_index=-100 where needed.
+VOCAB_SIZE = 64
+ALL_TASKS = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
+
+
+def gen_delay(B, L, device='cpu'):
+    """Token input 0-31, target is same sequence shifted by 1 position."""
+    x = torch.randint(0, 32, (B, L), device=device)
+    target = torch.full_like(x, -100)
+    target[:, 1:] = x[:, :L - 1]
     return x, target
 
 
-def gen_selective_copy(B, L, vocab_size=32, n_markers=4, device='cpu'):
-    """Token input with marker channel. Target is the n_markers marked tokens.
-    Input: (B, L) tokens + (B, L) marker flags → fed as 2-token tuples via embedding.
-    Output: (B, n_markers) token predictions at end of sequence."""
-    tokens = torch.randint(0, vocab_size, (B, L), device=device)
-    markers = torch.zeros(B, L, dtype=torch.long, device=device)
-    target = torch.zeros(B, n_markers, dtype=torch.long, device=device)
+def gen_selective_copy(B, L, n_markers=4, device='cpu'):
+    """Tokens 0-31 unmarked, 32-63 marked. Target: last n_markers positions predict marked tokens."""
+    tokens = torch.randint(0, 32, (B, L), device=device)
+    inp = tokens.clone()
+    target = torch.full((B, L), -100, dtype=torch.long, device=device)
     for b in range(B):
         idxs = torch.randperm(L, device=device)[:n_markers].sort().values
-        markers[b, idxs] = 1
-        target[b] = tokens[b, idxs]
-    return tokens, markers, target
+        inp[b, idxs] += 32  # mark in vocab
+        target[b, -n_markers:] = tokens[b, idxs]
+    return inp, target
 
 
 def gen_parity(B, L, device='cpu'):
     """Binary input {0,1}, target is running XOR (cumulative parity)."""
     x = torch.randint(0, 2, (B, L), device=device)
-    target = x.cumsum(dim=1) % 2  # running parity
+    target = x.cumsum(dim=1) % 2
     return x, target
 
 
@@ -564,58 +568,32 @@ def gen_mod_arith(B, L, mod_base=5, device='cpu'):
     return x, target
 
 
-def gen_induction(B, L, vocab_size=32, device='cpu'):
-    half = L // 2
-    pattern = torch.randint(0, vocab_size, (B, half), device=device)
-    seq = torch.cat([pattern, pattern], dim=1)  # (B, L)
-    input_seq = seq[:, :-1]
-    target_seq = seq[:, 1:]
-    return input_seq, target_seq
-
-
-MIXED_SUBTASKS = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
-MIXED_VOCAB = 64  # 0-31: normal tokens, 32-63: marked tokens (selective_copy)
+def gen_induction(B, L, device='cpu'):
+    """Repeated pattern, predict next token. Input/target both (B, L)."""
+    half = (L + 2) // 2  # enough so 2*half >= L+1
+    pattern = torch.randint(0, 32, (B, half), device=device)
+    seq = torch.cat([pattern, pattern], dim=1)  # (B, 2*half)
+    return seq[:, :L], seq[:, 1:L + 1]
 
 
 def gen_mixed(B, L, device='cpu'):
-    """Generate a mixed batch: each sample in the batch is drawn from a random subtask.
-    Unified vocab=64 (0-31 normal, 32-63 marked). All samples have shape (L,).
-    Returns (input, target, task_ids) where task_ids is (B,) with index into MIXED_SUBTASKS.
-    Target uses ignore_index=-100 for positions without a prediction target."""
+    """Mixed batch: each sample drawn from a random task.
+    Returns (input, target, task_ids) where task_ids is (B,) index into ALL_TASKS."""
     inp = torch.zeros(B, L, dtype=torch.long, device=device)
     tgt = torch.full((B, L), -100, dtype=torch.long, device=device)
     task_ids = torch.zeros(B, dtype=torch.long, device=device)
 
     for b in range(B):
-        tid = random.randint(0, len(MIXED_SUBTASKS) - 1)
-        task = MIXED_SUBTASKS[tid]
+        tid = random.randint(0, len(ALL_TASKS) - 1)
+        task = ALL_TASKS[tid]
         task_ids[b] = tid
-        if task == 'delay':
-            x, t = gen_delay(1, L, vocab_size=32, device=device)
-            inp[b] = x[0]
-            tgt[b] = t[0]
-        elif task == 'selective_copy':
-            tokens, markers, t = gen_selective_copy(1, L, vocab_size=32, n_markers=4, device=device)
-            # Encode markers into vocab: marked tokens get +32
-            inp[b] = tokens[0] + markers[0] * 32
-            # Target: only last n_markers positions, values are 0-31
-            n_m = t.shape[1]
-            tgt[b, -n_m:] = t[0]
-        elif task == 'induction':
-            # Need L+1 tokens so input[:L] and target[1:L+1] are both length L
-            half = (L + 2) // 2  # enough to get 2*half >= L+1
-            pattern = torch.randint(0, 32, (1, half), device=device)
-            seq = torch.cat([pattern, pattern], dim=1)[0]  # (2*half,)
-            inp[b] = seq[:L]
-            tgt[b] = seq[1:L + 1]
-        elif task == 'parity':
-            x, t = gen_parity(1, L, device=device)
-            inp[b] = x[0]
-            tgt[b] = t[0]
-        elif task == 'mod_arith':
-            x, t = gen_mod_arith(1, L, device=device)
-            inp[b] = x[0]
-            tgt[b] = t[0]
+        _g = {
+            'delay': gen_delay, 'selective_copy': gen_selective_copy,
+            'induction': gen_induction, 'parity': gen_parity, 'mod_arith': gen_mod_arith,
+        }
+        x, t = _g[task](1, L, device=device)
+        inp[b] = x[0]
+        tgt[b] = t[0]
 
     return inp, tgt, task_ids
 
@@ -646,19 +624,16 @@ def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, devi
         np.random.seed(seed)
         torch.manual_seed(seed)
         
+        _gen = {
+            'delay': lambda: gen_delay(B, L, device='cpu'),
+            'selective_copy': lambda: gen_selective_copy(B, L, device='cpu'),
+            'parity': lambda: gen_parity(B, L, device='cpu'),
+            'mod_arith': lambda: gen_mod_arith(B, L, device='cpu'),
+            'induction': lambda: gen_induction(B, L, device='cpu'),
+            'mixed': lambda: gen_mixed(B, L, device='cpu'),
+        }
         def gen_batch(task_name):
-            if task_name == 'delay':
-                return gen_delay(B, L, vocab_size=32, device='cpu')
-            elif task_name == 'selective_copy':
-                return gen_selective_copy(B, L, vocab_size=32, device='cpu')
-            elif task_name == 'parity':
-                return gen_parity(B, L, device='cpu')
-            elif task_name == 'mod_arith':
-                return gen_mod_arith(B, L, device='cpu')
-            elif task_name == 'induction':
-                return gen_induction(B, L, vocab_size=32, device='cpu')
-            elif task_name == 'mixed':
-                return gen_mixed(B, L, device='cpu')
+            return _gen[task_name]()
         
         train_batches = []
         for _ in tqdm(range(n_train_batches), desc=f"Generating {task_name} train", leave=False):
@@ -872,10 +847,6 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     opt = optim.Adam(model.parameters(), lr=lr)
 
     tracked_named_params = list(model.named_parameters())
-    embed = None
-    marker_embed = None
-    head = None
-    vocab_size = None
 
     if usb_debug_every:
         _set_usb_debug(model, True)
@@ -884,51 +855,12 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     act_active = {'on': False}
     act_hooks = []
 
-    if task_name == 'delay':
-        vocab_size = 32
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
-    elif task_name == 'selective_copy':
-        vocab_size = 32
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        marker_embed = nn.Embedding(2, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters())
-                         + list(marker_embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"marker_embed.{n}", p) for n, p in marker_embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
-    elif task_name == 'parity':
-        vocab_size = 2
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
-    elif task_name == 'mod_arith':
-        vocab_size = 5
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
-    elif task_name == 'induction':
-        vocab_size = 32
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
-    elif task_name == 'mixed':
-        vocab_size = MIXED_VOCAB  # 64
-        embed = nn.Embedding(vocab_size, dim).to(device)
-        head = nn.Linear(dim, vocab_size).to(device)
-        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
-        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
-        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
+    vocab_size = VOCAB_SIZE  # 64 for all tasks
+    embed = nn.Embedding(vocab_size, dim).to(device)
+    head = nn.Linear(dim, vocab_size).to(device)
+    opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+    tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+    tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
 
     if act_log_every:
         if isinstance(model, StackedModel):
@@ -946,110 +878,70 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     val_data = preloaded_data['val']
 
     def _forward(batch):
-        if task_name == 'delay':
-            assert embed is not None and head is not None
-            assert vocab_size is not None
-            inp, tgt = batch
-            y = head(model(embed(inp)))
-            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
-            with torch.no_grad():
-                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
-            return loss, acc
-        elif task_name == 'selective_copy':
-            assert embed is not None and marker_embed is not None and head is not None
-            assert vocab_size is not None
-            tokens, markers, tgt = batch
-            x = embed(tokens) + marker_embed(markers)
-            y = head(model(x))
-            n_markers = tgt.shape[1]
-            y_last = y[:, -n_markers:]
-            loss = F.cross_entropy(y_last.reshape(-1, vocab_size), tgt.reshape(-1))
-            with torch.no_grad():
-                acc = (y_last.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
-            return loss, acc
-        elif task_name == 'parity':
-            assert embed is not None and head is not None
-            assert vocab_size is not None
-            inp, tgt = batch
-            y = head(model(embed(inp)))
-            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
-            with torch.no_grad():
-                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
-            return loss, acc
-        elif task_name == 'mod_arith':
-            assert embed is not None and head is not None
-            assert vocab_size is not None
-            inp, tgt = batch
-            y = head(model(embed(inp)))
-            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
-            with torch.no_grad():
-                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
-            return loss, acc
-        elif task_name == 'induction':
-            assert embed is not None and head is not None
-            assert vocab_size is not None
-            inp, tgt = batch
-            y = head(model(embed(inp)))
-            loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
-            with torch.no_grad():
-                acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
-            return loss, acc
-        else:  # mixed
-            assert embed is not None and head is not None
-            assert vocab_size is not None
+        if task_name == 'mixed':
             inp, tgt, task_ids = batch
-            y = head(model(embed(inp)))
-            logits_flat = y.reshape(-1, vocab_size)
-            tgt_flat = tgt.reshape(-1)
-            loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
-            with torch.no_grad():
-                mask = tgt_flat != -100
-                if mask.any():
-                    acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
-                else:
-                    acc = 0.0
-            return loss, acc
+        else:
+            inp, tgt = batch
+        y = head(model(embed(inp)))
+        logits_flat = y.reshape(-1, vocab_size)
+        tgt_flat = tgt.reshape(-1)
+        loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
+        with torch.no_grad():
+            mask = tgt_flat != -100
+            if mask.any():
+                acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+            else:
+                acc = 0.0
+        return loss, acc
 
     def _eval_val():
         model.eval()
-        val_accs = []
         val_losses = []
-        per_task_correct = {t: 0 for t in MIXED_SUBTASKS} if task_name == 'mixed' else None
-        per_task_total = {t: 0 for t in MIXED_SUBTASKS} if task_name == 'mixed' else None
+        total_correct = 0
+        total_valid = 0
+        per_task_correct = {t: 0 for t in ALL_TASKS}
+        per_task_total = {t: 0 for t in ALL_TASKS}
+        is_mixed = task_name == 'mixed'
         with torch.no_grad():
             for batch in val_data:
-                loss, acc = _forward(batch)
-                val_losses.append(loss.item())
-                val_accs.append(acc)
-                # Per-task breakdown for mixed
-                if task_name == 'mixed' and per_task_correct is not None and per_task_total is not None:
+                if is_mixed:
                     inp, tgt, task_ids = batch
-                    y = head(model(embed(inp)))  # (B, L, V)
-                    B_cur = inp.shape[0]
-                    for tid_idx, subtask in enumerate(MIXED_SUBTASKS):
-                        mask_b = task_ids == tid_idx  # (B,)
+                else:
+                    inp, tgt = batch
+                    task_ids = None
+                y = head(model(embed(inp)))
+                logits_flat = y.reshape(-1, vocab_size)
+                tgt_flat = tgt.reshape(-1)
+                loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
+                val_losses.append(loss.item())
+                valid = tgt_flat != -100
+                if valid.any():
+                    correct = (logits_flat[valid].argmax(-1) == tgt_flat[valid])
+                    total_correct += correct.sum().item()
+                    total_valid += valid.sum().item()
+                # Per-task breakdown for mixed
+                if is_mixed and task_ids is not None:
+                    for tid_idx, subtask in enumerate(ALL_TASKS):
+                        mask_b = task_ids == tid_idx
                         if not mask_b.any():
                             continue
-                        y_sub = y[mask_b]       # (n, L, V)
-                        tgt_sub = tgt[mask_b]   # (n, L)
-                        logits_flat = y_sub.reshape(-1, vocab_size)
-                        tgt_flat = tgt_sub.reshape(-1)
-                        valid = tgt_flat != -100
-                        if valid.any():
-                            per_task_correct[subtask] += (logits_flat[valid].argmax(-1) == tgt_flat[valid]).sum().item()
-                            per_task_total[subtask] += valid.sum().item()
+                        y_sub = y[mask_b]
+                        tgt_sub = tgt[mask_b]
+                        lf = y_sub.reshape(-1, vocab_size)
+                        tf = tgt_sub.reshape(-1)
+                        v = tf != -100
+                        if v.any():
+                            per_task_correct[subtask] += (lf[v].argmax(-1) == tf[v]).sum().item()
+                            per_task_total[subtask] += v.sum().item()
         model.train()
         avg_loss = sum(val_losses) / len(val_losses)
-        avg_acc = sum(val_accs) / len(val_accs)
-        if per_task_correct is not None and per_task_total is not None:
+        avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
+        subtask_accs = None
+        if is_mixed:
             subtask_accs = {}
-            for t in MIXED_SUBTASKS:
-                if per_task_total[t] > 0:
-                    subtask_accs[t] = per_task_correct[t] / per_task_total[t]
-                else:
-                    subtask_accs[t] = 0.0
-            return avg_loss, avg_acc, subtask_accs
-        return avg_loss, avg_acc, None
+            for t in ALL_TASKS:
+                subtask_accs[t] = per_task_correct[t] / per_task_total[t] if per_task_total[t] > 0 else 0.0
+        return avg_loss, avg_acc, subtask_accs
 
     mem_baseline = 0
     if device == 'cuda':
@@ -1426,8 +1318,8 @@ if __name__ == '__main__':
     for task in task_pbar:
         task_pbar.set_description(f"Task: {task}")
         # Mixed task: 5x more batches so each subtask sees ~same samples/epoch as individual tasks
-        task_n_train = n_train * len(MIXED_SUBTASKS) if task == 'mixed' else n_train
-        task_n_val = n_val * len(MIXED_SUBTASKS) if task == 'mixed' else n_val
+        task_n_train = n_train * len(ALL_TASKS) if task == 'mixed' else n_train
+        task_n_val = n_val * len(ALL_TASKS) if task == 'mixed' else n_val
         print(f"\nPregenerating {task} data...")
         task_data = pregen_task_data(task, task_n_train, task_n_val, B, L, SEED, device=DEVICE)
         print(f"  {len(task_data['train'])} train + {len(task_data['val'])} val batches ready on {DEVICE}")
@@ -1490,7 +1382,7 @@ if __name__ == '__main__':
         fieldnames = [
             'model', 'task', 'params', 'initial_loss', 'final_loss', 
             'val_acc', 'best_epoch', 'epochs', 'wall_s', 'peak_mem_mb', 'converged', 'stop_reason'
-        ] + [f'acc_{t}' for t in MIXED_SUBTASKS]
+        ] + [f'acc_{t}' for t in ALL_TASKS]
         with open(args.csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
@@ -1505,9 +1397,9 @@ if __name__ == '__main__':
     for task in tasks:
         print(f"### {task}\n")
         if task == 'mixed':
-            subtask_hdrs = " | ".join(f"{t}" for t in MIXED_SUBTASKS)
+            subtask_hdrs = " | ".join(f"{t}" for t in ALL_TASKS)
             print(f"| Model | Params | Val Acc | {subtask_hdrs} | Best @ | Epochs | Stop | Time |")
-            sep_cols = " | ".join("------:" for _ in MIXED_SUBTASKS)
+            sep_cols = " | ".join("------:" for _ in ALL_TASKS)
             print(f"|:------|-------:|--------:| {sep_cols} |-------:|-------:|:-----|-----:|")
         else:
             print("| Model | Params | Val Acc | Best @ | Epochs | Stop Reason | Time |")
@@ -1527,7 +1419,7 @@ if __name__ == '__main__':
             wall_s = r.get('wall_s', 0)
             
             if task == 'mixed':
-                sub_cols = " | ".join(f"{r.get(f'acc_{t}', 0):.1%}" for t in MIXED_SUBTASKS)
+                sub_cols = " | ".join(f"{r.get(f'acc_{t}', 0):.1%}" for t in ALL_TASKS)
                 print(f"| {r['model']} | {r['params']:,} | {acc_str} | {sub_cols} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
             else:
                 print(f"| {r['model']} | {r['params']:,} | {acc_str} | {best_epoch} | {r['epochs']} | {stop} | {wall_s:.1f}s |")
