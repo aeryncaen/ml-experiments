@@ -573,6 +573,50 @@ def gen_induction(B, L, vocab_size=32, device='cpu'):
     return input_seq, target_seq
 
 
+MIXED_SUBTASKS = ['delay', 'selective_copy', 'induction', 'parity', 'mod_arith']
+MIXED_VOCAB = 64  # 0-31: normal tokens, 32-63: marked tokens (selective_copy)
+
+
+def gen_mixed(B, L, device='cpu'):
+    """Generate a mixed batch: each sample in the batch is drawn from a random subtask.
+    Unified vocab=64 (0-31 normal, 32-63 marked). All samples have shape (L,).
+    Returns (input, target) both (B, L). Target uses ignore_index=-100 for
+    positions without a prediction target (selective_copy non-output positions)."""
+    inp = torch.zeros(B, L, dtype=torch.long, device=device)
+    tgt = torch.full((B, L), -100, dtype=torch.long, device=device)
+
+    for b in range(B):
+        task = random.choice(MIXED_SUBTASKS)
+        if task == 'delay':
+            x, t = gen_delay(1, L, vocab_size=32, device=device)
+            inp[b] = x[0]
+            tgt[b] = t[0]
+        elif task == 'selective_copy':
+            tokens, markers, t = gen_selective_copy(1, L, vocab_size=32, n_markers=4, device=device)
+            # Encode markers into vocab: marked tokens get +32
+            inp[b] = tokens[0] + markers[0] * 32
+            # Target: only last n_markers positions, values are 0-31
+            n_m = t.shape[1]
+            tgt[b, -n_m:] = t[0]
+        elif task == 'induction':
+            # Need L+1 tokens so input[:L] and target[1:L+1] are both length L
+            half = (L + 2) // 2  # enough to get 2*half >= L+1
+            pattern = torch.randint(0, 32, (1, half), device=device)
+            seq = torch.cat([pattern, pattern], dim=1)[0]  # (2*half,)
+            inp[b] = seq[:L]
+            tgt[b] = seq[1:L + 1]
+        elif task == 'parity':
+            x, t = gen_parity(1, L, device=device)
+            inp[b] = x[0]
+            tgt[b] = t[0]
+        elif task == 'mod_arith':
+            x, t = gen_mod_arith(1, L, device=device)
+            inp[b] = x[0]
+            tgt[b] = t[0]
+
+    return inp, tgt
+
+
 # ---------------------------------------------------------------------------
 # Data pregeneration, disk caching, and GPU preloading
 # ---------------------------------------------------------------------------
@@ -610,6 +654,8 @@ def pregen_task_data(task_name, n_train_batches, n_val_batches, B, L, seed, devi
                 return gen_mod_arith(B, L, device='cpu')
             elif task_name == 'induction':
                 return gen_induction(B, L, vocab_size=32, device='cpu')
+            elif task_name == 'mixed':
+                return gen_mixed(B, L, device='cpu')
         
         train_batches = []
         for _ in tqdm(range(n_train_batches), desc=f"Generating {task_name} train", leave=False):
@@ -873,6 +919,13 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
         tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
         tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
+    elif task_name == 'mixed':
+        vocab_size = MIXED_VOCAB  # 64
+        embed = nn.Embedding(vocab_size, dim).to(device)
+        head = nn.Linear(dim, vocab_size).to(device)
+        opt = optim.Adam(list(model.parameters()) + list(embed.parameters()) + list(head.parameters()), lr=lr)
+        tracked_named_params += [(f"embed.{n}", p) for n, p in embed.named_parameters()]
+        tracked_named_params += [(f"head.{n}", p) for n, p in head.named_parameters()]
 
     if act_log_every:
         if isinstance(model, StackedModel):
@@ -929,7 +982,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
             return loss, acc
-        else:  # induction
+        elif task_name == 'induction':
             assert embed is not None and head is not None
             assert vocab_size is not None
             inp, tgt = batch
@@ -937,6 +990,21 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1))
             with torch.no_grad():
                 acc = (y.reshape(-1, vocab_size).argmax(-1) == tgt.reshape(-1)).float().mean().item()
+            return loss, acc
+        else:  # mixed
+            assert embed is not None and head is not None
+            assert vocab_size is not None
+            inp, tgt = batch
+            y = head(model(embed(inp)))
+            logits_flat = y.reshape(-1, vocab_size)
+            tgt_flat = tgt.reshape(-1)
+            loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
+            with torch.no_grad():
+                mask = tgt_flat != -100
+                if mask.any():
+                    acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+                else:
+                    acc = 0.0
             return loss, acc
 
     def _eval_val():
