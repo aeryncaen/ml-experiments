@@ -526,10 +526,19 @@ class FusedGateBlock(nn.Module):
             inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
 
-        # Neighbor gate: single lerp on half of K channels
-        self.neighbor_gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
-        nn.init.zeros_(self.neighbor_gate_proj.weight)
-        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+        # K causal lerp: 1/4 of head_dim (last quarter)
+        self.quarter_dim = self.head_dim // 4
+        self.k_gate_proj = nn.Linear(d_model, n_heads * self.quarter_dim, bias=True)
+        nn.init.zeros_(self.k_gate_proj.weight)
+        nn.init.constant_(self.k_gate_proj.bias, -2.0)
+
+        # Q acausal lerp: 1/2 of head_dim (last half), separate fwd/bwd gates
+        self.q_gate_fwd_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        self.q_gate_bwd_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        nn.init.zeros_(self.q_gate_fwd_proj.weight)
+        nn.init.constant_(self.q_gate_fwd_proj.bias, -2.0)
+        nn.init.zeros_(self.q_gate_bwd_proj.weight)
+        nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
     def _rope(self, x):
         T = x.shape[1]
@@ -554,27 +563,32 @@ class FusedGateBlock(nn.Module):
         x1, x2 = x[..., :d], x[..., d:]
         return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
 
-    def _gated_accumulate(self, k, gate):
-        """Cumulative lerp (EMA scan) on the second half of K channels.
-
-        k:    (B, S, H, head_dim)  — S is T or 2T depending on pairing
-        gate: (B, S, H, half_dim)  — per-channel per-head forget gate
-        Returns k with second half of channels replaced by accumulated values.
+    def _k_causal_lerp(self, k, gate):
+        """1-step causal lerp on last quarter of K channels.
+        k:    (B, T, H, head_dim)
+        gate: (B, T, H, quarter_dim)
         """
-        half = self.half_dim
-        k_static = k[:, :, :, :half]
-        k_dyn = k[:, :, :, half:]           # (B, S, H, half_dim)
-        # Cumulative scan: k_acc[t] = (1-g[t]) * k[t] + g[t] * k_acc[t-1]
-        # Sequential scan — S is small (32 or 64)
-        acc = torch.zeros_like(k_dyn[:, :1])  # (B, 1, H, half_dim)
-        parts = []
-        for s in range(k_dyn.shape[1]):
-            g = gate[:, s:s+1]               # (B, 1, H, half_dim)
-            cur = k_dyn[:, s:s+1]            # (B, 1, H, half_dim)
-            acc = (1 - g) * cur + g * acc
-            parts.append(acc)
-        k_acc = torch.cat(parts, dim=1)      # (B, S, H, half_dim)
-        return torch.cat([k_static, k_acc], dim=-1)
+        qd = self.quarter_dim
+        k_static = k[:, :, :, :-qd]
+        k_cur = k[:, :, :, -qd:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
+    def _q_acausal_lerp(self, q, g_fwd, g_bwd):
+        """Acausal lerp on last half of Q channels. Separate fwd/bwd gates.
+        Last token gets causal-only (no forward neighbor).
+        q:     (B, T, H, head_dim)
+        g_fwd: (B, T, H, half_dim)
+        g_bwd: (B, T, H, half_dim)
+        """
+        hd = self.half_dim
+        q_static = q[:, :, :, :-hd]
+        q_cur = q[:, :, :, -hd:]
+        q_prev = F.pad(q_cur[:, :-1], (0, 0, 0, 0, 1, 0))   # causal: t-1
+        q_next = F.pad(q_cur[:, 1:],  (0, 0, 0, 0, 0, 1))   # acausal: t+1, last pos gets zeros
+        q_mixed = (1 - g_fwd - g_bwd) * q_cur + g_fwd * q_next + g_bwd * q_prev
+        return torch.cat([q_static, q_mixed], dim=-1)
 
     def forward(self, x):
         b, t, d = x.shape
@@ -592,6 +606,15 @@ class FusedGateBlock(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
+        # K causal lerp (1/4 dims) — before RoPE
+        k_gate = torch.sigmoid(self.k_gate_proj(x)).view(b, t, self.n_head, self.quarter_dim)
+        k = self._k_causal_lerp(k, k_gate)
+
+        # Q acausal lerp (1/2 dims) — before RoPE
+        q_gf = torch.sigmoid(self.q_gate_fwd_proj(x)).view(b, t, self.n_head, self.half_dim)
+        q_gb = torch.sigmoid(self.q_gate_bwd_proj(x)).view(b, t, self.n_head, self.half_dim)
+        q = self._q_acausal_lerp(q, q_gf, q_gb)
+
         if self.paired:
             n2 = self.n_head // 2
             q = q.view(b, t, n2, self.head_dim * 2)
@@ -601,20 +624,12 @@ class FusedGateBlock(nn.Module):
             q = q.view(b, t * 2, n2, self.head_dim)
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
-            # Gate on interleaved 2T stream — accumulation crosses head pairs
-            gate_raw = torch.sigmoid(self.neighbor_gate_proj(x))  # (B, T, n_head * half_dim)
-            gate_raw = gate_raw.view(b, t, n2, self.half_dim * 2)  # (B, T, n2, half_dim*2)
-            gate = gate_raw.reshape(b, t * 2, n2, self.half_dim)   # (B, 2T, n2, half_dim)
-            k = self._gated_accumulate(k, gate)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
             q = self._rope(q)
             k = self._rope(k)
-            # Gate on T stream
-            gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
-            k = self._gated_accumulate(k, gate)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2)
