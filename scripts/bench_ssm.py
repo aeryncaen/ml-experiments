@@ -274,11 +274,12 @@ class FusedGateBlock(nn.Module):
         nn.init.zeros_(self.q_gate_bwd_proj.weight)
         nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
-        # Blend gate: per-position, per-head, content-dependent (init → ~0.12 → starts mostly softmax)
+        # Blend: gate + RMSNorm on silu² output to match softmax output scale
         if attn_mode == 'blend':
             self.blend_gate_proj = nn.Linear(d_model, n_heads, bias=True)
             nn.init.zeros_(self.blend_gate_proj.weight)
             nn.init.constant_(self.blend_gate_proj.bias, -2.0)
+            self.silu2_norm = nn.RMSNorm(self.head_dim)
 
     @staticmethod
     def _apply_rotary(x, cos, sin):
@@ -397,12 +398,12 @@ class FusedGateBlock(nn.Module):
         return weights @ v
 
     def _blend_attention(self, q, k, v, gate):
-        """Output-level lerp between softmax and SiLU² attention.
+        """Output-level lerp between softmax and RMSNorm'd SiLU² attention.
         gate: (B, H, T, 1) — per-position, per-head blend ratio (sigmoid).
-        y = (1 - gate) * softmax_attn(q,k,v) + gate * silu2_attn(q,k,v)
+        y = (1 - gate) * softmax_attn(q,k,v) + gate * rmsnorm(silu2_attn(q,k,v))
         """
         y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y_silu2 = self._silu2_attention(q, k, v)
+        y_silu2 = self.silu2_norm(self._silu2_attention(q, k, v))
         return (1 - gate) * y_softmax + gate * y_silu2
 
     def _attend(self, q, k, v, blend_gate=None):
