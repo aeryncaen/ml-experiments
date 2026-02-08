@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .lerp import AcausalLerp, CausalLerp
+from .lerp import AcausalLerp, CausalLerp, QTemporalConv
 from .rope import HybridRoPE, PairedRoPE
 
 
@@ -71,6 +71,7 @@ class ULBConfig:
     k_lerp_bias: float = -2.0
     q_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
+    q_mix: Literal['lerp', 'conv2', 'conv3'] = 'lerp'
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
@@ -139,7 +140,16 @@ class ULBBlock(nn.Module):
         quarter_dim = head_dim // 4
         half_dim = head_dim // 2
         self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
-        self.q_lerp = AcausalLerp(d, n_heads, half_dim, init_bias=config.q_lerp_bias)
+        self.q_lerp: AcausalLerp | None = None
+        self.q_conv: QTemporalConv | None = None
+        if config.q_mix == 'lerp':
+            self.q_lerp = AcausalLerp(d, n_heads, half_dim, init_bias=config.q_lerp_bias)
+        elif config.q_mix == 'conv2':
+            self.q_conv = QTemporalConv(n_heads, half_dim, kernel_size=2)
+        elif config.q_mix == 'conv3':
+            self.q_conv = QTemporalConv(n_heads, half_dim, kernel_size=3)
+        else:
+            raise ValueError(f"Unknown q_mix mode: {config.q_mix}")
 
         # --- Hybrid RoPE ---
         self.rope = HybridRoPE(d, n_heads, head_dim, rope_base=config.rope_base)
@@ -197,7 +207,10 @@ class ULBBlock(nn.Module):
 
         # --- Temporal lerps (before RoPE) ---
         k = self.k_lerp(k, x)
-        q = self.q_lerp(q, x)
+        if self.q_lerp is not None:
+            q = self.q_lerp(q, x)
+        elif self.q_conv is not None:
+            q = self.q_conv(q)
 
         # --- Data-dependent rotation angles (shared for Q and K) ---
         dd_angles = self.rope.compute_dd_angles(x)

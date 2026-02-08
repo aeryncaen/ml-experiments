@@ -53,6 +53,11 @@ class CausalLerp(nn.Module):
             K with last quarter_dim channels blended with t-1.
         """
         b, t, _, _ = k.shape
+        if t < 2:
+            # KV-cache decode commonly runs one token per step.
+            # With no previous token in the local window, causal lerp should
+            # not attenuate channels; return identity instead.
+            return k
         qd = self.quarter_dim
         gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_heads, qd)
 
@@ -106,6 +111,11 @@ class AcausalLerp(nn.Module):
             Q with last half_dim channels blended with t-1 and t+1.
         """
         b, t, _, _ = q.shape
+        if t < 2:
+            # During incremental decode, future token q[t+1] is unavailable.
+            # Returning identity here preserves stable single-step behavior and
+            # avoids artificial shrinking from zero-padding neighbors.
+            return q
         hd = self.half_dim
         g_fwd = torch.sigmoid(self.gate_fwd_proj(x)).view(b, t, self.n_heads, hd)
         g_bwd = torch.sigmoid(self.gate_bwd_proj(x)).view(b, t, self.n_heads, hd)
@@ -116,3 +126,70 @@ class AcausalLerp(nn.Module):
         q_next = F.pad(q_cur[:, 1:],  (0, 0, 0, 0, 0, 1))   # acausal: t+1, last pos gets zeros
         q_mixed = (1 - g_fwd - g_bwd) * q_cur + g_fwd * q_next + g_bwd * q_prev
         return torch.cat([q_static, q_mixed], dim=-1)
+
+
+class QTemporalConv(nn.Module):
+    """Depthwise temporal conv on the last half of Q channels.
+
+    This is a simple conv baseline for Q-peeking comparisons.
+    It applies a depthwise 1D convolution over time on each head-channel
+    independently, using right-padding so the output at position t can depend
+    on future positions up to t + (kernel_size - 1).
+
+    - kernel_size=2 -> lookahead 1
+    - kernel_size=3 -> lookahead 2
+
+    Args:
+        n_heads: Number of attention heads.
+        half_dim: Number of channels to mix (head_dim // 2).
+        kernel_size: Temporal kernel size (2 or 3).
+    """
+
+    def __init__(self, n_heads: int, half_dim: int, kernel_size: int):
+        super().__init__()
+        assert kernel_size in (2, 3), f"kernel_size must be 2 or 3, got {kernel_size}"
+        self.n_heads = n_heads
+        self.half_dim = half_dim
+        self.kernel_size = kernel_size
+        channels = n_heads * half_dim
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, groups=channels, bias=True)
+
+        # Identity-like init: y_t ~= x_t at start
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            assert self.conv.bias is not None
+            self.conv.bias.zero_()
+            if kernel_size == 2:
+                # Match q-lerp's small initial forward influence (~0.12)
+                self.conv.weight[:, 0, 0] = 0.88
+                self.conv.weight[:, 0, 1] = 0.12
+            else:  # kernel_size == 3
+                self.conv.weight[:, 0, 0] = 0.76
+                self.conv.weight[:, 0, 1] = 0.12
+                self.conv.weight[:, 0, 2] = 0.12
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        """Apply temporal conv to Q.
+
+        Args:
+            q: (B, T, H, head_dim)
+
+        Returns:
+            Q with last half_dim channels convolved over time.
+        """
+        b, t, _, _ = q.shape
+        if t < 2:
+            return q
+
+        hd = self.half_dim
+        q_static = q[:, :, :, :-hd]
+        q_cur = q[:, :, :, -hd:]  # (B, T, H, hd)
+
+        # (B, T, H, hd) -> (B, H*hd, T)
+        x = q_cur.permute(0, 2, 3, 1).reshape(b, self.n_heads * hd, t)
+        x = F.pad(x, (0, self.kernel_size - 1))
+        y = self.conv(x)[..., :t]
+        # (B, H*hd, T) -> (B, T, H, hd)
+        y = y.view(b, self.n_heads, hd, t).permute(0, 3, 1, 2)
+
+        return torch.cat([q_static, y], dim=-1)

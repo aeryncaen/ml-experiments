@@ -1523,8 +1523,12 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='blend')")
 
     # ULB (Universal Learning Block) — generalized FusedGateBlock from src/ulb/
-    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend'))")
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp'))")
+    try_add('ULBBlendPConv2', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2'))")
+    try_add('ULBBlendPConv3', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3'))")
 
     return models
 
