@@ -627,6 +627,232 @@ class FusedGateBlock(nn.Module):
         return y
 
 
+class FusedGateKVBlock(nn.Module):
+    """Variant: 1-step gated neighbor lerp on both K and V (same gate, same half channels).
+    No scan — just single-step lookback on K and V.
+    """
+
+    def __init__(self, d_model, n_heads=4, paired=False):
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_heads
+        self.paired = paired
+        self.inner_dim = d_model
+        assert self.inner_dim % n_heads == 0
+        self.head_dim = self.inner_dim // n_heads
+        self.half_dim = self.head_dim // 2
+
+        self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
+        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.swish_beta_up = nn.Parameter(torch.ones(self.inner_dim))
+        self.swish_beta_down = nn.Parameter(torch.ones(self.inner_dim))
+        self.attn_norm = nn.RMSNorm(self.inner_dim)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        if paired:
+            assert n_heads % 2 == 0
+            inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
+
+        self.neighbor_gate_proj = nn.Linear(d_model, n_heads * self.half_dim, bias=True)
+        nn.init.zeros_(self.neighbor_gate_proj.weight)
+        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+
+    def _rope(self, x):
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _paired_rope(self, x):
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq_paired.dtype)
+        t_even, t_odd = 2 * t, 2 * t + 1
+        freqs_even = torch.outer(t_even, self.inv_freq_paired)
+        freqs_odd = torch.outer(t_odd, self.inv_freq_paired)
+        cos = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
+        sin = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _gated_neighbor_kv(self, k, v, gate):
+        """1-step lerp on second half of both K and V channels."""
+        half = self.half_dim
+        # K
+        k_static = k[:, :, :, :half]
+        k_cur = k[:, :, :, half:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_mixed = (1 - gate) * k_cur + gate * k_prev
+        k_out = torch.cat([k_static, k_mixed], dim=-1)
+        # V
+        v_static = v[:, :, :, :half]
+        v_cur = v[:, :, :, half:]
+        v_prev = F.pad(v_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        v_mixed = (1 - gate) * v_cur + gate * v_prev
+        v_out = torch.cat([v_static, v_mixed], dim=-1)
+        return k_out, v_out
+
+    def forward(self, x):
+        b, t, d = x.shape
+        h_up = self.up_proj(x)
+        h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
+
+        q = self.q_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 1-step neighbor on K and V (before RoPE/pairing)
+        gate = torch.sigmoid(self.neighbor_gate_proj(x)).view(b, t, self.n_head, self.half_dim)
+        k, v = self._gated_neighbor_kv(k, v, gate)
+
+        if self.paired:
+            n2 = self.n_head // 2
+            q = q.view(b, t, n2, self.head_dim * 2)
+            k = k.view(b, t, n2, self.head_dim * 2)
+            q = self._paired_rope(q)
+            k = self._paired_rope(k)
+            q = q.view(b, t * 2, n2, self.head_dim)
+            k = k.view(b, t * 2, n2, self.head_dim)
+            v = v.reshape(b, t * 2, n2, self.head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
+        else:
+            q = self._rope(q)
+            k = self._rope(k)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+
+        y = y.contiguous().view(b, t, self.inner_dim)
+        y = self.attn_norm(y) * h_up
+        y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
+        return y
+
+
+class FusedGatePreSeqBlock(nn.Module):
+    """Variant: 1-step gated neighbor lerp on h_up (pre-QKV) instead of on K.
+    No scan — the sequence itself is blended before projection into Q/K/V.
+    """
+
+    def __init__(self, d_model, n_heads=4, paired=False):
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_heads
+        self.paired = paired
+        self.inner_dim = d_model
+        assert self.inner_dim % n_heads == 0
+        self.head_dim = self.inner_dim // n_heads
+        self.half_dim = self.head_dim // 2
+
+        self.up_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.down_proj = nn.Linear(self.inner_dim, d_model, bias=False)
+        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.swish_beta_up = nn.Parameter(torch.ones(self.inner_dim))
+        self.swish_beta_down = nn.Parameter(torch.ones(self.inner_dim))
+        self.attn_norm = nn.RMSNorm(self.inner_dim)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        if paired:
+            assert n_heads % 2 == 0
+            inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
+
+        # Gate for pre-sequence blending (operates on inner_dim, not head-split)
+        # Half the channels get blended with previous position
+        self.neighbor_gate_proj = nn.Linear(d_model, self.inner_dim // 2, bias=True)
+        nn.init.zeros_(self.neighbor_gate_proj.weight)
+        nn.init.constant_(self.neighbor_gate_proj.bias, -2.0)
+
+    def _rope(self, x):
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def _paired_rope(self, x):
+        T = x.shape[1]
+        t = torch.arange(T, device=x.device, dtype=self.inv_freq_paired.dtype)
+        t_even, t_odd = 2 * t, 2 * t + 1
+        freqs_even = torch.outer(t_even, self.inv_freq_paired)
+        freqs_odd = torch.outer(t_odd, self.inv_freq_paired)
+        cos = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
+        sin = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+    def forward(self, x):
+        b, t, d = x.shape
+        h_up = self.up_proj(x)
+        h_up = h_up * torch.sigmoid(self.swish_beta_up * h_up)
+
+        # Blend h_up with previous position (second half of channels)
+        half_inner = self.inner_dim // 2
+        gate = torch.sigmoid(self.neighbor_gate_proj(x))  # (B, T, inner_dim//2)
+        h_static = h_up[:, :, :half_inner]
+        h_cur = h_up[:, :, half_inner:]
+        h_prev = F.pad(h_cur[:, :-1], (0, 0, 1, 0))
+        h_blended = (1 - gate) * h_cur + gate * h_prev
+        h_up_mixed = torch.cat([h_static, h_blended], dim=-1)
+
+        # QKV from the blended sequence — Q/K/V all see neighbor info
+        q = self.q_proj(h_up_mixed).view(b, t, self.n_head, self.head_dim)
+        k = self.k_proj(h_up_mixed).view(b, t, self.n_head, self.head_dim)
+        v = self.v_proj(h_up_mixed).view(b, t, self.n_head, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if self.paired:
+            n2 = self.n_head // 2
+            q = q.view(b, t, n2, self.head_dim * 2)
+            k = k.view(b, t, n2, self.head_dim * 2)
+            q = self._paired_rope(q)
+            k = self._paired_rope(k)
+            q = q.view(b, t * 2, n2, self.head_dim)
+            k = k.view(b, t * 2, n2, self.head_dim)
+            v = v.reshape(b, t * 2, n2, self.head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
+        else:
+            q = self._rope(q)
+            k = self._rope(k)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2)
+
+        y = y.contiguous().view(b, t, self.inner_dim)
+        # Skip-multiply uses original h_up (not blended) — preserves clean gating
+        y = self.attn_norm(y) * h_up
+        y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
+        return y
+
+
 class DS1Wrapper(nn.Module):
     def __init__(self, dim, state_dim=64, mimo_rank=4, n_iters=2, **kwargs):
         super().__init__()
@@ -1340,6 +1566,18 @@ def make_models(dim, n_layers=1, requested_models=None):
 
     # FusedGatePaired: same but with paired head attention
     try_add('FusedGatePaired', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True))
+
+    # FusedGateKV: 1-step neighbor lerp on both K and V (no scan)
+    try_add('FusedGateKV', lambda: FusedGateKVBlock(d_model=dim, n_heads=4, paired=False))
+
+    # FusedGateKVP: same but paired
+    try_add('FusedGateKVP', lambda: FusedGateKVBlock(d_model=dim, n_heads=4, paired=True))
+
+    # FusedGatePreSeq: 1-step neighbor lerp on h_up before QKV projection (no scan)
+    try_add('FusedGatePreSeq', lambda: FusedGatePreSeqBlock(d_model=dim, n_heads=4, paired=False))
+
+    # FusedGatePreSeqP: same but paired
+    try_add('FusedGatePreSeqP', lambda: FusedGatePreSeqBlock(d_model=dim, n_heads=4, paired=True))
 
     return models
 
