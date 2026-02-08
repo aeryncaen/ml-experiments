@@ -1061,9 +1061,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     
     n_train = len(train_data)
 
-    # Linear warmup: 1 epoch of steps, from 1e-5 to lr
+    # Linear warmup: 1 epoch of steps, from lr/10 to lr
     warmup_steps = n_train
-    warmup_ratio = 1e-5 / lr if lr > 0 else 0.1
+    warmup_ratio = 0.1
     def warmup_fn(step):
         if step < warmup_steps:
             return warmup_ratio + (1.0 - warmup_ratio) * step / warmup_steps
@@ -1446,7 +1446,8 @@ if __name__ == '__main__':
             if args.compile:
                 model = torch.compile(model, mode=args.compile_mode)
             
-            r = train_task(model, task, dim, max_epochs=max_epochs, lr=1e-4, B=B, L=L, device=DEVICE,
+            task_lr = 1e-3 if task == 'mixed' else 1e-4
+            r = train_task(model, task, dim, max_epochs=max_epochs, lr=task_lr, B=B, L=L, device=DEVICE,
                            preloaded_data=task_data, early_stop_acc=args.early_stop_acc,
                            grad_log_every=args.grad_log_every,
                            grad_explode=args.grad_explode,
