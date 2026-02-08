@@ -886,7 +886,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     train_data = preloaded_data['train']
     val_data = preloaded_data['val']
 
-    def _forward(batch):
+    def _forward(batch, hard_mine=False):
         if task_name == 'mixed':
             inp, tgt, task_ids = batch
         else:
@@ -894,7 +894,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         B_cur = inp.shape[0]
         y = head(model(embed(inp)))  # (B, L, V)
 
-        if task_name == 'mixed' and B_cur > 1:
+        if hard_mine and B_cur > 1:
             # Hard mining: per-sample loss, weight hard samples more
             per_sample_loss = torch.zeros(B_cur, device=inp.device)
             per_sample_correct = torch.zeros(B_cur, device=inp.device)
@@ -1027,8 +1027,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
+    hard_mine_epoch = int(max_epochs * 2 / 3)  # last 1/3 of training
+    
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
+        use_hard_mine = task_name == 'mixed' and epoch >= hard_mine_epoch
+        if epoch == hard_mine_epoch and task_name == 'mixed':
+            tqdm.write(f"[hard mining] activated at epoch {epoch + 1}/{max_epochs}")
+        
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
         
@@ -1045,7 +1051,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             if track_act:
                 act_stats_step.clear()
                 act_active['on'] = True
-            loss, acc = _forward(batch)
+            loss, acc = _forward(batch, hard_mine=use_hard_mine)
             act_active['on'] = False
             if track_usb:
                 _set_usb_debug_active(model, False)
