@@ -1389,7 +1389,7 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
     return best_knob
 
 
-def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2):
+def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False):
     """Build models with configurable depth.
     
     If match_params=True, auto-size SSM/MHA internal dimensions to match FusedGateBlendP param count.
@@ -1416,7 +1416,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         if not _wanted(name):
             return
         try:
-            models[name] = _stack(make_fn, n_layers, dim)
+            if moe:
+                models[name] = _stack_moe(make_fn, n_layers, dim, n_experts=n_experts, top_k=top_k)
+            else:
+                models[name] = _stack(make_fn, n_layers, dim)
         except ImportError as e:
             print(f"  Warning: {name} not available ({e})")
         except Exception as e:
@@ -1482,26 +1485,6 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
 
-    # MoE v1: 4 experts × n_layers, top-2 routing, blind weighting
-    if _wanted('FusedGateBlendP_MoE'):
-        try:
-            models['FusedGateBlendP_MoE'] = _stack_moe(
-                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
-                n_layers, dim, n_experts=n_experts, top_k=top_k, version=1,
-            )
-        except Exception as e:
-            print(f"  Warning: FusedGateBlendP_MoE failed to initialize ({e})")
-
-    # MoE v2: sender-routed, merge weights from expert outputs
-    if _wanted('FusedGateBlendP_MoE2'):
-        try:
-            models['FusedGateBlendP_MoE2'] = _stack_moe(
-                lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
-                n_layers, dim, n_experts=n_experts, top_k=top_k, version=2,
-            )
-        except Exception as e:
-            print(f"  Warning: FusedGateBlendP_MoE2 failed to initialize ({e})")
-
     return models
 
 
@@ -1537,6 +1520,7 @@ if __name__ == '__main__':
                         help='Specific tasks to test (default: all)')
     parser.add_argument('--no-match-params', action='store_true',
                         help='Disable auto-sizing SSMs to match FusedGateBlendP param count')
+    parser.add_argument('--moe', action='store_true', help='Use MoE stacking for all models')
     parser.add_argument('--n-experts', type=int, default=4, help='Number of MoE experts per layer')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
@@ -1559,7 +1543,7 @@ if __name__ == '__main__':
     requested = args.models  # None means all available
     match_params = not args.no_match_params
     models_info = make_models(dim, n_layers=n_layers, requested_models=requested, match_params=match_params,
-                              n_experts=args.n_experts, top_k=args.top_k)
+                              n_experts=args.n_experts, top_k=args.top_k, moe=args.moe)
     all_names = list(models_info.keys())
     
     if not all_names:
@@ -1607,7 +1591,7 @@ if __name__ == '__main__':
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(SEED)
             model = make_models(dim, n_layers=n_layers, requested_models=[name], match_params=match_params,
-                                n_experts=args.n_experts, top_k=args.top_k)[name]
+                                n_experts=args.n_experts, top_k=args.top_k, moe=args.moe)[name]
             param_count = count_params(model)
             
             # Optionally compile the model
