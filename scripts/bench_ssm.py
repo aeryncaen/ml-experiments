@@ -238,16 +238,25 @@ class FusedGateBlock(nn.Module):
         # Post-attention norm (before skip-multiply)
         self.attn_norm = nn.RMSNorm(self.inner_dim)
 
-        # QK norm
+        # QK norm + post-norm bias (Mamba-3 style BC bias, init ones)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
+        self.q_bias = nn.Parameter(torch.ones(self.head_dim))
+        self.k_bias = nn.Parameter(torch.ones(self.head_dim))
 
-        # RoPE
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        # RoPE: first half of rotation pairs = fixed, second half = data-dependent
+        # head_dim operates in pairs for rotation, so head_dim//2 pairs total
+        self.rope_fixed_pairs = self.head_dim // 4   # first half of pairs: fixed RoPE
+        self.rope_dd_pairs = self.head_dim // 4      # second half of pairs: data-dependent
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rope_fixed_pairs * 2, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)  # (rope_fixed_pairs,)
+        # Data-dependent RoPE: project x → per-head rotation deltas, then cumsum
+        self.rope_dd_proj = nn.Linear(d_model, n_heads * self.rope_dd_pairs, bias=True)
+        nn.init.zeros_(self.rope_dd_proj.weight)
+        nn.init.zeros_(self.rope_dd_proj.bias)
         if paired:
             assert n_heads % 2 == 0
-            inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            inv_freq_p = 1.0 / (10000 ** (torch.arange(0, self.rope_fixed_pairs * 2, 2).float() / self.head_dim))
             self.register_buffer('inv_freq_paired', inv_freq_p, persistent=False)
 
         # K causal lerp: 1/4 of head_dim (last quarter)
@@ -264,28 +273,110 @@ class FusedGateBlock(nn.Module):
         nn.init.zeros_(self.q_gate_bwd_proj.weight)
         nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
-    def _rope(self, x):
-        T = x.shape[1]
-        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        cos = freqs.cos()[None, :, None, :]
-        sin = freqs.sin()[None, :, None, :]
+    @staticmethod
+    def _apply_rotary(x, cos, sin):
+        """Apply rotary embedding. x: (..., 2*n_pairs), cos/sin: (..., n_pairs)."""
         d = x.shape[-1] // 2
         x1, x2 = x[..., :d], x[..., d:]
         return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
 
-    def _paired_rope(self, x):
-        """Even/odd position encodings for paired head dim (2*head_dim width)."""
-        T = x.shape[1]
-        t = torch.arange(T, device=x.device, dtype=self.inv_freq_paired.dtype)
+    def _dd_rope_angles(self, x):
+        """Compute cumulative data-dependent rotation angles.
+        x: (B, T, D) → returns (B, T, H, rope_dd_pairs) cumulative angles.
+        """
+        b, t, _ = x.shape
+        # Project to per-head rotation deltas
+        deltas = self.rope_dd_proj(x)  # (B, T, H * rope_dd_pairs)
+        deltas = deltas.view(b, t, self.n_head, self.rope_dd_pairs)
+        # Cumulative sum across time → cumulative rotation angle
+        return deltas.cumsum(dim=1)
+
+    def _hybrid_rope(self, qk, dd_angles):
+        """Apply hybrid RoPE: fixed on first half of pairs, data-dependent on second half.
+        qk:        (B, T, H, head_dim)
+        dd_angles: (B, T, H, rope_dd_pairs) — cumulative angles for dynamic dims
+        """
+        fp = self.rope_fixed_pairs
+        dp = self.rope_dd_pairs
+        T = qk.shape[1]
+
+        # Split into fixed and dynamic dim regions
+        # Layout: [fixed_x1 (fp) | dd_x1 (dp) | fixed_x2 (fp) | dd_x2 (dp)]
+        qk_fixed = torch.cat([qk[..., :fp], qk[..., fp+dp:fp+dp+fp]], dim=-1)  # (B,T,H,2*fp)
+        qk_dd = torch.cat([qk[..., fp:fp+dp], qk[..., fp+dp+fp:]], dim=-1)     # (B,T,H,2*dp)
+
+        # Fixed RoPE
+        t = torch.arange(T, device=qk.device, dtype=self.inv_freq.dtype)
+        freqs_fixed = torch.outer(t, self.inv_freq)  # (T, fp)
+        cos_f = freqs_fixed.cos()[None, :, None, :]   # (1, T, 1, fp)
+        sin_f = freqs_fixed.sin()[None, :, None, :]
+        qk_fixed = self._apply_rotary(qk_fixed, cos_f, sin_f)
+
+        # Data-dependent RoPE
+        cos_d = dd_angles.cos()  # (B, T, H, dp)
+        sin_d = dd_angles.sin()
+        qk_dd = self._apply_rotary(qk_dd, cos_d, sin_d)
+
+        # Reassemble: [fixed_x1 | dd_x1 | fixed_x2 | dd_x2]
+        return torch.cat([qk_fixed[..., :fp], qk_dd[..., :dp],
+                          qk_fixed[..., fp:], qk_dd[..., dp:]], dim=-1)
+
+    def _paired_rope(self, q_or_k, dd_angles):
+        """Even/odd position encodings for paired head dim (2*head_dim width).
+        q_or_k:    (B, T, n_head//2, head_dim*2)
+        dd_angles: (B, T, n_head, rope_dd_pairs) — will be reshaped for paired heads
+        """
+        b, T, n2, hd2 = q_or_k.shape
+        fp = self.rope_fixed_pairs
+        dp = self.rope_dd_pairs
+
+        # Fixed RoPE with even/odd position indices
+        t = torch.arange(T, device=q_or_k.device, dtype=self.inv_freq_paired.dtype)
         t_even, t_odd = 2 * t, 2 * t + 1
-        freqs_even = torch.outer(t_even, self.inv_freq_paired)
+        freqs_even = torch.outer(t_even, self.inv_freq_paired)  # (T, fp)
         freqs_odd = torch.outer(t_odd, self.inv_freq_paired)
-        cos = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
-        sin = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
-        d = x.shape[-1] // 2
-        x1, x2 = x[..., :d], x[..., d:]
-        return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+        # Paired: concat even+odd freqs → (T, 2*fp)
+        cos_f = torch.cat([freqs_even.cos(), freqs_odd.cos()], dim=-1)[None, :, None, :]
+        sin_f = torch.cat([freqs_even.sin(), freqs_odd.sin()], dim=-1)[None, :, None, :]
+
+        # Data-dependent: reshape angles from (B,T,H,dp) → (B,T,n2,2*dp) for paired heads
+        dd = dd_angles.view(b, T, n2, 2 * dp)
+        cos_d = dd.cos()
+        sin_d = dd.sin()
+
+        # Split paired head_dim*2 into fixed and dd regions
+        # head_dim*2 layout: [fp | dp | fp | dp | fp | dp | fp | dp]
+        # Actually for paired, each "half" is head_dim, so:
+        # [head0: fp|dp|fp|dp] [head1: fp|dp|fp|dp]
+        # Simpler: treat as two head_dim chunks, apply hybrid to each, concat
+        hd = self.head_dim
+        h0 = q_or_k[..., :hd]
+        h1 = q_or_k[..., hd:]
+        dd0 = dd[..., :dp]
+        dd1 = dd[..., dp:]
+
+        # Fixed part of h0
+        h0_fixed = torch.cat([h0[..., :fp], h0[..., fp+dp:fp+dp+fp]], dim=-1)
+        h0_dd = torch.cat([h0[..., fp:fp+dp], h0[..., fp+dp+fp:]], dim=-1)
+        # Apply fixed rope with even freqs to h0
+        cos_f0 = freqs_even.cos()[None, :, None, :]
+        sin_f0 = freqs_even.sin()[None, :, None, :]
+        h0_fixed = self._apply_rotary(h0_fixed, cos_f0, sin_f0)
+        h0_dd = self._apply_rotary(h0_dd, dd0.cos(), dd0.sin())
+        h0 = torch.cat([h0_fixed[..., :fp], h0_dd[..., :dp],
+                         h0_fixed[..., fp:], h0_dd[..., dp:]], dim=-1)
+
+        # Fixed part of h1 (odd positions)
+        h1_fixed = torch.cat([h1[..., :fp], h1[..., fp+dp:fp+dp+fp]], dim=-1)
+        h1_dd = torch.cat([h1[..., fp:fp+dp], h1[..., fp+dp+fp:]], dim=-1)
+        cos_f1 = freqs_odd.cos()[None, :, None, :]
+        sin_f1 = freqs_odd.sin()[None, :, None, :]
+        h1_fixed = self._apply_rotary(h1_fixed, cos_f1, sin_f1)
+        h1_dd = self._apply_rotary(h1_dd, dd1.cos(), dd1.sin())
+        h1 = torch.cat([h1_fixed[..., :fp], h1_dd[..., :dp],
+                         h1_fixed[..., fp:], h1_dd[..., dp:]], dim=-1)
+
+        return torch.cat([h0, h1], dim=-1)
 
     def _k_causal_lerp(self, k, gate):
         """1-step causal lerp on last quarter of K channels.
@@ -326,9 +417,9 @@ class FusedGateBlock(nn.Module):
         k = self.k_proj(h_up).view(b, t, self.n_head, self.head_dim)
         v = self.v_proj(h_up).view(b, t, self.n_head, self.head_dim)
 
-        # QK norm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # QK norm + post-norm bias (Mamba-3 style BC bias)
+        q = self.q_norm(q) * self.q_bias
+        k = self.k_norm(k) * self.k_bias
 
         # K causal lerp (1/4 dims) — before RoPE
         k_gate = torch.sigmoid(self.k_gate_proj(x)).view(b, t, self.n_head, self.quarter_dim)
@@ -339,12 +430,15 @@ class FusedGateBlock(nn.Module):
         q_gb = torch.sigmoid(self.q_gate_bwd_proj(x)).view(b, t, self.n_head, self.half_dim)
         q = self._q_acausal_lerp(q, q_gf, q_gb)
 
+        # Data-dependent rotation angles (shared for Q and K)
+        dd_angles = self._dd_rope_angles(x)
+
         if self.paired:
             n2 = self.n_head // 2
             q = q.view(b, t, n2, self.head_dim * 2)
             k = k.view(b, t, n2, self.head_dim * 2)
-            q = self._paired_rope(q)
-            k = self._paired_rope(k)
+            q = self._paired_rope(q, dd_angles)
+            k = self._paired_rope(k, dd_angles)
             q = q.view(b, t * 2, n2, self.head_dim)
             k = k.view(b, t * 2, n2, self.head_dim)
             v = v.reshape(b, t * 2, n2, self.head_dim)
@@ -352,8 +446,8 @@ class FusedGateBlock(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(b, t, self.n_head, self.head_dim)
         else:
-            q = self._rope(q)
-            k = self._rope(k)
+            q = self._hybrid_rope(q, dd_angles)
+            k = self._hybrid_rope(k, dd_angles)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2)
