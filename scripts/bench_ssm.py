@@ -992,12 +992,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                             per_task_total[subtask] += v.sum().item()
         model.train()
         avg_loss = sum(val_losses) / len(val_losses)
-        avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
         subtask_accs = None
         if is_mixed:
             subtask_accs = {}
             for t in ALL_TASKS:
                 subtask_accs[t] = per_task_correct[t] / per_task_total[t] if per_task_total[t] > 0 else 0.0
+            avg_acc = sum(subtask_accs.values()) / len(subtask_accs)
+        else:
+            avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
         return avg_loss, avg_acc, subtask_accs
 
     mem_baseline = 0
