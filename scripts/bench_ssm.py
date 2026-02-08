@@ -274,9 +274,9 @@ class FusedGateBlock(nn.Module):
         nn.init.zeros_(self.q_gate_bwd_proj.weight)
         nn.init.constant_(self.q_gate_bwd_proj.bias, -2.0)
 
-        # SiLU² blend parameter (only used when attn_mode='blend')
-        if attn_mode == 'blend':
-            self.silu2_alpha = nn.Parameter(torch.tensor(0.0))  # init at 0 → starts as pure softmax
+        # Blend parameter (used when attn_mode='blend' or 'blend_relu2')
+        if attn_mode in ('blend', 'blend_relu2'):
+            self.blend_alpha = nn.Parameter(torch.tensor(0.0))  # init at 0 → starts as pure softmax
 
     @staticmethod
     def _apply_rotary(x, cos, sin):
@@ -396,30 +396,52 @@ class FusedGateBlock(nn.Module):
         weights = F.silu(logits) ** 2 * causal_mask
         return weights @ v
 
-    def _blend_attention(self, q, k, v):
-        """Softmax + learnable SiLU² correction.
-        weights = softmax(logits) + alpha * silu(logits)² * causal_mask
-        Starts as pure softmax (alpha=0), learns to add sparse corrections.
+    def _relu2_attention(self, q, k, v):
+        """ReLU² attention: replace softmax with relu(logits)².
+        q, k, v: (B, H, T, D) — standard SDPA layout.
+        Returns: (B, H, T, D)
         """
         scale = 1.0 / math.sqrt(q.shape[-1])
-        logits = (q @ k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        logits = (q @ k.transpose(-2, -1)) * scale
         T = logits.shape[-1]
         causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
-        # Softmax branch (needs -inf mask for causality)
+        weights = F.relu(logits) ** 2 * causal_mask
+        return weights @ v
+
+    def _blend_attention(self, q, k, v):
+        """Softmax + learnable SiLU² correction."""
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        logits = (q @ k.transpose(-2, -1)) * scale
+        T = logits.shape[-1]
+        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
         softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
         w_softmax = torch.softmax(softmax_logits, dim=-1)
-        # SiLU² branch
         w_silu2 = F.silu(logits) ** 2 * causal_mask
-        # Blend
-        weights = w_softmax + self.silu2_alpha * w_silu2
+        weights = w_softmax + self.blend_alpha * w_silu2
+        return weights @ v
+
+    def _blend_relu2_attention(self, q, k, v):
+        """Softmax + learnable ReLU² correction."""
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        logits = (q @ k.transpose(-2, -1)) * scale
+        T = logits.shape[-1]
+        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        softmax_logits = logits.masked_fill(causal_mask == 0, float('-inf'))
+        w_softmax = torch.softmax(softmax_logits, dim=-1)
+        w_relu2 = F.relu(logits) ** 2 * causal_mask
+        weights = w_softmax + self.blend_alpha * w_relu2
         return weights @ v
 
     def _attend(self, q, k, v):
         """Dispatch to the configured attention mode."""
         if self.attn_mode == 'silu2':
             return self._silu2_attention(q, k, v)
+        elif self.attn_mode == 'relu2':
+            return self._relu2_attention(q, k, v)
         elif self.attn_mode == 'blend':
             return self._blend_attention(q, k, v)
+        elif self.attn_mode == 'blend_relu2':
+            return self._blend_relu2_attention(q, k, v)
         else:
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -1220,6 +1242,14 @@ def make_models(dim, n_layers=1, requested_models=None):
     # Blend: softmax + learnable silu² correction (alpha init 0 → starts as pure softmax)
     try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
     try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
+
+    # ReLU² variants
+    try_add('FusedGateRelu2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='relu2'))
+    try_add('FusedGateRelu2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='relu2'))
+
+    # Blend ReLU²: softmax + learnable relu² correction
+    try_add('FusedGateBlendR2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend_relu2'))
+    try_add('FusedGateBlendR2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend_relu2'))
 
     return models
 
