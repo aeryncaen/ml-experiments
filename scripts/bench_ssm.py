@@ -1238,22 +1238,22 @@ class MoEStackedModel(nn.Module):
 
         for norm, router, experts in zip(self.norms, self.routers, self.experts):
             h = norm(x)
-            # Router: (B, T, n_experts)
-            logits = router(h)
-            # Top-k selection
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, T, top_k)
-            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, T, top_k)
+            # Router: pool over sequence → per-sample routing decision
+            h_pool = h.mean(dim=1)  # (B, D)
+            logits = router(h_pool)  # (B, n_experts)
+            # Top-k selection per sample
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
+            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
 
-            # Run selected experts and weighted sum
-            # Gather expert outputs — run all experts, mask later (simpler for small n_experts)
-            expert_outs = torch.stack([e(h) for e in experts], dim=-2)  # (B, T, n_experts, D)
+            # Run all experts on h: each produces (B, T, D)
+            expert_outs = torch.stack([e(h) for e in experts], dim=2)  # (B, T, n_experts, D)
 
-            # Gather top-k expert outputs
-            idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, T, top_k, D)
+            # Gather top-k expert outputs per sample
+            idx_expanded = topk_idx[:, None, :, None].expand(-1, T, -1, D)  # (B, T, top_k, D)
             selected = expert_outs.gather(2, idx_expanded)  # (B, T, top_k, D)
 
-            # Weighted sum
-            out = (selected * topk_weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
+            # Weighted sum (weights are per-sample, broadcast over T)
+            out = (selected * topk_weights[:, None, :, None]).sum(dim=2)  # (B, T, D)
             x = x + out
             layer_outputs.append(x)
 
