@@ -1432,81 +1432,99 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     def _wanted(name):
         return requested_models is None or name in requested_models
 
-    def try_add(name, make_fn):
+    def try_add(name, make_fn, cfg_desc):
         if not _wanted(name):
             return
         try:
             if moe:
-                models[name] = _stack_moe(make_fn, n_layers, dim, n_experts=n_experts, top_k=top_k)
+                model = _stack_moe(make_fn, n_layers, dim, n_experts=n_experts, top_k=top_k)
             else:
-                models[name] = _stack(make_fn, n_layers, dim)
+                model = _stack(make_fn, n_layers, dim)
+            setattr(model, '_bench_config', cfg_desc)
+            models[name] = model
         except ImportError as e:
             print(f"  Warning: {name} not available ({e})")
         except Exception as e:
             print(f"  Warning: {name} failed to initialize ({e})")
 
     # DS1++: DS1 + signed sparse attention
-    try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True))
+    try_add('DS1++', lambda: DS1Wrapper(dim=dim, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True),
+            f"DS1Wrapper(dim={dim}, state_dim=48, mimo_rank=4, n_iters=2, diff_attn=True)")
 
     # S4D: auto-size d_state to match target
     if target_params and _wanted('S4D'):
         s4d_dstate = _find_knob(lambda k: lambda: S4D(d_model=dim, d_state=k), n_layers, dim, target_params)
     else:
         s4d_dstate = 144
-    try_add('S4D', lambda: S4D(d_model=dim, d_state=s4d_dstate))
+    try_add('S4D', lambda: S4D(d_model=dim, d_state=s4d_dstate),
+            f"S4D(d_model={dim}, d_state={s4d_dstate})")
 
     # S5: auto-size state_width to match target
     if target_params and _wanted('S5'):
         s5_sw = _find_knob(lambda k: lambda: S5Wrapper(width=dim, state_width=k), n_layers, dim, target_params)
     else:
         s5_sw = 140
-    try_add('S5', lambda: S5Wrapper(width=dim, state_width=s5_sw))
+    try_add('S5', lambda: S5Wrapper(width=dim, state_width=s5_sw),
+            f"S5Wrapper(width={dim}, state_width={s5_sw})")
 
     # Mamba: auto-size d_state to match target (expand=2 default)
     if target_params and _wanted('Mamba'):
         mamba_dstate = _find_knob(lambda k: lambda: MambaWrapper(d_model=dim, d_state=k, d_conv=4, expand=2), n_layers, dim, target_params)
     else:
         mamba_dstate = 72
-    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=mamba_dstate, d_conv=4, expand=2))
+    try_add('Mamba', lambda: MambaWrapper(d_model=dim, d_state=mamba_dstate, d_conv=4, expand=2),
+            f"MambaWrapper(d_model={dim}, d_state={mamba_dstate}, d_conv=4, expand=2)")
 
     # USB: Full MHA with directional scans (elementwise state - good for state tracking)
     try_add('USB', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
-                                       scan_state_modes=('elementwise', 'elementwise', 'elementwise')))
+                                       scan_state_modes=('elementwise', 'elementwise', 'elementwise')),
+            f"USBWrapper(d_model={dim}, headdim=32, expansion_factor=2, scan_state_modes=('elementwise','elementwise','elementwise'))")
     
     # USB_outer: USB with outer product state (all groups - good for retrieval)
     try_add('USB_outer', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
-                                             scan_state_modes=('outer', 'outer', 'outer')))
+                                             scan_state_modes=('outer', 'outer', 'outer')),
+            f"USBWrapper(d_model={dim}, headdim=32, expansion_factor=2, scan_state_modes=('outer','outer','outer'))")
     
     # USB_hybrid: G1/G2 outer (retrieval), G3 elementwise (state tracking)
     try_add('USB_hybrid', lambda: USBWrapper(d_model=dim, headdim=32, expansion_factor=2,
-                                              scan_state_modes=('outer', 'outer', 'elementwise')))
+                                              scan_state_modes=('outer', 'outer', 'elementwise')),
+            f"USBWrapper(d_model={dim}, headdim=32, expansion_factor=2, scan_state_modes=('outer','outer','elementwise'))")
 
     # MHA: conv + attention + SwiGLU MLP, auto-size mlp_inner to match target
     if target_params:
         mha_mlp = _find_knob(lambda k: lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=k), n_layers, dim, target_params)
     else:
         mha_mlp = 0
-    try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp))
+    try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
+            f"MHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
-    try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0))
+    try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0),
+            f"IdealWrapper(d_model={dim}, n_heads=4, ffn_mult=4.0)")
 
     # FusedGate: fused attention+MLP block (up → swish → attn → skip-mul → swish → down)
-    try_add('FusedGate', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False))
+    try_add('FusedGate', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=False, attn_mode='softmax')")
 
     # FusedGatePaired: same but with paired head attention
-    try_add('FusedGatePaired', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True))
+    try_add('FusedGatePaired', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='softmax')")
 
     # SiLU² attention variants
-    try_add('FusedGateSilu2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='silu2'))
-    try_add('FusedGateSilu2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='silu2'))
+    try_add('FusedGateSilu2', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='silu2'),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=False, attn_mode='silu2')")
+    try_add('FusedGateSilu2P', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='silu2'),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='silu2')")
 
     # Blend: output-level lerp between softmax and silu², content-dependent gate
-    try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'))
-    try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'))
+    try_add('FusedGateBlend', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=False, attn_mode='blend'),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=False, attn_mode='blend')")
+    try_add('FusedGateBlendP', lambda: FusedGateBlock(d_model=dim, n_heads=4, paired=True, attn_mode='blend'),
+            f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='blend')")
 
     # ULB (Universal Learning Block) — generalized FusedGateBlock from src/ulb/
-    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')))
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend'))")
 
     return models
 
@@ -1578,11 +1596,12 @@ if __name__ == '__main__':
         if missing:
             print(f"Warning: Requested models not available: {missing}")
     
-    print(f"\n{'Model':<10} {'Params':>10} {'Layers':>8}")
-    print('-' * 30)
+    print(f"\n{'Model':<12} {'Params':>10} {'Layers':>8}  Config")
+    print('-' * 140)
     for name in all_names:
         m = models_info[name]
-        print(f"{name:<10} {count_params(m):>10,} {n_layers:>8}")
+        cfg = getattr(m, '_bench_config', '<unknown>')
+        print(f"{name:<12} {count_params(m):>10,} {n_layers:>8}  {cfg}")
 
     print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}")
     print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
