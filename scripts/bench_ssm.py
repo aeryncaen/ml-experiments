@@ -1605,6 +1605,17 @@ if __name__ == '__main__':
 
     print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}")
     print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
+    print("\nTraining config:")
+    print("- Optimizer: Adam")
+    print("- Loss: cross_entropy(ignore_index=-100)")
+    print("- Vocab: unified VOCAB_SIZE=64 (shared embedding/head across tasks)")
+    print("- LR: mixed=1e-3, standalone tasks=1e-4")
+    print("- LR schedule: 1 epoch linear warmup (0.1x -> 1.0x), then cosine decay to 0.05x")
+    hard_mine_epoch = int(max_epochs * 2 / 3)
+    print(f"- Hard mining (mixed only): OFF until epoch {hard_mine_epoch + 1}, ON from epoch {hard_mine_epoch + 1}..{max_epochs}")
+    print("  weighting: easiest~0.5x, hardest~2.0x, normalized to mean=1.0 per batch")
+    print("- Mixed mode data scale: train/val batch counts multiplied by 5 (one per subtask)")
+    print("- Mixed convergence criterion: all subtasks must exceed early-stop threshold")
     print('=' * 100)
 
     header = f"{'Model':<10} {'Task':<16} {'Init':>8} {'Best':>8} {'Val Acc':>8} {'Best@':>6} {'Epochs':>7} {'Wall(s)':>8} {'Status':>10}"
