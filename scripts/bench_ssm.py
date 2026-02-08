@@ -511,8 +511,8 @@ class FusedGateBlock(nn.Module):
 
         y = y.contiguous().view(b, t, self.inner_dim)
 
-        # Skip-add
-        y = self.attn_norm(y) + h_up
+        # Skip-multiply
+        y = self.attn_norm(y) * h_up
 
         # Down-project with Swish
         y = self.down_proj(y * torch.sigmoid(self.swish_beta_down * y))
@@ -1200,16 +1200,19 @@ def count_params(model):
 
 
 class StackedModel(nn.Module):
-    """Stack N identical layers with pre-norm residual connections."""
+    """Stack N identical layers with pre-norm residual connections + embed residual."""
     def __init__(self, make_layer, n_layers, dim):
         super().__init__()
         self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
+        # Per-layer learnable scale for embedding residual (init zero = no-op)
+        self.embed_alpha = nn.Parameter(torch.zeros(n_layers))
 
     def forward(self, x):
-        for norm, layer in zip(self.norms, self.layers):
-            x = x + layer(norm(x))
+        x0 = x
+        for i, (norm, layer) in enumerate(zip(self.norms, self.layers)):
+            x = x + layer(norm(x)) + self.embed_alpha[i] * x0
         return self.final_norm(x)
 
 
