@@ -1057,15 +1057,25 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     # PoolOfExperts annealing
     _initial_router_noise = getattr(model, 'router_noise_scale', None)
     _initial_exit_ramp = getattr(model, 'exit_ramp_scale', None)
+    _in_efficiency_phase = False
+    _efficiency_start_epoch = None
+    _converged_epoch = None
 
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
         
-        # Anneal router noise linearly to 0, exit ramp linearly to 3x initial
+        # Anneal router noise and exit ramp
         if _initial_router_noise is not None:
             frac = epoch / max_epochs
-            model.router_noise_scale = _initial_router_noise * (1.0 - frac)
-            model.exit_ramp_scale = _initial_exit_ramp * (1.0 + 2.0 * frac)
+            if _in_efficiency_phase:
+                # Efficiency phase: kill noise, ramp exit hard
+                model.router_noise_scale = 0.0
+                eff_frac = (epoch - _efficiency_start_epoch) / max(1, max_epochs - _efficiency_start_epoch)
+                model.exit_ramp_scale = _initial_exit_ramp * (3.0 + 7.0 * eff_frac)  # 3x → 10x
+            else:
+                # Normal phase: noise decays, ramp grows gently
+                model.router_noise_scale = _initial_router_noise * (1.0 - frac)
+                model.exit_ramp_scale = _initial_exit_ramp * (1.0 + 2.0 * frac)
 
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
@@ -1196,13 +1206,26 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         else:
             converged = val_acc >= early_stop_acc
         if converged:
-            stop_reason = "CONVERGED"
-            break
+            if _initial_exit_ramp is not None and not _in_efficiency_phase:
+                # PoolOfExperts: don't stop, enter efficiency phase — push earlier exit
+                _in_efficiency_phase = True
+                _efficiency_start_epoch = epoch
+                _converged_epoch = final_epoch
+                tqdm.write(f"[efficiency] converged at epoch {final_epoch}, "
+                           f"spending remaining epochs pushing early exit")
+            elif _in_efficiency_phase:
+                pass  # keep going, ramp is increasing
+            else:
+                stop_reason = "CONVERGED"
+                break
         
         # Early stopping: train plateau (100% train acc but val not improving)
         if train_acc >= 0.9999 and val_acc < early_stop_acc:
             stop_reason = "PLATEAU"
             break
+
+    if _in_efficiency_phase:
+        stop_reason = "EFFICIENT"
 
     if device == 'cuda':
         torch.cuda.synchronize()
