@@ -1049,9 +1049,16 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     
     use_hard_mine = False  # activated when majority of subtasks converge
     
+    # Router noise annealing for PoolOfExperts
+    _initial_router_noise = getattr(model, 'router_noise_scale', None)
+
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
         
+        # Anneal router noise linearly to 0
+        if _initial_router_noise is not None:
+            model.router_noise_scale = _initial_router_noise * (1.0 - epoch / max_epochs)
+
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
         
