@@ -361,33 +361,40 @@ class PoolOfExperts(nn.Module):
             if has_exit.all():
                 break
 
-            # Run selected experts, collect outputs and outbound logits
+            # Run all selected experts on full batch, stack, gather
             h = self.hop_norm(x)
+
+            # Find which experts are active this hop
+            active_eids = topk_idx.unique()
+            active_eids = active_eids[active_eids != exit_idx]
+
+            # Run active experts on full batch, build lookup
+            expert_outs = {}   # eid -> (B, T, D)
+            expert_logits = {} # eid -> (B, pool_size+1)
+            for eid in active_eids.tolist():
+                e_out = self.experts[eid](h)  # (B, T, D)
+                expert_outs[eid] = e_out
+                e_pool = e_out.mean(dim=1)  # (B, D)
+                expert_logits[eid] = self.expert_routers[eid](e_pool)  # (B, pool_size+1)
+
+                block_aux = getattr(self.experts[eid], 'aux_loss', 0.0)
+                total_aux = total_aux + block_aux
+
+            # Weighted merge via gather: stack active expert outputs, use topk_idx to select
+            # Build full (B, T, pool_size, D) would be wasteful if pool is large.
+            # Instead, since top_k is small, iterate K slots with tensor ops (no per-sample Python).
             out = torch.zeros_like(x)  # (B, T, D)
-            next_logits = torch.zeros(B, self.pool_size + 1, device=x.device)  # (B, pool_size+1)
+            next_logits = torch.zeros(B, self.pool_size + 1, device=x.device, dtype=x.dtype)
 
             for k_idx in range(self.top_k):
-                expert_ids = topk_idx[:, k_idx]  # (B,)
                 w = topk_weights[:, k_idx]  # (B,)
-
-                unique_experts = expert_ids.unique()
-                for eid in unique_experts:
-                    eid_val = eid.item()
-                    if eid_val == exit_idx:
+                eids = topk_idx[:, k_idx]   # (B,)
+                for eid in active_eids.tolist():
+                    mask = eids == eid  # (B,)
+                    if not mask.any():
                         continue
-                    mask = expert_ids == eid  # (B,) bool
-                    expert_out = self.experts[eid_val](h[mask])  # (mask_count, T, D)
-                    out[mask] = out[mask] + w[mask, None, None] * expert_out
-
-                    # Outbound logits from this expert, weighted by same merge weight
-                    expert_pool = expert_out.mean(dim=1)  # (mask_count, D)
-                    expert_logits = self.expert_routers[eid_val](expert_pool)  # (mask_count, pool_size+1)
-                    next_logits[mask] = next_logits[mask] + w[mask, None] * expert_logits
-
-            # Collect block aux from experts that ran
-            for e in self.experts:
-                block_aux = getattr(e, 'aux_loss', 0.0)
-                total_aux = total_aux + block_aux
+                    out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
+                    next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
 
             x = x + out
             logits = next_logits
