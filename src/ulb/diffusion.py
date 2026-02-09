@@ -117,16 +117,15 @@ class MaskedDiffusionPoE(PoolOfExperts):
         return x
 
     def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run stem layer and produce initial router logits.
+        """Route only — no computation. Pick first experts from embeddings.
 
         Args:
             x: (B, L, D) embedded sequence.
 
         Returns:
-            x: Stem-processed (B, L, D).
+            x: Unchanged (B, L, D).
             logits: Router logits (B, n_router_options).
         """
-        x = x + self.stem_layer(self.stem_norm(x))
         pool = x.mean(dim=1)  # (B, D)
         logits = self._perturb_logits(self.stem_router(pool))
         return x, logits
