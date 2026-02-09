@@ -369,42 +369,127 @@ class PoolOfExperts(nn.Module):
             logits[:, self.pool_size:] = logits[:, self.pool_size:].masked_fill(exit_mask, float('-inf'))
         return logits
 
+    def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run stem layer and produce initial router logits.
+
+        Args:
+            x: Input tensor (B, T, D).
+
+        Returns:
+            x: Stem-processed tensor (B, T, D).
+            logits: Perturbed stem router logits (B, n_router_options).
+        """
+        x = x + self.stem_layer(self.stem_norm(x))
+        stem_pool = x.mean(dim=1)  # (B, D)
+        logits = self._perturb_logits(self.stem_router(stem_pool))
+        return x, logits
+
+    def route(self, logits: torch.Tensor, hop: int
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply exit ramp, top-k selection, and exit detection.
+
+        Args:
+            logits: Router logits (B, n_router_options).
+            hop: Current hop index (0-based).
+
+        Returns:
+            topk_idx: Selected indices (B, top_k).
+            topk_weights: Softmax weights over selected (B, top_k).
+            has_exit: Boolean per sample — True if any selected index is exit (B,).
+        """
+        exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
+        if exit_bias > 0:
+            bias = torch.zeros_like(logits)
+            bias[:, self.pool_size:] = exit_bias
+            logits = logits + bias
+
+        topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)
+        topk_weights = F.softmax(topk_vals, dim=-1)
+        has_exit = (topk_idx >= self.pool_size).any(dim=-1)
+        return topk_idx, topk_weights, has_exit
+
+    def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                    topk_weights: torch.Tensor
+                    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Run selected experts and produce weighted-merged output and next logits.
+
+        Args:
+            x: Current hidden state (B, T, D).
+            topk_idx: Selected expert/exit indices (B, top_k).
+            topk_weights: Softmax weights (B, top_k).
+
+        Returns:
+            out: Weighted-merged expert output (B, T, D) — added to x by caller.
+            next_logits: Perturbed merged outbound router logits (B, n_router_options).
+            hop_aux: Accumulated aux loss from experts this hop.
+        """
+        B = x.shape[0]
+        h = self.hop_norm(x)
+
+        # Find which experts are active this hop (indices < pool_size)
+        active_eids = topk_idx.unique()
+        active_eids = active_eids[active_eids < self.pool_size]
+
+        # Run active experts on full batch, build lookup
+        hop_aux = 0.0
+        expert_outs = {}   # eid -> (B, T, D)
+        expert_logits = {} # eid -> (B, n_router_options)
+        for eid in active_eids.tolist():
+            e_out = self.experts[eid](h)  # (B, T, D)
+            expert_outs[eid] = e_out
+            e_pool = e_out.mean(dim=1)  # (B, D)
+            expert_logits[eid] = self.expert_routers[eid](e_pool)
+
+            block_aux = getattr(self.experts[eid], 'aux_loss', 0.0)
+            hop_aux = hop_aux + block_aux
+
+        # Weighted merge
+        out = torch.zeros_like(x)
+        next_logits = torch.zeros(B, self.n_router_options, device=x.device, dtype=x.dtype)
+
+        for k_idx in range(self.top_k):
+            w = topk_weights[:, k_idx]
+            eids = topk_idx[:, k_idx]
+            for eid in active_eids.tolist():
+                mask = eids == eid
+                if not mask.any():
+                    continue
+                out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
+                next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
+
+        next_logits = self._perturb_logits(next_logits)
+        return out, next_logits, hop_aux
+
+    def finalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Run exit layer and final norm.
+
+        Args:
+            x: Hidden state after routing loop (B, T, D).
+
+        Returns:
+            Normalized output (B, T, D).
+        """
+        x = x + self.exit_layer(self.exit_norm(x))
+        return self.final_norm(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
+        B = x.shape[0]
 
         # Stem
-        x = x + self.stem_layer(self.stem_norm(x))
+        x, logits = self.stem(x)
 
         total_aux = 0.0
-        non_exit_decisions = 0  # total routing decisions that chose to continue
-        if self.trace:
-            # Per-sample trace: list of (hop, topk_idx, topk_weights, exited) per sample
-            trace_hops = []  # list of dicts per hop
-
-        # First hop: stem router decides
-        stem_pool = x.mean(dim=1)  # (B, D)
-        logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, n_router_options)
+        non_exit_decisions = 0
+        trace_hops: list[dict] = []
 
         for hop in range(self.max_hops):
-            # Depth-dependent exit ramp: linearly boost exit logits with depth
-            exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
-            if exit_bias > 0:
-                bias = torch.zeros_like(logits)
-                bias[:, self.pool_size:] = exit_bias
-                logits = logits + bias
-
-            # Top-k from current logits
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
-            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
-
-            # Check for exit: any index >= pool_size is an exit slot
-            has_exit = (topk_idx >= self.pool_size).any(dim=-1)
+            topk_idx, topk_weights, has_exit = self.route(logits, hop)
 
             if self.trace:
                 trace_hops.append({
-                    'topk_idx': topk_idx.detach().cpu(),     # (B, top_k)
-                    'topk_weights': topk_weights.detach().cpu(),  # (B, top_k)
-                    'has_exit': has_exit.detach().cpu(),      # (B,)
+                    'topk_idx': topk_idx.detach().cpu(),
+                    'topk_weights': topk_weights.detach().cpu(),
+                    'has_exit': has_exit.detach().cpu(),
                 })
 
             non_exit_decisions += (~has_exit).sum()
@@ -412,47 +497,15 @@ class PoolOfExperts(nn.Module):
             if has_exit.all():
                 break
 
-            # Run all selected experts on full batch, stack, gather
-            h = self.hop_norm(x)
-
-            # Find which experts are active this hop (indices < pool_size)
-            active_eids = topk_idx.unique()
-            active_eids = active_eids[active_eids < self.pool_size]
-
-            # Run active experts on full batch, build lookup
-            expert_outs = {}   # eid -> (B, T, D)
-            expert_logits = {} # eid -> (B, n_router_options)
-            for eid in active_eids.tolist():
-                e_out = self.experts[eid](h)  # (B, T, D)
-                expert_outs[eid] = e_out
-                e_pool = e_out.mean(dim=1)  # (B, D)
-                expert_logits[eid] = self.expert_routers[eid](e_pool)  # (B, n_router_options)
-
-                block_aux = getattr(self.experts[eid], 'aux_loss', 0.0)
-                total_aux = total_aux + block_aux
-
-            # Weighted merge: iterate K slots with tensor ops (no per-sample Python)
-            out = torch.zeros_like(x)  # (B, T, D)
-            next_logits = torch.zeros(B, self.n_router_options, device=x.device, dtype=x.dtype)
-
-            for k_idx in range(self.top_k):
-                w = topk_weights[:, k_idx]  # (B,)
-                eids = topk_idx[:, k_idx]   # (B,)
-                for eid in active_eids.tolist():
-                    mask = eids == eid  # (B,)
-                    if not mask.any():
-                        continue
-                    out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
-                    next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
-
+            out, logits, hop_aux = self.execute_hop(x, topk_idx, topk_weights)
             x = x + out
-            logits = self._perturb_logits(next_logits)
+            total_aux = total_aux + hop_aux
 
-        # Exit layer
-        x = x + self.exit_layer(self.exit_norm(x))
+        # Exit
+        x = self.finalize(x)
 
         self.aux_loss = total_aux
-        self.last_mean_hops = non_exit_decisions / B  # avg hops per sample
+        self.last_mean_hops = non_exit_decisions / B
         if self.trace:
             self.last_trace = trace_hops
-        return self.final_norm(x)
+        return x
