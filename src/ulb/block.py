@@ -195,6 +195,81 @@ class ULBBlock(nn.Module):
         else:
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
+    def preprocess_qk(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Apply temporal lerps, compute dd_angles and blend gate.
+
+        Args:
+            q: (B, T, H, head_dim) — after QK norm + bias.
+            k: (B, T, H, head_dim) — after QK norm + bias.
+            x: (B, T, D) — original pre-normed input (used by lerps and gates).
+
+        Returns:
+            q: Preprocessed Q (B, T, H, head_dim).
+            k: Preprocessed K (B, T, H, head_dim).
+            dd_angles: Data-dependent rotation angles for RoPE.
+            blend_gate: (B, H, T, 1) or None.
+        """
+        if self.k_lerp is not None:
+            k = self.k_lerp(k, x)
+        if self.q_lerp is not None:
+            q = self.q_lerp(q, x)
+        elif self.q_conv is not None:
+            q = self.q_conv(q)
+
+        dd_angles = self.rope.compute_dd_angles(x)
+
+        blend_gate = None
+        if self.config.attn_mode == 'blend':
+            assert self.blend_attn is not None
+            blend_gate = self.blend_attn.compute_gate(x)
+
+        return q, k, dd_angles, blend_gate
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               dd_angles: torch.Tensor, blend_gate: torch.Tensor | None
+               ) -> torch.Tensor:
+        """Apply RoPE, paired layout if needed, and attention.
+
+        Args:
+            q: (B, T, H, head_dim) — preprocessed Q.
+            k: (B, T, H, head_dim) — preprocessed K.
+            v: (B, T, H, head_dim) — V (untouched).
+            dd_angles: Data-dependent rotation angles.
+            blend_gate: (B, H, T, 1) or None.
+
+        Returns:
+            y: (B, T, H, head_dim) — attention output.
+        """
+        cfg = self.config
+        b, t = q.shape[:2]
+        n_heads = cfg.n_heads
+        head_dim = cfg.head_dim
+
+        if cfg.paired:
+            n2 = n_heads // 2
+            q = q.view(b, t, n2, head_dim * 2)
+            k = k.view(b, t, n2, head_dim * 2)
+            q = self.paired_rope(q, dd_angles)
+            k = self.paired_rope(k, dd_angles)
+            q = q.view(b, t * 2, n2, head_dim)
+            k = k.view(b, t * 2, n2, head_dim)
+            v = v.reshape(b, t * 2, n2, head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            if blend_gate is not None:
+                bg = blend_gate.view(b, n2, 2, t, 1)
+                blend_gate = bg.permute(0, 1, 3, 2, 4).reshape(b, n2, t * 2, 1)
+            y = self._attend(q, k, v, blend_gate)
+            y = y.transpose(1, 2).contiguous().view(b, t, n_heads, head_dim)
+        else:
+            q = self.rope(q, dd_angles)
+            k = self.rope(k, dd_angles)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = self._attend(q, k, v, blend_gate)
+            y = y.transpose(1, 2)
+
+        return y
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
@@ -213,60 +288,18 @@ class ULBBlock(nn.Module):
         # --- Up projection ---
         h_up = self.up_act(self.up_proj(x))
 
-        # --- QKV projections ---
+        # --- QKV projections + norm + bias ---
         q = self.q_proj(h_up).view(b, t, n_heads, head_dim)
         k = self.k_proj(h_up).view(b, t, n_heads, head_dim)
         v = self.v_proj(h_up).view(b, t, n_heads, head_dim)
-
-        # --- QK norm + post-norm bias ---
         q = self.q_norm(q) * self.q_bias
         k = self.k_norm(k) * self.k_bias
 
-        # --- Temporal lerps (before RoPE) ---
-        if self.k_lerp is not None:
-            k = self.k_lerp(k, x)
-        if self.q_lerp is not None:
-            q = self.q_lerp(q, x)
-        elif self.q_conv is not None:
-            q = self.q_conv(q)
+        # --- Preprocessing (lerps, RoPE angles, blend gate) ---
+        q, k, dd_angles, blend_gate = self.preprocess_qk(q, k, x)
 
-        # --- Data-dependent rotation angles (shared for Q and K) ---
-        dd_angles = self.rope.compute_dd_angles(x)
-
-        # --- Blend gate (only for blend mode) ---
-        blend_gate = None
-        if cfg.attn_mode == 'blend':
-            assert self.blend_attn is not None
-            blend_gate = self.blend_attn.compute_gate(x)  # (B, H, T, 1)
-
-        # --- RoPE + Attention ---
-        if cfg.paired:
-            n2 = n_heads // 2
-            # Pair adjacent heads: (B, T, H, hd) -> (B, T, H/2, 2*hd)
-            q = q.view(b, t, n2, head_dim * 2)
-            k = k.view(b, t, n2, head_dim * 2)
-            q = self.paired_rope(q, dd_angles)
-            k = self.paired_rope(k, dd_angles)
-            # Interleave to 2T sequence: (B, T, H/2, 2*hd) -> (B, 2T, H/2, hd)
-            q = q.view(b, t * 2, n2, head_dim)
-            k = k.view(b, t * 2, n2, head_dim)
-            v = v.reshape(b, t * 2, n2, head_dim)
-            # Transpose to SDPA layout: (B, H, T, D)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            if blend_gate is not None:
-                # Paired doubles T: reshape gate (B,H,T,1) -> (B,n2,2T,1)
-                bg = blend_gate.view(b, n2, 2, t, 1)
-                blend_gate = bg.permute(0, 1, 3, 2, 4).reshape(b, n2, t * 2, 1)
-            y = self._attend(q, k, v, blend_gate)
-            # Undo paired layout: (B, H/2, 2T, hd) -> (B, T, H, hd)
-            y = y.transpose(1, 2).contiguous().view(b, t, n_heads, head_dim)
-        else:
-            q = self.rope(q, dd_angles)
-            k = self.rope(k, dd_angles)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = self._attend(q, k, v, blend_gate)
-            y = y.transpose(1, 2)
-
+        # --- Attention ---
+        y = self.attend(q, k, v, dd_angles, blend_gate)
         y = y.contiguous().view(b, t, cfg.inner_dim)
 
         # --- Skip-multiply (NOT skip-add) ---
