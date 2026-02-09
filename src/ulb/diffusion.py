@@ -68,8 +68,7 @@ class DiffusionPoE(PoolOfExperts):
         # Hop position embedding — lets each expert know where it is in the chain
         self.hop_embed = nn.Embedding(self.max_hops, dim)
 
-        # Exit ramp to penalize excessive depth
-        self.exit_ramp_scale = 5.0
+        self.exit_ramp_scale = 0.0
 
     def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project (B, 2) → (B, D), run stem layer, produce initial logits.
