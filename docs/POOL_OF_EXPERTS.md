@@ -35,8 +35,8 @@ A random router pick has only a **1/pool_size** chance of selecting an expert. E
 
 1. **Exit ramp.** Exit logits are boosted by `exit_ramp_scale * (hop / max_hops)`. Deeper hops face increasing pressure to exit, making the max_hops cap differentiable rather than a hard cliff. Default scale is 5.0.
 2. **Top-K selection.** From the current logits, select the top K entries. Softmax over the K selected logits gives merge weights.
-3. **Exit check.** If any exit slot appears in the top-K for all samples in the batch, stop.
-4. **Expert execution.** All active (non-exit) experts in the top-K run on the full batch. Each produces an output tensor and outbound routing logits.
+3. **Exit check.** Samples with any exit slot in their top-K receive no expert contribution this hop. If all samples have exited, the loop stops.
+4. **Expert execution.** Experts selected by still-active samples run on the full batch. Each produces an output tensor and outbound routing logits.
 5. **Weighted merge.** Expert outputs are merged into a single state using the softmax weights from step 2. The outbound logits from each expert are merged with the *same weights*.
 6. **Residual add.** `x = x + merged_output`.
 7. **Next logits.** The weighted-merged outbound logits become the input logits for the next hop's top-K selection.
@@ -45,11 +45,13 @@ This means routing is a chain: experts collectively decide where the signal goes
 
 ### Exit Mechanism
 
-Exit is not a separate decision — it competes with experts in the same logit space. If the merged outbound logits rank any exit slot in the top-K for every sample in the batch, the loop terminates. This means:
+Exit is not a separate decision — it competes with experts in the same logit space. A sample "exits" when any exit slot appears in its top-K. That sample receives no expert contribution that hop (`x += 0`) — its state is effectively frozen from that point, only receiving the final exit layer.
+
+The loop terminates when every sample in the batch has exited. Samples that exit early aren't forced through further expert computation — they just coast with no update while the remaining active samples continue routing. This means:
 
 - Experts can learn to vote for exit when their processing is sufficient.
-- Exit must win across the entire batch (conservative — no sample left behind).
-- A hard `max_hops` cap prevents runaway chains. Default is `2 * pool_size`.
+- Samples exit independently. A sample that exits at hop 1 is unaffected by other samples that continue to hop 5.
+- A hard `max_hops` cap prevents runaway chains for any sample. Default is `2 * pool_size`.
 - The exit ramp makes approaching max_hops increasingly expensive, so the cap is soft in practice.
 
 ### Revisiting
