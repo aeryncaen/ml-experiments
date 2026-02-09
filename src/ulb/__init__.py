@@ -5,7 +5,7 @@ A fused attention+MLP block that achieves SSM-equivalent capabilities
 with zero sequential scan.
 
 Usage:
-    from ulb import ULBBlock, ULBConfig, StackedULB, MoEStackedULB
+    from ulb import ULBBlock, ULBConfig, StackedULB, MoEStackedULB, PoolOfExperts
 
     # Single block
     block = ULBBlock(ULBConfig(d_model=128, n_heads=4, paired=True, attn_mode='blend'))
@@ -24,7 +24,7 @@ from .block import ULBBlock, ULBConfig
 from .lerp import AcausalLerp, CausalLerp, QTemporalConv
 from .norm import RMSNorm
 from .rope import HybridRoPE, PairedRoPE, apply_rotary
-from .stack import MoEStackedULB, StackedULB
+from .stack import MoEStackedULB, PoolOfExperts, StackedULB
 
 __all__ = [
     # Core
@@ -33,6 +33,7 @@ __all__ = [
     # Stacking
     "StackedULB",
     "MoEStackedULB",
+    "PoolOfExperts",
     # Components (for independent use)
     "RMSNorm",
     "LearnableSwish",

@@ -168,7 +168,7 @@ from ds_moe.model import DS1, RMSNorm
 # ---------------------------------------------------------------------------
 from s6.usb_block import USBBlock, USBConfig
 from ideal.stack import IdealWrapper
-from ulb import ULBBlock, ULBConfig, StackedULB, MoEStackedULB
+from ulb import ULBBlock, ULBConfig, StackedULB, MoEStackedULB, PoolOfExperts
 
 
 class USBWrapper(nn.Module):
@@ -1252,6 +1252,11 @@ def _stack_moe(make_layer, n_layers, dim, n_experts=4, top_k=2, version=1):
     return MoEStackedModel(make_layer, n_layers, dim, n_experts=n_experts, top_k=top_k, version=version)
 
 
+def _stack_poe(make_layer, dim, pool_size=8, top_k=2, max_hops=None):
+    """Wrap with PoolOfExperts (dynamic-depth expert pool)."""
+    return PoolOfExperts(make_layer, pool_size=pool_size, dim=dim, top_k=top_k, max_hops=max_hops)
+
+
 def _count_stacked_params(make_fn, n_layers, dim):
     """Count params of a StackedModel without keeping it around."""
     m = _stack(make_fn, n_layers, dim)
@@ -1307,7 +1312,8 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
     return best_knob
 
 
-def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False):
+def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False,
+                poe=False, poe_max_hops=None):
     """Build models with configurable depth.
     
     If match_params=True, auto-size SSM/MHA internal dimensions to match ULBBlendP param count.
@@ -1334,7 +1340,9 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         if not _wanted(name):
             return
         try:
-            if moe:
+            if poe:
+                model = _stack_poe(make_fn, dim, pool_size=n_experts * n_layers, top_k=top_k, max_hops=poe_max_hops)
+            elif moe:
                 model = _stack_moe(make_fn, n_layers, dim, n_experts=n_experts, top_k=top_k)
             else:
                 model = _stack(make_fn, n_layers, dim)
@@ -1486,13 +1494,18 @@ if __name__ == '__main__':
     parser.add_argument('--no-match-params', action='store_true',
                         help='Disable auto-sizing SSMs to match ULBBlendP param count')
     parser.add_argument('--moe', action='store_true', help='Use MoE stacking for all models')
+    parser.add_argument('--poe', action='store_true', help='Use PoolOfExperts (dynamic-depth expert pool)')
     parser.add_argument('--n-experts', type=int, default=4, help='Number of MoE experts per layer')
+    parser.add_argument('--poe-max-hops', type=int, default=None, help='Max routing hops for PoolOfExperts (default: 2x pool_size)')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
     parser.add_argument('--seed', type=int, default=SEED,
                         help='Random seed for data pregeneration and model init')
     args = parser.parse_args()
+
+    if args.moe and args.poe:
+        parser.error("--moe and --poe are mutually exclusive")
 
     print(f"Device: {DEVICE}")
     if args.compile:
@@ -1511,7 +1524,8 @@ if __name__ == '__main__':
     requested = args.models  # None means all available
     match_params = not args.no_match_params
     models_info = make_models(dim, n_layers=n_layers, requested_models=requested, match_params=match_params,
-                              n_experts=args.n_experts, top_k=args.top_k, moe=args.moe)
+                              n_experts=args.n_experts, top_k=args.top_k, moe=args.moe,
+                              poe=args.poe, poe_max_hops=args.poe_max_hops)
     all_names = list(models_info.keys())
     
     if not all_names:
@@ -1570,7 +1584,8 @@ if __name__ == '__main__':
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(run_seed)
             model = make_models(dim, n_layers=n_layers, requested_models=[name], match_params=match_params,
-                                n_experts=args.n_experts, top_k=args.top_k, moe=args.moe)[name]
+                                n_experts=args.n_experts, top_k=args.top_k, moe=args.moe,
+                                poe=args.poe, poe_max_hops=args.poe_max_hops)[name]
             param_count = count_params(model)
             
             # Optionally compile the model
