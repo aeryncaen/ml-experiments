@@ -906,6 +906,19 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     train_data = preloaded_data['train']
     val_data = preloaded_data['val']
 
+    all_params = list(model.parameters()) + list(embed.parameters()) + list(head.parameters())
+
+    def _per_sample_loss(y, tgt):
+        """Per-sample mean CE loss. Normalizes by scored positions per sample
+        so sparse tasks (selective_copy: 4/64 positions) get equal gradient
+        contribution per sample as dense tasks (64/64 positions)."""
+        B_cur, L_cur = tgt.shape
+        per_pos = F.cross_entropy(
+            y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
+        ).reshape(B_cur, L_cur)
+        valid_count = (tgt != -100).float().sum(dim=1).clamp(min=1)
+        return per_pos.sum(dim=1) / valid_count  # (B,)
+
     def _forward(batch, hard_mine=False):
         if task_name == 'mixed':
             inp, tgt, task_ids = batch
@@ -913,20 +926,12 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             inp, tgt = batch
         B_cur = inp.shape[0]
         y = head(model(embed(inp)))  # (B, L, V)
-        # Collect aux_loss from ReLU routing (0.0 if topk mode)
         aux_loss = getattr(model, 'aux_loss', 0.0)
+        per_sample_loss = _per_sample_loss(y, tgt)
 
         if hard_mine and B_cur > 1:
-            # Hard mining (vectorized): per-sample loss, weight hard samples more
-            L_cur = tgt.shape[1]
-            # Per-position loss: (B, L)
-            per_pos_loss = F.cross_entropy(
-                y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
-            ).reshape(B_cur, L_cur)
-            valid_mask = tgt != -100  # (B, L)
-            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)  # (B,)
-            per_sample_loss = per_pos_loss.sum(dim=1) / valid_count  # (B,)
-            # Weights: rank by loss, hard=2x, easy=0.5x
+            valid_mask = tgt != -100
+            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)
             with torch.no_grad():
                 lo_v, hi_v = per_sample_loss.min(), per_sample_loss.max()
                 if hi_v > lo_v:
@@ -935,21 +940,99 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 else:
                     weights = torch.ones(B_cur, device=inp.device)
                 weights = weights / weights.mean()
-                preds = y.argmax(dim=-1)  # (B, L)
+                preds = y.argmax(dim=-1)
                 correct = ((preds == tgt) & valid_mask).float().sum(dim=1)
                 acc = (correct / valid_count).mean().item()
             loss = (per_sample_loss * weights).mean() + aux_loss
         else:
-            logits_flat = y.reshape(-1, vocab_size)
-            tgt_flat = tgt.reshape(-1)
-            loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100) + aux_loss
+            loss = per_sample_loss.mean() + aux_loss
             with torch.no_grad():
+                tgt_flat = tgt.reshape(-1)
                 mask = tgt_flat != -100
                 if mask.any():
-                    acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+                    acc = (y.reshape(-1, vocab_size)[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
                 else:
                     acc = 0.0
         return loss, acc
+
+    def _pcgrad_step(batch):
+        """PCGrad (Yu et al. 2020) for mixed-task training.
+
+        1. Forward pass, compute per-task per-sample-mean losses
+        2. Backward each task loss separately, store per-task gradients
+        3. Project conflicting gradients (Algorithm 1 from the paper)
+        4. Write projected gradients to .grad and return for opt.step()
+        """
+        inp, tgt, task_ids = batch
+        B_cur = inp.shape[0]
+
+        y = head(model(embed(inp)))
+        aux_loss = getattr(model, 'aux_loss', 0.0)
+        per_sample_loss = _per_sample_loss(y, tgt)
+
+        # Compute per-task losses
+        task_losses = []
+        task_present = []
+        for tid, tname in enumerate(ALL_TASKS):
+            mask = task_ids == tid
+            if mask.any():
+                task_losses.append(per_sample_loss[mask].mean())
+                task_present.append(tid)
+
+        # Backward each task loss, store flattened gradients
+        n_tasks = len(task_losses)
+        task_grads = []
+        for i, tloss in enumerate(task_losses):
+            opt.zero_grad(set_to_none=True)
+            tloss.backward(retain_graph=(i < n_tasks - 1))
+            # Flatten all grads into one vector
+            g = torch.cat([p.grad.flatten() if p.grad is not None
+                           else torch.zeros(p.numel(), device=device)
+                           for p in all_params])
+            task_grads.append(g)
+
+        # PCGrad: project conflicting gradients
+        pc_grads = [g.clone() for g in task_grads]
+        for i in range(n_tasks):
+            order = list(range(n_tasks))
+            random.shuffle(order)
+            for j in order:
+                if j == i:
+                    continue
+                dot = (pc_grads[i] * task_grads[j]).sum()
+                if dot < 0:
+                    pc_grads[i] -= (dot / (task_grads[j].norm() ** 2 + 1e-12)) * task_grads[j]
+
+        # Sum projected gradients and write back to .grad
+        final_grad = sum(pc_grads) / n_tasks
+        # Add aux_loss gradient if nonzero
+        if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
+            opt.zero_grad(set_to_none=True)
+            aux_loss.backward()
+            aux_g = torch.cat([p.grad.flatten() if p.grad is not None
+                               else torch.zeros(p.numel(), device=device)
+                               for p in all_params])
+            final_grad = final_grad + aux_g
+
+        # Write flattened grad back to param .grad
+        opt.zero_grad(set_to_none=True)
+        offset = 0
+        for p in all_params:
+            numel = p.numel()
+            p.grad = final_grad[offset:offset + numel].reshape(p.shape)
+            offset += numel
+
+        # Compute acc for logging
+        with torch.no_grad():
+            tgt_flat = tgt.reshape(-1)
+            mask = tgt_flat != -100
+            if mask.any():
+                acc = (y.reshape(-1, vocab_size)[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+            else:
+                acc = 0.0
+            loss_val = per_sample_loss.mean().item()
+
+        return loss_val, acc
 
     def _eval_val():
         model.eval()
@@ -1071,7 +1154,12 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             if track_act:
                 act_stats_step.clear()
                 act_active['on'] = True
-            loss, acc = _forward(batch, hard_mine=use_hard_mine)
+            # Mixed mode uses PCGrad (gradient surgery); single-task uses standard backward
+            use_pcgrad = task_name == 'mixed'
+            if use_pcgrad:
+                loss_val, acc = _pcgrad_step(batch)
+            else:
+                loss, acc = _forward(batch, hard_mine=use_hard_mine)
             act_active['on'] = False
             if track_usb:
                 _set_usb_debug_active(model, False)
@@ -1105,9 +1193,10 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                         f"[act] step={total_steps} max_abs={step_max_abs:.3e} "
                         f"max_module={max_name} nan={step_has_nan} inf={step_has_inf}"
                     )
-            
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
+
+            if not use_pcgrad:
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
 
             if grad_log_every and (total_steps % grad_log_every == 0):
                 stats = _grad_stats(tracked_named_params)
@@ -1133,12 +1222,13 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                     )
             opt.step()
             scheduler.step()
-            
-            epoch_losses.append(loss.item())
+
+            step_loss = loss_val if use_pcgrad else loss.item()
+            epoch_losses.append(step_loss)
             epoch_accs.append(acc)
             total_steps += 1
             
-            step_pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1%}")
+            step_pbar.set_postfix(loss=f"{step_loss:.4f}", acc=f"{acc:.1%}")
         
         # Record initial loss from first epoch
         if initial_loss is None:
