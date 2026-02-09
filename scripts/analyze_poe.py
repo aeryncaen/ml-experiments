@@ -11,7 +11,7 @@ Usage:
     python scripts/analyze_poe.py --checkpoint path/to/ULBBlendP_mixed.pt [--n-batches 50]
 """
 
-import sys, os, argparse, random
+import sys, argparse
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -25,11 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from ulb import ULBBlock, ULBConfig, PoolOfExperts
 
 
-# ---------------------------------------------------------------------------
-# Data generation (reuse from bench_ssm)
-# ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_ssm import pregen_task_data, ALL_TASKS, VOCAB_SIZE
+from bench_ssm import ALL_TASKS, VOCAB_SIZE
 
 
 def rebuild_model(ckpt, device='cpu'):
@@ -264,8 +261,8 @@ def print_report(traces, pool_size):
 def main():
     parser = argparse.ArgumentParser(description='Analyze PoE routing behavior')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to saved .pt checkpoint')
+    parser.add_argument('--data', type=str, required=True, help='Path to cached .bench_cache/*.pt data file')
     parser.add_argument('--device', type=str, default='cpu', help='Device to run on')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for data generation')
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -278,17 +275,16 @@ def main():
     model, embed, head = rebuild_model(ckpt, device=args.device)
     print(f"Pool size: {model.pool_size}, top_k: {model.top_k}, max_hops: {model.max_hops}")
 
-    # Generate val data
     task = ckpt['task']
-    bench_args = ckpt['args']
-    B = bench_args.get('batch_size', 256)
-    L = bench_args.get('seq_len', 64)
-    n_val = bench_args.get('val_batches', 20)
-    if task == 'mixed':
-        n_val *= len(ALL_TASKS)
 
-    print(f"\nGenerating {n_val} val batches (B={B}, L={L})...")
-    task_data = pregen_task_data(task, 0, n_val, B, L, args.seed, device=args.device)
+    print(f"Loading data: {args.data}")
+    cached = torch.load(args.data, weights_only=True)
+    def _to(t):
+        return t.to(args.device, non_blocking=True) if isinstance(t, torch.Tensor) else t
+    task_data = {
+        'train': [tuple(_to(t) for t in batch) for batch in cached['train']],
+        'val': [tuple(_to(t) for t in batch) for batch in cached['val']],
+    }
 
     n_total = len(task_data['train']) + len(task_data['val'])
     print(f"Running {n_total} batches (train + val) with tracing...\n")
