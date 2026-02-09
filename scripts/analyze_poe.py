@@ -108,21 +108,31 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
             n_hops = len(trace)
             for b in range(batch_size):
                 sample_depth = n_hops  # max if never exited
-                sample_path = []
+                hop_experts = []  # list of lists, one per hop
                 for h, hop_data in enumerate(trace):
                     experts_selected = hop_data['topk_idx'][b].tolist()
                     exited = hop_data['has_exit'][b].item()
 
                     real_experts = [e for e in experts_selected if e < model.pool_size]
-                    sample_path.extend(real_experts)
+                    if real_experts:
+                        hop_experts.append(real_experts)
 
                     if exited:
                         sample_depth = h + 1
                         break
 
+                # Cartesian product across hops -> all paths through this sample
+                if hop_experts:
+                    paths = [[]]
+                    for hop in hop_experts:
+                        paths = [p + [e] for p in paths for e in hop]
+                    sample_paths = [tuple(p) for p in paths]
+                else:
+                    sample_paths = [()]  # immediate exit
+
                 record = {
                     'depth': sample_depth,
-                    'path': tuple(sample_path),
+                    'paths': sample_paths,
                     'acc': per_sample_acc[b].item(),
                     'task': None,
                 }
@@ -135,10 +145,21 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
     return all_traces
 
 
+def _fmt_path(path):
+    """Format a path tuple as 'e1 → e2 → e3'"""
+    if not path:
+        return "(exit)"
+    return " → ".join(str(e) for e in path)
+
+
 def print_report(traces, pool_size):
     """Print analysis report."""
     depths = [t['depth'] for t in traces]
-    paths = [t['path'] for t in traces]
+
+    # Collect all paths (cartesian product per sample)
+    all_paths = []
+    for t in traces:
+        all_paths.extend(t['paths'])
 
     print("=" * 80)
     print("POOL OF EXPERTS — ROUTING ANALYSIS")
@@ -173,9 +194,9 @@ def print_report(traces, pool_size):
             print(f"  {task:<20} {np.mean(task_depths):>6.2f} {np.median(task_depths):>7.1f} "
                   f"{np.std(task_depths):>6.2f} {min(task_depths):>4} {max(task_depths):>4}")
 
-    # Expert utilization
+    # Expert utilization (from raw top-k selections, not cartesian paths)
     expert_counts = Counter()
-    for path in paths:
+    for path in all_paths:
         for e in path:
             expert_counts[e] += 1
     total_expert_uses = sum(expert_counts.values())
@@ -187,27 +208,29 @@ def print_report(traces, pool_size):
         bar = "█" * int(pct)
         print(f"  Expert {eid:>2}: {count:>7} ({pct:>5.1f}%) {bar}")
 
-    # Hot paths (top 20 most common expert sequences)
-    path_counts = Counter(paths)
-    print(f"\n## Hot Paths (top 20 of {len(path_counts)} unique)")
+    # Hot paths (top 20 — cartesian product across hops)
+    path_counts = Counter(all_paths)
+    n_total_paths = len(all_paths)
+    print(f"\n## Hot Paths (top 20 of {len(path_counts)} unique, {n_total_paths} total)")
     print(f"  {'Rank':>4} {'Count':>7} {'Pct':>6} {'Path'}")
     print(f"  {'-'*60}")
     for rank, (path, count) in enumerate(path_counts.most_common(20), 1):
-        pct = count / len(traces) * 100
-        path_str = " → ".join(str(e) for e in path) if path else "(empty/immediate exit)"
-        print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {path_str}")
+        pct = count / n_total_paths * 100
+        print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {_fmt_path(path)}")
 
     # Per-task hot paths
     if tasks:
         for task in sorted(tasks):
-            task_paths = [t['path'] for t in traces if t['task'] == task]
+            task_paths = []
+            for t in traces:
+                if t['task'] == task:
+                    task_paths.extend(t['paths'])
             task_path_counts = Counter(task_paths)
             print(f"\n## Hot Paths — {task} (top 10 of {len(task_path_counts)} unique)")
             print(f"  {'Rank':>4} {'Count':>7} {'Pct':>6} {'Path'}")
             for rank, (path, count) in enumerate(task_path_counts.most_common(10), 1):
                 pct = count / len(task_paths) * 100
-                path_str = " → ".join(str(e) for e in path) if path else "(empty/immediate exit)"
-                print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {path_str}")
+                print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {_fmt_path(path)}")
 
     # Depth vs accuracy
     print(f"\n## Depth vs Accuracy")
