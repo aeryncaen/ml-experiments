@@ -954,6 +954,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     def _eval_val():
         model.eval()
         val_losses = []
+        val_hops = []
         total_correct = 0
         total_valid = 0
         per_task_correct = {t: 0 for t in ALL_TASKS}
@@ -967,6 +968,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                     inp, tgt = batch
                     task_ids = None
                 y = head(model(embed(inp)))
+                _h = getattr(model, 'last_n_hops', None)
+                if _h is not None:
+                    val_hops.append(_h)
                 logits_flat = y.reshape(-1, vocab_size)
                 tgt_flat = tgt.reshape(-1)
                 loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
@@ -1000,7 +1004,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             avg_acc = sum(subtask_accs.values()) / len(subtask_accs)
         else:
             avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
-        return avg_loss, avg_acc, subtask_accs
+        mean_hops = sum(val_hops) / len(val_hops) if val_hops else None
+        return avg_loss, avg_acc, subtask_accs, mean_hops
 
     mem_baseline = 0
     if device == 'cuda':
@@ -1049,15 +1054,18 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     
     use_hard_mine = False  # activated when majority of subtasks converge
     
-    # Router noise annealing for PoolOfExperts
+    # PoolOfExperts annealing
     _initial_router_noise = getattr(model, 'router_noise_scale', None)
+    _initial_exit_ramp = getattr(model, 'exit_ramp_scale', None)
 
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
         
-        # Anneal router noise linearly to 0
+        # Anneal router noise linearly to 0, exit ramp linearly to 3x initial
         if _initial_router_noise is not None:
-            model.router_noise_scale = _initial_router_noise * (1.0 - epoch / max_epochs)
+            frac = epoch / max_epochs
+            model.router_noise_scale = _initial_router_noise * (1.0 - frac)
+            model.exit_ramp_scale = _initial_exit_ramp * (1.0 + 2.0 * frac)
 
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
@@ -1153,7 +1161,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         train_acc = sum(epoch_accs) / len(epoch_accs)
         
         # Evaluate on validation set
-        val_loss, val_acc, subtask_accs = _eval_val()
+        val_loss, val_acc, subtask_accs, val_mean_hops = _eval_val()
         final_epoch = epoch + 1
         
         # Track best
@@ -1163,12 +1171,13 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             best_val_loss = val_loss
             best_subtask_accs = subtask_accs
         
+        _hops_str = f" hops={val_mean_hops:.1f}" if val_mean_hops is not None else ""
         if subtask_accs is not None:
             _short = {'delay': 'D', 'selective_copy': 'S', 'induction': 'I', 'parity': 'P', 'mod_arith': 'M'}
             parts = " ".join(f"{_short[t]}={a:.1%}" for t, a in subtask_accs.items())
-            epoch_pbar.set_postfix_str(f"L={val_loss:.3f} A={val_acc:.1%} {parts}")
+            epoch_pbar.set_postfix_str(f"L={val_loss:.3f} A={val_acc:.1%} {parts}{_hops_str}")
         else:
-            epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
+            epoch_pbar.set_postfix_str(f"L={val_loss:.4f} A={val_acc:.1%}{_hops_str}")
         
         # Hard mining: on when majority of subtasks have individually converged, off otherwise
         prev_hard_mine = use_hard_mine

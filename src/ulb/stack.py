@@ -298,12 +298,17 @@ class PoolOfExperts(nn.Module):
         pool_size:    Number of experts in the pool.
         dim:          Model dimension.
         top_k:        Number of experts selected per hop (default 2).
-        max_hops:     Hard cap on routing depth.  Default = 2 * pool_size.
-                      Can be annealed during training by setting .max_hops.
+        max_hops:     Loop bound on routing depth.  Default = 2 * pool_size.
+                      The exit ramp guarantees exit before this is reached.
         router_noise: Gaussian noise scale added to logits during training
                       (default 1.0).  Annealable via .router_noise_scale.
         router_dropout: Probability of masking each logit to -inf during
                       training (default 0.1).
+
+    Annealable attributes:
+        exit_ramp_scale: Controls how aggressively depth pushes toward exit.
+                      At hop h, exit logits get boosted by exit_ramp_scale * h/max_hops.
+                      Default 10.0.  Increase over training to push shallower execution.
     """
 
     # Index convention: router outputs logits over (pool_size * 2) options.
@@ -320,6 +325,7 @@ class PoolOfExperts(nn.Module):
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
         self.router_dropout = router_dropout
+        self.exit_ramp_scale = 10.0  # settable for annealing — increase to push earlier exit
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
@@ -384,6 +390,13 @@ class PoolOfExperts(nn.Module):
         logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, n_router_options)
 
         for hop in range(self.max_hops):
+            # Depth-dependent exit ramp: linearly boost exit logits with depth
+            exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
+            if exit_bias > 0:
+                bias = torch.zeros_like(logits)
+                bias[:, self.pool_size:] = exit_bias
+                logits = logits + bias
+
             # Top-k from current logits
             topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
             topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
