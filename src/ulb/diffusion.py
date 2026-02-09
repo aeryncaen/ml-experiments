@@ -65,8 +65,8 @@ class DiffusionPoE(PoolOfExperts):
             nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
-        # No exit ramp — let routing discover depth organically
-        self.exit_ramp_scale = 0.0
+        # Exit ramp to penalize excessive depth
+        self.exit_ramp_scale = 5.0
 
     def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project (B, 2) → (B, D), run stem layer, produce initial logits.

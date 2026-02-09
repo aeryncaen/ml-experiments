@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from ulb.diffusion import DiffusionPoE
@@ -64,7 +65,8 @@ def train(args):
     steps_per_epoch = args.steps_per_epoch
     best_loss = float('inf')
 
-    for epoch in range(1, args.epochs + 1):
+    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="ep")
+    for epoch in pbar:
         model.train()
         epoch_loss = 0.0
 
@@ -104,14 +106,9 @@ def train(args):
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            marker = " *"
-        else:
-            marker = ""
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"  epoch {epoch:>4}/{args.epochs}  loss={avg_loss:.6f}  "
-                  f"hops={mean_hops:.2f}  noise_scale={model.router_noise_scale:.3f}  "
-                  f"lr={scheduler.get_last_lr()[0]:.2e}{marker}")
+        pbar.set_postfix(loss=f"{avg_loss:.4f}", best=f"{best_loss:.4f}",
+                         hops=f"{mean_hops:.2f}", noise=f"{model.router_noise_scale:.2f}")
 
     return model
 
