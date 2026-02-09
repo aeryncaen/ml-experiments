@@ -29,7 +29,7 @@ Key design decisions (preserved from FusedGateBlock):
     - No internal residual — block returns delta only
     - V is left alone — no V blending
     - KV have bias, Q has no bias
-    - No expansion — inner_dim = d_model
+    - Optional inner_dim expansion for wider QKV / attention
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
     - Up/down are thin linears (d → d) with Swish activation
@@ -62,6 +62,9 @@ class ULBConfig:
         k_lerp_bias:     Initial bias for K causal lerp gate (default -2.0).
         q_lerp_bias:     Initial bias for Q acausal lerp gates (default -2.0).
         blend_gate_bias: Initial bias for blend attention gate (default -1.1, ~25% silu2).
+        inner_dim:  Inner dimension for QKV and attention. If None, defaults to
+                    d_model (no expansion). Must be divisible by n_heads, and
+                    inner_dim // n_heads must be divisible by 4 (for hybrid RoPE).
     """
     d_model: int = 128
     n_heads: int = 4
@@ -74,25 +77,23 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
+    inner_dim: int = 0  # 0 means "same as d_model"; resolved in __post_init__
 
     def __post_init__(self):
-        assert self.d_model % self.n_heads == 0, (
-            f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+        if self.inner_dim == 0:
+            self.inner_dim = self.d_model
+        assert self.inner_dim % self.n_heads == 0, (
+            f"inner_dim ({self.inner_dim}) must be divisible by n_heads ({self.n_heads})")
         if self.paired:
             assert self.n_heads % 2 == 0, (
                 f"n_heads ({self.n_heads}) must be even for paired mode")
-        head_dim = self.d_model // self.n_heads
+        head_dim = self.inner_dim // self.n_heads
         assert head_dim % 4 == 0, (
             f"head_dim ({head_dim}) must be divisible by 4 for hybrid RoPE")
 
     @property
     def head_dim(self) -> int:
-        return self.d_model // self.n_heads
-
-    @property
-    def inner_dim(self) -> int:
-        """No expansion: inner_dim = d_model."""
-        return self.d_model
+        return self.inner_dim // self.n_heads
 
 
 class ULBBlock(nn.Module):
