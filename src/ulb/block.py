@@ -5,8 +5,7 @@ SSM-equivalent capabilities (state tracking, pattern matching) purely through
 attention preprocessing, with zero sequential scan.
 
 Architecture (forward pass):
-    route = sub_router(x)                             # single router for paired projs
-    h_up = sub_expert_route(x, route, up_projs, swish_ups)
+    h_up = sub_expert_route(x, up_projs, swish_ups)  # per-token routed
 
     q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up)
     q = q_norm(q) * q_bias       # per-head RMSNorm + post-norm bias
@@ -22,7 +21,7 @@ Architecture (forward pass):
     y = attend(q, k, v)          # softmax, silu2, or blend
 
     y = attn_norm(y) * h_up      # skip-MULTIPLY (not skip-add)
-    y = sub_expert_route(y, route, down_projs, swish_downs)  # same route
+    y = sub_expert_route(y, down_projs, swish_downs)  # per-token routed
     return y                      # caller does x = x + block(x)
 
 Key design decisions (preserved from FusedGateBlock):
@@ -33,8 +32,8 @@ Key design decisions (preserved from FusedGateBlock):
     - No expansion — inner_dim = d_model
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
-    - Up/down projections are paired per-token routed sub-experts (default 4, top-2).
-      Single router picks which pair handles each token. Pointwise routing.
+    - Up/down projections are per-token routed sub-experts (default 4, top-2).
+      Each sub-expert has its own linear + learned swish. Pointwise routing.
 """
 
 from dataclasses import dataclass, field
@@ -142,13 +141,14 @@ class ULBBlock(nn.Module):
 
         self.up_projs = nn.ModuleList([nn.Linear(d, inner, bias=False) for _ in range(n_sub)])
         self.down_projs = nn.ModuleList([nn.Linear(inner, d, bias=False) for _ in range(n_sub)])
-        # Single router for paired up/down projections
-        self.sub_router = nn.Linear(d, n_sub, bias=False)
+        self.up_router = nn.Linear(d, n_sub, bias=False)
+        self.down_router = nn.Linear(inner, n_sub, bias=False)
 
         # ReLU routing state (ReMoE paper: adaptive L1 sparsity regularization)
         if config.router_mode == 'relu':
             self._target_sparsity = 1.0 - config.sub_top_k / config.n_sub_experts
-            self.register_buffer('_relu_lambda_sub', torch.tensor(1e-8))
+            self.register_buffer('_relu_lambda_up', torch.tensor(1e-8))
+            self.register_buffer('_relu_lambda_down', torch.tensor(1e-8))
             self._relu_alpha = 1.2
         # aux_loss is always available; 0.0 for topk mode
         self.aux_loss = 0.0
@@ -317,11 +317,10 @@ class ULBBlock(nn.Module):
         n_heads = cfg.n_heads
         head_dim = cfg.head_dim
 
-        # --- Route sub-experts (single router for paired up/down) ---
-        relu_lambda_sub = getattr(self, '_relu_lambda_sub', None)
-        route_logits = self.sub_router(x)  # (B, T, n_sub)
+        # --- Up-project and activate (sub-expert routed) ---
+        relu_lambda_up = getattr(self, '_relu_lambda_up', None)
         h_up, aux_up = self._sub_expert_forward(
-            x, route_logits, self.up_projs, self.swish_ups, relu_lambda_sub)
+            x, self.up_router(x), self.up_projs, self.swish_ups, relu_lambda_up)
 
         # --- QKV projections ---
         q = self.q_proj(h_up).view(b, t, n_heads, head_dim)
@@ -382,11 +381,12 @@ class ULBBlock(nn.Module):
         # --- Skip-multiply (NOT skip-add) ---
         y = self.attn_norm(y) * h_up
 
-        # --- Down-project with Swish (same route as up) ---
+        # --- Down-project with Swish (sub-expert routed) ---
+        relu_lambda_down = getattr(self, '_relu_lambda_down', None)
         y, aux_down = self._sub_expert_forward(
-            y, route_logits, self.down_projs, self.swish_downs)
+            y, self.down_router(y), self.down_projs, self.swish_downs, relu_lambda_down)
 
-        # Store aux_loss for caller to grab (only up contributes reg since it owns the router)
-        self.aux_loss = aux_up
+        # Store aux_loss for caller to grab
+        self.aux_loss = aux_up + aux_down
 
         return y
