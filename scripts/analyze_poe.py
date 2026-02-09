@@ -32,7 +32,7 @@ from bench_ssm import pregen_task_data, ALL_TASKS, VOCAB_SIZE
 
 
 def rebuild_model(ckpt, device='cpu'):
-    """Reconstruct a PoolOfExperts model from checkpoint metadata."""
+    """Reconstruct a PoolOfExperts model + embed + head from checkpoint."""
     args = ckpt['args']
     dim = ckpt['dim']
     n_layers = ckpt['n_layers']
@@ -58,35 +58,28 @@ def rebuild_model(ckpt, device='cpu'):
     model = model.to(device)
     model.eval()
     model.trace = True
-    return model, cfg
+
+    # Rebuild embed/head
+    embed = torch.nn.Embedding(VOCAB_SIZE, dim).to(device)
+    head = torch.nn.Linear(dim, VOCAB_SIZE).to(device)
+
+    if 'embed_state_dict' in ckpt:
+        embed.load_state_dict(ckpt['embed_state_dict'])
+        head.load_state_dict(ckpt['head_state_dict'])
+    else:
+        print("WARNING: checkpoint has no embed/head weights — accuracy will be random")
+
+    embed.eval()
+    head.eval()
+
+    return model, embed, head
 
 
-def analyze(model, task_data, task_name, dim, device, n_batches=50):
-    """Run model on data with tracing, collect routing stats."""
-    B = task_data['val'][0][0].shape[0] if task_data['val'] else 32
-    L = task_data['val'][0][0].shape[1] if task_data['val'] else 64
-
+def analyze(model, embed, head, task_data, task_name, dim, device, n_batches=50):
+    """Run model on data with tracing, collect routing stats and accuracy."""
     is_mixed = task_name == 'mixed'
 
-    # Shared embedding/head (same as bench_ssm)
-    embed = torch.nn.Embedding(VOCAB_SIZE, dim).to(device)
-    head = torch.nn.Linear(dim, VOCAB_SIZE, bias=False).to(device)
-
-    # We need to load the embed/head from the checkpoint too — but they're not
-    # part of the PoolOfExperts. For analysis purposes we only care about routing,
-    # not accuracy. But we DO want accuracy to correlate with depth.
-    # Since we can't recover embed/head, we'll just use the model's routing
-    # and compute accuracy from the full forward.
-    #
-    # Actually — bench_ssm creates embed/head inside train_task and they're not
-    # saved. We need them for accuracy. Let's just report routing stats without
-    # accuracy for now, and add accuracy correlation later if the embed/head
-    # get saved.
-
-    # Collect traces
-    all_traces = []       # list of per-batch trace data
-    all_task_ids = []     # for mixed: which task each sample belongs to
-
+    all_traces = []
     val_batches = task_data['val'][:n_batches]
 
     with torch.no_grad():
@@ -98,38 +91,27 @@ def analyze(model, task_data, task_name, dim, device, n_batches=50):
                 task_ids = None
 
             inp = inp.to(device)
-            # Run through model (skip embed/head — just routing analysis)
-            # We need embed for the model to work, but we don't have trained weights.
-            # So we can't do accuracy. Let's just trace routing with random embeddings.
-            # Actually, the state_dict includes the model weights but NOT embed/head.
-            # For routing analysis, we need proper input features.
-            #
-            # Hack: use a fresh random embedding. The routing decisions will be
-            # based on the model's trained weights + these features, which is wrong
-            # for accuracy but still shows learned routing structure.
-            #
-            # TODO: save embed/head in checkpoint for full analysis.
+            tgt = tgt.to(device)
 
-            x = torch.randn(inp.shape[0], inp.shape[1], model.stem_norm.weight.shape[0], device=device)
-            model(x)
+            y = head(model(embed(inp)))
+            preds = y.argmax(dim=-1)  # (B, L)
+            valid = tgt != -100
+            correct = (preds == tgt) & valid  # (B, L)
+            per_sample_acc = correct.float().sum(dim=-1) / valid.float().sum(dim=-1).clamp(min=1)  # (B,)
 
             trace = model.last_trace
             if trace is None:
                 continue
 
-            batch_size = x.shape[0]
-
-            # Per-sample: compute depth (hop where exit first appeared)
+            batch_size = inp.shape[0]
             n_hops = len(trace)
             for b in range(batch_size):
                 sample_depth = n_hops  # max if never exited
                 sample_path = []
                 for h, hop_data in enumerate(trace):
                     experts_selected = hop_data['topk_idx'][b].tolist()
-                    weights = hop_data['topk_weights'][b].tolist()
                     exited = hop_data['has_exit'][b].item()
 
-                    # Record non-exit experts
                     real_experts = [e for e in experts_selected if e < model.pool_size]
                     sample_path.extend(real_experts)
 
@@ -139,7 +121,8 @@ def analyze(model, task_data, task_name, dim, device, n_batches=50):
 
                 record = {
                     'depth': sample_depth,
-                    'path': tuple(sample_path),  # hashable for counting
+                    'path': tuple(sample_path),
+                    'acc': per_sample_acc[b].item(),
                     'task': None,
                 }
                 if is_mixed and task_ids is not None:
@@ -225,16 +208,33 @@ def print_report(traces, pool_size):
                 path_str = " → ".join(str(e) for e in path) if path else "(empty/immediate exit)"
                 print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {path_str}")
 
-    # Depth as difficulty proxy
+    # Depth vs accuracy
+    print(f"\n## Depth vs Accuracy")
+    depth_accs = defaultdict(list)
+    for t in traces:
+        depth_accs[t['depth']].append(t['acc'])
+    print(f"  {'Depth':>5} {'Count':>7} {'Mean Acc':>9} {'Std':>6}")
+    print(f"  {'-'*30}")
+    for d in sorted(depth_accs.keys()):
+        accs = depth_accs[d]
+        print(f"  {d:>5} {len(accs):>7} {np.mean(accs):>8.1%} {np.std(accs):>6.3f}")
+
+    # Per-task depth and accuracy
     if tasks:
-        print(f"\n## Depth as Difficulty Proxy")
-        print(f"  If certain tasks consistently use more hops, those tasks are")
-        print(f"  'harder' for the model. This could inform curriculum learning.")
-        task_means = {task: np.mean([t['depth'] for t in traces if t['task'] == task]) for task in tasks}
-        sorted_tasks = sorted(task_means.items(), key=lambda x: x[1], reverse=True)
-        print(f"\n  Ranked by mean depth (hardest first):")
-        for task, mean_d in sorted_tasks:
-            print(f"    {task:<20} {mean_d:.2f} hops")
+        print(f"\n## Per-Task Depth & Accuracy")
+        print(f"  {'Task':<20} {'Mean Depth':>10} {'Mean Acc':>9}")
+        print(f"  {'-'*42}")
+        task_stats = {}
+        for task in sorted(tasks):
+            task_traces = [t for t in traces if t['task'] == task]
+            mean_d = np.mean([t['depth'] for t in task_traces])
+            mean_a = np.mean([t['acc'] for t in task_traces])
+            task_stats[task] = (mean_d, mean_a)
+            print(f"  {task:<20} {mean_d:>10.2f} {mean_a:>8.1%}")
+
+        print(f"\n  Ranked by mean depth (deepest first):")
+        for task, (mean_d, mean_a) in sorted(task_stats.items(), key=lambda x: x[1][0], reverse=True):
+            print(f"    {task:<20} {mean_d:.2f} hops, {mean_a:.1%} acc")
 
 
 def main():
@@ -252,7 +252,7 @@ def main():
           f"Params: {ckpt['params']:,}, dim={ckpt['dim']}, layers={ckpt['n_layers']}")
     print(f"Result: acc={ckpt['result']['acc']:.1%}, stop={ckpt['result']['stop_reason']}")
 
-    model, cfg = rebuild_model(ckpt, device=args.device)
+    model, embed, head = rebuild_model(ckpt, device=args.device)
     print(f"Pool size: {model.pool_size}, top_k: {model.top_k}, max_hops: {model.max_hops}")
 
     # Generate val data
@@ -268,7 +268,7 @@ def main():
     task_data = pregen_task_data(task, 0, n_val, B, L, args.seed, device=args.device)
 
     print(f"Running {min(args.n_batches, len(task_data['val']))} batches with tracing...\n")
-    traces = analyze(model, task_data, task, ckpt['dim'], args.device, n_batches=args.n_batches)
+    traces = analyze(model, embed, head, task_data, task, ckpt['dim'], args.device, n_batches=args.n_batches)
 
     print_report(traces, model.pool_size)
 

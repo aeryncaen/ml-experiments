@@ -1243,6 +1243,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                       else best_val_acc >= early_stop_acc),
         'stop_reason': stop_reason,
         'subtask_accs': best_subtask_accs,
+        'embed_state_dict': embed.state_dict(),
+        'head_state_dict': head.state_dict(),
     }
 
 
@@ -1630,6 +1632,8 @@ if __name__ == '__main__':
                 _model = getattr(model, '_orig_mod', model)  # unwrap torch.compile
                 save_data = {
                     'state_dict': _model.state_dict(),
+                    'embed_state_dict': r['embed_state_dict'],
+                    'head_state_dict': r['head_state_dict'],
                     'model_name': name,
                     'task': task,
                     'dim': dim,
