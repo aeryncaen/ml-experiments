@@ -282,11 +282,14 @@ class PoolOfExperts(nn.Module):
     """Dynamic-depth expert pool with learned routing and exit.
 
     Instead of a fixed grid (n_experts x n_layers), there is a flat pool of
-    N experts.  A non-routed stem layer builds features, then a router selects
-    K experts from the pool.  Their outputs are weighted-merged into a single
-    state (residual add), and the merged state routes again — to K more experts
-    or to the exit.  The loop stops as soon as the exit token appears anywhere
-    in the top-K selection.  A non-routed exit layer produces the final output.
+    N experts.  A non-routed stem layer builds features, then a stem router
+    selects the first K experts.  Each expert has its own outbound router
+    (Linear → pool_size+1 logits).  After running K experts, their outputs
+    are weighted-merged (softmax over top-k logits) into one state (residual
+    add), and their outbound logits are merged with the same weights.  The
+    merged logits are then top-k'd to pick the next K experts.  The loop
+    stops when exit appears in the top-K.  A non-routed exit layer produces
+    the final output.
 
     Experts can be revisited (no exclusion mask).
 
@@ -297,35 +300,35 @@ class PoolOfExperts(nn.Module):
         top_k:        Number of experts selected per hop (default 2).
         max_hops:     Hard cap on routing depth.  Default = 2 * pool_size.
                       Can be annealed during training by setting .max_hops.
-        router_mode:  'topk' or 'relu' (default 'relu').
-        relu_lb:      Load-balanced L1 regularization for relu mode (default True).
     """
 
     # Index convention: router outputs logits over (pool_size + 1) options.
     # Index pool_size is the EXIT token.
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
-                 top_k: int = 2, max_hops: int | None = None,
-                 router_mode: Literal['topk', 'relu'] = 'relu', relu_lb: bool = True):
+                 top_k: int = 2, max_hops: int | None = None):
         super().__init__()
         self.pool_size = pool_size
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
-        self.router_mode = router_mode
-        self.relu_lb = relu_lb
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
         self.stem_layer = make_layer()
 
+        # Stem router: kicks off the first hop
+        self.stem_router = nn.Linear(dim, pool_size + 1, bias=False)
+
         # Expert pool
         self.experts = nn.ModuleList([make_layer() for _ in range(pool_size)])
 
+        # Per-expert outbound router: each expert votes on next destination
+        self.expert_routers = nn.ModuleList([
+            nn.Linear(dim, pool_size + 1, bias=False) for _ in range(pool_size)
+        ])
+
         # Per-hop pre-norm (shared across hops)
         self.hop_norm = RMSNorm(dim)
-
-        # Router: projects to pool_size + 1 (experts + exit)
-        self.router = nn.Linear(dim, pool_size + 1, bias=False)
 
         # Exit: non-routed output layer
         self.exit_norm = RMSNorm(dim)
@@ -333,107 +336,53 @@ class PoolOfExperts(nn.Module):
 
         self.final_norm = RMSNorm(dim)
 
-        # ReLU routing state
-        if router_mode == 'relu':
-            self._target_sparsity = 1.0 - top_k / (pool_size + 1)
-            self._relu_alpha = 1.2
-            self.register_buffer('_relu_lambda', torch.tensor(1e-8))
-
         self.aux_loss = 0.0
-
-    def _route(self, logits: torch.Tensor):
-        """Route over pool + exit.
-
-        Returns:
-            selected_idx: (B, top_k) indices into {0..pool_size} where pool_size = exit
-            selected_weights: (B, top_k) softmax weights
-            has_exit: (B,) bool — True if exit was selected for that sample
-            aux_loss: scalar
-        """
-        exit_idx = self.pool_size
-
-        if self.router_mode == 'relu':
-            weights, aux_loss = self._relu_route(logits)
-            # For relu, pick top_k from the weight vector
-            topk_weights, topk_idx = weights.topk(self.top_k, dim=-1)
-            # Re-normalize selected weights
-            w_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            topk_weights = topk_weights / w_sum
-            has_exit = (topk_idx == exit_idx).any(dim=-1)
-            return topk_idx, topk_weights, has_exit, aux_loss
-        else:
-            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)
-            topk_weights = F.softmax(topk_vals, dim=-1)
-            has_exit = (topk_idx == exit_idx).any(dim=-1)
-            return topk_idx, topk_weights, has_exit, 0.0
-
-    def _relu_route(self, logits: torch.Tensor):
-        """ReLU routing with adaptive L1 (ReMoE)."""
-        weights = F.relu(logits)  # (B, pool_size + 1)
-
-        aux_loss = 0.0
-        if self.training:
-            B, E = weights.shape
-            with torch.no_grad():
-                sparsity = (weights == 0).float().mean().item()
-                sign = 1.0 if (self._target_sparsity - sparsity) > 0 else -1.0
-                self._relu_lambda.mul_(self._relu_alpha ** sign)
-
-            if self.relu_lb:
-                with torch.no_grad():
-                    active_counts = (weights > 0).float().sum(dim=0)  # (E,)
-                    desired_ratio = self.top_k / E
-                    f_e = desired_ratio * B / active_counts.clamp(min=1)
-                l_reg = (weights * f_e.unsqueeze(0)).mean()
-            else:
-                l_reg = weights.mean()
-
-            aux_loss = self._relu_lambda.detach() * l_reg
-
-        return weights, aux_loss
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
+        exit_idx = self.pool_size
 
         # Stem
         x = x + self.stem_layer(self.stem_norm(x))
 
         total_aux = 0.0
-        hop_outputs = [x]  # for learned layer weighting
+
+        # First hop: stem router decides
+        stem_pool = x.mean(dim=1)  # (B, D)
+        logits = self.stem_router(stem_pool)  # (B, pool_size + 1)
 
         for hop in range(self.max_hops):
-            h = self.hop_norm(x)
-            h_pool = h.mean(dim=1)  # (B, D)
-            logits = self.router(h_pool)  # (B, pool_size + 1)
+            # Top-k from current logits
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
+            topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
 
-            selected_idx, selected_weights, has_exit, route_aux = self._route(logits)
-            total_aux = total_aux + route_aux
-
-            # If ALL samples want to exit, stop
+            # Check for exit
+            has_exit = (topk_idx == exit_idx).any(dim=-1)
             if has_exit.all():
                 break
 
-            # Run selected experts, weighted merge
-            # Mask out exit selections — don't run an expert for exit
-            # For simplicity, run all pool experts that appear in any sample's selection,
-            # then gather. But since pool could be large, instead iterate selected experts.
-            # Since top_k is small, just iterate the K slots.
-
+            # Run selected experts, collect outputs and outbound logits
+            h = self.hop_norm(x)
             out = torch.zeros_like(x)  # (B, T, D)
-            for k_idx in range(self.top_k):
-                expert_ids = selected_idx[:, k_idx]  # (B,)
-                w = selected_weights[:, k_idx]  # (B,)
+            next_logits = torch.zeros(B, self.pool_size + 1, device=x.device)  # (B, pool_size+1)
 
-                # Group samples by expert
+            for k_idx in range(self.top_k):
+                expert_ids = topk_idx[:, k_idx]  # (B,)
+                w = topk_weights[:, k_idx]  # (B,)
+
                 unique_experts = expert_ids.unique()
                 for eid in unique_experts:
                     eid_val = eid.item()
-                    if eid_val == self.pool_size:
-                        # Exit token — skip, weight goes to zero contribution
+                    if eid_val == exit_idx:
                         continue
                     mask = expert_ids == eid  # (B,) bool
                     expert_out = self.experts[eid_val](h[mask])  # (mask_count, T, D)
                     out[mask] = out[mask] + w[mask, None, None] * expert_out
+
+                    # Outbound logits from this expert, weighted by same merge weight
+                    expert_pool = expert_out.mean(dim=1)  # (mask_count, D)
+                    expert_logits = self.expert_routers[eid_val](expert_pool)  # (mask_count, pool_size+1)
+                    next_logits[mask] = next_logits[mask] + w[mask, None] * expert_logits
 
             # Collect block aux from experts that ran
             for e in self.experts:
@@ -441,11 +390,11 @@ class PoolOfExperts(nn.Module):
                 total_aux = total_aux + block_aux
 
             x = x + out
-            hop_outputs.append(x)
+            logits = next_logits
 
         # Exit layer
         x = x + self.exit_layer(self.exit_norm(x))
 
         self.aux_loss = total_aux
-        self.last_n_hops = len(hop_outputs) - 1  # for logging
+        self.last_n_hops = hop + 1  # for logging
         return self.final_norm(x)
