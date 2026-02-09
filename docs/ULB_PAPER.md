@@ -45,16 +45,16 @@ This is not "attention with a small tweak" and not "an SSM with attention decora
 
 ## 2. ULB Block Definition
 
-Let input sequence be $x \in \mathbb{R}^{B\times T\times D}$, head count $H$, head dim $d=D/H$.
+Let input sequence be $x \in \mathbb{R}^{B\times T\times D}$, head count $H$, inner dimension $D_{in}$ (configurable via `inner_ratio`, default 1.0; $D_{in} = \mathrm{round}(D \cdot \texttt{inner\_ratio} / (4H)) \cdot 4H$), and head dim $d=D_{in}/H$.
 
 ULB block computes
 
 $$
-h = \mathrm{Swish}_\beta(W_{up}x),
+h = \mathrm{Swish}_\beta(W_{up}x), \qquad W_{up} \in \mathbb{R}^{D \times D_{in}},
 $$
 
 $$
-q = W_q h,\quad k = W_k h,\quad v = W_v h,
+q = W_q h,\quad k = W_k h,\quad v = W_v h, \qquad W_q,W_k,W_v \in \mathbb{R}^{D_{in} \times D_{in}},
 $$
 
 with per-head reshaping to $\mathbb{R}^{B\times T\times H\times d}$ and post-norm channel biases:
@@ -88,7 +88,7 @@ $$
 multiplicative fusion and projection:
 
 $$
-y = W_{down}\,\mathrm{Swish}_\beta\!\left(\mathrm{RMSNorm}(y_{attn})\odot h\right).
+y = W_{down}\,\mathrm{Swish}_\beta\!\left(\mathrm{RMSNorm}(y_{attn})\odot h\right), \qquad W_{down} \in \mathbb{R}^{D_{in} \times D}.
 $$
 
 Stack-level residual is external (pre-norm residual stack):
@@ -238,7 +238,8 @@ In this implementation lineage, the following choices are deliberate:
 - KV projection bias with Q bias disabled in projection,
 - post-norm multiplicative Q/K channel biases,
 - no conv dependence for retrieval-heavy tasks,
-- learnable Swish rather than fixed SiLU.
+- learnable Swish rather than fixed SiLU (configurable via `swish_mode`),
+- configurable `inner_ratio` for wider QKV attention (up/down project between $D$ and $D_{in}$).
 
 These interact with transition operators; changing them shifts stability/capability tradeoffs.
 
@@ -445,8 +446,10 @@ This upweights unresolved failure modes late in training without changing object
 
 Validation computes:
 
-1. global token accuracy over all non-ignored targets,
-2. per-subtask accuracy (for mixed mode) using `task_ids` masks.
+1. per-subtask accuracy (for mixed mode) using `task_ids` masks,
+2. macro-averaged validation accuracy: the mean of per-subtask accuracies (not micro-averaged global token accuracy).
+
+Macro-averaging prevents easy high-token-count tasks from inflating the reported accuracy.
 
 Convergence criterion for mixed mode is strict:
 
@@ -454,7 +457,7 @@ $$
 \forall \tau \in \texttt{ALL\_TASKS},\; \mathrm{Acc}_{val}^{(\tau)} \ge \texttt{early\_stop\_acc}.
 $$
 
-With default `early_stop_acc = 0.99`, a model is considered converged only if **every** subtask crosses 99%.
+With default `early_stop_acc = 0.98`, a model is considered converged only if **every** subtask crosses 98%.
 
 This avoids misleading wins where one easy task dominates the average.
 
@@ -489,22 +492,24 @@ To isolate layer inductive bias rather than brute capacity, we run an **extreme 
 - 1 layer
 - `dim=64`, `seq_len=64`, `batch=256`
 - mixed benchmark (all 5 subtasks jointly)
-- matched parameter budgets (~27.4K–27.5K), with baselines auto-sized to match ULBBlendP parameter count
+- matched parameter budgets, with baselines auto-sized to match ULBBlendP parameter count
 
 Parameter matching protocol (as implemented in `bench_ssm.py`):
 
-- Reference target is ULB/FusedGate-style paired blend block parameter count at the same depth/width.
+- Reference target is ULBBlendP block parameter count at the same depth/width (with default `inner_ratio`).
 - Baseline internal knobs are searched per depth to minimize param difference:
   - S4D: `d_state`
   - Mamba: `d_state` (with `expand=2`, `d_conv=4` fixed)
   - MHA: `mlp_inner`
 
-Exact single-layer model configs used for the table below:
+Exact single-layer model configs used for the table below (run with `inner_ratio=1.0`, thin up/down linears):
 
 - `S4D(d_model=64, d_state=148)`
 - `MambaWrapper(d_model=64, d_state=2, d_conv=4, expand=2)`
 - `MHABlock(d_model=64, n_heads=4, mlp_inner=54)`
-- `ULBBlock(ULBConfig(d_model=64, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp'))`
+- `ULBBlock(ULBConfig(d_model=64, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', inner_ratio=1.0))`
+
+> Note: param counts in the table below reflect the architecture state at the time of that run. Exact counts shift as up/down projection structure and `inner_ratio` change; re-run bench to get current numbers.
 
 ### Results (single run, seed-fixed)
 

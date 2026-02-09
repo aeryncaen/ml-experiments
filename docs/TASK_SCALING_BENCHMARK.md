@@ -282,7 +282,7 @@ Zoology uses vocab=8192 and up to 256 kv_pairs. We adapt to our small-model regi
 
 ### Model Configurations
 
-Primary regime: small models on hard tasks (dim=64, ~27K params, 1 layer). The point is to see which architectures make the best use of limited parameters.
+Primary regime: small models on hard tasks (dim=64, 1 layer, param-matched to ULBBlendP at default `inner_ratio`). The point is to see which architectures make the best use of limited parameters.
 
 | Model | Config |
 |-------|--------|

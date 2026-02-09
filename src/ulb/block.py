@@ -32,7 +32,7 @@ Key design decisions (preserved from FusedGateBlock):
     - Optional inner_dim expansion for wider QKV / attention
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
-    - Up/down are thin linears (d → d) with Swish activation
+    - Up/down are thin linears (d → inner_dim) with Swish activation
 """
 
 from dataclasses import dataclass, field
@@ -62,9 +62,9 @@ class ULBConfig:
         k_lerp_bias:     Initial bias for K causal lerp gate (default -2.0).
         q_lerp_bias:     Initial bias for Q acausal lerp gates (default -2.0).
         blend_gate_bias: Initial bias for blend attention gate (default -1.1, ~25% silu2).
-        inner_dim:  Inner dimension for QKV and attention. If None, defaults to
-                    d_model (no expansion). Must be divisible by n_heads, and
-                    inner_dim // n_heads must be divisible by 4 (for hybrid RoPE).
+        inner_ratio: Ratio of inner_dim to d_model (default 1.0). Inner dim is
+                     snapped to nearest multiple of n_heads*4 for RoPE compatibility.
+                     Values > 1.0 give wider QKV / attention at higher param cost.
     """
     d_model: int = 128
     n_heads: int = 4
