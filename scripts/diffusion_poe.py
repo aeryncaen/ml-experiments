@@ -108,7 +108,7 @@ def train(args):
             best_loss = avg_loss
 
         pbar.set_postfix(loss=f"{avg_loss:.4f}", best=f"{best_loss:.4f}",
-                         hops=f"{mean_hops:.2f}", noise=f"{model.router_noise_scale:.2f}")
+                         hops=f"{mean_hops:.2f}", rtr_noise=f"{model.router_noise_scale:.2f}")
 
     return model
 
