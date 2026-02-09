@@ -868,7 +868,7 @@ def _make_activation_hook(name, store, active_flag):
 
 
 def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, device='cpu',
-               preloaded_data=None, early_stop_acc=0.99, grad_log_every=50,
+               preloaded_data=None, early_stop_acc=0.98, grad_log_every=50,
                grad_explode=1e3, grad_vanish=1e-6, act_log_every=50,
                act_explode=1e3, usb_debug_every=0):
     """Train with epochs and early stopping when val accuracy exceeds threshold."""
@@ -1511,7 +1511,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-epochs', type=int, default=100, help='Maximum training epochs')
     parser.add_argument('--train-batches', type=int, default=100, help='Number of training batches per epoch')
     parser.add_argument('--val-batches', type=int, default=20, help='Number of validation batches')
-    parser.add_argument('--early-stop-acc', type=float, default=0.99, help='Early stop when val acc exceeds this')
+    parser.add_argument('--early-stop-acc', type=float, default=0.98, help='Early stop when val acc exceeds this')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--seq-len', type=int, default=32, help='Sequence length')
     parser.add_argument('--grad-log-every', type=int, default=50,
