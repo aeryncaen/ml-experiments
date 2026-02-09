@@ -76,15 +76,15 @@ def rebuild_model(ckpt, device='cpu'):
     return model, embed, head
 
 
-def analyze(model, embed, head, task_data, task_name, dim, device, n_batches=50):
-    """Run model on data with tracing, collect routing stats and accuracy."""
+def analyze(model, embed, head, task_data, task_name, dim, device):
+    """Run model on all data (train + val) with tracing, collect routing stats and accuracy."""
     is_mixed = task_name == 'mixed'
 
     all_traces = []
-    val_batches = task_data['val'][:n_batches]
+    all_batches = task_data['train'] + task_data['val']
 
     with torch.no_grad():
-        for batch in tqdm(val_batches, desc="Tracing"):
+        for batch in tqdm(all_batches, desc="Tracing"):
             if is_mixed:
                 inp, tgt, task_ids = batch
             else:
@@ -241,7 +241,6 @@ def print_report(traces, pool_size):
 def main():
     parser = argparse.ArgumentParser(description='Analyze PoE routing behavior')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to saved .pt checkpoint')
-    parser.add_argument('--n-batches', type=int, default=50, help='Number of val batches to analyze')
     parser.add_argument('--device', type=str, default='cpu', help='Device to run on')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for data generation')
     args = parser.parse_args()
@@ -268,8 +267,9 @@ def main():
     print(f"\nGenerating {n_val} val batches (B={B}, L={L})...")
     task_data = pregen_task_data(task, 0, n_val, B, L, args.seed, device=args.device)
 
-    print(f"Running {min(args.n_batches, len(task_data['val']))} batches with tracing...\n")
-    traces = analyze(model, embed, head, task_data, task, ckpt['dim'], args.device, n_batches=args.n_batches)
+    n_total = len(task_data['train']) + len(task_data['val'])
+    print(f"Running {n_total} batches (train + val) with tracing...\n")
+    traces = analyze(model, embed, head, task_data, task, ckpt['dim'], args.device)
 
     print_report(traces, model.pool_size)
 
