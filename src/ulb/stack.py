@@ -360,7 +360,7 @@ class PoolOfExperts(nn.Module):
         # Dropout: drop a random number of exit logits (0..n_exit), never touch expert logits
         if self.router_dropout > 0:
             n_exit = self.n_router_options - self.pool_size
-            max_drop = int(n_exit * 0.75)
+            max_drop = int(n_exit * 0.25)
             n_drop = torch.randint(0, max_drop + 1, (logits.shape[0],), device=logits.device)
             # Per-sample random permutation of exit slot indices
             rand = torch.rand(logits.shape[0], n_exit, device=logits.device)
