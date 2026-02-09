@@ -908,17 +908,6 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
 
     all_params = list(model.parameters()) + list(embed.parameters()) + list(head.parameters())
 
-    def _per_sample_loss(y, tgt):
-        """Per-sample mean CE loss. Normalizes by scored positions per sample
-        so sparse tasks (selective_copy: 4/64 positions) get equal gradient
-        contribution per sample as dense tasks (64/64 positions)."""
-        B_cur, L_cur = tgt.shape
-        per_pos = F.cross_entropy(
-            y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
-        ).reshape(B_cur, L_cur)
-        valid_count = (tgt != -100).float().sum(dim=1).clamp(min=1)
-        return per_pos.sum(dim=1) / valid_count  # (B,)
-
     def _forward(batch, hard_mine=False):
         if task_name == 'mixed':
             inp, tgt, task_ids = batch
@@ -927,15 +916,20 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         B_cur = inp.shape[0]
         y = head(model(embed(inp)))  # (B, L, V)
         aux_loss = getattr(model, 'aux_loss', 0.0)
-        per_sample_loss = _per_sample_loss(y, tgt)
+        loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100)
 
         if hard_mine and B_cur > 1:
+            # Recompute per-sample losses for weighting
+            per_pos = F.cross_entropy(
+                y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
+            ).reshape(B_cur, -1)
             valid_mask = tgt != -100
             valid_count = valid_mask.float().sum(dim=1).clamp(min=1)
+            per_sample = per_pos.sum(dim=1) / valid_count
             with torch.no_grad():
-                lo_v, hi_v = per_sample_loss.min(), per_sample_loss.max()
+                lo_v, hi_v = per_sample.min(), per_sample.max()
                 if hi_v > lo_v:
-                    ranks = (per_sample_loss.detach() - lo_v) / (hi_v - lo_v)
+                    ranks = (per_sample.detach() - lo_v) / (hi_v - lo_v)
                     weights = 0.5 + 1.5 * ranks
                 else:
                     weights = torch.ones(B_cur, device=inp.device)
@@ -943,9 +937,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 preds = y.argmax(dim=-1)
                 correct = ((preds == tgt) & valid_mask).float().sum(dim=1)
                 acc = (correct / valid_count).mean().item()
-            loss = (per_sample_loss * weights).mean() + aux_loss
+            loss = (per_sample * weights).mean() + aux_loss
         else:
-            loss = per_sample_loss.mean() + aux_loss
+            loss = loss + aux_loss
             with torch.no_grad():
                 tgt_flat = tgt.reshape(-1)
                 mask = tgt_flat != -100
@@ -958,7 +952,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     def _pcgrad_step(batch):
         """PCGrad (Yu et al. 2020) for mixed-task training.
 
-        1. Forward pass, compute per-task per-sample-mean losses
+        1. Forward pass, compute per-task global-mean CE losses
         2. Backward each task loss separately, store per-task gradients
         3. Project conflicting gradients (Algorithm 1 from the paper)
         4. Write projected gradients to .grad and return for opt.step()
@@ -968,15 +962,17 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
 
         y = head(model(embed(inp)))
         aux_loss = getattr(model, 'aux_loss', 0.0)
-        per_sample_loss = _per_sample_loss(y, tgt)
 
-        # Compute per-task losses
+        # Compute per-task losses using standard global-mean CE
         task_losses = []
         task_present = []
         for tid, tname in enumerate(ALL_TASKS):
             mask = task_ids == tid
             if mask.any():
-                task_losses.append(per_sample_loss[mask].mean())
+                y_sub = y[mask]
+                tgt_sub = tgt[mask]
+                tloss = F.cross_entropy(y_sub.reshape(-1, vocab_size), tgt_sub.reshape(-1), ignore_index=-100)
+                task_losses.append(tloss)
                 task_present.append(tid)
 
         # Backward each task loss, store flattened gradients
@@ -1030,7 +1026,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 acc = (y.reshape(-1, vocab_size)[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
             else:
                 acc = 0.0
-            loss_val = per_sample_loss.mean().item()
+            loss_val = F.cross_entropy(y.reshape(-1, vocab_size), tgt_flat, ignore_index=-100).item()
 
         return loss_val, acc
 
