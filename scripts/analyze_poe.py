@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
@@ -83,7 +84,7 @@ def analyze(model, embed, head, task_data, task_name, dim, device, n_batches=50)
     val_batches = task_data['val'][:n_batches]
 
     with torch.no_grad():
-        for batch in val_batches:
+        for batch in tqdm(val_batches, desc="Tracing"):
             if is_mixed:
                 inp, tgt, task_ids = batch
             else:
