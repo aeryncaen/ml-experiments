@@ -320,7 +320,7 @@ class PoolOfExperts(nn.Module):
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
         self.router_dropout = router_dropout
-        self.exit_ramp_scale = 5.0
+        self.exit_ramp_scale = 3.0
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
