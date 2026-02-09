@@ -1058,8 +1058,10 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     _initial_router_noise = getattr(model, 'router_noise_scale', None)
     _initial_exit_ramp = getattr(model, 'exit_ramp_scale', None)
     _in_efficiency_phase = False
-    _efficiency_steps = 0  # number of epochs spent converged during efficiency phase
     _converged_epoch = None
+    _target_hops = None
+    if _initial_exit_ramp is not None:
+        _target_hops = model.pool_size / (2 * model.top_k)  # use half the pool
 
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
@@ -1068,13 +1070,11 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         if _initial_router_noise is not None:
             frac = epoch / max_epochs
             if _in_efficiency_phase:
-                # Efficiency phase: noise off, ramp held at current level
-                # (ramp only steps after val check confirms still converged)
+                # Efficiency phase: noise off, ramp driven by feedback controller
                 model.router_noise_scale = 0.0
             else:
-                # Normal phase: noise decays, ramp grows gently
+                # Normal phase: noise decays, ramp stays at initial
                 model.router_noise_scale = _initial_router_noise * (1.0 - frac)
-                model.exit_ramp_scale = _initial_exit_ramp * (1.0 + 2.0 * frac)
 
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
@@ -1209,15 +1209,17 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 # PoolOfExperts: don't stop, enter efficiency phase — push earlier exit
                 _in_efficiency_phase = True
                 _converged_epoch = final_epoch
-                _efficiency_steps += 1
-                model.exit_ramp_scale = _initial_exit_ramp * (3.0 + 7.0 * _efficiency_steps / max(1, max_epochs))
                 tqdm.write(f"[efficiency] converged at epoch {final_epoch}, "
-                           f"spending remaining epochs pushing early exit")
-            elif _in_efficiency_phase:
-                # Still converged — step the ramp harder
-                _efficiency_steps += 1
-                model.exit_ramp_scale = _initial_exit_ramp * (3.0 + 7.0 * _efficiency_steps / max(1, max_epochs))
-            else:
+                           f"target hops={_target_hops:.1f}, pushing early exit")
+            if _in_efficiency_phase and val_mean_hops is not None:
+                # Feedback: bump ramp proportional to how far above target we are
+                overshoot = val_mean_hops - _target_hops
+                if overshoot > 0:
+                    # Scale step by how far off we are — bigger gap = bigger push
+                    model.exit_ramp_scale += _initial_exit_ramp * 0.5 * (overshoot / _target_hops)
+                    tqdm.write(f"[efficiency] hops={val_mean_hops:.1f} > target={_target_hops:.1f}, "
+                               f"ramp → {model.exit_ramp_scale:.1f}")
+            elif not _in_efficiency_phase:
                 stop_reason = "CONVERGED"
                 break
         elif _in_efficiency_phase:
