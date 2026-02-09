@@ -312,7 +312,7 @@ class PoolOfExperts(nn.Module):
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
                  top_k: int = 2, max_hops: int | None = None,
-                 router_noise: float = 1.0, router_dropout: float = 0.1):
+                 router_noise: float = 1.0, router_dropout: float = 0.0):
         super().__init__()
         self.pool_size = pool_size
         self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
