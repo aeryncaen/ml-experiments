@@ -386,6 +386,7 @@ class PoolOfExperts(nn.Module):
         x = x + self.stem_layer(self.stem_norm(x))
 
         total_aux = 0.0
+        non_exit_decisions = 0  # total routing decisions that chose to continue
         if self.trace:
             # Per-sample trace: list of (hop, topk_idx, topk_weights, exited) per sample
             trace_hops = []  # list of dicts per hop
@@ -415,6 +416,8 @@ class PoolOfExperts(nn.Module):
                     'topk_weights': topk_weights.detach().cpu(),  # (B, top_k)
                     'has_exit': has_exit.detach().cpu(),      # (B,)
                 })
+
+            non_exit_decisions += (~has_exit).sum()
 
             if has_exit.all():
                 break
@@ -459,7 +462,7 @@ class PoolOfExperts(nn.Module):
         x = x + self.exit_layer(self.exit_norm(x))
 
         self.aux_loss = total_aux
-        self.last_n_hops = hop + 1  # for logging
+        self.last_mean_hops = non_exit_decisions / B  # avg hops per sample
         if self.trace:
             self.last_trace = trace_hops
         return self.final_norm(x)

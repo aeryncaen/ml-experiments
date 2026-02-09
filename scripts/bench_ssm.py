@@ -968,9 +968,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                     inp, tgt = batch
                     task_ids = None
                 y = head(model(embed(inp)))
-                _h = getattr(model, 'last_n_hops', None)
+                _h = getattr(model, 'last_mean_hops', None)
                 if _h is not None:
-                    val_hops.append(_h)
+                    val_hops.append(_h.item() if hasattr(_h, 'item') else _h)
                 logits_flat = y.reshape(-1, vocab_size)
                 tgt_flat = tgt.reshape(-1)
                 loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
