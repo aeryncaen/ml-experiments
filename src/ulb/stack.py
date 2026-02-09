@@ -352,6 +352,8 @@ class PoolOfExperts(nn.Module):
         self.final_norm = RMSNorm(dim)
 
         self.aux_loss = 0.0
+        self.trace = False  # set True to record per-sample routing decisions
+        self.last_trace = None  # populated when trace=True
 
     def _perturb_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply noise and dropout to router logits during training."""
@@ -384,6 +386,9 @@ class PoolOfExperts(nn.Module):
         x = x + self.stem_layer(self.stem_norm(x))
 
         total_aux = 0.0
+        if self.trace:
+            # Per-sample trace: list of (hop, topk_idx, topk_weights, exited) per sample
+            trace_hops = []  # list of dicts per hop
 
         # First hop: stem router decides
         stem_pool = x.mean(dim=1)  # (B, D)
@@ -403,6 +408,14 @@ class PoolOfExperts(nn.Module):
 
             # Check for exit: any index >= pool_size is an exit slot
             has_exit = (topk_idx >= self.pool_size).any(dim=-1)
+
+            if self.trace:
+                trace_hops.append({
+                    'topk_idx': topk_idx.detach().cpu(),     # (B, top_k)
+                    'topk_weights': topk_weights.detach().cpu(),  # (B, top_k)
+                    'has_exit': has_exit.detach().cpu(),      # (B,)
+                })
+
             if has_exit.all():
                 break
 
@@ -447,4 +460,6 @@ class PoolOfExperts(nn.Module):
 
         self.aux_loss = total_aux
         self.last_n_hops = hop + 1  # for logging
+        if self.trace:
+            self.last_trace = trace_hops
         return self.final_norm(x)

@@ -1547,6 +1547,8 @@ if __name__ == '__main__':
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
+    parser.add_argument('--save-dir', type=str, default=None,
+                        help='Directory to save trained models (optional)')
     parser.add_argument('--seed', type=int, default=SEED,
                         help='Random seed for data pregeneration and model init')
     args = parser.parse_args()
@@ -1653,6 +1655,24 @@ if __name__ == '__main__':
                 parts = "  ".join(f"{t}: {a:.1%}" for t, a in r['subtask_accs'].items())
                 tqdm.write(f"{'':>10} subtasks: {parts}")
             
+            # Save model if requested
+            if args.save_dir:
+                os.makedirs(args.save_dir, exist_ok=True)
+                save_path = os.path.join(args.save_dir, f"{name}_{task}.pt")
+                _model = getattr(model, '_orig_mod', model)  # unwrap torch.compile
+                save_data = {
+                    'state_dict': _model.state_dict(),
+                    'model_name': name,
+                    'task': task,
+                    'dim': dim,
+                    'n_layers': n_layers,
+                    'params': param_count,
+                    'result': r,
+                    'args': vars(args),
+                }
+                torch.save(save_data, save_path)
+                tqdm.write(f"  saved → {save_path}")
+
             # Store result
             result_entry = {
                 'model': name,
