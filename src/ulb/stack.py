@@ -113,13 +113,13 @@ class MoEStackedULB(nn.Module):
         if version == 1:
             # v1: per-layer router decides own experts, blind weighting
             self.routers = nn.ModuleList([
-                nn.Linear(dim, n_experts) for _ in range(n_layers)
+                nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)
             ])
             self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))
         elif version == 2:
             # v2: sender-routed — layer l's output routes to layer l+1
             self.routers = nn.ModuleList([
-                nn.Linear(dim, n_experts) for _ in range(n_layers)
+                nn.Linear(dim, n_experts, bias=False) for _ in range(n_layers)
             ])
             # Per-layer merge scorer: looks at expert outputs to decide weights
             self.merge_scorers = nn.ModuleList([
@@ -327,14 +327,14 @@ class PoolOfExperts(nn.Module):
         self.stem_layer = make_layer()
 
         # Stem router: kicks off the first hop
-        self.stem_router = nn.Linear(dim, self.n_router_options)
+        self.stem_router = nn.Linear(dim, self.n_router_options, bias=False)
 
         # Expert pool
         self.experts = nn.ModuleList([make_layer() for _ in range(pool_size)])
 
         # Per-expert outbound router: each expert votes on next destination
         self.expert_routers = nn.ModuleList([
-            nn.Linear(dim, self.n_router_options) for _ in range(pool_size)
+            nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
         # Per-hop pre-norm (shared across hops)
