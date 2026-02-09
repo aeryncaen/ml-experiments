@@ -906,8 +906,6 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     train_data = preloaded_data['train']
     val_data = preloaded_data['val']
 
-    all_params = list(model.parameters()) + list(embed.parameters()) + list(head.parameters())
-
     def _forward(batch, hard_mine=False):
         if task_name == 'mixed':
             inp, tgt, task_ids = batch
@@ -948,87 +946,6 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 else:
                     acc = 0.0
         return loss, acc
-
-    def _pcgrad_step(batch):
-        """PCGrad (Yu et al. 2020) for mixed-task training.
-
-        1. Forward pass, compute per-task global-mean CE losses
-        2. Backward each task loss separately, store per-task gradients
-        3. Project conflicting gradients (Algorithm 1 from the paper)
-        4. Write projected gradients to .grad and return for opt.step()
-        """
-        inp, tgt, task_ids = batch
-        B_cur = inp.shape[0]
-
-        y = head(model(embed(inp)))
-        aux_loss = getattr(model, 'aux_loss', 0.0)
-
-        # Compute per-task losses using standard global-mean CE
-        task_losses = []
-        task_present = []
-        for tid, tname in enumerate(ALL_TASKS):
-            mask = task_ids == tid
-            if mask.any():
-                y_sub = y[mask]
-                tgt_sub = tgt[mask]
-                tloss = F.cross_entropy(y_sub.reshape(-1, vocab_size), tgt_sub.reshape(-1), ignore_index=-100)
-                task_losses.append(tloss)
-                task_present.append(tid)
-
-        # Backward each task loss, store flattened gradients
-        n_tasks = len(task_losses)
-        task_grads = []
-        for i, tloss in enumerate(task_losses):
-            opt.zero_grad(set_to_none=True)
-            tloss.backward(retain_graph=(i < n_tasks - 1))
-            # Flatten all grads into one vector
-            g = torch.cat([p.grad.flatten() if p.grad is not None
-                           else torch.zeros(p.numel(), device=device)
-                           for p in all_params])
-            task_grads.append(g)
-
-        # PCGrad: project conflicting gradients
-        pc_grads = [g.clone() for g in task_grads]
-        for i in range(n_tasks):
-            order = list(range(n_tasks))
-            random.shuffle(order)
-            for j in order:
-                if j == i:
-                    continue
-                dot = (pc_grads[i] * task_grads[j]).sum()
-                if dot < 0:
-                    pc_grads[i] -= (dot / (task_grads[j].norm() ** 2 + 1e-12)) * task_grads[j]
-
-        # Sum projected gradients and write back to .grad
-        final_grad = sum(pc_grads) / n_tasks
-        # Add aux_loss gradient if nonzero
-        if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
-            opt.zero_grad(set_to_none=True)
-            aux_loss.backward()
-            aux_g = torch.cat([p.grad.flatten() if p.grad is not None
-                               else torch.zeros(p.numel(), device=device)
-                               for p in all_params])
-            final_grad = final_grad + aux_g
-
-        # Write flattened grad back to param .grad
-        opt.zero_grad(set_to_none=True)
-        offset = 0
-        for p in all_params:
-            numel = p.numel()
-            p.grad = final_grad[offset:offset + numel].reshape(p.shape)
-            offset += numel
-
-        # Compute acc for logging
-        with torch.no_grad():
-            tgt_flat = tgt.reshape(-1)
-            mask = tgt_flat != -100
-            if mask.any():
-                acc = (y.reshape(-1, vocab_size)[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
-            else:
-                acc = 0.0
-            loss_val = F.cross_entropy(y.reshape(-1, vocab_size), tgt_flat, ignore_index=-100).item()
-
-        return loss_val, acc
 
     def _eval_val():
         model.eval()
@@ -1126,7 +1043,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
-    hard_mine_epoch = int(max_epochs * 2 / 3)  # last 1/3 of training
+    hard_mine_epoch = int(max_epochs * 1 / 3)  # last 2/3 of training
     
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
@@ -1150,12 +1067,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             if track_act:
                 act_stats_step.clear()
                 act_active['on'] = True
-            # Mixed mode uses PCGrad (gradient surgery); single-task uses standard backward
-            use_pcgrad = task_name == 'mixed'
-            if use_pcgrad:
-                loss_val, acc = _pcgrad_step(batch)
-            else:
-                loss, acc = _forward(batch, hard_mine=use_hard_mine)
+            loss, acc = _forward(batch, hard_mine=use_hard_mine)
             act_active['on'] = False
             if track_usb:
                 _set_usb_debug_active(model, False)
@@ -1190,9 +1102,8 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                         f"max_module={max_name} nan={step_has_nan} inf={step_has_inf}"
                     )
 
-            if not use_pcgrad:
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
 
             if grad_log_every and (total_steps % grad_log_every == 0):
                 stats = _grad_stats(tracked_named_params)
@@ -1219,7 +1130,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             opt.step()
             scheduler.step()
 
-            step_loss = loss_val if use_pcgrad else loss.item()
+            step_loss = loss.item()
             epoch_losses.append(step_loss)
             epoch_accs.append(acc)
             total_steps += 1
@@ -1616,7 +1527,7 @@ if __name__ == '__main__':
     print("- Vocab: unified VOCAB_SIZE=64 (shared embedding/head across tasks)")
     print("- LR: mixed=1e-3, standalone tasks=1e-4")
     print("- LR schedule: 1 epoch linear warmup (0.1x -> 1.0x), then cosine decay to 0.05x")
-    hard_mine_epoch = int(max_epochs * 2 / 3)
+    hard_mine_epoch = int(max_epochs * 1 / 3)
     print(f"- Hard mining (mixed only): OFF until epoch {hard_mine_epoch + 1}, ON from epoch {hard_mine_epoch + 1}..{max_epochs}")
     print("  weighting: easiest~0.5x, hardest~2.0x, normalized to mean=1.0 per batch")
     print("- Mixed mode data scale: train/val batch counts multiplied by 5 (one per subtask)")
