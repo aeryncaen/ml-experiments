@@ -121,6 +121,9 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_val_loss = float('inf')
+    save_dir = Path(args.save_dir) if args.save_dir else Path('out/shakespeare_diffusion')
+    save_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = save_dir / 'best_model.pt'
 
     pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="ep")
     for epoch in pbar:
@@ -206,6 +209,17 @@ def train(args):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            torch.save({
+                'state_dict': model.state_dict(),
+                'args': vars(args),
+                'char2idx': char2idx,
+                'idx2char': idx2char,
+                'params': n_params,
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+            }, best_ckpt_path)
+            tqdm.write(f"  [epoch {epoch}] New best val_loss={val_loss:.4f} vacc={val_acc:.1%} → saved {best_ckpt_path}")
 
         pbar.set_postfix(
             loss=f"{avg_loss:.3f}",
