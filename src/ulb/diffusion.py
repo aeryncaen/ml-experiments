@@ -85,7 +85,7 @@ class MaskedDiffusionPoE(PoolOfExperts):
         # Hop position embedding
         self.hop_embed = nn.Embedding(self.max_hops, dim)
 
-        self.exit_ramp_scale = 0.0
+        self.exit_ramp_scale = 2.0
 
     def _set_input_len(self, n: int):
         """Propagate input_len to all expert blocks."""
