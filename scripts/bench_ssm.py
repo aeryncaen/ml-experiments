@@ -1047,7 +1047,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
-    hard_mine_epoch = int(max_epochs * 1 / 3)  # last 2/3 of training
+    hard_mine_epoch = int(max_epochs * 2 / 3)  # last 1/3 of training
     
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
@@ -1531,7 +1531,7 @@ if __name__ == '__main__':
     print("- Vocab: unified VOCAB_SIZE=64 (shared embedding/head across tasks)")
     print("- LR: mixed=1e-3, standalone tasks=1e-4")
     print("- LR schedule: 1 epoch linear warmup (0.1x -> 1.0x), then cosine decay to 0.05x")
-    hard_mine_epoch = int(max_epochs * 1 / 3)
+    hard_mine_epoch = int(max_epochs * 2 / 3)
     print(f"- Hard mining (mixed only): OFF until epoch {hard_mine_epoch + 1}, ON from epoch {hard_mine_epoch + 1}..{max_epochs}")
     print("  weighting: easiest~0.5x, hardest~2.0x, normalized to mean=1.0 per batch")
     print("- Mixed mode data scale: train/val batch counts multiplied by 5 (one per subtask)")
