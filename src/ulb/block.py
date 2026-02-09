@@ -5,7 +5,7 @@ SSM-equivalent capabilities (state tracking, pattern matching) purely through
 attention preprocessing, with zero sequential scan.
 
 Architecture (forward pass):
-    h_up = sub_expert_route(x, up_projs, swish_ups)  # per-token routed
+    h_up = up_mlp(x)                                  # expanding MLP
 
     q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up)
     q = q_norm(q) * q_bias       # per-head RMSNorm + post-norm bias
@@ -21,7 +21,7 @@ Architecture (forward pass):
     y = attend(q, k, v)          # softmax, silu2, or blend
 
     y = attn_norm(y) * h_up      # skip-MULTIPLY (not skip-add)
-    y = sub_expert_route(y, down_projs, swish_downs)  # per-token routed
+    y = down_mlp(y)                                    # expanding MLP
     return y                      # caller does x = x + block(x)
 
 Key design decisions (preserved from FusedGateBlock):
@@ -32,8 +32,8 @@ Key design decisions (preserved from FusedGateBlock):
     - No expansion — inner_dim = d_model
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
-    - Up/down projections are per-token routed sub-experts (default 4, top-2).
-      Each sub-expert has its own linear + learned swish. Pointwise routing.
+    - Up/down are expanding MLPs (d → ~2d → d), param-matched to former
+      4-expert routed projections. Learned Swish activation in the middle.
 """
 
 from dataclasses import dataclass, field
@@ -63,15 +63,9 @@ class ULBConfig:
         k_lerp_bias:     Initial bias for K causal lerp gate (default -2.0).
         q_lerp_bias:     Initial bias for Q acausal lerp gates (default -2.0).
         blend_gate_bias: Initial bias for blend attention gate (default -1.1, ~25% silu2).
-        n_sub_experts:   Number of sub-expert linear pairs for up/down projections.
-                         Each sub-expert has its own linear + learned swish.
-                         Routed per-token (pointwise, so no causality issue).
-                         Default 4.
-        sub_top_k:       How many sub-experts to activate per token (default 2).
-        router_mode:     'topk' (default) or 'relu' (ReMoE-style differentiable routing).
-        relu_lb:         If True (default), use load-balanced L1 regularization (Eq 10 in
-                         ReMoE paper). If False, use plain L1 (Eq 9). Only relevant when
-                         router_mode='relu'.
+        n_sub_experts:   Controls MLP expansion in up/down projections.
+                         Expansion m ≈ n_sub_experts * d, giving param parity with
+                         n_sub_experts routed linear experts. Default 4.
     """
     d_model: int = 128
     n_heads: int = 4
@@ -85,9 +79,6 @@ class ULBConfig:
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     n_sub_experts: int = 4
-    sub_top_k: int = 2
-    router_mode: Literal['topk', 'relu'] = 'relu'
-    relu_lb: bool = False  # load-balanced L1 (Eq 10 in ReMoE paper)
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
@@ -130,37 +121,25 @@ class ULBBlock(nn.Module):
         n_heads = config.n_heads
         head_dim = config.head_dim
 
-        # --- Sub-expert routed projections ---
-        # Per-token routed up/down projection pairs, each with its own
-        # learned activation. Pointwise, so no causality issue.
+        # --- Up/down MLPs (param-matched to former sub-expert routing) ---
+        # Expansion sized to match: n_sub_experts * (d² + 2d) ≈ m * (2d + 1)
         n_sub = config.n_sub_experts
-        self.n_sub = n_sub
-        self.sub_top_k = config.sub_top_k
-        self.router_mode = config.router_mode
-        self.relu_lb = config.relu_lb
-
-        self.up_projs = nn.ModuleList([nn.Linear(d, inner, bias=False) for _ in range(n_sub)])
-        self.down_projs = nn.ModuleList([nn.Linear(inner, d, bias=False) for _ in range(n_sub)])
-        self.up_router = nn.Linear(d, n_sub, bias=False)
-        self.down_router = nn.Linear(inner, n_sub, bias=False)
-
-        # ReLU routing state (ReMoE paper: adaptive L1 sparsity regularization)
-        if config.router_mode == 'relu':
-            self._target_sparsity = 1.0 - config.sub_top_k / config.n_sub_experts
-            self.register_buffer('_relu_lambda_up', torch.tensor(1e-8))
-            self.register_buffer('_relu_lambda_down', torch.tensor(1e-8))
-            self._relu_alpha = 1.2
-        # aux_loss is always available; 0.0 for topk mode
-        self.aux_loss = 0.0
+        mlp_expand = round(n_sub * (d * d + 2 * d) / (2 * d + 1))
+        self.up_proj1 = nn.Linear(d, mlp_expand, bias=False)
+        self.up_proj2 = nn.Linear(mlp_expand, inner, bias=False)
+        self.down_proj1 = nn.Linear(inner, mlp_expand, bias=False)
+        self.down_proj2 = nn.Linear(mlp_expand, d, bias=False)
 
         if config.swish_mode == 'learnable':
-            self.swish_ups = nn.ModuleList([LearnableSwish(inner) for _ in range(n_sub)])
-            self.swish_downs = nn.ModuleList([LearnableSwish(inner) for _ in range(n_sub)])
+            self.up_act = LearnableSwish(mlp_expand)
+            self.down_act = LearnableSwish(mlp_expand)
         elif config.swish_mode == 'silu':
-            self.swish_ups = nn.ModuleList([nn.SiLU() for _ in range(n_sub)])
-            self.swish_downs = nn.ModuleList([nn.SiLU() for _ in range(n_sub)])
+            self.up_act = nn.SiLU()
+            self.down_act = nn.SiLU()
         else:
             raise ValueError(f"Unknown swish_mode: {config.swish_mode}")
+
+        self.aux_loss = 0.0
 
         # QKV: KV have bias, Q does not
         self.q_proj = nn.Linear(inner, inner, bias=False)
@@ -206,85 +185,6 @@ class ULBBlock(nn.Module):
             self.blend_attn = BlendAttention(
                 d, n_heads, head_dim, init_bias=config.blend_gate_bias)
 
-    def _sub_expert_forward(self, x: torch.Tensor, logits: torch.Tensor,
-                            projs: nn.ModuleList, activations: nn.ModuleList,
-                            relu_lambda: torch.Tensor | None = None,
-                            ) -> tuple[torch.Tensor, torch.Tensor | float]:
-        """Per-token routed sub-expert projection.
-
-        Args:
-            x: (B, T, D_in)
-            logits: (B, T, n_sub) — pre-computed router logits
-            projs: list of n_sub Linear(D_in, D_out)
-            activations: list of n_sub activation modules
-            relu_lambda: adaptive L1 coefficient buffer (only for relu mode)
-
-        Returns:
-            (output, aux_loss) — output is (B, T, D_out), aux_loss is scalar.
-        """
-        # Run all sub-experts (both modes need all outputs since n_sub is small)
-        expert_outs = torch.stack(
-            [act(proj(x)) for proj, act in zip(projs, activations)],
-            dim=2)  # (B, T, n_sub, D_out)
-
-        if self.router_mode == 'relu':
-            return self._relu_route(logits, expert_outs, relu_lambda)
-        else:
-            return self._topk_route(logits, expert_outs)
-
-    def _topk_route(self, logits: torch.Tensor, expert_outs: torch.Tensor,
-                    ) -> tuple[torch.Tensor, torch.Tensor | float]:
-        """TopK + Softmax routing (original)."""
-        topk_vals, topk_idx = logits.topk(self.sub_top_k, dim=-1)  # (B, T, k)
-        topk_weights = F.softmax(topk_vals, dim=-1)  # (B, T, k)
-        D_out = expert_outs.shape[-1]
-        idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D_out)  # (B, T, k, D_out)
-        selected = expert_outs.gather(2, idx_expanded)  # (B, T, k, D_out)
-        return (selected * topk_weights.unsqueeze(-1)).sum(dim=2), 0.0
-
-    def _relu_route(self, logits: torch.Tensor, expert_outs: torch.Tensor,
-                    relu_lambda: torch.Tensor | None,
-                    ) -> tuple[torch.Tensor, torch.Tensor | float]:
-        """ReLU routing with adaptive L1 sparsity regularization (ReMoE).
-
-        Eq 5: weights = ReLU(logits)
-        Eq 9/10: L_reg = mean of (f_e * weights_e) over all positions and experts
-        Lambda adapted per step to hit target sparsity.
-        """
-        assert relu_lambda is not None, "relu_lambda buffer required for relu routing"
-        weights = F.relu(logits)  # (B, T, n_sub) — non-negative, 0 = inactive
-
-        # Weighted sum of expert outputs
-        output = (expert_outs * weights.unsqueeze(-1)).sum(dim=2)  # (B, T, D_out)
-
-        # --- Adaptive L1 regularization ---
-        if self.training:
-            B, T, E = weights.shape
-            # Sparsity: fraction of zero entries
-            with torch.no_grad():
-                sparsity = (weights == 0).float().mean().item()
-                # Adapt lambda: increase if too dense, decrease if too sparse
-                sign = 1.0 if (self._target_sparsity - sparsity) > 0 else -1.0
-                relu_lambda.mul_(self._relu_alpha ** sign)
-
-            # L1 regularization (Eq 9 plain, Eq 10 load-balanced)
-            if self.relu_lb:
-                # f_e = (k/E) * T / count_e — overload ratio per expert
-                with torch.no_grad():
-                    active_counts = (weights > 0).float().sum(dim=(0, 1))  # (E,)
-                    desired_ratio = self.sub_top_k / self.n_sub
-                    f_e = desired_ratio * (B * T) / active_counts.clamp(min=1)  # (E,)
-                # Weighted L1: penalize overloaded experts harder
-                l_reg = (weights * f_e.unsqueeze(0).unsqueeze(0)).mean()
-            else:
-                # Plain L1 (Eq 9)
-                l_reg = weights.mean()
-
-            # Return differentiable loss (lambda is detached, l_reg has grad)
-            return output, relu_lambda.detach() * l_reg
-        else:
-            return output, 0.0
-
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 blend_gate: torch.Tensor | None = None) -> torch.Tensor:
         """Dispatch to the configured attention mode.
@@ -317,10 +217,8 @@ class ULBBlock(nn.Module):
         n_heads = cfg.n_heads
         head_dim = cfg.head_dim
 
-        # --- Up-project and activate (sub-expert routed) ---
-        relu_lambda_up = getattr(self, '_relu_lambda_up', None)
-        h_up, aux_up = self._sub_expert_forward(
-            x, self.up_router(x), self.up_projs, self.swish_ups, relu_lambda_up)
+        # --- Up MLP ---
+        h_up = self.up_proj2(self.up_act(self.up_proj1(x)))
 
         # --- QKV projections ---
         q = self.q_proj(h_up).view(b, t, n_heads, head_dim)
@@ -381,12 +279,7 @@ class ULBBlock(nn.Module):
         # --- Skip-multiply (NOT skip-add) ---
         y = self.attn_norm(y) * h_up
 
-        # --- Down-project with Swish (sub-expert routed) ---
-        relu_lambda_down = getattr(self, '_relu_lambda_down', None)
-        y, aux_down = self._sub_expert_forward(
-            y, self.down_router(y), self.down_projs, self.swish_downs, relu_lambda_down)
-
-        # Store aux_loss for caller to grab
-        self.aux_loss = aux_up + aux_down
+        # --- Down MLP ---
+        y = self.down_proj2(self.down_act(self.down_proj1(y)))
 
         return y
