@@ -913,36 +913,40 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             inp, tgt = batch
         B_cur = inp.shape[0]
         y = head(model(embed(inp)))  # (B, L, V)
+        # Collect aux_loss from ReLU routing (0.0 if topk mode)
         aux_loss = getattr(model, 'aux_loss', 0.0)
-        loss = F.cross_entropy(y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100)
 
         if hard_mine and B_cur > 1:
-            # Recompute per-sample losses for weighting
-            per_pos = F.cross_entropy(
+            # Hard mining (vectorized): per-sample loss, weight hard samples more
+            L_cur = tgt.shape[1]
+            # Per-position loss: (B, L)
+            per_pos_loss = F.cross_entropy(
                 y.reshape(-1, vocab_size), tgt.reshape(-1), ignore_index=-100, reduction='none'
-            ).reshape(B_cur, -1)
-            valid_mask = tgt != -100
-            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)
-            per_sample = per_pos.sum(dim=1) / valid_count
+            ).reshape(B_cur, L_cur)
+            valid_mask = tgt != -100  # (B, L)
+            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)  # (B,)
+            per_sample_loss = per_pos_loss.sum(dim=1) / valid_count  # (B,)
+            # Weights: rank by loss, hard=2x, easy=0.5x
             with torch.no_grad():
-                lo_v, hi_v = per_sample.min(), per_sample.max()
+                lo_v, hi_v = per_sample_loss.min(), per_sample_loss.max()
                 if hi_v > lo_v:
-                    ranks = (per_sample.detach() - lo_v) / (hi_v - lo_v)
+                    ranks = (per_sample_loss.detach() - lo_v) / (hi_v - lo_v)
                     weights = 0.5 + 1.5 * ranks
                 else:
                     weights = torch.ones(B_cur, device=inp.device)
                 weights = weights / weights.mean()
-                preds = y.argmax(dim=-1)
+                preds = y.argmax(dim=-1)  # (B, L)
                 correct = ((preds == tgt) & valid_mask).float().sum(dim=1)
                 acc = (correct / valid_count).mean().item()
-            loss = (per_sample * weights).mean() + aux_loss
+            loss = (per_sample_loss * weights).mean() + aux_loss
         else:
-            loss = loss + aux_loss
+            logits_flat = y.reshape(-1, vocab_size)
+            tgt_flat = tgt.reshape(-1)
+            loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100) + aux_loss
             with torch.no_grad():
-                tgt_flat = tgt.reshape(-1)
                 mask = tgt_flat != -100
                 if mask.any():
-                    acc = (y.reshape(-1, vocab_size)[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
+                    acc = (logits_flat[mask].argmax(-1) == tgt_flat[mask]).float().mean().item()
                 else:
                     acc = 0.0
         return loss, acc
