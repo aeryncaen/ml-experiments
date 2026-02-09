@@ -77,7 +77,7 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
-    inner_ratio: float = 2.0  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
+    inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
 
     def __post_init__(self):
         if self.paired:
