@@ -77,7 +77,7 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
-    inner_dim: int = 112
+    inner_dim: int = 96
 
     def __post_init__(self):
         if self.inner_dim == 0:
