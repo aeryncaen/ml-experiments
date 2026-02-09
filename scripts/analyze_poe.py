@@ -105,6 +105,7 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
             n_hops = len(trace)
             for b in range(batch_size):
                 sample_depth = n_hops  # max if never exited
+                hit_max = True
                 hop_experts = []  # list of lists, one per hop
                 for h, hop_data in enumerate(trace):
                     experts_selected = hop_data['topk_idx'][b].tolist()
@@ -116,6 +117,7 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
 
                     if exited:
                         sample_depth = h + 1
+                        hit_max = False
                         break
 
                 # Cartesian product across hops -> all paths through this sample
@@ -127,10 +129,13 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
                 else:
                     sample_paths = [()]  # immediate exit
 
+                acc = per_sample_acc[b].item()
                 record = {
                     'depth': sample_depth,
                     'paths': sample_paths,
-                    'acc': per_sample_acc[b].item(),
+                    'acc': acc,
+                    'correct': acc >= 0.99,
+                    'hit_max': hit_max,
                     'task': None,
                 }
                 if is_mixed and task_ids is not None:
@@ -151,19 +156,25 @@ def _fmt_path(path):
 
 def print_report(traces, pool_size):
     """Print analysis report."""
-    depths = [t['depth'] for t in traces]
+    n_hit_max = sum(1 for t in traces if t['hit_max'])
+    clean = [t for t in traces if not t['hit_max']]
+    depths = [t['depth'] for t in clean]
 
-    # Collect all paths (cartesian product per sample)
+    # Collect paths only from clean (non-max_hops) samples
     all_paths = []
-    for t in traces:
+    for t in clean:
         all_paths.extend(t['paths'])
 
     print("=" * 80)
     print("POOL OF EXPERTS — ROUTING ANALYSIS")
     print("=" * 80)
 
+    print(f"\n  Total samples: {len(traces)}")
+    print(f"  Hit max_hops:  {n_hit_max} ({n_hit_max/len(traces)*100:.1f}%) — excluded from analysis below")
+    print(f"  Clean samples: {len(clean)}")
+
     # Overall depth stats
-    print(f"\n## Depth Statistics (n={len(traces)} samples)")
+    print(f"\n## Depth Statistics (n={len(clean)} samples)")
     print(f"  Mean:   {np.mean(depths):.2f}")
     print(f"  Median: {np.median(depths):.1f}")
     print(f"  Std:    {np.std(depths):.2f}")
@@ -176,22 +187,22 @@ def print_report(traces, pool_size):
     max_depth = max(depths)
     for d in range(1, max_depth + 1):
         count = depth_counts.get(d, 0)
-        pct = count / len(traces) * 100
+        pct = count / len(clean) * 100
         bar = "█" * int(pct / 2)
         print(f"  {d:>3} hops: {count:>6} ({pct:>5.1f}%) {bar}")
 
     # Per-task depth breakdown
-    tasks = set(t['task'] for t in traces if t['task'] is not None)
+    tasks = set(t['task'] for t in clean if t['task'] is not None)
     if tasks:
         print(f"\n## Per-Task Depth")
         print(f"  {'Task':<20} {'Mean':>6} {'Median':>7} {'Std':>6} {'Min':>4} {'Max':>4}")
         print(f"  {'-'*50}")
         for task in sorted(tasks):
-            task_depths = [t['depth'] for t in traces if t['task'] == task]
+            task_depths = [t['depth'] for t in clean if t['task'] == task]
             print(f"  {task:<20} {np.mean(task_depths):>6.2f} {np.median(task_depths):>7.1f} "
                   f"{np.std(task_depths):>6.2f} {min(task_depths):>4} {max(task_depths):>4}")
 
-    # Expert utilization (from raw top-k selections, not cartesian paths)
+    # Expert utilization
     expert_counts = Counter()
     for path in all_paths:
         for e in path:
@@ -205,7 +216,7 @@ def print_report(traces, pool_size):
         bar = "█" * int(pct)
         print(f"  Expert {eid:>2}: {count:>7} ({pct:>5.1f}%) {bar}")
 
-    # Hot paths (top 20 — cartesian product across hops)
+    # Hot paths
     path_counts = Counter(all_paths)
     n_total_paths = len(all_paths)
     print(f"\n## Hot Paths (top 20 of {len(path_counts)} unique, {n_total_paths} total)")
@@ -219,7 +230,7 @@ def print_report(traces, pool_size):
     if tasks:
         for task in sorted(tasks):
             task_paths = []
-            for t in traces:
+            for t in clean:
                 if t['task'] == task:
                     task_paths.extend(t['paths'])
             task_path_counts = Counter(task_paths)
@@ -232,7 +243,7 @@ def print_report(traces, pool_size):
     # Depth vs accuracy
     print(f"\n## Depth vs Accuracy")
     depth_accs = defaultdict(list)
-    for t in traces:
+    for t in clean:
         depth_accs[t['depth']].append(t['acc'])
     print(f"  {'Depth':>5} {'Count':>7} {'Mean Acc':>9} {'Std':>6}")
     print(f"  {'-'*30}")
@@ -240,29 +251,58 @@ def print_report(traces, pool_size):
         accs = depth_accs[d]
         print(f"  {d:>5} {len(accs):>7} {np.mean(accs):>8.1%} {np.std(accs):>6.3f}")
 
+    # Correct vs incorrect path comparison
+    correct_paths = Counter()
+    incorrect_paths = Counter()
+    n_correct = 0
+    n_incorrect = 0
+    for t in clean:
+        if t['correct']:
+            n_correct += 1
+            for p in t['paths']:
+                correct_paths[p] += 1
+        else:
+            n_incorrect += 1
+            for p in t['paths']:
+                incorrect_paths[p] += 1
+
+    print(f"\n## Correct vs Incorrect Samples")
+    print(f"  Correct:   {n_correct} ({n_correct/len(clean)*100:.1f}%)")
+    print(f"  Incorrect: {n_incorrect} ({n_incorrect/len(clean)*100:.1f}%)")
+
+    if n_incorrect > 0:
+        print(f"\n  Top 10 paths for INCORRECT samples:")
+        print(f"  {'Rank':>4} {'Count':>7} {'Pct':>6} {'Path'}")
+        total_inc = sum(incorrect_paths.values())
+        for rank, (path, count) in enumerate(incorrect_paths.most_common(10), 1):
+            pct = count / total_inc * 100
+            print(f"  {rank:>4} {count:>7} {pct:>5.1f}% {_fmt_path(path)}")
+
     # Per-task depth and accuracy
     if tasks:
         print(f"\n## Per-Task Depth & Accuracy")
-        print(f"  {'Task':<20} {'Mean Depth':>10} {'Mean Acc':>9}")
-        print(f"  {'-'*42}")
+        print(f"  {'Task':<20} {'Mean Depth':>10} {'Mean Acc':>9} {'Correct%':>9}")
+        print(f"  {'-'*52}")
         task_stats = {}
         for task in sorted(tasks):
-            task_traces = [t for t in traces if t['task'] == task]
+            task_traces = [t for t in clean if t['task'] == task]
             mean_d = np.mean([t['depth'] for t in task_traces])
             mean_a = np.mean([t['acc'] for t in task_traces])
-            task_stats[task] = (mean_d, mean_a)
-            print(f"  {task:<20} {mean_d:>10.2f} {mean_a:>8.1%}")
+            pct_correct = sum(1 for t in task_traces if t['correct']) / len(task_traces) * 100
+            task_stats[task] = (mean_d, mean_a, pct_correct)
+            print(f"  {task:<20} {mean_d:>10.2f} {mean_a:>8.1%} {pct_correct:>8.1f}%")
 
         print(f"\n  Ranked by mean depth (deepest first):")
-        for task, (mean_d, mean_a) in sorted(task_stats.items(), key=lambda x: x[1][0], reverse=True):
-            print(f"    {task:<20} {mean_d:.2f} hops, {mean_a:.1%} acc")
+        for task, (mean_d, mean_a, pct_c) in sorted(task_stats.items(), key=lambda x: x[1][0], reverse=True):
+            print(f"    {task:<20} {mean_d:.2f} hops, {mean_a:.1%} acc, {pct_c:.1f}% correct")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze PoE routing behavior')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to saved .pt checkpoint')
-    parser.add_argument('--data', type=str, required=True, help='Path to cached .bench_cache/*.pt data file')
+    parser.add_argument('--data', type=str, default=None, help='Path to cached .bench_cache/*.pt data file (required on first run)')
     parser.add_argument('--device', type=str, default='cpu', help='Device to run on')
+    parser.add_argument('--rerun', action='store_true', help='Force rerun even if cached traces exist')
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -277,18 +317,29 @@ def main():
 
     task = ckpt['task']
 
-    print(f"Loading data: {args.data}")
-    cached = torch.load(args.data, weights_only=True)
-    def _to(t):
-        return t.to(args.device, non_blocking=True) if isinstance(t, torch.Tensor) else t
-    task_data = {
-        'train': [tuple(_to(t) for t in batch) for batch in cached['train']],
-        'val': [tuple(_to(t) for t in batch) for batch in cached['val']],
-    }
+    # Cache traces next to checkpoint
+    trace_cache = Path(args.checkpoint).with_suffix('.traces.pt')
+    if trace_cache.exists() and not args.rerun:
+        print(f"Loading cached traces: {trace_cache}")
+        traces = torch.load(trace_cache, weights_only=False)
+    else:
+        if not args.data:
+            parser.error("--data is required when no cached traces exist (or with --rerun)")
+        print(f"Loading data: {args.data}")
+        cached = torch.load(args.data, weights_only=True)
+        def _to(t):
+            return t.to(args.device, non_blocking=True) if isinstance(t, torch.Tensor) else t
+        task_data = {
+            'train': [tuple(_to(t) for t in batch) for batch in cached['train']],
+            'val': [tuple(_to(t) for t in batch) for batch in cached['val']],
+        }
 
-    n_total = len(task_data['train']) + len(task_data['val'])
-    print(f"Running {n_total} batches (train + val) with tracing...\n")
-    traces = analyze(model, embed, head, task_data, task, ckpt['dim'], args.device)
+        n_total = len(task_data['train']) + len(task_data['val'])
+        print(f"Running {n_total} batches (train + val) with tracing...\n")
+        traces = analyze(model, embed, head, task_data, task, ckpt['dim'], args.device)
+
+        print(f"Caching traces → {trace_cache}")
+        torch.save(traces, trace_cache)
 
     print_report(traces, model.pool_size)
 
