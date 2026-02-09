@@ -5,7 +5,7 @@ SSM-equivalent capabilities (state tracking, pattern matching) purely through
 attention preprocessing, with zero sequential scan.
 
 Architecture (forward pass):
-    h_up = up_mlp(x)                                  # expanding MLP
+    h_up = up_act(up_proj(x))                           # thin linear + Swish
 
     q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up)
     q = q_norm(q) * q_bias       # per-head RMSNorm + post-norm bias
@@ -21,7 +21,7 @@ Architecture (forward pass):
     y = attend(q, k, v)          # softmax, silu2, or blend
 
     y = attn_norm(y) * h_up      # skip-MULTIPLY (not skip-add)
-    y = down_mlp(y)                                    # expanding MLP
+    y = down_proj(down_act(y))                          # thin linear + Swish
     return y                      # caller does x = x + block(x)
 
 Key design decisions (preserved from FusedGateBlock):
@@ -32,8 +32,7 @@ Key design decisions (preserved from FusedGateBlock):
     - No expansion — inner_dim = d_model
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
-    - Up/down are expanding MLPs (d → ~2d → d), param-matched to former
-      4-expert routed projections. Learned Swish activation in the middle.
+    - Up/down are thin linears (d → d) with Swish activation
 """
 
 from dataclasses import dataclass, field
@@ -63,9 +62,6 @@ class ULBConfig:
         k_lerp_bias:     Initial bias for K causal lerp gate (default -2.0).
         q_lerp_bias:     Initial bias for Q acausal lerp gates (default -2.0).
         blend_gate_bias: Initial bias for blend attention gate (default -1.1, ~25% silu2).
-        n_sub_experts:   Controls MLP expansion in up/down projections.
-                         Expansion m ≈ n_sub_experts * d, giving param parity with
-                         n_sub_experts routed linear experts. Default 4.
     """
     d_model: int = 128
     n_heads: int = 4
@@ -78,7 +74,6 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
-    n_sub_experts: int = 4
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
@@ -121,18 +116,13 @@ class ULBBlock(nn.Module):
         n_heads = config.n_heads
         head_dim = config.head_dim
 
-        # --- Up/down MLPs (param-matched to former sub-expert routing) ---
-        # Expansion sized to match: n_sub_experts * (d² + 2d) ≈ m * (2d + 1)
-        n_sub = config.n_sub_experts
-        mlp_expand = round(n_sub * (d * d + 2 * d) / (2 * d + 1))
-        self.up_proj1 = nn.Linear(d, mlp_expand, bias=False)
-        self.up_proj2 = nn.Linear(mlp_expand, inner, bias=False)
-        self.down_proj1 = nn.Linear(inner, mlp_expand, bias=False)
-        self.down_proj2 = nn.Linear(mlp_expand, d, bias=False)
+        # --- Up/down projections (thin linear + activation) ---
+        self.up_proj = nn.Linear(d, inner, bias=False)
+        self.down_proj = nn.Linear(inner, d, bias=False)
 
         if config.swish_mode == 'learnable':
-            self.up_act = LearnableSwish(mlp_expand)
-            self.down_act = LearnableSwish(mlp_expand)
+            self.up_act = LearnableSwish(inner)
+            self.down_act = LearnableSwish(inner)
         elif config.swish_mode == 'silu':
             self.up_act = nn.SiLU()
             self.down_act = nn.SiLU()
@@ -217,8 +207,8 @@ class ULBBlock(nn.Module):
         n_heads = cfg.n_heads
         head_dim = cfg.head_dim
 
-        # --- Up MLP ---
-        h_up = self.up_proj2(self.up_act(self.up_proj1(x)))
+        # --- Up projection ---
+        h_up = self.up_act(self.up_proj(x))
 
         # --- QKV projections ---
         q = self.q_proj(h_up).view(b, t, n_heads, head_dim)
@@ -279,7 +269,7 @@ class ULBBlock(nn.Module):
         # --- Skip-multiply (NOT skip-add) ---
         y = self.attn_norm(y) * h_up
 
-        # --- Down MLP ---
-        y = self.down_proj2(self.down_act(self.down_proj1(y)))
+        # --- Down projection ---
+        y = self.down_proj(self.down_act(y))
 
         return y
