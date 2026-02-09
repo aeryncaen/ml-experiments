@@ -1150,7 +1150,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         final_epoch = epoch + 1
         
         # Track best
-        if val_acc > best_val_acc:
+        if val_acc >= best_val_acc:
             best_epoch = final_epoch
             best_val_acc = val_acc
             best_val_loss = val_loss

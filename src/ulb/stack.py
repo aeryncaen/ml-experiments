@@ -353,8 +353,19 @@ class PoolOfExperts(nn.Module):
         if self.router_noise_scale > 0:
             logits = logits + self.router_noise_scale * torch.randn_like(logits)
         # Dropout: mask random logits to -inf so they can't be selected
+        # Guarantee at least top_k logits survive per sample
         if self.router_dropout > 0:
-            drop_mask = torch.rand_like(logits) < self.router_dropout
+            rand = torch.rand_like(logits)
+            drop_mask = rand < self.router_dropout
+            # Per sample: if too many dropped, keep the top_k with highest rand values
+            n_surviving = (~drop_mask).sum(dim=-1)  # (B,)
+            too_few = n_surviving < self.top_k
+            if too_few.any():
+                # For samples with too few survivors, only drop the lowest-rand entries
+                _, sorted_idx = rand.sort(dim=-1, descending=True)
+                keep = torch.zeros_like(drop_mask)
+                keep.scatter_(1, sorted_idx[:, :self.top_k], True)
+                drop_mask[too_few] = drop_mask[too_few] & ~keep[too_few]
             logits = logits.masked_fill(drop_mask, float('-inf'))
         return logits
 
