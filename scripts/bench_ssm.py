@@ -1166,7 +1166,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         # Hard mining: on when majority of subtasks have individually converged, off otherwise
         prev_hard_mine = use_hard_mine
         if subtask_accs is not None:
-            n_converged = sum(1 for a in subtask_accs.values() if a >= early_stop_acc)
+            n_converged = sum(1 for a in subtask_accs.values() if round(a, 3) >= early_stop_acc)
             use_hard_mine = n_converged > len(subtask_accs) / 2
             if use_hard_mine != prev_hard_mine:
                 state = "ON" if use_hard_mine else "OFF"
@@ -1176,7 +1176,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         # Early stopping: converged
         # Mixed task: all subtasks must exceed threshold
         if subtask_accs is not None:
-            converged = all(a >= early_stop_acc for a in subtask_accs.values())
+            converged = all(round(a, 3) >= early_stop_acc for a in subtask_accs.values())
         else:
             converged = val_acc >= early_stop_acc
         if converged:
@@ -1223,7 +1223,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         'steps': total_steps,
         'wall_s': wall,
         'peak_mem_mb': peak_mem,
-        'converged': (all(a >= early_stop_acc for a in best_subtask_accs.values())
+        'converged': (all(round(a, 3) >= early_stop_acc for a in best_subtask_accs.values())
                       if best_subtask_accs is not None
                       else best_val_acc >= early_stop_acc),
         'stop_reason': stop_reason,
