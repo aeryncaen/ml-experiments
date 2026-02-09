@@ -306,14 +306,16 @@ class PoolOfExperts(nn.Module):
                       training (default 0.1).
     """
 
-    # Index convention: router outputs logits over (pool_size + 1) options.
-    # Index pool_size is the EXIT token.
+    # Index convention: router outputs logits over (pool_size * 2) options.
+    # Indices 0..pool_size-1 are experts, pool_size..pool_size*2-1 are exit slots.
+    # Half the router space is exit — depth must be earned.
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
                  top_k: int = 2, max_hops: int | None = None,
                  router_noise: float = 1.0, router_dropout: float = 0.1):
         super().__init__()
         self.pool_size = pool_size
+        self.n_router_options = pool_size * 2  # half experts, half exit
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
@@ -324,14 +326,14 @@ class PoolOfExperts(nn.Module):
         self.stem_layer = make_layer()
 
         # Stem router: kicks off the first hop
-        self.stem_router = nn.Linear(dim, pool_size + 1, bias=False)
+        self.stem_router = nn.Linear(dim, self.n_router_options, bias=False)
 
         # Expert pool
         self.experts = nn.ModuleList([make_layer() for _ in range(pool_size)])
 
         # Per-expert outbound router: each expert votes on next destination
         self.expert_routers = nn.ModuleList([
-            nn.Linear(dim, pool_size + 1, bias=False) for _ in range(pool_size)
+            nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
         # Per-hop pre-norm (shared across hops)
@@ -371,7 +373,6 @@ class PoolOfExperts(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        exit_idx = self.pool_size
 
         # Stem
         x = x + self.stem_layer(self.stem_norm(x))
@@ -380,42 +381,40 @@ class PoolOfExperts(nn.Module):
 
         # First hop: stem router decides
         stem_pool = x.mean(dim=1)  # (B, D)
-        logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, pool_size + 1)
+        logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, n_router_options)
 
         for hop in range(self.max_hops):
             # Top-k from current logits
             topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
             topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
 
-            # Check for exit
-            has_exit = (topk_idx == exit_idx).any(dim=-1)
+            # Check for exit: any index >= pool_size is an exit slot
+            has_exit = (topk_idx >= self.pool_size).any(dim=-1)
             if has_exit.all():
                 break
 
             # Run all selected experts on full batch, stack, gather
             h = self.hop_norm(x)
 
-            # Find which experts are active this hop
+            # Find which experts are active this hop (indices < pool_size)
             active_eids = topk_idx.unique()
-            active_eids = active_eids[active_eids != exit_idx]
+            active_eids = active_eids[active_eids < self.pool_size]
 
             # Run active experts on full batch, build lookup
             expert_outs = {}   # eid -> (B, T, D)
-            expert_logits = {} # eid -> (B, pool_size+1)
+            expert_logits = {} # eid -> (B, n_router_options)
             for eid in active_eids.tolist():
                 e_out = self.experts[eid](h)  # (B, T, D)
                 expert_outs[eid] = e_out
                 e_pool = e_out.mean(dim=1)  # (B, D)
-                expert_logits[eid] = self.expert_routers[eid](e_pool)  # (B, pool_size+1)
+                expert_logits[eid] = self.expert_routers[eid](e_pool)  # (B, n_router_options)
 
                 block_aux = getattr(self.experts[eid], 'aux_loss', 0.0)
                 total_aux = total_aux + block_aux
 
-            # Weighted merge via gather: stack active expert outputs, use topk_idx to select
-            # Build full (B, T, pool_size, D) would be wasteful if pool is large.
-            # Instead, since top_k is small, iterate K slots with tensor ops (no per-sample Python).
+            # Weighted merge: iterate K slots with tensor ops (no per-sample Python)
             out = torch.zeros_like(x)  # (B, T, D)
-            next_logits = torch.zeros(B, self.pool_size + 1, device=x.device, dtype=x.dtype)
+            next_logits = torch.zeros(B, self.n_router_options, device=x.device, dtype=x.dtype)
 
             for k_idx in range(self.top_k):
                 w = topk_weights[:, k_idx]  # (B,)
