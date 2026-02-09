@@ -1047,13 +1047,10 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
     final_epoch = 0
     stop_reason = "MAX_EPOCH"
     
-    hard_mine_epoch = int(max_epochs * 2 / 3)  # last 1/3 of training
+    use_hard_mine = False  # activated when majority of subtasks converge
     
     epoch_pbar = tqdm(range(max_epochs), desc="Epochs", leave=False)
     for epoch in epoch_pbar:
-        use_hard_mine = task_name == 'mixed' and epoch >= hard_mine_epoch
-        if epoch == hard_mine_epoch and task_name == 'mixed':
-            tqdm.write(f"[hard mining] activated at epoch {epoch + 1}/{max_epochs}")
         
         # Shuffle train indices each epoch
         train_indices = torch.randperm(n_train).tolist()
@@ -1166,6 +1163,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         else:
             epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
+        # Activate hard mining when majority of subtasks have individually converged
+        if not use_hard_mine and subtask_accs is not None:
+            n_converged = sum(1 for a in subtask_accs.values() if a >= early_stop_acc)
+            if n_converged > len(subtask_accs) / 2:
+                use_hard_mine = True
+                tqdm.write(f"[hard mining] activated at epoch {epoch + 1}/{max_epochs} "
+                           f"({n_converged}/{len(subtask_accs)} subtasks converged)")
+
         # Early stopping: converged
         # Mixed task: all subtasks must exceed threshold
         if subtask_accs is not None:
@@ -1531,8 +1536,7 @@ if __name__ == '__main__':
     print("- Vocab: unified VOCAB_SIZE=64 (shared embedding/head across tasks)")
     print("- LR: mixed=1e-3, standalone tasks=1e-4")
     print("- LR schedule: 1 epoch linear warmup (0.1x -> 1.0x), then cosine decay to 0.05x")
-    hard_mine_epoch = int(max_epochs * 2 / 3)
-    print(f"- Hard mining (mixed only): OFF until epoch {hard_mine_epoch + 1}, ON from epoch {hard_mine_epoch + 1}..{max_epochs}")
+    print("- Hard mining (mixed only): activates when majority of subtasks individually converge")
     print("  weighting: easiest~0.5x, hardest~2.0x, normalized to mean=1.0 per batch")
     print("- Mixed mode data scale: train/val batch counts multiplied by 5 (one per subtask)")
     print("- Mixed convergence criterion: all subtasks must exceed early-stop threshold")
