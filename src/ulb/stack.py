@@ -315,7 +315,7 @@ class PoolOfExperts(nn.Module):
                  router_noise: float = 1.0, router_dropout: float = 0.0):
         super().__init__()
         self.pool_size = pool_size
-        self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
+        self.n_router_options = pool_size * 2  # pool_size expert + pool_size exit
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
