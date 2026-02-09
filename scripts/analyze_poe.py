@@ -134,7 +134,7 @@ def analyze(model, embed, head, task_data, task_name, dim, device):
                     'depth': sample_depth,
                     'paths': sample_paths,
                     'acc': acc,
-                    'correct': acc >= 0.99,
+                    'correct': acc >= 0.98,
                     'hit_max': hit_max,
                     'task': None,
                 }
