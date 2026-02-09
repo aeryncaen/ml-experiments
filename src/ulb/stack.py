@@ -377,9 +377,9 @@ class PoolOfExperts(nn.Module):
 
         total_aux = 0.0
         non_exit_decisions = 0  # total routing decisions that chose to continue
+        active = torch.ones(B, dtype=torch.bool, device=x.device)  # per-sample active mask
         if self.trace:
-            # Per-sample trace: list of (hop, topk_idx, topk_weights, exited) per sample
-            trace_hops = []  # list of dicts per hop
+            trace_hops = []
 
         # First hop: stem router decides
         stem_pool = x.mean(dim=1)  # (B, D)
@@ -398,25 +398,29 @@ class PoolOfExperts(nn.Module):
             topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
 
             # Check for exit: any index >= pool_size is an exit slot
-            has_exit = (topk_idx >= self.pool_size).any(dim=-1)
+            has_exit = (topk_idx >= self.pool_size).any(dim=-1)  # (B,)
 
             if self.trace:
                 trace_hops.append({
-                    'topk_idx': topk_idx.detach().cpu(),     # (B, top_k)
-                    'topk_weights': topk_weights.detach().cpu(),  # (B, top_k)
-                    'has_exit': has_exit.detach().cpu(),      # (B,)
+                    'topk_idx': topk_idx.detach().cpu(),
+                    'topk_weights': topk_weights.detach().cpu(),
+                    'has_exit': has_exit.detach().cpu(),
+                    'active': active.detach().cpu(),
                 })
 
-            non_exit_decisions += (~has_exit).sum()
+            # Mark exited samples inactive
+            active = active & ~has_exit
+            non_exit_decisions += active.sum()
 
-            if has_exit.all():
+            if not active.any():
                 break
 
             # Run all selected experts on full batch, stack, gather
             h = self.hop_norm(x)
 
-            # Find which experts are active this hop (indices < pool_size)
-            active_eids = topk_idx.unique()
+            # Find which experts are active this hop (indices < pool_size from active samples only)
+            active_idx = topk_idx[active]  # (n_active, top_k)
+            active_eids = active_idx.unique()
             active_eids = active_eids[active_eids < self.pool_size]
 
             # Run active experts on full batch, build lookup
@@ -445,7 +449,9 @@ class PoolOfExperts(nn.Module):
                     out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
                     next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
 
-            x = x + out
+            # Only update active samples
+            active_mask = active[:, None, None].float()  # (B, 1, 1)
+            x = x + out * active_mask
             logits = self._perturb_logits(next_logits)
 
         # Exit layer
