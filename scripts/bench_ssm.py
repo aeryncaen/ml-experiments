@@ -1464,7 +1464,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-epochs', type=int, default=100, help='Maximum training epochs')
     parser.add_argument('--train-batches', type=int, default=100, help='Number of training batches per epoch')
     parser.add_argument('--val-batches', type=int, default=20, help='Number of validation batches')
-    parser.add_argument('--early-stop-acc', type=float, default=0.98, help='Early stop when val acc exceeds this')
+    parser.add_argument('--early-stop-acc', type=float, default=0.99, help='Early stop when val acc exceeds this')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--seq-len', type=int, default=32, help='Sequence length')
     parser.add_argument('--grad-log-every', type=int, default=50,
