@@ -86,7 +86,7 @@ class ULBConfig:
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     n_sub_experts: int = 4
     sub_top_k: int = 2
-    router_mode: Literal['topk', 'relu'] = 'topk'
+    router_mode: Literal['topk', 'relu'] = 'relu'
     relu_lb: bool = False  # load-balanced L1 (Eq 10 in ReMoE paper)
 
     def __post_init__(self):
