@@ -320,7 +320,7 @@ class PoolOfExperts(nn.Module):
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
         self.router_dropout = router_dropout
-
+        self.exit_ramp_scale = 10.0
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
@@ -386,6 +386,13 @@ class PoolOfExperts(nn.Module):
         logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, n_router_options)
 
         for hop in range(self.max_hops):
+            # Depth-dependent exit ramp: linearly boost exit logits with depth
+            exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
+            if exit_bias > 0:
+                bias = torch.zeros_like(logits)
+                bias[:, self.pool_size:] = exit_bias
+                logits = logits + bias
+
             # Top-k from current logits
             topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
             topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
