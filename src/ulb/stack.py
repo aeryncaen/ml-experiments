@@ -300,17 +300,24 @@ class PoolOfExperts(nn.Module):
         top_k:        Number of experts selected per hop (default 2).
         max_hops:     Hard cap on routing depth.  Default = 2 * pool_size.
                       Can be annealed during training by setting .max_hops.
+        router_noise: Gaussian noise scale added to logits during training
+                      (default 1.0).  Annealable via .router_noise_scale.
+        router_dropout: Probability of masking each logit to -inf during
+                      training (default 0.1).
     """
 
     # Index convention: router outputs logits over (pool_size + 1) options.
     # Index pool_size is the EXIT token.
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
-                 top_k: int = 2, max_hops: int | None = None):
+                 top_k: int = 2, max_hops: int | None = None,
+                 router_noise: float = 1.0, router_dropout: float = 0.1):
         super().__init__()
         self.pool_size = pool_size
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
+        self.router_noise_scale = router_noise  # settable for annealing
+        self.router_dropout = router_dropout
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
@@ -338,6 +345,19 @@ class PoolOfExperts(nn.Module):
 
         self.aux_loss = 0.0
 
+    def _perturb_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply noise and dropout to router logits during training."""
+        if not self.training:
+            return logits
+        # Gaussian noise
+        if self.router_noise_scale > 0:
+            logits = logits + self.router_noise_scale * torch.randn_like(logits)
+        # Dropout: mask random logits to -inf so they can't be selected
+        if self.router_dropout > 0:
+            drop_mask = torch.rand_like(logits) < self.router_dropout
+            logits = logits.masked_fill(drop_mask, float('-inf'))
+        return logits
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         exit_idx = self.pool_size
@@ -349,7 +369,7 @@ class PoolOfExperts(nn.Module):
 
         # First hop: stem router decides
         stem_pool = x.mean(dim=1)  # (B, D)
-        logits = self.stem_router(stem_pool)  # (B, pool_size + 1)
+        logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, pool_size + 1)
 
         for hop in range(self.max_hops):
             # Top-k from current logits
@@ -397,7 +417,7 @@ class PoolOfExperts(nn.Module):
                     next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
 
             x = x + out
-            logits = next_logits
+            logits = self._perturb_logits(next_logits)
 
         # Exit layer
         x = x + self.exit_layer(self.exit_norm(x))
