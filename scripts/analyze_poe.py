@@ -26,7 +26,7 @@ from ulb import ULBBlock, ULBConfig, PoolOfExperts
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_ssm import ALL_TASKS, VOCAB_SIZE
+from bench_ssm import ALL_TASKS, VOCAB_SIZE, CACHE_DIR, _cache_key
 
 
 def rebuild_model(ckpt, device='cpu'):
@@ -300,7 +300,6 @@ def print_report(traces, pool_size):
 def main():
     parser = argparse.ArgumentParser(description='Analyze PoE routing behavior')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to saved .pt checkpoint')
-    parser.add_argument('--data', type=str, default=None, help='Path to cached .bench_cache/*.pt data file (required on first run)')
     parser.add_argument('--device', type=str, default='cpu', help='Device to run on')
     parser.add_argument('--rerun', action='store_true', help='Force rerun even if cached traces exist')
     args = parser.parse_args()
@@ -323,10 +322,26 @@ def main():
         print(f"Loading cached traces: {trace_cache}")
         traces = torch.load(trace_cache, weights_only=False)
     else:
-        if not args.data:
-            parser.error("--data is required when no cached traces exist (or with --rerun)")
-        print(f"Loading data: {args.data}")
-        cached = torch.load(args.data, weights_only=True)
+        # Find the bench data cache from checkpoint args
+        bench_args = ckpt['args']
+        B = bench_args['batch_size']
+        L = bench_args['seq_len']
+        seed = bench_args['seed']
+        n_train = bench_args['train_batches']
+        n_val = bench_args['val_batches']
+        if task == 'mixed':
+            n_train *= len(ALL_TASKS)
+            n_val *= len(ALL_TASKS)
+        key = _cache_key(task, n_train + n_val, B, L, seed)
+        data_path = CACHE_DIR / f"{task}_{key}.pt"
+
+        if not data_path.exists():
+            print(f"ERROR: bench data cache not found: {data_path}")
+            print(f"Run bench_ssm.py first to generate the data.")
+            sys.exit(1)
+
+        print(f"Loading data: {data_path}")
+        cached = torch.load(data_path, weights_only=True)
         def _to(t):
             return t.to(args.device, non_blocking=True) if isinstance(t, torch.Tensor) else t
         task_data = {
