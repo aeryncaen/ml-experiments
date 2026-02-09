@@ -299,16 +299,11 @@ class PoolOfExperts(nn.Module):
         dim:          Model dimension.
         top_k:        Number of experts selected per hop (default 2).
         max_hops:     Loop bound on routing depth.  Default = 2 * pool_size.
-                      The exit ramp guarantees exit before this is reached.
         router_noise: Gaussian noise scale added to logits during training
                       (default 1.0).  Annealable via .router_noise_scale.
-        router_dropout: Probability of masking each logit to -inf during
-                      training (default 0.1).
-
-    Annealable attributes:
-        exit_ramp_scale: Controls how aggressively depth pushes toward exit.
-                      At hop h, exit logits get boosted by exit_ramp_scale * h/max_hops.
-                      Default 10.0.  Increase over training to push shallower execution.
+        router_dropout: Enables random exit-logit dropout during training.
+                      Drops a random number (0..75%) of exit logits per sample.
+                      Expert logits are never dropped.
     """
 
     # Index convention: router outputs logits over (pool_size²) options.
@@ -325,7 +320,7 @@ class PoolOfExperts(nn.Module):
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
         self.router_dropout = router_dropout
-        self.exit_ramp_scale = 10.0  # settable for annealing — increase to push earlier exit
+
 
         # Stem: non-routed entry layer
         self.stem_norm = RMSNorm(dim)
@@ -362,21 +357,16 @@ class PoolOfExperts(nn.Module):
         # Gaussian noise
         if self.router_noise_scale > 0:
             logits = logits + self.router_noise_scale * torch.randn_like(logits)
-        # Dropout: mask random logits to -inf so they can't be selected
-        # Guarantee at least top_k logits survive per sample
+        # Dropout: drop a random number of exit logits (0..n_exit), never touch expert logits
         if self.router_dropout > 0:
-            rand = torch.rand_like(logits)
-            drop_mask = rand < self.router_dropout
-            # Per sample: if too many dropped, keep the top_k with highest rand values
-            n_surviving = (~drop_mask).sum(dim=-1)  # (B,)
-            too_few = n_surviving < self.top_k
-            if too_few.any():
-                # For samples with too few survivors, only drop the lowest-rand entries
-                _, sorted_idx = rand.sort(dim=-1, descending=True)
-                keep = torch.zeros_like(drop_mask)
-                keep.scatter_(1, sorted_idx[:, :self.top_k], True)
-                drop_mask[too_few] = drop_mask[too_few] & ~keep[too_few]
-            logits = logits.masked_fill(drop_mask, float('-inf'))
+            n_exit = self.n_router_options - self.pool_size
+            max_drop = int(n_exit * 0.75)
+            n_drop = torch.randint(0, max_drop + 1, (logits.shape[0],), device=logits.device)
+            # Per-sample random permutation of exit slot indices
+            rand = torch.rand(logits.shape[0], n_exit, device=logits.device)
+            exit_rank = rand.argsort(dim=-1)  # (B, n_exit)
+            exit_mask = exit_rank < n_drop[:, None]  # (B, n_exit)
+            logits[:, self.pool_size:] = logits[:, self.pool_size:].masked_fill(exit_mask, float('-inf'))
         return logits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -396,13 +386,6 @@ class PoolOfExperts(nn.Module):
         logits = self._perturb_logits(self.stem_router(stem_pool))  # (B, n_router_options)
 
         for hop in range(self.max_hops):
-            # Depth-dependent exit ramp: linearly boost exit logits with depth
-            exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
-            if exit_bias > 0:
-                bias = torch.zeros_like(logits)
-                bias[:, self.pool_size:] = exit_bias
-                logits = logits + bias
-
             # Top-k from current logits
             topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B, top_k)
             topk_weights = F.softmax(topk_vals, dim=-1)  # (B, top_k)
