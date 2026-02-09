@@ -1163,12 +1163,14 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         else:
             epoch_pbar.set_postfix(val_loss=f"{val_loss:.4f}", val_acc=f"{val_acc:.1%}")
         
-        # Activate hard mining when majority of subtasks have individually converged
-        if not use_hard_mine and subtask_accs is not None:
+        # Hard mining: on when majority of subtasks have individually converged, off otherwise
+        prev_hard_mine = use_hard_mine
+        if subtask_accs is not None:
             n_converged = sum(1 for a in subtask_accs.values() if a >= early_stop_acc)
-            if n_converged > len(subtask_accs) / 2:
-                use_hard_mine = True
-                tqdm.write(f"[hard mining] activated at epoch {epoch + 1}/{max_epochs} "
+            use_hard_mine = n_converged > len(subtask_accs) / 2
+            if use_hard_mine != prev_hard_mine:
+                state = "ON" if use_hard_mine else "OFF"
+                tqdm.write(f"[hard mining] {state} at epoch {epoch + 1}/{max_epochs} "
                            f"({n_converged}/{len(subtask_accs)} subtasks converged)")
 
         # Early stopping: converged
