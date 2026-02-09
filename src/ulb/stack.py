@@ -59,6 +59,9 @@ class StackedULB(nn.Module):
 class MoEStackedULB(nn.Module):
     """MoE grid: n_experts wide x n_layers tall.
 
+    A non-routed stem layer runs first to build features from raw embeddings
+    before any routing decisions are made.
+
     v1 (default): each layer routes itself.
         - Router applied to mean-pooled pre-normed hidden state.
         - Top-k experts selected per sample, softmax over selected logits.
@@ -68,8 +71,8 @@ class MoEStackedULB(nn.Module):
           outputs + input before final norm.
 
     v2 (sender-routed): previous layer's output routes next layer's experts.
-        - Layer 0 routing comes from input content.
-        - Merge weights from output_scorer(expert_output) + router_logits.
+        - Routing comes from stem output (not raw embeddings).
+        - Merge weights computed AFTER expert outputs via output_scorer + router_logits.
         - Same learned layer weighting.
 
     Args:
@@ -93,6 +96,10 @@ class MoEStackedULB(nn.Module):
         self.version = version
         self.router_mode = router_mode
         self.relu_lb = relu_lb
+
+        # Stem: single non-routed layer to build features before routing
+        self.stem_norm = RMSNorm(dim)
+        self.stem_layer = make_layer()
 
         # Grid of experts: [layer][expert]
         self.experts = nn.ModuleList([
@@ -175,6 +182,10 @@ class MoEStackedULB(nn.Module):
 
     def _v1_forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
+
+        # Stem: build features before routing
+        x = x + self.stem_layer(self.stem_norm(x))
+
         layer_outputs = [x]
         total_aux = 0.0
 
@@ -211,10 +222,14 @@ class MoEStackedULB(nn.Module):
 
     def _v2_forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
+
+        # Stem: build features before routing
+        x = x + self.stem_layer(self.stem_norm(x))
+
         layer_outputs = [x]
         total_aux = 0.0
 
-        # Initial routing decision from input content
+        # Initial routing decision from stem output
         route_signal = x.mean(dim=1)  # (B, D)
 
         for l, (norm, experts) in enumerate(zip(self.norms, self.experts)):
