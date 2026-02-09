@@ -65,6 +65,9 @@ class DiffusionPoE(PoolOfExperts):
             nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
+        # Hop position embedding — lets each expert know where it is in the chain
+        self.hop_embed = nn.Embedding(self.max_hops, dim)
+
         # Exit ramp to penalize excessive depth
         self.exit_ramp_scale = 5.0
 
@@ -84,14 +87,15 @@ class DiffusionPoE(PoolOfExperts):
         return x, logits
 
     def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
-                    topk_weights: torch.Tensor
+                    topk_weights: torch.Tensor, hop: int = 0
                     ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """Run selected experts on (B, D) state, merge outputs and logits.
+        """Run selected experts on (B, D) state with hop conditioning.
 
-        Same as parent but no mean(dim=1) pooling for router — already (B, D).
+        Adds hop position embedding before running experts, so each expert
+        knows where it is in the denoising chain.
         """
         B = x.shape[0]
-        h = self.hop_norm(x)
+        h = self.hop_norm(x) + self.hop_embed.weight[hop]  # (B, D) + (D,) broadcast
 
         active_eids = topk_idx.unique()
         active_eids = active_eids[active_eids < self.pool_size]

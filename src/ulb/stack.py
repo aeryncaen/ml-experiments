@@ -409,7 +409,7 @@ class PoolOfExperts(nn.Module):
         return topk_idx, topk_weights, has_exit
 
     def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
-                    topk_weights: torch.Tensor
+                    topk_weights: torch.Tensor, hop: int = 0
                     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         """Run selected experts and produce weighted-merged output and next logits.
 
@@ -417,6 +417,7 @@ class PoolOfExperts(nn.Module):
             x: Current hidden state (B, T, D).
             topk_idx: Selected expert/exit indices (B, top_k).
             topk_weights: Softmax weights (B, top_k).
+            hop: Current hop index (0-based). Subclasses can use for conditioning.
 
         Returns:
             out: Weighted-merged expert output (B, T, D) — added to x by caller.
@@ -497,7 +498,7 @@ class PoolOfExperts(nn.Module):
             if has_exit.all():
                 break
 
-            out, logits, hop_aux = self.execute_hop(x, topk_idx, topk_weights)
+            out, logits, hop_aux = self.execute_hop(x, topk_idx, topk_weights, hop)
             x = x + out
             total_aux = total_aux + hop_aux
 
