@@ -77,23 +77,25 @@ class ULBConfig:
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
-    inner_dim: int = 96
+    inner_ratio: float = 2.0  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
 
     def __post_init__(self):
-        if self.inner_dim == 0:
-            self.inner_dim = self.d_model
-        assert self.inner_dim % self.n_heads == 0, (
-            f"inner_dim ({self.inner_dim}) must be divisible by n_heads ({self.n_heads})")
         if self.paired:
             assert self.n_heads % 2 == 0, (
                 f"n_heads ({self.n_heads}) must be even for paired mode")
-        head_dim = self.inner_dim // self.n_heads
-        assert head_dim % 4 == 0, (
-            f"head_dim ({head_dim}) must be divisible by 4 for hybrid RoPE")
+        # Snap inner_dim to nearest multiple of n_heads*4 (RoPE needs head_dim % 4 == 0)
+        snap = self.n_heads * 4
+        self._inner_dim = round(self.d_model * self.inner_ratio / snap) * snap
+        assert self._inner_dim > 0, (
+            f"inner_dim resolved to 0 (d_model={self.d_model}, inner_ratio={self.inner_ratio})")
+
+    @property
+    def inner_dim(self) -> int:
+        return self._inner_dim
 
     @property
     def head_dim(self) -> int:
-        return self.inner_dim // self.n_heads
+        return self._inner_dim // self.n_heads
 
 
 class ULBBlock(nn.Module):
