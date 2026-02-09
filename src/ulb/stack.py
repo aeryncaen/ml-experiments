@@ -311,16 +311,16 @@ class PoolOfExperts(nn.Module):
                       Default 10.0.  Increase over training to push shallower execution.
     """
 
-    # Index convention: router outputs logits over (pool_size * 2) options.
-    # Indices 0..pool_size-1 are experts, pool_size..pool_size*2-1 are exit slots.
-    # Half the router space is exit — depth must be earned.
+    # Index convention: router outputs logits over (pool_size²) options.
+    # Indices 0..pool_size-1 are experts, pool_size..pool_size²-1 are exit slots.
+    # Random selection has 1/pool_size chance of picking an expert — depth must be earned.
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
                  top_k: int = 2, max_hops: int | None = None,
                  router_noise: float = 1.0, router_dropout: float = 0.1):
         super().__init__()
         self.pool_size = pool_size
-        self.n_router_options = pool_size * 2  # half experts, half exit
+        self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
