@@ -1531,7 +1531,7 @@ if __name__ == '__main__':
         print(f"{name:<12} {count_params(m):>10,} {n_layers:>8}  {cfg}")
 
     print(f"\nMax {max_epochs} epochs, {n_train} train batches, {n_val} val batches, B={B}, L={L}, dim={dim}, layers={n_layers}, seed={run_seed}")
-    print(f"Early stop at >{args.early_stop_acc:.0%} val accuracy")
+    print(f"Early stop at >={args.early_stop_acc:.0%} val accuracy")
     print("\nTraining config:")
     print("- Optimizer: Adam")
     print("- Loss: cross_entropy(ignore_index=-100)")
@@ -1671,6 +1671,6 @@ if __name__ == '__main__':
     
     # Legend
     print("**Legend:**")
-    print("- **Bold** = converged (>{:.0%} val acc)".format(args.early_stop_acc))
+    print("- **Bold** = converged (>={:.0%} val acc)".format(args.early_stop_acc))
     print("- Best @ = epoch with best val accuracy")
     print("- Stop: CONVERGED (hit target) | PLATEAU (train stuck at 100%) | MAX_EPOCH")
