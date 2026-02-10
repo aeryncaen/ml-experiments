@@ -258,7 +258,7 @@ class CausalULB(nn.Module):
                  n_layers: int = 4, max_seq_len: int = 256,
                  paired: bool = True, attn_mode: str = 'blend',
                  inner_ratio: float = 1.75,
-                 q_mix: str = 'lerp', k_mix: str = 'lerp',
+                 k_mix: str = 'lerp',
                  is_causal: bool = True):
         super().__init__()
         from .block import ULBBlock, ULBConfig
@@ -276,7 +276,6 @@ class CausalULB(nn.Module):
             paired=paired,
             attn_mode=attn_mode,
             inner_ratio=inner_ratio,
-            q_mix=q_mix,
             k_mix=k_mix,
             is_causal=is_causal,
         )

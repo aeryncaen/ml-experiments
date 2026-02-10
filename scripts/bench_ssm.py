@@ -1458,34 +1458,26 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='blend')")
 
     # ULB (Universal Learning Block) ablation family
-    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable'))")
 
-    # Q-mix ablations (same as base otherwise)
-    try_add('ULBBlendPQNone', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='none', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='none', k_lerp=True, swish_mode='learnable'))")
-    try_add('ULBBlendPConv2', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv2', k_lerp=True, swish_mode='learnable'))")
-    try_add('ULBBlendPConv3', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='conv3', k_lerp=True, swish_mode='learnable'))")
-
-    # K-lerp ablation
-    try_add('ULBBlendPNoK', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=False, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=False, swish_mode='learnable'))")
+    # K-mix ablation
+    try_add('ULBBlendPNoK', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', k_mix='none', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', k_mix='none', swish_mode='learnable'))")
 
     # Attention-path ablations
-    try_add('ULBSoftmaxP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='softmax', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='softmax', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
-    try_add('ULBSilu2P', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='silu2', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='silu2', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBSoftmaxP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='softmax', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='softmax', swish_mode='learnable'))")
+    try_add('ULBSilu2P', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='silu2', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='silu2', swish_mode='learnable'))")
 
     # Activation ablation
-    try_add('ULBBlendPSiLU', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='silu')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='silu'))")
+    try_add('ULBBlendPSiLU', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='silu')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', swish_mode='silu'))")
 
     # Paired-head ablation
-    try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable')),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', q_mix='lerp', k_lerp=True, swish_mode='learnable'))")
+    try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable'))")
 
     return models
 

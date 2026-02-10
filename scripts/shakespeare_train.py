@@ -94,7 +94,6 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
         inner_ratio=args.inner_ratio,
-        q_mix=args.q_mix,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
     )
@@ -150,7 +149,6 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
         inner_ratio=args.inner_ratio,
-        q_mix=args.q_mix,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
     )
@@ -750,8 +748,6 @@ def main():
     parser.add_argument('--n-heads', type=int, default=4, help='Attention heads')
     parser.add_argument('--n-layers', type=int, default=4, help='Number of layers (MHA) or passed to PoE')
     parser.add_argument('--inner-ratio', type=float, default=1.75, help='Inner dim ratio (ULB)')
-    parser.add_argument('--q-mix', type=str, default='lerp', choices=['none', 'lerp', 'add', 'conv2', 'conv3'],
-                        help='Q temporal mixing mode (ULB)')
     parser.add_argument('--k-mix', type=str, default='lerp',
                         choices=['none', 'lerp', 'add', 'acausal_lerp', 'acausal_add', 'conv2', 'conv3'],
                         help='K temporal mixing mode (ULB)')

@@ -21,7 +21,7 @@ Usage:
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
 from .block import ULBBlock, ULBConfig
-from .lerp import AcausalLerp, CausalLerp, QTemporalConv
+from .lerp import CausalLerp, CausalAdd, KAcausalLerp, KAcausalAdd, KTemporalConv
 from .norm import RMSNorm
 from .rope import HybridRoPE, PairedRoPE, apply_rotary
 from .stack import MoEStackedULB, PoolOfExperts, StackedULB
@@ -41,8 +41,10 @@ __all__ = [
     "PairedRoPE",
     "apply_rotary",
     "CausalLerp",
-    "AcausalLerp",
-    "QTemporalConv",
+    "CausalAdd",
+    "KAcausalLerp",
+    "KAcausalAdd",
+    "KTemporalConv",
     "BlendAttention",
     "silu2_attention",
 ]

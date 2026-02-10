@@ -52,19 +52,11 @@ class ULBDiffuserBlock(ULBBlock):
         """
         n = self.input_len
 
-        # K-lerp: applies to full sequence (causal, safe)
+        # K mixing: applies to full sequence
         if self.k_lerp is not None:
             k = self.k_lerp(k, x)
-
-        # Q-peek: only on input positions
-        if n > 0 and (self.q_lerp is not None or self.q_conv is not None):
-            q_in = q[:, :n]
-            x_in = x[:, :n]
-            if self.q_lerp is not None:
-                q_in = self.q_lerp(q_in, x_in)
-            elif self.q_conv is not None:
-                q_in = self.q_conv(q_in)
-            q = torch.cat([q_in, q[:, n:]], dim=1)
+        elif self.k_conv is not None:
+            k = self.k_conv(k)
 
         dd_angles = self.rope.compute_dd_angles(x)
 

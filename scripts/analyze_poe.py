@@ -43,10 +43,10 @@ def rebuild_model(ckpt, device='cpu'):
     name = ckpt['model_name']
     if 'BlendP' in name:
         cfg = ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend',
-                        q_mix='lerp', k_lerp=True, swish_mode='learnable')
+                        swish_mode='learnable')
     elif 'Blend' in name:
         cfg = ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend',
-                        q_mix='lerp', k_lerp=True, swish_mode='learnable')
+                        swish_mode='learnable')
     else:
         cfg = ULBConfig(d_model=dim, n_heads=4)
 
