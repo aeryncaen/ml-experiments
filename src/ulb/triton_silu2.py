@@ -95,7 +95,7 @@ def _silu2_attn_fwd_kernel(
 
         # QK^T
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
+        qk += tl.dot(q, tl.trans(k), input_precision="ieee")
         qk = qk * softmax_scale
 
         # Causal mask
@@ -121,7 +121,7 @@ def _silu2_attn_fwd_kernel(
                             mask=((start_n + offs_n)[:, None] < seqlen) & (offs_d[None, :] < headdim), other=0.0)
 
         # Accumulate
-        acc_o += tl.dot(weights.to(v.dtype), v)
+        acc_o += tl.dot(weights.to(v.dtype), v, input_precision="ieee")
 
     # Store output
     out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :])
@@ -245,7 +245,7 @@ def _silu2_attn_bwd_kernel(
                 q = tl.load(q_ptrs, mask=(offs_m_curr[:, None] < seqlen) & (offs_d[None, :] < headdim), other=0.0)
 
         # Recompute S = QK^T * scale
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k), input_precision="ieee") * softmax_scale
 
         # Causal mask
         causal = offs_m_curr[:, None] >= offs_n[None, :]
@@ -269,10 +269,10 @@ def _silu2_attn_bwd_kernel(
                 do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen) & (offs_d[None, :] < headdim), other=0.0)
 
         # dV += A^T @ dO
-        dv += tl.dot(A.to(do.dtype), do, trans_a=True)
+        dv += tl.dot(tl.trans(A.to(do.dtype)), do, input_precision="ieee")
 
         # dA = dO @ V^T   (BLOCK_M x BLOCK_N)
-        dA = tl.dot(do, tl.trans(v))
+        dA = tl.dot(do, tl.trans(v), input_precision="ieee")
 
         # dS = dA * 2 * silu(S) * dsilu(S) * causal_mask
         # dsilu(x) = sig(x) + x * sig(x) * (1 - sig(x))
@@ -284,10 +284,10 @@ def _silu2_attn_bwd_kernel(
         dS = dS * softmax_scale
 
         # dK += dS^T @ Q
-        dk += tl.dot(dS.to(q.dtype), q, trans_a=True)
+        dk += tl.dot(tl.trans(dS.to(q.dtype)), q, input_precision="ieee")
 
         # dQ += dS @ K  (scatter-add into dQ)
-        dq_contrib = tl.dot(dS.to(k.dtype), k)
+        dq_contrib = tl.dot(dS.to(k.dtype), k, input_precision="ieee")
         dq_ptrs = dq_base + (offs_m_curr[:, None] * stride_dqm + offs_d[None, :])
         if EVEN_M & EVEN_HEADDIM:
             tl.atomic_add(dq_ptrs, dq_contrib)

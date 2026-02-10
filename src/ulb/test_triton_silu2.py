@@ -33,11 +33,14 @@ def test_forward(B=2, H=4, T=128, D=32, dtype=torch.float32):
     tri = silu2_attention_triton(q, k, v)
 
     max_diff = (ref - tri).abs().max().item()
-    rel_err = max_diff / (ref.abs().max().item() + 1e-8)
+    mean_diff = (ref - tri).abs().mean().item()
+    ref_max = ref.abs().max().item() + 1e-8
+    rel_err = max_diff / ref_max
+    mean_rel = mean_diff / (ref.abs().mean().item() + 1e-8)
     print(f"Forward  B={B} H={H} T={T} D={D} dtype={dtype}")
-    print(f"  max_diff={max_diff:.2e}  rel_err={rel_err:.2e}")
+    print(f"  max_diff={max_diff:.2e}  rel_err={rel_err:.2e}  mean_rel={mean_rel:.2e}")
 
-    ok = rel_err < 1e-3 if dtype == torch.float32 else rel_err < 5e-2
+    ok = rel_err < 1e-4 if dtype == torch.float32 else rel_err < 5e-2
     print(f"  {'PASS' if ok else 'FAIL'}")
     return ok
 
