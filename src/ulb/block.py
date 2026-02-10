@@ -68,7 +68,7 @@ class ULBConfig:
     d_model: int = 128
     n_heads: int = 4
     paired: bool = True
-    attn_mode: Literal['softmax', 'silu2', 'blend'] = 'blend'
+    attn_mode: Literal['softmax', 'silu2', 'blend'] = 'softmax'
     rope_base: float = 10000.0
     k_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
