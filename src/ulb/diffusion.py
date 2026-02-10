@@ -215,6 +215,10 @@ class MaskedDiffusionPoE(PoolOfExperts):
         x = self.finalize(x)
         final_logits = self.output_head(x[:, L_in:])  # (B, L_out, vocab)
 
+        # Accumulate final confidence
+        final_confidence = final_logits.softmax(dim=-1).max(dim=-1).values  # (B, L_out)
+        confidence = torch.max(confidence, final_confidence)
+
         self.aux_loss = total_aux
         self.last_mean_hops = non_exit_decisions / B
         if self.trace:

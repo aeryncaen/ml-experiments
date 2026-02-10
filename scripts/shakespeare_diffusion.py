@@ -271,12 +271,10 @@ def generate(model, prompt_text: str, gen_len: int, char2idx: dict, idx2char: di
 
     for step in range(n_steps):
         # Forward pass
-        logits, _ = model(prompt_ids, output_ids, current_mask)  # (1, gen_len, vocab)
+        logits, confidence = model(prompt_ids, output_ids, current_mask)  # (1, gen_len, vocab), (1, gen_len)
 
         # Predict all positions
-        probs = logits.softmax(dim=-1)
-        pred_ids = probs.argmax(dim=-1)  # (1, gen_len)
-        confidence = probs.max(dim=-1).values  # (1, gen_len)
+        pred_ids = logits.argmax(dim=-1)  # (1, gen_len)
 
         # Fill in predictions for masked positions
         output_ids = torch.where(current_mask, pred_ids, output_ids)
