@@ -321,7 +321,8 @@ class PoolOfExperts(nn.Module):
                  router_noise: float = 1.0, router_dropout: float = 0.0,
                  shared_fraction: float = 0.0,
                  block_shared_fraction: float | None = None,
-                 router_shared_fraction: float | None = None):
+                 router_shared_fraction: float | None = None,
+                 ):
         super().__init__()
         self.pool_size = pool_size
         self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
@@ -346,9 +347,21 @@ class PoolOfExperts(nn.Module):
             nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
-        # Per-hop pre-norm (shared across hops) + hop position embedding
+        # Per-hop pre-norm (shared across hops)
         self.hop_norm = RMSNorm(dim)
-        self.hop_embed = nn.Embedding(self.max_hops, dim)
+
+        # Per-expert hop conditioning: content-gated hop embedding
+        # Each expert has a (max_hops, dim) embedding and a small gate projection.
+        # gate = sigmoid(linear(x[..., :hop_gate_dim]))  →  (B, T, 1)
+        # conditioning = gate * hop_embed[hop]            →  (B, T, dim)
+        hop_gate_dim = min(dim, 12)
+        self.hop_gate_dim = hop_gate_dim
+        self.hop_embeds = nn.ParameterList([
+            nn.Parameter(torch.randn(self.max_hops, dim) * 0.02) for _ in range(pool_size)
+        ])
+        self.hop_gates = nn.ModuleList([
+            nn.Linear(hop_gate_dim, 1, bias=False) for _ in range(pool_size)
+        ])
 
         # Exit: non-routed output layer
         self.exit_norm = RMSNorm(dim)
@@ -464,7 +477,7 @@ class PoolOfExperts(nn.Module):
             hop_aux: Accumulated aux loss from experts this hop.
         """
         B = x.shape[0]
-        h = self.hop_norm(x) + self.hop_embed.weight[hop]  # broadcast (D,) over (B, T, D)
+        h = self.hop_norm(x)
 
         # Find which experts are active this hop (indices < pool_size)
         active_eids = topk_idx.unique()
@@ -475,7 +488,10 @@ class PoolOfExperts(nn.Module):
         expert_outs = {}   # eid -> (B, T, D)
         expert_logits = {} # eid -> (B, n_router_options)
         for eid in active_eids.tolist():
-            e_out = self.experts[eid](h)  # (B, T, D)
+            # Content-gated hop conditioning: gate(x_slice) * hop_embed[hop]
+            gate = torch.sigmoid(self.hop_gates[eid](h[..., :self.hop_gate_dim]))  # (B, T, 1)
+            hop_cond = gate * self.hop_embeds[eid][hop]  # (B, T, dim)
+            e_out = self.experts[eid](h + hop_cond)  # (B, T, D)
             expert_outs[eid] = e_out
             e_pool = e_out.mean(dim=1)  # (B, D)
             expert_logits[eid] = self.expert_routers[eid](e_pool)
