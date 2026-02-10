@@ -299,10 +299,6 @@ class MaskedDiffusionPoE(PoolOfExperts):
 
             current_mask = new_mask
 
-            # If no positions are still masked, we're done
-            if not current_mask.any():
-                break
-
         # Exit layer: finalize + predict all remaining
         x = self.finalize(x)
         final_logits = self.output_head(x[:, L_in:])  # (B, L_out, vocab)
