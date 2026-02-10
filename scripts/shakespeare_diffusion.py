@@ -110,7 +110,11 @@ def train(args):
         top_k=args.top_k,
         max_hops=args.max_hops,
         local_window=args.local_window,
-        router_noise=1.0,
+        router_mode=args.router_mode,
+        router_noise=args.router_noise,
+        block_shared_fraction=args.block_shared_fraction,
+        router_shared_fraction=args.router_shared_fraction,
+        hop_shared_fraction=args.hop_shared_fraction,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -147,7 +151,7 @@ def train(args):
 
         # Anneal router noise
         frac = (epoch - 1) / max(args.epochs - 1, 1)
-        model.router_noise_scale = 1.0 * (1 - frac)
+        model.router_noise_scale = args.router_noise * (1 - frac)
 
         for step in range(args.steps_per_epoch):
             prompt, target = train_ds.sample_batch(args.batch_size, device)
@@ -316,6 +320,17 @@ def main():
     parser.add_argument('--top-k', type=int, default=2, help='Experts per hop')
     parser.add_argument('--max-hops', type=int, default=None, help='Max routing depth')
     parser.add_argument('--local-window', type=int, default=16, help='Local attention window')
+    parser.add_argument('--router-mode', type=str, default='single',
+                        choices=['squared', 'single', 'half'],
+                        help='Router exit slot density (default: single)')
+    parser.add_argument('--router-noise', type=float, default=1.0,
+                        help='Starting router noise scale (linearly annealed to 0)')
+    parser.add_argument('--block-shared-fraction', type=float, default=0.0,
+                        help='Fraction of expert block output dims shared (0.0=independent)')
+    parser.add_argument('--router-shared-fraction', type=float, default=0.0,
+                        help='Fraction of router output dims shared (0.0=independent)')
+    parser.add_argument('--hop-shared-fraction', type=float, default=0.0,
+                        help='Fraction of hop embed/gate dims shared (0.0=independent)')
     parser.add_argument('--prompt-len', type=int, default=64, help='Prompt length in chars')
     parser.add_argument('--output-len', type=int, default=64, help='Output length in chars')
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
