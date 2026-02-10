@@ -322,7 +322,7 @@ class PoolOfExperts(nn.Module):
                  shared_fraction: float = 0.0,
                  block_shared_fraction: float | None = None,
                  router_shared_fraction: float | None = None,
-                 ):
+                 hop_shared_fraction: float | None = None):
         super().__init__()
         self.pool_size = pool_size
         self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
@@ -356,8 +356,9 @@ class PoolOfExperts(nn.Module):
         # conditioning = gate * hop_embed[hop]            →  (B, T, dim)
         hop_gate_dim = min(dim, 12)
         self.hop_gate_dim = hop_gate_dim
-        self.hop_embeds = nn.ParameterList([
-            nn.Parameter(torch.randn(self.max_hops, dim) * 0.02) for _ in range(pool_size)
+        from .shared import ParamHolder
+        self.hop_embeds = nn.ModuleList([
+            ParamHolder(torch.randn(self.max_hops, dim) * 0.02) for _ in range(pool_size)
         ])
         self.hop_gates = nn.ModuleList([
             nn.Linear(hop_gate_dim, 1, bias=False) for _ in range(pool_size)
@@ -374,13 +375,23 @@ class PoolOfExperts(nn.Module):
         _router_frac = router_shared_fraction if router_shared_fraction is not None else shared_fraction
         self.block_shared_fraction = _block_frac
         self.router_shared_fraction = _router_frac
-        from .shared import share_expert_weights, share_linear_list
+        from .shared import share_expert_weights, share_linear_list, share_parameter_list
         self._shared_block_params = (
             share_expert_weights(self.experts, _block_frac) if _block_frac > 0.0
             else nn.ParameterDict()
         )
         self._shared_router_params = (
             share_linear_list(self.expert_routers, _router_frac) if _router_frac > 0.0
+            else nn.ParameterDict()
+        )
+        _hop_frac = hop_shared_fraction if hop_shared_fraction is not None else shared_fraction
+        self.hop_shared_fraction = _hop_frac
+        self._shared_hop_embed_params = (
+            share_parameter_list(self.hop_embeds, _hop_frac, prefix='hop_embed') if _hop_frac > 0.0
+            else nn.ParameterDict()
+        )
+        self._shared_hop_gate_params = (
+            share_linear_list(self.hop_gates, _hop_frac, prefix='hop_gate') if _hop_frac > 0.0
             else nn.ParameterDict()
         )
 

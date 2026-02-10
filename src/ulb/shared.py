@@ -217,3 +217,82 @@ def share_linear_list(linears: nn.ModuleList, fraction: float,
         linears[i] = SharedLinear(shared_w, shared_b, priv_w, priv_b)
 
     return shared_params
+
+
+class ParamHolder(nn.Module):
+    """Trivial wrapper to hold a raw Parameter in a ModuleList.
+
+    Supports indexing: holder[i] returns weight[i].
+    """
+
+    def __init__(self, data: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(data)
+
+    def __getitem__(self, idx):
+        return self.weight[idx]
+
+
+class SharedParameter(nn.Module):
+    """Parameter with last-dim split into shared + private slices.
+
+    value = cat([shared, private], dim=-1)
+
+    Used for embedding tables or any raw parameter where the last dim
+    should be partially shared across experts.
+
+    Args:
+        shared: (..., shared_dim) — same across all experts.
+        private: (..., private_dim) — unique per expert.
+    """
+
+    def __init__(self, shared: nn.Parameter, private: nn.Parameter):
+        super().__init__()
+        self.shared = shared
+        self.private = private
+
+    @property
+    def weight(self):
+        return torch.cat([self.shared, self.private], dim=-1)
+
+    def __getitem__(self, idx):
+        return self.weight[idx]
+
+
+def share_parameter_list(params: nn.ModuleList, fraction: float,
+                         prefix: str = 'param') -> nn.ParameterDict:
+    """Share the last dim of parameters held in ParamHolder modules.
+
+    Splits the last dimension into shared and private slices.
+    The shared slice is stored once and referenced by all.
+    Replaces each ParamHolder with a SharedParameter in-place.
+
+    Args:
+        params: ModuleList of ParamHolder modules (mutated in-place).
+        fraction: Fraction of last dim to share.
+        prefix: Name prefix for shared params in the returned dict.
+
+    Returns:
+        nn.ParameterDict of shared parameters.
+    """
+    if fraction <= 0.0:
+        return nn.ParameterDict()
+
+    n = len(params)
+    shared_params = nn.ParameterDict()
+
+    orig0 = params[0].weight
+    last_dim = orig0.shape[-1]
+    shared_dim = round(last_dim * fraction)
+    if shared_dim == 0:
+        return nn.ParameterDict()
+
+    shared = nn.Parameter(orig0.data[..., :shared_dim].clone())
+    shared_params[f'{prefix}_weight'] = shared
+
+    for i in range(n):
+        orig = params[i].weight
+        private = nn.Parameter(orig.data[..., shared_dim:].clone())
+        params[i] = SharedParameter(shared, private)
+
+    return shared_params
