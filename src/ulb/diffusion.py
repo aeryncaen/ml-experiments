@@ -1,20 +1,21 @@
 """MaskedDiffusionPoE — PoolOfExperts for masked token diffusion (LLaDA-style).
 
-Each expert is a denoising step that predicts masked tokens. Routing decides
-the adaptive demasking schedule. Low-confidence predictions are remasked
-between hops. The exit layer forces full unmasking.
+Each expert is a denoising step that predicts tokens. Routing decides
+the adaptive compute schedule. Hops refine proposals and accumulate
+confidence. The exit layer makes the final unmasking decision.
 
 Architecture:
     [prompt_tokens | masked_output_tokens] → embed → stem → routing loop → exit → logits
 
 Each hop:
     1. Run selected experts on the embedded sequence
-    2. Predict token logits for masked output positions
-    3. Re-embed top-1 predictions into the output segment
-    4. Remask the least confident predictions (low-confidence remasking)
+    2. Predict token logits for all output positions
+    3. Re-embed predictions into the output segment (so next hop attends over proposals)
+    4. Update accumulated confidence scores
     5. Route to next hop or exit
 
-Exit layer: predict all remaining masks, no remasking.
+Mask stays fixed through all hops — hops refine proposals and confidence,
+the exit/finalize layer makes the final unmasking decision.
 """
 
 import torch
@@ -34,8 +35,8 @@ class MaskedDiffusionPoE(PoolOfExperts):
     """PoolOfExperts adapted for masked token diffusion.
 
     Processes [prompt | output] sequences where output tokens may be masked.
-    Each hop predicts masked tokens, re-embeds predictions, and remasks
-    low-confidence ones. The exit layer forces full unmasking.
+    Each hop predicts tokens, re-embeds proposals, and accumulates confidence.
+    Mask stays fixed through hops — the exit layer makes the final decision.
 
     Args:
         ulb_config: ULBConfig for the diffuser blocks.
@@ -198,8 +199,8 @@ class MaskedDiffusionPoE(PoolOfExperts):
 
         Returns:
             logits: (B, L_out, vocab_size) predictions for output positions.
-            mask: (B, L_out) boolean — final mask state (which positions were
-                  still masked at exit, before forced unmasking).
+            confidence: (B, L_out) accumulated confidence per output position
+                        (max softmax prob across hops).
         """
         B, L_in = prompt_ids.shape
         L_out = output_ids.shape[1]
@@ -216,8 +217,8 @@ class MaskedDiffusionPoE(PoolOfExperts):
         # Embed
         x = self._embed_sequence(full_ids, full_mask)  # (B, L, D)
 
-        # Track which output positions are still masked
-        current_mask = output_mask.clone()  # (B, L_out)
+        # Accumulated confidence per output position (max across hops)
+        confidence = torch.zeros(B, L_out, device=x.device, dtype=x.dtype)
 
         # Stem
         x, logits = self.stem(x)
@@ -245,59 +246,22 @@ class MaskedDiffusionPoE(PoolOfExperts):
             x = x + out
             total_aux = total_aux + hop_aux
 
-            # Predict tokens for masked output positions
+            # Predict tokens for all output positions
             out_hidden = x[:, L_in:]  # (B, L_out, D)
             out_logits = self.output_head(out_hidden)  # (B, L_out, vocab)
 
-            # Re-embed predictions into masked positions (greedy argmax)
+            # Track confidence: max softmax prob per position
+            hop_confidence = out_logits.softmax(dim=-1).max(dim=-1).values  # (B, L_out)
+            # Update running confidence (keep max across hops)
+            confidence = torch.max(confidence, hop_confidence)
+
+            # Re-embed predictions into output positions so next hop attends over proposed tokens
             pred_ids = out_logits.argmax(dim=-1)  # (B, L_out)
-            pred_confidence = out_logits.softmax(dim=-1).max(dim=-1).values  # (B, L_out)
-
-            # Only consider currently masked positions
-            pred_confidence = pred_confidence.masked_fill(~current_mask, float('inf'))
-
-            # Low-confidence remasking: remask a fraction of predictions
-            # Fraction decreases with hop: remask (max_hops - hop - 1) / max_hops
-            # At last possible hop before exit, remask nothing
-            remaining_hops = self.max_hops - hop - 1
-            if remaining_hops > 0:
-                remask_frac = remaining_hops / self.max_hops
-                n_masked = current_mask.sum(dim=-1)  # (B,)
-                n_remask = (n_masked.float() * remask_frac).long()  # (B,)
-
-                # Per-sample: find the n_remask least confident predictions to remask
-                # (among currently masked positions that we just predicted)
-                sorted_conf, sorted_idx = pred_confidence.sort(dim=-1)  # ascending
-                # Build remask mask: positions in the bottom n_remask
-                rank = torch.arange(L_out, device=x.device).unsqueeze(0).expand(B, -1)
-                remask = rank < n_remask.unsqueeze(-1)  # (B, L_out) in sorted order
-                # Map back to original positions
-                remask_orig = torch.zeros_like(remask)
-                remask_orig.scatter_(1, sorted_idx, remask)
-                # Only remask positions that were masked
-                remask_orig = remask_orig & current_mask
-            else:
-                remask_orig = torch.zeros_like(current_mask)
-
-            # Update the output segment: embed predicted tokens, remask some
-            new_mask = remask_orig  # positions that stay masked
-            unmasked = current_mask & ~remask_orig  # positions we're keeping
-
-            # Re-embed: replace unmasked predictions in the sequence
-            if unmasked.any():
-                new_embeds = self.token_embed(pred_ids)  # (B, L_out, D)
-                positions = torch.arange(L_in, L, device=x.device)
-                new_embeds = new_embeds + self.pos_embed(positions)
-                # Replace in x: where unmasked, use new embeddings
-                x_out = x[:, L_in:]
-                x_out = torch.where(unmasked.unsqueeze(-1), new_embeds, x_out)
-                # Where remasked, use mask embedding
-                x_out = torch.where(new_mask.unsqueeze(-1),
-                                    self.mask_embed + self.pos_embed(positions),
-                                    x_out)
-                x = torch.cat([x[:, :L_in], x_out], dim=1)
-
-            current_mask = new_mask
+            new_embeds = self.token_embed(pred_ids)  # (B, L_out, D)
+            positions = torch.arange(L_in, L, device=x.device)
+            new_embeds = new_embeds + self.pos_embed(positions)
+            # Replace all output positions with predicted embeddings
+            x = torch.cat([x[:, :L_in], new_embeds], dim=1)
 
         # Exit layer: finalize + predict all remaining
         x = self.finalize(x)
@@ -308,4 +272,4 @@ class MaskedDiffusionPoE(PoolOfExperts):
         if self.trace:
             self.last_trace = trace_hops
 
-        return final_logits, current_mask
+        return final_logits, confidence
