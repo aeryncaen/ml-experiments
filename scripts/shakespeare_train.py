@@ -1000,6 +1000,10 @@ def train(args):
     is_llada = args.mode == 'llada'
     is_mlm = args.mode == 'mlm'
 
+    # MLM: seq_len is derived from prompt_len + output_len
+    if is_mlm:
+        args.seq_len = args.prompt_len + args.output_len
+
     # Data
     text = load_shakespeare()
     data = encode(text)
@@ -1103,8 +1107,9 @@ def train(args):
     if is_diffusion or is_mlm:
         prompt_len = args.prompt_len
         output_len = args.output_len
-        assert prompt_len + output_len == args.seq_len, \
-            f"prompt_len ({prompt_len}) + output_len ({output_len}) must equal seq_len ({args.seq_len})"
+        if is_diffusion:
+            assert prompt_len + output_len == args.seq_len, \
+                f"prompt_len ({prompt_len}) + output_len ({output_len}) must equal seq_len ({args.seq_len})"
 
     # Find the inner routing module for noise annealing and hops tracking.
     # For StackedLM wrapping PoolOfExperts: model.stacker
