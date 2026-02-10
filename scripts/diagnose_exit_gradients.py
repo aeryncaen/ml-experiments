@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Diagnose gradient behavior for exited vs non-exited samples across hops.
+"""Diagnose gradient behavior for fully-exited vs active samples across hops.
 
-Runs a few training steps and measures:
-- Per-hop: which samples have exited, gradient norms for exited vs active
-- Expert gradient contribution from exited vs active samples
-- Hidden state drift for exited samples (should be zero after exit)
-- Final loss contribution from exited vs active samples
+With top_k=2, a sample can have one exit slot and one real expert.
+We classify samples into 3 categories per hop:
+  - full_active: neither top-k selection is exit (both are real experts)
+  - partial_exit: exactly one top-k is exit, one is real expert
+  - full_exit: both top-k selections are exit (truly done)
+
+Only full_exit samples should get zero expert output. Partial exits still
+get real computation from their non-exit expert stream.
 
 Usage:
     python scripts/diagnose_exit_gradients.py [--device cuda]
@@ -23,20 +26,20 @@ from ulb.diffusion import MaskedDiffusionPoE
 
 
 def diagnose(device='cuda'):
-    # Small model, enough to see routing behavior
     cfg = ULBConfig(d_model=64, n_heads=4, paired=True, attn_mode='blend', inner_ratio=1.75)
     model = MaskedDiffusionPoE(
         ulb_config=cfg, vocab_size=32, max_seq_len=128,
         pool_size=4, top_k=2, max_hops=8, local_window=8, router_noise=1.0,
     ).to(device)
+    pool_size = model.pool_size
 
     B, L_in, L_out = 32, 64, 64
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    print("=" * 70)
-    print("Exit gradient diagnosis")
-    print(f"B={B}, L_in={L_in}, L_out={L_out}, pool=4, top_k=2, max_hops=8")
-    print("=" * 70)
+    print("=" * 80)
+    print("Exit gradient diagnosis (per-stream)")
+    print(f"B={B}, L_in={L_in}, L_out={L_out}, pool={pool_size}, top_k=2, max_hops=8")
+    print("=" * 80)
 
     for step in range(5):
         model.train()
@@ -46,58 +49,79 @@ def diagnose(device='cuda'):
         mask = torch.rand(B, L_out, device=device) < t
         mask[:, 0] = True
 
-        # ---- Instrument the forward pass ----
-        # We'll monkey-patch execute_hop to record per-sample info
-
         hop_data = []
-        exit_status = []  # per hop, (B,) bool of cumulative exits
-
         orig_route = model.route
         orig_execute = model.execute_hop
-        cumulative_exit = torch.zeros(B, dtype=torch.bool, device=device)
 
-        # Track hidden states per hop for exited samples
-        hidden_snapshots = {}  # hop -> x.detach() for exited samples
+        # Track cumulative full-exit (both streams chose exit)
+        cumul_full_exit = torch.zeros(B, dtype=torch.bool, device=device)
 
         def patched_route(logits, hop):
-            nonlocal cumulative_exit
+            nonlocal cumul_full_exit
             topk_idx, topk_weights, has_exit = orig_route(logits, hop)
-            cumulative_exit = cumulative_exit | has_exit
-            exit_status.append({
-                'hop': hop,
-                'has_exit': has_exit.detach().cpu(),
-                'cumulative_exit': cumulative_exit.detach().cpu(),
-                'n_exited': cumulative_exit.sum().item(),
-                'n_active': B - cumulative_exit.sum().item(),
-                'topk_idx': topk_idx.detach().cpu(),
-            })
+
+            with torch.no_grad():
+                is_exit = topk_idx >= pool_size  # (B, top_k)
+                n_exit_streams = is_exit.sum(dim=-1)  # (B,) 0, 1, or 2
+
+                full_active = n_exit_streams == 0
+                partial_exit = n_exit_streams == 1
+                full_exit = n_exit_streams == 2
+
+                # Only mark as truly done if BOTH streams exit
+                cumul_full_exit = cumul_full_exit | full_exit
+
+                hop_data.append({
+                    'hop': hop,
+                    'phase': 'route',
+                    'n_full_active': full_active.sum().item(),
+                    'n_partial_exit': partial_exit.sum().item(),
+                    'n_full_exit': full_exit.sum().item(),
+                    'n_cumul_full_exit': cumul_full_exit.sum().item(),
+                    'full_active': full_active.clone(),
+                    'partial_exit': partial_exit.clone(),
+                    'full_exit': full_exit.clone(),
+                    'cumul_full_exit': cumul_full_exit.clone(),
+                })
+
             return topk_idx, topk_weights, has_exit
 
         def patched_execute(x, topk_idx, topk_weights, hop=0):
-            # Record x norms for exited vs active BEFORE the hop
-            with torch.no_grad():
-                exited = cumulative_exit
-                active = ~exited
-                x_norm_exited = x[exited].norm(dim=-1).mean().item() if exited.any() else 0.0
-                x_norm_active = x[active].norm(dim=-1).mean().item() if active.any() else 0.0
+            # Find the latest route data for this hop
+            route_info = None
+            for hd in reversed(hop_data):
+                if hd['hop'] == hop and hd['phase'] == 'route':
+                    route_info = hd
+                    break
 
-            # Run the real execute_hop with gradient tracking
             x.retain_grad()
             out, logits, hop_aux = orig_execute(x, topk_idx, topk_weights, hop)
 
-            # Record output norms
             with torch.no_grad():
-                out_norm_exited = out[exited].norm(dim=-1).mean().item() if exited.any() else 0.0
-                out_norm_active = out[active].norm(dim=-1).mean().item() if active.any() else 0.0
+                fa = route_info['full_active']
+                pe = route_info['partial_exit']
+                fe = route_info['full_exit']
+                cfe = route_info['cumul_full_exit']
+                prev_full_exit = cfe & ~fe  # samples that fully exited on a PREVIOUS hop
+
+                out_fa = out[fa].norm(dim=-1).mean().item() if fa.any() else 0.0
+                out_pe = out[pe].norm(dim=-1).mean().item() if pe.any() else 0.0
+                out_fe = out[fe].norm(dim=-1).mean().item() if fe.any() else 0.0
+                out_prev = out[prev_full_exit].norm(dim=-1).mean().item() if prev_full_exit.any() else 0.0
 
             hop_data.append({
                 'hop': hop,
-                'x_norm_exited': x_norm_exited,
-                'x_norm_active': x_norm_active,
-                'out_norm_exited': out_norm_exited,
-                'out_norm_active': out_norm_active,
-                'x_ref': x,  # keep ref for grad inspection after backward
-                'exited_mask': exited.clone(),
+                'phase': 'execute',
+                'x_ref': x,
+                'full_active': fa.clone(),
+                'partial_exit': pe.clone(),
+                'full_exit': fe.clone(),
+                'prev_full_exit': prev_full_exit.clone(),
+                'out_full_active': out_fa,
+                'out_partial_exit': out_pe,
+                'out_full_exit': out_fe,
+                'out_prev_full_exit': out_prev,
+                'n_prev_full_exit': prev_full_exit.sum().item(),
             })
 
             return out, logits, hop_aux
@@ -118,62 +142,60 @@ def diagnose(device='cuda'):
         per_sample_loss = masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
         loss = per_sample_loss.mean()
 
-        # Backward
         optimizer.zero_grad()
         loss.backward()
 
         # ---- Report ----
         print(f"\n--- Step {step} | loss={loss.item():.4f} ---")
 
-        # Exit timeline
-        print(f"\n  Exit timeline:")
-        for es in exit_status:
-            print(f"    hop {es['hop']}: {es['n_exited']:>3} exited, {es['n_active']:>3} active")
+        # Route timeline
+        print(f"\n  Route decisions per hop:")
+        print(f"    {'hop':>4}  {'full_act':>8}  {'partial':>8}  {'full_exit':>9}  {'cumul_done':>10}")
+        for hd in hop_data:
+            if hd['phase'] != 'route':
+                continue
+            print(f"    {hd['hop']:>4}  {hd['n_full_active']:>8}  {hd['n_partial_exit']:>8}  "
+                  f"{hd['n_full_exit']:>9}  {hd['n_cumul_full_exit']:>10}")
 
         # Per-hop output norms and gradients
-        print(f"\n  Per-hop output norms (exited vs active samples):")
-        print(f"    {'hop':>4}  {'out_exited':>12}  {'out_active':>12}  "
-              f"{'grad_exited':>12}  {'grad_active':>12}")
+        print(f"\n  Per-hop output norms by category:")
+        print(f"    {'hop':>4}  {'out_active':>10}  {'out_partial':>11}  {'out_full_ex':>11}  "
+              f"{'out_prev_ex':>11}  {'n_prev':>6}  "
+              f"{'grad_active':>11}  {'grad_partial':>12}  {'grad_full_ex':>12}  {'grad_prev_ex':>12}")
         for hd in hop_data:
+            if hd['phase'] != 'execute':
+                continue
             x_ref = hd['x_ref']
-            exited = hd['exited_mask']
-            active = ~exited
+            fa = hd['full_active']
+            pe = hd['partial_exit']
+            fe = hd['full_exit']
+            pfe = hd['prev_full_exit']
+
             if x_ref.grad is not None:
-                grad_exited = x_ref.grad[exited].norm(dim=-1).mean().item() if exited.any() else 0.0
-                grad_active = x_ref.grad[active].norm(dim=-1).mean().item() if active.any() else 0.0
+                g_fa = x_ref.grad[fa].norm(dim=-1).mean().item() if fa.any() else 0.0
+                g_pe = x_ref.grad[pe].norm(dim=-1).mean().item() if pe.any() else 0.0
+                g_fe = x_ref.grad[fe].norm(dim=-1).mean().item() if fe.any() else 0.0
+                g_pfe = x_ref.grad[pfe].norm(dim=-1).mean().item() if pfe.any() else 0.0
             else:
-                grad_exited = grad_active = float('nan')
+                g_fa = g_pe = g_fe = g_pfe = float('nan')
 
-            print(f"    {hd['hop']:>4}  {hd['out_norm_exited']:>12.6f}  {hd['out_norm_active']:>12.6f}  "
-                  f"{grad_exited:>12.6f}  {grad_active:>12.6f}")
-
-        # Per-sample loss breakdown
-        with torch.no_grad():
-            final_exited = cumulative_exit.cpu()
-            loss_exited = per_sample_loss[final_exited].mean().item() if final_exited.any() else 0.0
-            loss_active = per_sample_loss[~final_exited].mean().item() if (~final_exited).any() else 0.0
-            print(f"\n  Final loss: exited={loss_exited:.4f}, never-exited={loss_active:.4f}")
+            print(f"    {hd['hop']:>4}  {hd['out_full_active']:>10.6f}  {hd['out_partial_exit']:>11.6f}  "
+                  f"{hd['out_full_exit']:>11.6f}  {hd['out_prev_full_exit']:>11.6f}  "
+                  f"{hd['n_prev_full_exit']:>6}  "
+                  f"{g_fa:>11.6f}  {g_pe:>12.6f}  {g_fe:>12.6f}  {g_pfe:>12.6f}")
 
         # Expert param gradient norms
         expert_grad_norms = []
         for i, expert in enumerate(model.experts):
-            total_norm = 0.0
-            n_params = 0
-            for p in expert.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.norm().item() ** 2
-                    n_params += p.numel()
+            total_norm = sum(p.grad.norm().item() ** 2 for p in expert.parameters() if p.grad is not None)
             expert_grad_norms.append(total_norm ** 0.5)
         print(f"\n  Expert gradient norms: {['%.4f' % g for g in expert_grad_norms]}")
 
-        # Router gradient norms
         stem_grad = model.stem_router.weight.grad.norm().item() if model.stem_router.weight.grad is not None else 0.0
         print(f"  Stem router grad norm: {stem_grad:.6f}")
 
-        # Restore
         model.route = orig_route
         model.execute_hop = orig_execute
-
         optimizer.step()
 
 
