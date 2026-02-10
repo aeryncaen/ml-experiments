@@ -427,6 +427,11 @@ def _silu2_attn_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
     return _silu2_attn_forward(q, k, v, scale)
 
 
+@_silu2_attn_op.register_fake
+def _silu2_attn_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
 def _silu2_attn_setup_context(ctx, inputs, output):
     q, k, v = inputs
     ctx.save_for_backward(q, k, v)
