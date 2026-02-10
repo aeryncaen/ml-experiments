@@ -85,6 +85,19 @@ def build_mha(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_ulb(vocab_size: int, args) -> nn.Module:
+    """Build a CausalULB (ULB blocks, same embed/head as MHA baseline)."""
+    from ulb.transformer import CausalULB
+    return CausalULB(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+        inner_ratio=args.inner_ratio,
+    )
+
+
 def build_ulb_poe(vocab_size: int, args) -> nn.Module:
     """Build a MaskedDiffusionPoE (ULB diffusion variant)."""
     from ulb.block import ULBConfig
@@ -114,6 +127,7 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
 
 ARCH_BUILDERS = {
     'mha': build_mha,
+    'ulb': build_ulb,
     'ulb-poe': build_ulb_poe,
 }
 
@@ -241,7 +255,7 @@ def generate_ar(model, prompt_text: str, gen_len: int, char2idx: dict, idx2char:
     """Autoregressive generation with temperature sampling."""
     model.eval()
     ids = encode(prompt_text, char2idx).unsqueeze(0).to(device)  # (1, L)
-    max_ctx = model.pos_embed.num_embeddings  # don't exceed pos embed table
+    max_ctx = model.max_seq_len  # don't exceed RoPE / pos embed range
 
     for _ in range(gen_len):
         ctx = ids[:, -max_ctx:]                  # sliding window

@@ -1,13 +1,11 @@
-"""Simple causal transformer — MHA + SwiGLU, GPT-2 style.
+"""Causal language models — baseline architectures.
 
-Baseline model for comparison. Nothing fancy:
-- Pre-norm residual blocks
-- Multi-head attention via F.scaled_dot_product_attention (flash when available)
-- SwiGLU FFN
-- Learned positional embeddings
+CausalTransformer: MHA + SwiGLU, GPT-2 style.
+CausalULB: ULB blocks, same embed/head wrapper.
 
 Usage:
     model = CausalTransformer(vocab_size=65, dim=128, n_heads=4, n_layers=4, max_seq_len=256)
+    model = CausalULB(vocab_size=65, dim=128, n_heads=4, n_layers=4, max_seq_len=256)
     logits = model(token_ids)  # (B, T, vocab_size)
 """
 
@@ -30,8 +28,25 @@ class SwiGLU(nn.Module):
         return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
+def _precompute_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> torch.Tensor:
+    """Precompute RoPE complex frequencies."""
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_seq_len)
+    angles = torch.outer(t, freqs)  # (T, head_dim/2)
+    return torch.polar(torch.ones_like(angles), angles)  # (T, head_dim/2) complex
+
+
+def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embeddings. x is (B, H, T, D), freqs is (T, D/2) complex."""
+    T = x.shape[2]
+    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (B, H, T, D/2)
+    freqs = freqs[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, D/2)
+    out = torch.view_as_real(xc * freqs).flatten(-2)  # (B, H, T, D)
+    return out.type_as(x)
+
+
 class TransformerBlock(nn.Module):
-    """Pre-norm MHA + SwiGLU block."""
+    """Pre-norm MHA + SwiGLU block with RoPE."""
 
     def __init__(self, dim: int, n_heads: int, ffn_expand: float = 8/3):
         super().__init__()
@@ -46,7 +61,7 @@ class TransformerBlock(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.ffn = SwiGLU(dim, expand=ffn_expand)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
 
         # Attention
@@ -56,6 +71,11 @@ class TransformerBlock(nn.Module):
         q = q.transpose(1, 2)  # (B, H, T, D_h)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # RoPE
+        q = _apply_rope(q, rope_freqs)
+        k = _apply_rope(k, rope_freqs)
+
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.o_proj(attn_out)
@@ -69,12 +89,14 @@ class TransformerBlock(nn.Module):
 class CausalTransformer(nn.Module):
     """Simple causal language model: embed → N blocks → norm → head.
 
+    Uses RoPE for positional encoding (no learned positional embeddings).
+
     Args:
         vocab_size: Token vocabulary size.
         dim: Model dimension.
         n_heads: Number of attention heads.
         n_layers: Number of transformer blocks.
-        max_seq_len: Maximum sequence length for positional embeddings.
+        max_seq_len: Maximum sequence length for RoPE precomputation.
         ffn_expand: SwiGLU expansion ratio (default 8/3 ≈ 2.67).
     """
 
@@ -83,14 +105,81 @@ class CausalTransformer(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+        self.max_seq_len = max_seq_len
 
         self.token_embed = nn.Embedding(vocab_size, dim)
-        self.pos_embed = nn.Embedding(max_seq_len, dim)
 
         self.blocks = nn.ModuleList([
             TransformerBlock(dim, n_heads, ffn_expand) for _ in range(n_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        # Precompute RoPE frequencies
+        head_dim = dim // n_heads
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            token_ids: (B, T) token indices.
+
+        Returns:
+            (B, T, vocab_size) logits.
+        """
+        x = self.token_embed(token_ids)
+
+        for block in self.blocks:
+            x = block(x, self.rope_freqs)
+
+        return self.head(self.final_norm(x))
+
+
+class CausalULB(nn.Module):
+    """Causal language model using ULB blocks.
+
+    Same embed/head structure as CausalTransformer but uses ULBBlock
+    (pre-norm residual stacking) instead of MHA+SwiGLU.
+
+    Args:
+        vocab_size: Token vocabulary size.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_layers: Number of ULB blocks.
+        max_seq_len: Maximum sequence length for positional embeddings.
+        paired: Use paired-head attention (default True).
+        attn_mode: Attention mode — 'softmax', 'silu2', or 'blend' (default 'blend').
+        inner_ratio: QKV/attention inner dim as ratio of d_model (default 1.75).
+    """
+
+    def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
+                 n_layers: int = 4, max_seq_len: int = 256,
+                 paired: bool = True, attn_mode: str = 'blend',
+                 inner_ratio: float = 1.75):
+        super().__init__()
+        from .block import ULBBlock, ULBConfig
+        from .norm import RMSNorm
+
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.pos_embed = nn.Embedding(max_seq_len, dim)
+
+        config = ULBConfig(
+            d_model=dim,
+            n_heads=n_heads,
+            paired=paired,
+            attn_mode=attn_mode,
+            inner_ratio=inner_ratio,
+        )
+        self.blocks = nn.ModuleList([ULBBlock(config) for _ in range(n_layers)])
+        self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
+        self.final_norm = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
 
         # Weight tying
@@ -107,7 +196,7 @@ class CausalTransformer(nn.Module):
         B, T = token_ids.shape
         x = self.token_embed(token_ids) + self.pos_embed(torch.arange(T, device=token_ids.device))
 
-        for block in self.blocks:
-            x = block(x)
+        for norm, block in zip(self.norms, self.blocks):
+            x = x + block(norm(x))
 
         return self.head(self.final_norm(x))
