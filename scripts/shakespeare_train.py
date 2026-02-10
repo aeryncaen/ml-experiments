@@ -1109,7 +1109,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob=0.15→{args.mask_prob} (curriculum)")
+        print(f"  mask_prob=0.40→{args.mask_prob} over first half (curriculum)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1202,10 +1202,11 @@ def train(args):
             frac = (epoch - 1) / max(args.epochs - 1, 1)
             _router_module.router_noise_scale = args.router_noise * (1 - frac)
 
-        # MLM masking curriculum: ramp from 15% to mask_prob over training
+        # MLM masking curriculum: ramp from 40% to mask_prob over first half of training
         if is_mlm:
-            frac = (epoch - 1) / max(args.epochs - 1, 1)
-            cur_mask_prob = 0.15 + frac * (args.mask_prob - 0.15)
+            ramp_end = max(args.epochs // 2, 1)
+            frac = min((epoch - 1) / ramp_end, 1.0)
+            cur_mask_prob = 0.40 + frac * (args.mask_prob - 0.40)
 
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
