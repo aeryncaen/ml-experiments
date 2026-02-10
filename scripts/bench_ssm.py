@@ -1271,9 +1271,10 @@ def _stack_moe(make_layer, n_layers, dim, n_experts=4, top_k=2, version=1):
 
 def _stack_poe(make_layer, dim, pool_size=8, top_k=2, max_hops=None,
                block_shared_fraction=0.0, router_shared_fraction=0.0,
-               hop_shared_fraction=0.0):
+               hop_shared_fraction=0.0, router_noise=1.0):
     """Wrap with PoolOfExperts (dynamic-depth expert pool)."""
     return PoolOfExperts(make_layer, pool_size=pool_size, dim=dim, top_k=top_k, max_hops=max_hops,
+                         router_noise=router_noise,
                          block_shared_fraction=block_shared_fraction,
                          router_shared_fraction=router_shared_fraction,
                          hop_shared_fraction=hop_shared_fraction)
@@ -1337,7 +1338,7 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
 def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False,
                 poe=False, poe_max_hops=None,
                 poe_block_share_fraction=0.0, poe_router_share_fraction=0.0,
-                poe_hop_share_fraction=0.0):
+                poe_hop_share_fraction=0.0, router_noise=1.0):
     """Build models with configurable depth.
     
     If match_params=True, auto-size SSM/MHA internal dimensions to match ULBBlendP param count.
@@ -1368,7 +1369,8 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
                 model = _stack_poe(make_fn, dim, pool_size=n_experts * n_layers, top_k=top_k, max_hops=poe_max_hops,
                                    block_shared_fraction=poe_block_share_fraction,
                                    router_shared_fraction=poe_router_share_fraction,
-                                   hop_shared_fraction=poe_hop_share_fraction)
+                                   hop_shared_fraction=poe_hop_share_fraction,
+                                   router_noise=router_noise)
             elif moe:
                 model = _stack_moe(make_fn, n_layers, dim, n_experts=n_experts, top_k=top_k)
             else:
@@ -1530,6 +1532,8 @@ if __name__ == '__main__':
                         help='Fraction of expert router output dims shared across pool (0.0=independent)')
     parser.add_argument('--poe-hop-share-fraction', type=float, default=0.0,
                         help='Fraction of hop embed/gate dims shared across experts (0.0=independent)')
+    parser.add_argument('--router-noise', type=float, default=1.0,
+                        help='Starting router noise scale (linearly annealed to 0 over training)')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
@@ -1563,7 +1567,8 @@ if __name__ == '__main__':
                               poe=args.poe, poe_max_hops=args.poe_max_hops,
                               poe_block_share_fraction=args.poe_block_share_fraction,
                               poe_router_share_fraction=args.poe_router_share_fraction,
-                              poe_hop_share_fraction=args.poe_hop_share_fraction)
+                              poe_hop_share_fraction=args.poe_hop_share_fraction,
+                              router_noise=args.router_noise)
     all_names = list(models_info.keys())
     
     if not all_names:
@@ -1626,7 +1631,8 @@ if __name__ == '__main__':
                                 poe=args.poe, poe_max_hops=args.poe_max_hops,
                                 poe_block_share_fraction=args.poe_block_share_fraction,
                                 poe_router_share_fraction=args.poe_router_share_fraction,
-                                poe_hop_share_fraction=args.poe_hop_share_fraction)[name]
+                                poe_hop_share_fraction=args.poe_hop_share_fraction,
+                                router_noise=args.router_noise)[name]
             param_count = count_params(model)
             
             # Optionally compile the model

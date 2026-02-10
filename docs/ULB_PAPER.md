@@ -247,7 +247,9 @@ These interact with transition operators; changing them shifts stability/capabil
 
 ## 9. ULB + MoE
 
-ULB composes with a layerwise Mixture-of-Experts (MoE) stacker that is model-agnostic (any block type can be used as an expert). This section specifies the exact mechanism used in this codebase.
+> **Note:** This section describes the older **layerwise MoE grid** (`MoEStackedULB`) with per-layer routing and fixed depth. The current system uses **Pool of Experts** (`PoolOfExperts`) with pool-squared routing, adaptive depth AND width, per-expert routing chains, content-gated hop conditioning, and dim-slicing weight sharing. See [`POOL_OF_EXPERTS.md`](POOL_OF_EXPERTS.md) for the current architecture.
+
+ULB composes with a layerwise Mixture-of-Experts (MoE) stacker that is model-agnostic (any block type can be used as an expert). This section specifies the mechanism of the original grid-based variant.
 
 ### 9.1 Architecture
 
@@ -349,6 +351,8 @@ ULB already factorizes temporal behavior into transition channels and attention 
 - Learned cross-layer mixing avoids forcing only the final layer to carry all task signal.
 
 Empirically in this repository, this combination yields rapid convergence and full mixed-task saturation for ULB-based models, consistent with strong expert specialization.
+
+The Pool of Experts variant (see [`POOL_OF_EXPERTS.md`](POOL_OF_EXPERTS.md)) extends these principles further: per-expert routing chains let experts collectively decide the next hop, adaptive width via partial exit allows the model to narrow its expert usage when confident, and content-gated hop conditioning gives experts per-hop identity. In practice the model discovers its own compute allocation strategy during training — e.g., unanimously choosing narrow-but-deep routing (1 expert wide, full depth) when that is sufficient.
 
 ### 9.4 Compute and systems note
 
