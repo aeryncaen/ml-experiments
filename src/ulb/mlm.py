@@ -43,13 +43,17 @@ class BertMLM(nn.Module):
         # Learned mask token embedding
         self.mask_embed = nn.Parameter(torch.randn(dim) * 0.02)
 
-        # Prediction head: dense -> SiLU -> RMSNorm (ModernBERT-style)
+        # MLM prediction head: dense -> SiLU -> RMSNorm (ModernBERT-style)
         self.pred_dense = nn.Linear(dim, dim, bias=False)
         self.pred_act = nn.SiLU()
         self.pred_norm = nn.RMSNorm(dim)
 
-        # Init pred_dense with trunc_normal like other input projections
+        # Next-token prediction head (AR objective)
+        self.next_token_head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Init heads with trunc_normal like other input projections
         nn.init.trunc_normal_(self.pred_dense.weight, std=0.02, a=-0.04, b=0.04)
+        nn.init.trunc_normal_(self.next_token_head.weight, std=0.02, a=-0.04, b=0.04)
 
         self.aux_loss = 0.0
 
@@ -98,7 +102,7 @@ class BertMLM(nn.Module):
         return x
 
     def _run_backbone(self, x: torch.Tensor) -> torch.Tensor:
-        """Run backbone layers on pre-computed embeddings. Returns logits.
+        """Run backbone layers on pre-computed embeddings. Returns hidden states.
 
         Same dispatch logic as LLaDAModel._run_backbone_from_embeddings.
         """
@@ -117,12 +121,10 @@ class BertMLM(nn.Module):
         else:
             raise ValueError(f"Unknown backbone type: {type(bb)}")
 
-        # Prediction head: dense -> SiLU -> RMSNorm -> decoder
-        x = self.pred_norm(self.pred_act(self.pred_dense(x)))
-        return bb.head(x)
+        return x
 
     def forward(self, token_ids: torch.Tensor,
-                mask: torch.Tensor) -> torch.Tensor:
+                mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -130,11 +132,19 @@ class BertMLM(nn.Module):
             mask: (B, T) bool — True = masked (predict these).
 
         Returns:
-            logits: (B, T, vocab_size) predictions at ALL positions.
-                    (Loss should only be computed on masked positions.)
+            mlm_logits: (B, T, vocab_size) — MLM predictions (loss on masked positions).
+            ar_logits:  (B, T, vocab_size) — next-token predictions (shift by 1 for loss).
         """
         x = self._embed_with_mask(token_ids, mask)
-        logits = self._run_backbone(x)
+        h = self._run_backbone(x)
+
+        # MLM head: dense -> SiLU -> RMSNorm -> decoder (weight-tied)
+        mlm_logits = self.backbone.head(
+            self.pred_norm(self.pred_act(self.pred_dense(h)))
+        )
+
+        # AR head: direct projection from hidden states
+        ar_logits = self.next_token_head(h)
 
         # Collect aux_loss from backbone
         if hasattr(self.backbone, 'stacker'):
@@ -142,4 +152,4 @@ class BertMLM(nn.Module):
         else:
             self.aux_loss = 0.0
 
-        return logits
+        return mlm_logits, ar_logits
