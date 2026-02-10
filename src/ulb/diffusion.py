@@ -122,20 +122,6 @@ class MaskedDiffusionPoE(PoolOfExperts):
         x = x + self.pos_embed(positions)
         return x
 
-    def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route only — no computation. Pick first experts from embeddings.
-
-        Args:
-            x: (B, L, D) embedded sequence.
-
-        Returns:
-            x: Unchanged (B, L, D).
-            logits: Router logits (B, n_router_options).
-        """
-        pool = x.mean(dim=1)  # (B, D)
-        logits = self._perturb_logits(self.stem_router(pool))
-        return x, logits
-
     def finalize(self, x: torch.Tensor) -> torch.Tensor:
         """Exit layer + final norm. Returns hidden states (not logits).
 
