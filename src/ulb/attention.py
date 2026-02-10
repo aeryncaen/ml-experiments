@@ -5,6 +5,7 @@ Three attention mechanisms that can be selected per-block:
 - softmax: Standard scaled dot-product attention (causal). The baseline.
 - silu2:   SiLU-squared attention — silu(QK^T/sqrt(d))^2 * causal_mask.
            Unnormalized, no softmax. Has different gradient dynamics.
+           Uses Triton flash-style tiled kernels on CUDA (no T^2 materialization).
 - blend:   Output-level lerp between softmax and RMSNorm'd silu2, with a
            per-position, per-head content-dependent gate. Allows the model
            to use softmax where precision matters and silu2 where smooth
@@ -19,9 +20,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Triton kernels available only on CUDA
+_HAS_TRITON = False
+try:
+    from .triton_silu2 import silu2_attention_triton
+    _HAS_TRITON = True
+except ImportError:
+    pass
+
+
+def _silu2_attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Reference silu2 attention (materializes T^2 matrix). Used on CPU/MPS."""
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    logits = (q @ k.transpose(-2, -1)) * scale
+    T = logits.shape[-1]
+    causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+    weights = F.silu(logits) ** 2 * causal_mask
+    return weights @ v
+
 
 def silu2_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """SiLU-squared attention: silu(logits)^2, unnormalized, causal.
+
+    Uses Triton flash-style kernels on CUDA, reference implementation elsewhere.
 
     Args:
         q, k, v: (B, H, T, D) — standard SDPA layout.
@@ -29,12 +50,9 @@ def silu2_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     Returns:
         (B, H, T, D) attention output.
     """
-    scale = 1.0 / math.sqrt(q.shape[-1])
-    logits = (q @ k.transpose(-2, -1)) * scale
-    T = logits.shape[-1]
-    causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
-    weights = F.silu(logits) ** 2 * causal_mask
-    return weights @ v
+    if _HAS_TRITON and q.is_cuda:
+        return silu2_attention_triton(q, k, v)
+    return _silu2_attention_ref(q, k, v)
 
 
 class BlendAttention(nn.Module):
