@@ -168,7 +168,6 @@ class CausalULB(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.token_embed = nn.Embedding(vocab_size, dim)
-        self.pos_embed = nn.Embedding(max_seq_len, dim)
 
         config = ULBConfig(
             d_model=dim,
@@ -194,7 +193,7 @@ class CausalULB(nn.Module):
             (B, T, vocab_size) logits.
         """
         B, T = token_ids.shape
-        x = self.token_embed(token_ids) + self.pos_embed(torch.arange(T, device=token_ids.device))
+        x = self.token_embed(token_ids)
 
         for norm, block in zip(self.norms, self.blocks):
             x = x + block(norm(x))
