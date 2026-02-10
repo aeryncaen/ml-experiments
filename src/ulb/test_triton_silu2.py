@@ -98,9 +98,126 @@ def test_various_headdims():
     return all_ok
 
 
+def bench(B=4, H=8, D=32, seqlens=(64, 128, 256, 512, 1024, 2048, 4096),
+          warmup=10, iters=50):
+    """Benchmark Triton vs PyTorch reference, forward + backward."""
+    from triton_silu2 import silu2_attention_triton
+    import time
+
+    print(f"\nBenchmark: B={B} H={H} D={D}, warmup={warmup}, iters={iters}")
+    print(f"{'T':>6}  {'ref_fwd':>10}  {'tri_fwd':>10}  {'speedup':>8}  "
+          f"{'ref_bwd':>10}  {'tri_bwd':>10}  {'speedup':>8}  "
+          f"{'ref_mem':>10}  {'tri_mem':>10}")
+    print("-" * 110)
+
+    for T in seqlens:
+        # Check if we can fit this
+        elem = B * H * T * D
+        mem_est_gb = elem * 4 * 6 / 1e9  # rough: q,k,v,grad,out * float32
+        if mem_est_gb > 40:
+            print(f"{T:>6}  SKIPPED (estimated {mem_est_gb:.1f}GB)")
+            continue
+
+        torch.manual_seed(0)
+        q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        grad = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
+
+        # --- Reference forward ---
+        for _ in range(warmup):
+            o = silu2_attention_ref(q, k, v)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            o = silu2_attention_ref(q, k, v)
+        torch.cuda.synchronize()
+        ref_fwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+        # --- Reference backward ---
+        for _ in range(warmup):
+            o = silu2_attention_ref(q, k, v)
+            o.backward(grad)
+            q.grad = k.grad = v.grad = None
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            o = silu2_attention_ref(q, k, v)
+            o.backward(grad)
+            q.grad = k.grad = v.grad = None
+        torch.cuda.synchronize()
+        ref_bwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+        # Reference peak memory
+        torch.cuda.reset_peak_memory_stats()
+        o = silu2_attention_ref(q, k, v)
+        o.backward(grad)
+        q.grad = k.grad = v.grad = None
+        torch.cuda.synchronize()
+        ref_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+        # --- Triton forward ---
+        q2 = q.detach().clone().requires_grad_(True)
+        k2 = k.detach().clone().requires_grad_(True)
+        v2 = v.detach().clone().requires_grad_(True)
+
+        for _ in range(warmup):
+            o = silu2_attention_triton(q2, k2, v2)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            o = silu2_attention_triton(q2, k2, v2)
+        torch.cuda.synchronize()
+        tri_fwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+        # --- Triton backward ---
+        for _ in range(warmup):
+            o = silu2_attention_triton(q2, k2, v2)
+            o.backward(grad)
+            q2.grad = k2.grad = v2.grad = None
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            o = silu2_attention_triton(q2, k2, v2)
+            o.backward(grad)
+            q2.grad = k2.grad = v2.grad = None
+        torch.cuda.synchronize()
+        tri_bwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+        # Triton peak memory
+        torch.cuda.reset_peak_memory_stats()
+        o = silu2_attention_triton(q2, k2, v2)
+        o.backward(grad)
+        q2.grad = k2.grad = v2.grad = None
+        torch.cuda.synchronize()
+        tri_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+        fwd_speedup = ref_fwd_ms / tri_fwd_ms
+        bwd_speedup = ref_bwd_ms / tri_bwd_ms
+
+        print(f"{T:>6}  {ref_fwd_ms:>8.2f}ms  {tri_fwd_ms:>8.2f}ms  {fwd_speedup:>7.2f}x  "
+              f"{ref_bwd_ms:>8.2f}ms  {tri_bwd_ms:>8.2f}ms  {bwd_speedup:>7.2f}x  "
+              f"{ref_mem_mb:>8.1f}MB  {tri_mem_mb:>8.1f}MB")
+
+        del q, k, v, q2, k2, v2, grad, o
+        torch.cuda.empty_cache()
+
+
 if __name__ == '__main__':
     if not torch.cuda.is_available():
         print("CUDA not available, skipping Triton tests.")
+        sys.exit(0)
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bench', action='store_true', help='Run benchmark only')
+    parser.add_argument('--B', type=int, default=4, help='Batch size for bench')
+    parser.add_argument('--H', type=int, default=8, help='Heads for bench')
+    parser.add_argument('--D', type=int, default=32, help='Head dim for bench')
+    args = parser.parse_args()
+
+    if args.bench:
+        bench(B=args.B, H=args.H, D=args.D)
         sys.exit(0)
 
     print("=" * 60)
@@ -123,6 +240,9 @@ if __name__ == '__main__':
 
     print("\n--- Backward (non-power-of-2 seqlen) ---")
     all_pass &= test_backward(B=1, H=2, T=137, D=32)
+
+    print("\n--- Benchmark ---")
+    bench()
 
     print("\n" + "=" * 60)
     if all_pass:
