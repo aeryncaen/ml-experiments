@@ -189,7 +189,7 @@ def bench(B=4, H=8, D=32, seqlens=(64, 128, 256, 512, 1024, 2048, 4096),
               f"{ref_mem:>7.1f}MB {comp_mem:>7.1f}MB {tri_mem:>7.1f}MB  "
               f"{tri_vs_comp_bwd:>6.2f}x")
 
-        del q, k, v, q2, k2, v2, q3, k3, v3, grad, o
+        del q, k, v, q2, k2, v2, q3, k3, v3, grad
         torch.cuda.empty_cache()
 
 
