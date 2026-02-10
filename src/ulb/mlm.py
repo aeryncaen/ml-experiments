@@ -43,6 +43,14 @@ class BertMLM(nn.Module):
         # Learned mask token embedding
         self.mask_embed = nn.Parameter(torch.randn(dim) * 0.02)
 
+        # Prediction head: dense -> SiLU -> RMSNorm (ModernBERT-style)
+        self.pred_dense = nn.Linear(dim, dim, bias=False)
+        self.pred_act = nn.SiLU()
+        self.pred_norm = nn.RMSNorm(dim)
+
+        # Init pred_dense with trunc_normal like other input projections
+        nn.init.trunc_normal_(self.pred_dense.weight, std=0.02, a=-0.04, b=0.04)
+
         self.aux_loss = 0.0
 
     def _embed_with_mask(self, token_ids: torch.Tensor,
@@ -98,17 +106,20 @@ class BertMLM(nn.Module):
 
         if hasattr(bb, 'stacker'):
             x = bb.stacker(x)
-            return bb.head(x)
         elif hasattr(bb, 'rope_freqs'):
             for block in bb.blocks:
                 x = block(x, bb.rope_freqs)
+            x = bb.final_norm(x)
         elif hasattr(bb, 'norms'):
             for norm, block in zip(bb.norms, bb.blocks):
                 x = x + block(norm(x))
+            x = bb.final_norm(x)
         else:
             raise ValueError(f"Unknown backbone type: {type(bb)}")
 
-        return bb.head(bb.final_norm(x))
+        # Prediction head: dense -> SiLU -> RMSNorm -> decoder
+        x = self.pred_norm(self.pred_act(self.pred_dense(x)))
+        return bb.head(x)
 
     def forward(self, token_ids: torch.Tensor,
                 mask: torch.Tensor) -> torch.Tensor:

@@ -34,6 +34,7 @@ Key design decisions (preserved from FusedGateBlock):
     - Up/down are thin linears (d → inner_dim) with Swish activation
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -314,3 +315,34 @@ class ULBBlock(nn.Module):
         y = self.down_proj(self.down_act(y))
 
         return y
+
+
+def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
+                       cutoff_factor: float = 2.0):
+    """Full Megatron init for ULB-based models.
+
+    - Input projections (up_proj, q_proj, k_proj, v_proj, w_gate, w_up, qkv_proj):
+      trunc_normal(std)
+    - Output projections (down_proj, o_proj, w_down): trunc_normal(std / sqrt(2 * n_layers))
+    - Embeddings (token_embed): trunc_normal(std)
+    - All biases: zero
+    """
+    out_std = std / math.sqrt(2.0 * n_layers)
+    cutoff = cutoff_factor * std
+    out_cutoff = cutoff_factor * out_std
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if name.endswith('.down_proj') or name.endswith('.o_proj') or name.endswith('.w_down'):
+                nn.init.trunc_normal_(module.weight, std=out_std,
+                                      a=-out_cutoff, b=out_cutoff)
+            elif name.endswith('.head'):
+                pass  # weight-tied to embedding
+            else:
+                nn.init.trunc_normal_(module.weight, std=std,
+                                      a=-cutoff, b=cutoff)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, std=std,
+                                  a=-cutoff, b=cutoff)

@@ -9,6 +9,8 @@ Usage:
     logits = model(token_ids)  # (B, T, vocab_size)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +20,41 @@ try:
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
+
+
+def megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
+                   cutoff_factor: float = 2.0):
+    """Full Megatron init (ModernBERT-style).
+
+    - Input projections (qkv_proj, ffn.w_gate, ffn.w_up): trunc_normal(std)
+    - Output projections (o_proj, ffn.w_down): trunc_normal(std / sqrt(2 * n_layers))
+    - Embeddings (token_embed): trunc_normal(std)
+    - All biases: zero
+
+    For stacker-compatible layers (CausalMHALayer, BidirectionalMHALayer),
+    pass layer_id to scale output projections per-layer.
+    """
+    out_std = std / math.sqrt(2.0 * n_layers)
+    cutoff = cutoff_factor * std
+    out_cutoff = cutoff_factor * out_std
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # Identify output projections by name
+            if name.endswith('.o_proj') or name.endswith('.w_down'):
+                nn.init.trunc_normal_(module.weight, std=out_std,
+                                      a=-out_cutoff, b=out_cutoff)
+            elif name.endswith('.head'):
+                # head is weight-tied to embedding, skip
+                pass
+            else:
+                nn.init.trunc_normal_(module.weight, std=std,
+                                      a=-cutoff, b=cutoff)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, std=std,
+                                  a=-cutoff, b=cutoff)
 
 
 class SwiGLU(nn.Module):
@@ -128,6 +165,9 @@ class CausalTransformer(nn.Module):
         head_dim = dim // n_heads
         self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
 
+        # Megatron init
+        megatron_init_(self, n_layers)
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -145,10 +185,12 @@ class CausalTransformer(nn.Module):
 
 
 class BidirectionalTransformerBlock(nn.Module):
-    """Pre-norm MHA + SwiGLU block with RoPE. Full bidirectional attention (no causal mask)."""
+    """Pre-norm MHA + SwiGLU block with RoPE. Supports causal or bidirectional attention."""
 
-    def __init__(self, dim: int, n_heads: int, ffn_expand: float = 8/3):
+    def __init__(self, dim: int, n_heads: int, ffn_expand: float = 8/3,
+                 is_causal: bool = True):
         super().__init__()
+        self.is_causal = is_causal
         self.attn_norm = nn.RMSNorm(dim)
         self.ffn_norm = nn.RMSNorm(dim)
 
@@ -175,7 +217,7 @@ class BidirectionalTransformerBlock(nn.Module):
         q = _apply_rope(q, rope_freqs)
         k = _apply_rope(k, rope_freqs)
 
-        if HAS_FLASH_ATTN:
+        if HAS_FLASH_ATTN and not self.is_causal:
             # flash_attn_func expects (B, T, H, D) in bf16/fp16
             q = q.transpose(1, 2).to(torch.bfloat16)
             k = k.transpose(1, 2).to(torch.bfloat16)
@@ -183,7 +225,7 @@ class BidirectionalTransformerBlock(nn.Module):
             attn_out = flash_attn_func(q, k, v, causal=False)
             attn_out = attn_out.to(x.dtype).contiguous().view(B, T, D)
         else:
-            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.o_proj(attn_out)
 
@@ -194,9 +236,7 @@ class BidirectionalTransformerBlock(nn.Module):
 
 
 class BidirectionalTransformer(nn.Module):
-    """Bidirectional transformer — same as CausalTransformer but without causal mask.
-
-    For use as a LLaDA backbone where the model sees all positions.
+    """MHA + SwiGLU transformer with RoPE. Supports causal (default) or bidirectional.
 
     Args:
         vocab_size: Token vocabulary size.
@@ -205,10 +245,12 @@ class BidirectionalTransformer(nn.Module):
         n_layers: Number of transformer blocks.
         max_seq_len: Maximum sequence length for RoPE precomputation.
         ffn_expand: SwiGLU expansion ratio (default 8/3).
+        is_causal: Whether to use causal masking (default True).
     """
 
     def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
-                 n_layers: int = 4, max_seq_len: int = 256, ffn_expand: float = 8/3):
+                 n_layers: int = 4, max_seq_len: int = 256, ffn_expand: float = 8/3,
+                 is_causal: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -217,7 +259,8 @@ class BidirectionalTransformer(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, dim)
 
         self.blocks = nn.ModuleList([
-            BidirectionalTransformerBlock(dim, n_heads, ffn_expand) for _ in range(n_layers)
+            BidirectionalTransformerBlock(dim, n_heads, ffn_expand, is_causal=is_causal)
+            for _ in range(n_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
@@ -228,6 +271,9 @@ class BidirectionalTransformer(nn.Module):
         # Precompute RoPE frequencies
         head_dim = dim // n_heads
         self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+        # Megatron init
+        megatron_init_(self, n_layers)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -302,14 +348,15 @@ class CausalMHALayer(nn.Module):
 
 
 class BidirectionalMHALayer(nn.Module):
-    """Bidirectional MHA + SwiGLU layer compatible with ULB stackers.
+    """MHA + SwiGLU layer compatible with ULB stackers. Supports causal or bidirectional.
 
-    Same as CausalMHALayer but without causal mask.
+    Same as CausalMHALayer but with configurable causal mask.
     """
 
     def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
-                 ffn_expand: float = 8/3):
+                 ffn_expand: float = 8/3, is_causal: bool = True):
         super().__init__()
+        self.is_causal = is_causal
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         assert dim % n_heads == 0
@@ -335,14 +382,14 @@ class BidirectionalMHALayer(nn.Module):
         q = _apply_rope(q, self.rope_freqs)
         k = _apply_rope(k, self.rope_freqs)
 
-        if HAS_FLASH_ATTN:
+        if HAS_FLASH_ATTN and not self.is_causal:
             q = q.transpose(1, 2).to(torch.bfloat16)
             k = k.transpose(1, 2).to(torch.bfloat16)
             v = v.transpose(1, 2).to(torch.bfloat16)
             attn_out = flash_attn_func(q, k, v, causal=False)
             attn_out = attn_out.to(x.dtype).contiguous().view(B, T, D)
         else:
-            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         h = self.o_proj(attn_out)
 

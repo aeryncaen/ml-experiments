@@ -164,6 +164,16 @@ class StackedLM(nn.Module):
         # Weight tying
         self.head.weight = self.token_embed.weight
 
+        # Megatron init — infer effective depth from stacker
+        n_layers = getattr(stacker, 'n_layers', None)
+        if n_layers is None:
+            n_layers = getattr(stacker, 'pool_size', None)
+        if n_layers is None and hasattr(stacker, 'layers'):
+            n_layers = len(stacker.layers)
+        if n_layers is not None:
+            from ulb.block import ulb_megatron_init_
+            ulb_megatron_init_(self, n_layers)
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         x = self.token_embed(token_ids)
         x = self.stacker(x)
@@ -339,6 +349,7 @@ def build_llada_mha(vocab_size: int, args) -> nn.Module:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len + args.gen_len,
+        is_causal=not args.no_causal,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
@@ -371,7 +382,8 @@ def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
     from ulb.transformer import LLaDAModel
     max_sl = args.seq_len + args.gen_len
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl,
+        is_causal=not args.no_causal)
     stacker = MoEStackedULB(
         make_layer=make_layer,
         n_layers=args.n_layers,
@@ -424,7 +436,8 @@ def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
     from ulb.transformer import LLaDAModel
     max_sl = args.seq_len + args.gen_len
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl,
+        is_causal=not args.no_causal)
     stacker = PoolOfExperts(
         make_layer=make_layer,
         pool_size=args.pool_size,
@@ -508,6 +521,7 @@ def build_mlm_mha(vocab_size: int, args) -> nn.Module:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
+        is_causal=not args.no_causal,
     )
     return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
 
@@ -536,7 +550,8 @@ def build_mlm_mha_moe(vocab_size: int, args) -> nn.Module:
     from ulb.stack import MoEStackedULB
     from ulb.mlm import BertMLM
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len,
+        is_causal=not args.no_causal)
     stacker = MoEStackedULB(
         make_layer=make_layer, n_layers=args.n_layers, dim=args.dim,
         n_experts=args.n_experts, top_k=args.top_k,

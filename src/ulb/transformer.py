@@ -72,6 +72,10 @@ class CausalULB(nn.Module):
         # Weight tying
         self.head.weight = self.token_embed.weight
 
+        # Megatron init
+        from .block import ulb_megatron_init_
+        ulb_megatron_init_(self, n_layers)
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
