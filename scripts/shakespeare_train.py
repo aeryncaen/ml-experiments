@@ -74,7 +74,7 @@ class TextDataset:
 
 def build_mha(vocab_size: int, args) -> nn.Module:
     """Build a CausalTransformer (MHA + SwiGLU baseline)."""
-    from ulb.transformer import CausalTransformer
+    from mha import CausalTransformer
     return CausalTransformer(
         vocab_size=vocab_size,
         dim=args.dim,
@@ -129,7 +129,8 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
 
 def build_llada_mha(vocab_size: int, args) -> nn.Module:
     """Build LLaDA with BidirectionalTransformer backbone."""
-    from ulb.transformer import BidirectionalTransformer, LLaDAModel
+    from mha import BidirectionalTransformer
+    from ulb.transformer import LLaDAModel
     backbone = BidirectionalTransformer(
         vocab_size=vocab_size,
         dim=args.dim,
@@ -638,7 +639,8 @@ def train(args):
         val_loss /= n_val
         val_acc /= n_val
 
-        if val_loss < best_val_loss:
+        is_best = val_loss < best_val_loss
+        if is_best:
             best_val_loss = val_loss
             torch.save({
                 'state_dict': model.state_dict(),
@@ -649,8 +651,8 @@ def train(args):
                 'val_loss': val_loss,
                 'val_acc': val_acc,
             }, best_ckpt_path)
-            tqdm.write(f"  [epoch {epoch}] New best val_loss={val_loss:.4f} "
-                        f"vacc={val_acc:.1%} -> saved {best_ckpt_path}")
+        best_marker = " *" if is_best else ""
+        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{best_marker}")
 
         # Early stop on val accuracy
         if args.early_stop_acc > 0 and val_acc >= args.early_stop_acc:
