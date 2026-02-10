@@ -481,18 +481,60 @@ LLADA_BUILDERS = {
 # --- MLM (Deep Hybrid) builders ---
 
 def build_mlm_mha(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with BidirectionalMHALayer blocks."""
-    from mha import BidirectionalMHALayer
+    """Build DeepMLM with BidirectionalTransformer backbone (same as LLaDA MHA)."""
+    from mha import BidirectionalTransformer
     from ulb.mlm import DeepMLM
     max_sl = args.seq_len + args.gen_len
-    make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
-    return DeepMLM(make_layer, args.n_layers, vocab_size, args.dim, max_sl)
+    backbone = BidirectionalTransformer(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=max_sl,
+    )
+    return DeepMLM(backbone, vocab_size, args.dim)
 
 
 def build_mlm_ulb(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with ULBBlock blocks."""
+    """Build DeepMLM with CausalULB backbone (same as LLaDA ULB)."""
+    from ulb.transformer import CausalULB
+    from ulb.mlm import DeepMLM
+    max_sl = args.seq_len + args.gen_len
+    backbone = CausalULB(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=max_sl,
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+        embed_lerp=args.embed_lerp,
+    )
+    return DeepMLM(backbone, vocab_size, args.dim)
+
+
+def build_mlm_mha_moe(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLM with MoE-stacked BidirectionalMHALayer backbone (same as LLaDA MHA-MoE)."""
+    from mha import BidirectionalMHALayer
+    from ulb.stack import MoEStackedULB
+    from ulb.mlm import DeepMLM
+    max_sl = args.seq_len + args.gen_len
+    make_layer = lambda: BidirectionalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+    stacker = MoEStackedULB(
+        make_layer=make_layer, n_layers=args.n_layers, dim=args.dim,
+        n_experts=args.n_experts, top_k=args.top_k,
+        version=args.moe_version, router_mode=args.moe_router_mode,
+    )
+    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
+    return DeepMLM(backbone, vocab_size, args.dim)
+
+
+def build_mlm_ulb_moe(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLM with MoE-stacked ULBBlock backbone (same as LLaDA ULB-MoE)."""
     from ulb.block import ULBBlock, ULBConfig
+    from ulb.stack import MoEStackedULB
     from ulb.mlm import DeepMLM
     config = ULBConfig(
         d_model=args.dim,
@@ -504,38 +546,13 @@ def build_mlm_ulb(vocab_size: int, args) -> nn.Module:
     )
     max_sl = args.seq_len + args.gen_len
     make_layer = lambda: ULBBlock(config)
-    return DeepMLM(make_layer, args.n_layers, vocab_size, args.dim, max_sl)
-
-
-def build_mlm_mha_moe(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLMMoE with BidirectionalMHALayer experts."""
-    from mha import BidirectionalMHALayer
-    from ulb.mlm import DeepMLMMoE
-    max_sl = args.seq_len + args.gen_len
-    make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
-    return DeepMLMMoE(make_layer, args.n_layers, vocab_size, args.dim, max_sl,
-                      n_experts=args.n_experts, top_k=args.top_k,
-                      version=args.moe_version, router_mode=args.moe_router_mode)
-
-
-def build_mlm_ulb_moe(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLMMoE with ULBBlock experts."""
-    from ulb.block import ULBBlock, ULBConfig
-    from ulb.mlm import DeepMLMMoE
-    config = ULBConfig(
-        d_model=args.dim,
-        n_heads=args.n_heads,
-        paired=True,
-        inner_ratio=args.inner_ratio,
-        k_mix=args.k_mix,
-        is_causal=not args.no_causal,
+    stacker = MoEStackedULB(
+        make_layer=make_layer, n_layers=args.n_layers, dim=args.dim,
+        n_experts=args.n_experts, top_k=args.top_k,
+        version=args.moe_version, router_mode=args.moe_router_mode,
     )
-    max_sl = args.seq_len + args.gen_len
-    make_layer = lambda: ULBBlock(config)
-    return DeepMLMMoE(make_layer, args.n_layers, vocab_size, args.dim, max_sl,
-                      n_experts=args.n_experts, top_k=args.top_k,
-                      version=args.moe_version, router_mode=args.moe_router_mode)
+    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
+    return DeepMLM(backbone, vocab_size, args.dim)
 
 
 MLM_BUILDERS = {
