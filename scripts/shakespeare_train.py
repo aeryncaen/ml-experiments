@@ -1370,10 +1370,30 @@ def train(args):
                     recon_text = decode(result).replace('\n', '\\n')
                     n_masked = mask.sum().item()
                     n_correct = ((preds[0] == original) & mask[0]).sum().item()
-                    tqdm.write(f"  [sample] {n_correct}/{n_masked} masked correct")
+                    tqdm.write(f"  [sample rand] {n_correct}/{n_masked} masked correct")
                     tqdm.write(f"    orig:  {orig_text[:80]}")
                     tqdm.write(f"    mask:  {masked_text[:80]}")
                     tqdm.write(f"    recon: {recon_text[:80]}")
+
+                    # EOS-generation sample: contiguous chunk at end before EOS
+                    sample_batch2 = val_ds.sample_batch(1, device)
+                    T2 = sample_batch2.shape[1]
+                    chunk = min(args.gen_len, T2 - 2)
+                    mask2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
+                    mask2[0, T2 - 1 - chunk:T2 - 1] = True  # right before EOS
+                    logits2 = model(sample_batch2, mask2)
+                    preds2 = logits2.argmax(dim=-1)
+                    original2 = sample_batch2[0]
+                    result2 = original2.clone()
+                    result2[mask2[0]] = preds2[0][mask2[0]]
+                    masked_view2 = original2.clone()
+                    masked_view2[mask2[0]] = ord('_')
+                    n_masked2 = mask2.sum().item()
+                    n_correct2 = ((preds2[0] == original2) & mask2[0]).sum().item()
+                    tqdm.write(f"  [sample gen] {n_correct2}/{n_masked2} masked correct")
+                    tqdm.write(f"    orig:  {decode(original2).replace(chr(10), chr(92)+'n')[:80]}")
+                    tqdm.write(f"    mask:  {decode(masked_view2).replace(chr(10), chr(92)+'n')[:80]}")
+                    tqdm.write(f"    recon: {decode(result2).replace(chr(10), chr(92)+'n')[:80]}")
                 else:
                     sample_prompt = "KING:\nO, "
                     sample_len = 64
