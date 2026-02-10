@@ -748,9 +748,9 @@ def main():
     parser.add_argument('--n-heads', type=int, default=4, help='Attention heads')
     parser.add_argument('--n-layers', type=int, default=4, help='Number of layers (MHA) or passed to PoE')
     parser.add_argument('--inner-ratio', type=float, default=1.75, help='Inner dim ratio (ULB)')
-    parser.add_argument('--q-mix', type=str, default='lerp', choices=['none', 'lerp', 'conv2', 'conv3'],
+    parser.add_argument('--q-mix', type=str, default='lerp', choices=['none', 'lerp', 'add', 'conv2', 'conv3'],
                         help='Q temporal mixing mode (ULB)')
-    parser.add_argument('--k-mix', type=str, default='lerp', choices=['none', 'lerp', 'conv2', 'conv3'],
+    parser.add_argument('--k-mix', type=str, default='lerp', choices=['none', 'lerp', 'add', 'conv2', 'conv3'],
                         help='K temporal mixing mode (ULB, causal)')
     parser.add_argument('--seq-len', type=int, default=80, help='Total sequence length')
 

@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .lerp import AcausalLerp, CausalLerp, KTemporalConv, QTemporalConv
+from .lerp import AcausalAdd, AcausalLerp, CausalAdd, CausalLerp, KTemporalConv, QTemporalConv
 from .rope import HybridRoPE, PairedRoPE
 
 
@@ -74,8 +74,8 @@ class ULBConfig:
     k_lerp_bias: float = -2.0
     q_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
-    q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
-    k_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
+    q_mix: Literal['none', 'lerp', 'add', 'conv2', 'conv3'] = 'lerp'
+    k_mix: Literal['none', 'lerp', 'add', 'conv2', 'conv3'] = 'lerp'
     k_lerp: bool = True  # legacy compat — overridden by k_mix if set
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
@@ -153,11 +153,13 @@ class ULBBlock(nn.Module):
         quarter_dim = head_dim // 4
 
         # K mixing (causal only)
-        self.k_lerp: CausalLerp | None = None
+        self.k_lerp: CausalLerp | CausalAdd | None = None
         self.k_conv: KTemporalConv | None = None
         k_mix = config.k_mix
         if k_mix == 'lerp':
             self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'add':
+            self.k_lerp = CausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'conv2':
             self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=2)
         elif k_mix == 'conv3':
@@ -168,10 +170,12 @@ class ULBBlock(nn.Module):
             raise ValueError(f"Unknown k_mix mode: {k_mix}")
 
         # Q mixing (acausal) — operates on 3rd quarter, non-overlapping with K-mix's last quarter
-        self.q_lerp: AcausalLerp | None = None
+        self.q_lerp: AcausalLerp | AcausalAdd | None = None
         self.q_conv: QTemporalConv | None = None
         if config.q_mix == 'lerp':
             self.q_lerp = AcausalLerp(d, n_heads, quarter_dim, init_bias=config.q_lerp_bias)
+        elif config.q_mix == 'add':
+            self.q_lerp = AcausalAdd(d, n_heads, quarter_dim, init_bias=config.q_lerp_bias)
         elif config.q_mix == 'none':
             pass
         elif config.q_mix == 'conv2':
