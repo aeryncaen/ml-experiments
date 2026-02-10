@@ -1,21 +1,23 @@
-"""DeepMLM — Deep Hybrid Masked Language Model.
+"""DeepMLM — Deep Hybrid Masked Language Model with learned internal diffusion.
 
-No noise schedule, no diffusion. Every layer predicts tokens at masked
-(output) positions, accumulates logits into a secondary residual stream,
-and re-embeds the current best predictions. Single-pass generation.
+Each layer is a learned diffusion step. Layers predict tokens at output
+positions and independently decide whether to unmask or re-mask each
+position via gumbel-softmax (differentiable). The noise schedule is
+entirely learned — no external schedule, no fixed mask ratios.
 
 Architecture:
-    [prompt_tokens | MASK * gen_len] → embed → layer loop → accumulated logits
+    [prompt_tokens | MASK * gen_len] → embed → layer loop → final logits
 
 Each layer:
     1. Pre-norm residual: x = x + layer(norm(x))
-    2. Predict logits at output positions via shared output head
-    3. Accumulate logits: accum = accum + layer_logits
-    4. Re-embed: replace output hidden states with token_embed(argmax(accum)) + pos_embed
-       (full replace — next layer sees current best predictions)
+    2. Predict token logits at output positions via shared output head
+    3. Predict per-position mask logit via learned gate (unmask vs re-mask)
+    4. Gumbel-softmax the gate → soft decision g in [0, 1]
+    5. x[:, P:] = g * (token_embed(pred) + pos_embed) + (1-g) * (mask_embed + pos_embed)
+       Positions can be unmasked or re-masked at any layer.
 
-Training: CE loss on accumulated logits vs ground-truth output tokens.
-Generation: Single forward pass, decode argmax of accumulated logits.
+Training: CE loss on final layer logits vs ground-truth output tokens.
+Generation: Single forward pass, decode argmax of final logits.
 """
 
 from typing import Callable, Literal
@@ -28,29 +30,41 @@ from .norm import RMSNorm
 
 
 class DeepMLM(nn.Module):
-    """Deep hybrid MLM with per-layer predict and re-embed.
+    """Deep hybrid MLM with learned internal diffusion.
+
+    Each layer predicts tokens and a per-position mask/unmask gate.
+    The gate is sampled via gumbel-softmax (differentiable) and controls
+    whether each output position is unmasked (re-embedded with prediction)
+    or re-masked. Positions can be unmasked and re-masked freely across layers.
 
     Args:
         make_layer: Callable that creates a single block (no arguments).
                     Block signature: forward(x) -> delta, where x is pre-normed.
-        n_layers: Number of layers.
+        n_layers: Number of layers (each is a learned diffusion step).
         vocab_size: Token vocabulary size.
         dim: Model dimension.
         max_seq_len: Maximum total sequence length (prompt + output).
+        gumbel_tau: Temperature for gumbel-softmax (default 1.0).
     """
 
     def __init__(self, make_layer, n_layers: int, vocab_size: int,
-                 dim: int, max_seq_len: int):
+                 dim: int, max_seq_len: int, gumbel_tau: float = 1.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.n_layers = n_layers
+        self.gumbel_tau = gumbel_tau
 
         # Layers
         self.layers = nn.ModuleList([make_layer() for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
+
+        # Per-layer mask gate: projects hidden state to 2 logits (mask, unmask)
+        self.mask_gates = nn.ModuleList([
+            nn.Linear(dim, 2) for _ in range(n_layers)
+        ])
 
         # Embeddings
         self.token_embed = nn.Embedding(vocab_size, dim)
@@ -66,18 +80,15 @@ class DeepMLM(nn.Module):
 
     def forward(self, prompt_ids: torch.Tensor,
                 target_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass with learned internal diffusion.
 
         Args:
             prompt_ids: (B, P) prompt token indices.
             target_ids: (B, G) ground-truth output token indices.
-                        During generation, pass dummy ids (zeros); the model
-                        ignores them since all output positions are masked.
+                        During generation, pass dummy ids (zeros).
 
         Returns:
-            accum: (B, G, vocab_size) accumulated softmax distribution across
-                   all layers. This IS the prediction — argmax for token ids,
-                   log for loss computation.
+            logits: (B, G, vocab_size) final layer predictions.
         """
         B, P = prompt_ids.shape
         G = target_ids.shape[1]
@@ -86,26 +97,36 @@ class DeepMLM(nn.Module):
         # Embed prompt
         prompt_x = self.token_embed(prompt_ids)  # (B, P, D)
 
-        # Embed output: mask_embed + absolute positional embeddings
+        # Embed output: all positions start masked
         output_positions = torch.arange(P, P + G, device=device)
-        output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + self.pos_embed(output_positions)
-        # (B, G, D)
+        pos_embeds = self.pos_embed(output_positions)  # (G, D)
+        mask_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds  # (B, G, D)
 
-        x = torch.cat([prompt_x, output_x], dim=1)  # (B, P+G, D)
+        x = torch.cat([prompt_x, mask_x], dim=1)  # (B, P+G, D)
 
         aux = 0.0
 
-        for norm, layer in zip(self.norms, self.layers):
+        for norm, layer, gate in zip(self.norms, self.layers, self.mask_gates):
             x = x + layer(norm(x))
             aux = aux + getattr(layer, 'aux_loss', 0.0)
 
-            # Predict at output positions
-            out_logits = self.output_head(x[:, P:])  # (B, G, vocab)
-
-            # Re-embed from this layer's predictions
+            # Predict tokens at output positions
+            out_hidden = x[:, P:]  # (B, G, D)
+            out_logits = self.output_head(out_hidden)  # (B, G, vocab)
             pred_ids = out_logits.detach().argmax(dim=-1)  # (B, G)
-            new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
-            x = torch.cat([x[:, :P], new_embeds], dim=1)
+            pred_embeds = self.token_embed(pred_ids) + pos_embeds  # (B, G, D)
+
+            # Mask gate: gumbel-softmax over (mask, unmask)
+            gate_logits = gate(out_hidden)  # (B, G, 2)
+            g = F.gumbel_softmax(gate_logits, tau=self.gumbel_tau,
+                                 hard=not self.training, dim=-1)
+            g_unmask = g[:, :, 1:2]  # (B, G, 1) — probability of unmasking
+
+            # Lerp: unmask → pred_embeds, mask → mask_embed + pos
+            masked = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+            new_output = g_unmask * pred_embeds + (1.0 - g_unmask) * masked
+
+            x = torch.cat([x[:, :P], new_output], dim=1)
 
         # Final prediction
         x = self.final_norm(x)
@@ -116,13 +137,10 @@ class DeepMLM(nn.Module):
 
 
 class DeepMLMMoE(nn.Module):
-    """Deep hybrid MLM with MoE routing per layer.
+    """Deep hybrid MLM with MoE routing and learned internal diffusion.
 
-    Same per-layer predict/re-embed as DeepMLM, but each layer is an MoE
-    layer: route → run experts → merge → predict → re-embed.
-
-    Wraps a MoEStackedULB internally, iterating its layers manually
-    instead of calling its forward().
+    Same gumbel-softmax mask/unmask gates as DeepMLM, but each layer uses
+    MoE routing: route → run experts → merge → predict → gate → re-embed.
 
     Args:
         make_layer: Callable that creates a single expert block.
@@ -134,19 +152,22 @@ class DeepMLMMoE(nn.Module):
         top_k: Top-k expert selection per sample.
         version: MoE routing version (1 or 2).
         router_mode: 'topk' or 'relu'.
+        gumbel_tau: Temperature for gumbel-softmax (default 1.0).
     """
 
     def __init__(self, make_layer: Callable[[], nn.Module],
                  n_layers: int, vocab_size: int, dim: int, max_seq_len: int,
                  n_experts: int = 4, top_k: int = 2,
                  version: Literal[1, 2] = 1,
-                 router_mode: Literal['topk', 'relu'] = 'topk'):
+                 router_mode: Literal['topk', 'relu'] = 'topk',
+                 gumbel_tau: float = 1.0):
         super().__init__()
         from .stack import MoEStackedULB
 
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.gumbel_tau = gumbel_tau
 
         # MoE stacker — we'll iterate its internals manually
         self.stacker = MoEStackedULB(
@@ -159,6 +180,12 @@ class DeepMLMMoE(nn.Module):
             router_mode=router_mode,
         )
 
+        # Per-layer mask gates (applied after MoE merge)
+        # +1 for stem layer
+        self.mask_gates = nn.ModuleList([
+            nn.Linear(dim, 2) for _ in range(n_layers + 1)
+        ])
+
         # Embeddings
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.mask_embed = nn.Parameter(torch.randn(dim) * 0.02)
@@ -170,9 +197,26 @@ class DeepMLMMoE(nn.Module):
 
         self.aux_loss = 0.0
 
+    def _gate_and_reembed(self, x, P, G, gate, pos_embeds, B):
+        """Predict tokens, gate mask/unmask, re-embed output positions."""
+        out_hidden = x[:, P:]  # (B, G, D)
+        out_logits = self.output_head(out_hidden)  # (B, G, vocab)
+        pred_ids = out_logits.detach().argmax(dim=-1)  # (B, G)
+        pred_embeds = self.token_embed(pred_ids) + pos_embeds  # (B, G, D)
+
+        gate_logits = gate(out_hidden)  # (B, G, 2)
+        g = F.gumbel_softmax(gate_logits, tau=self.gumbel_tau,
+                             hard=not self.training, dim=-1)
+        g_unmask = g[:, :, 1:2]  # (B, G, 1)
+
+        masked = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+        new_output = g_unmask * pred_embeds + (1.0 - g_unmask) * masked
+
+        return torch.cat([x[:, :P], new_output], dim=1)
+
     def forward(self, prompt_ids: torch.Tensor,
                 target_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MoE routing and per-layer predict/re-embed."""
+        """Forward pass with MoE routing and learned internal diffusion."""
         B, P = prompt_ids.shape
         G = target_ids.shape[1]
         T = P + G
@@ -183,15 +227,16 @@ class DeepMLMMoE(nn.Module):
         # Embed
         prompt_x = self.token_embed(prompt_ids)
         output_positions = torch.arange(P, P + G, device=device)
-        output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + self.pos_embed(output_positions)
+        pos_embeds = self.pos_embed(output_positions)  # (G, D)
+        output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, T, D)
 
         total_aux = 0.0
 
-        # Stem layer (non-routed)
+        # Stem layer (non-routed) + gate
         x = x + stk.stem_layer(stk.stem_norm(x))
+        x = self._gate_and_reembed(x, P, G, self.mask_gates[0], pos_embeds, B)
 
-        # v1 forward with per-layer predict/re-embed
         layer_outputs = [x]
 
         if stk.version == 1:
@@ -218,13 +263,8 @@ class DeepMLMMoE(nn.Module):
                 x = x + out
                 layer_outputs.append(x)
 
-                # Predict at output positions
-                out_logits = self.output_head(x[:, P:])
-
-                # Re-embed from this layer's predictions
-                pred_ids = out_logits.detach().argmax(dim=-1)
-                new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
-                x = torch.cat([x[:, :P], new_embeds], dim=1)
+                # Gate and re-embed
+                x = self._gate_and_reembed(x, P, G, self.mask_gates[l + 1], pos_embeds, B)
                 layer_outputs[-1] = x
 
             # Learned layer weighting
@@ -260,13 +300,8 @@ class DeepMLMMoE(nn.Module):
                 layer_outputs.append(x)
                 route_signal = x.mean(dim=1)
 
-                # Predict at output positions
-                out_logits = self.output_head(x[:, P:])
-
-                # Re-embed from this layer's predictions
-                pred_ids = out_logits.detach().argmax(dim=-1)
-                new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
-                x = torch.cat([x[:, :P], new_embeds], dim=1)
+                # Gate and re-embed
+                x = self._gate_and_reembed(x, P, G, self.mask_gates[l + 1], pos_embeds, B)
                 layer_outputs[-1] = x
 
             # Learned layer weighting
