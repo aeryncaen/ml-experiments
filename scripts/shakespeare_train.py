@@ -417,7 +417,12 @@ def train(args):
                 'val_acc': val_acc,
             }, best_ckpt_path)
             tqdm.write(f"  [epoch {epoch}] New best val_loss={val_loss:.4f} "
-                       f"vacc={val_acc:.1%} -> saved {best_ckpt_path}")
+                        f"vacc={val_acc:.1%} -> saved {best_ckpt_path}")
+
+        # Early stop on val accuracy
+        if args.early_stop_acc > 0 and val_acc >= args.early_stop_acc:
+            tqdm.write(f"  [epoch {epoch}] Early stop: val_acc={val_acc:.1%} >= {args.early_stop_acc:.0%}")
+            break
 
         # Status bar
         postfix = dict(
@@ -442,10 +447,82 @@ def train(args):
 # Main
 # ---------------------------------------------------------------------------
 
+def interactive_generate(args):
+    """Load a checkpoint and run an interactive generation loop."""
+    ckpt_path = args.generate
+    device = torch.device(args.device)
+
+    print(f"Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    saved_args = argparse.Namespace(**ckpt['args'])
+    char2idx = ckpt['char2idx']
+    idx2char = ckpt['idx2char']
+    vocab_size = len(char2idx)
+
+    # Use mode/arch from checkpoint, allow CLI overrides for gen params
+    mode = saved_args.mode
+    arch = saved_args.arch
+    temperature = args.temperature
+    gen_len = args.gen_len
+
+    print(f"Model: {arch} / {mode}, params: {ckpt.get('params', '?'):,}")
+    if 'val_acc' in ckpt:
+        print(f"Checkpoint from epoch {ckpt.get('epoch', '?')}, "
+              f"val_loss={ckpt.get('val_loss', '?'):.4f}, val_acc={ckpt.get('val_acc', '?'):.1%}")
+
+    # Rebuild model from saved args
+    model = ARCH_BUILDERS[arch](vocab_size, saved_args).to(device)
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+
+    max_prompt = saved_args.seq_len - 1 if mode == 'ar' else saved_args.prompt_len
+
+    print(f"\nInteractive generation — type a prompt and press Enter.")
+    print(f"  mode={mode}, temperature={temperature}, gen_len={gen_len}, max_prompt={max_prompt}")
+    print(f"  (Ctrl+C or empty line to quit)\n")
+
+    while True:
+        try:
+            prompt_text = input("prompt> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
+        if not prompt_text:
+            print("Bye.")
+            break
+
+        # Allow \n in input for multi-line prompts
+        prompt_text = prompt_text.replace('\\n', '\n')
+
+        # Truncate to fit
+        if len(prompt_text) > max_prompt:
+            prompt_text = prompt_text[-max_prompt:]
+            print(f"  (truncated to last {max_prompt} chars)")
+
+        # Check all chars are in vocab
+        unknown = [c for c in prompt_text if c not in char2idx]
+        if unknown:
+            print(f"  Warning: unknown chars {unknown!r} — skipping")
+            continue
+
+        if mode == 'ar':
+            gen = generate_ar(model, prompt_text, gen_len, char2idx, idx2char,
+                              device, temperature=temperature)
+        else:
+            gen = generate_diffusion(model, prompt_text, gen_len, char2idx, idx2char,
+                                     device)
+
+        print(f"\n{prompt_text}\033[1m{gen}\033[0m\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Shakespeare trainer (AR / Diffusion)')
 
     # Mode and architecture
+    parser.add_argument('--generate', type=str, default=None, metavar='CKPT',
+                        help='Load checkpoint and run interactive generation (skip training)')
+    parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature (AR)')
+    parser.add_argument('--gen-len', type=int, default=256, help='Generation length')
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion'],
                         help='Training mode: autoregressive or masked diffusion')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
@@ -484,6 +561,8 @@ def main():
     parser.add_argument('--val-batches', type=int, default=10, help='Validation batches')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--early-stop-acc', type=float, default=0.99,
+                        help='Stop training when val acc exceeds this (0 to disable)')
     parser.add_argument('--device', type=str, default='cpu', help='Device')
     parser.add_argument('--save-dir', type=str, default=None, help='Save directory')
     parser.add_argument('--compile', action='store_true', help='torch.compile the model')
@@ -492,6 +571,11 @@ def main():
                         help='torch.compile mode')
 
     args = parser.parse_args()
+
+    # --generate mode: load checkpoint and run interactive prompt loop
+    if args.generate:
+        interactive_generate(args)
+        return
 
     print("=" * 60)
     print(f"Shakespeare — {args.arch.upper()} / {args.mode.upper()}")
