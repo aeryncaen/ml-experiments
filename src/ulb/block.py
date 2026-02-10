@@ -280,7 +280,9 @@ class ULBBlock(nn.Module):
             x: (B, T, D) — pre-normed input from the stacking model.
 
         Returns:
-            (B, T, D) — the delta to add to the residual stream.
+            (B, T, D) block output for this layer.
+            Callers typically combine it with a residual path externally
+            (e.g. ``x = x + block(norm(x))``).
             Side effect: sets self.aux_loss (scalar tensor or 0.0).
         """
         cfg = self.config
