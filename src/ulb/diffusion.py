@@ -46,13 +46,23 @@ class MaskedDiffusionPoE(PoolOfExperts):
         top_k: Experts selected per hop.
         max_hops: Loop bound on routing depth.
         local_window: Half-window for acausal local attention on output.
+        router_mode: Exit slot density ('squared', 'single', 'half').
         router_noise: Gaussian noise on router logits during training.
+        shared_fraction: Convenience — sets block, router, and hop sharing fractions.
+        block_shared_fraction: Fraction of expert block output dims shared.
+        router_shared_fraction: Fraction of router output dims shared.
+        hop_shared_fraction: Fraction of hop embed/gate dims shared.
     """
 
     def __init__(self, ulb_config: ULBConfig, vocab_size: int, max_seq_len: int = 1024,
                  pool_size: int = 4, top_k: int = 2, max_hops: int | None = None,
                  local_window: int = 16,
-                 router_noise: float = 1.0):
+                 router_mode: str = 'single',
+                 router_noise: float = 1.0,
+                 shared_fraction: float = 0.0,
+                 block_shared_fraction: float | None = None,
+                 router_shared_fraction: float | None = None,
+                 hop_shared_fraction: float | None = None):
         dim = ulb_config.d_model
         make_layer = lambda: ULBDiffuserBlock(ulb_config, local_window=local_window)
         super().__init__(
@@ -61,7 +71,12 @@ class MaskedDiffusionPoE(PoolOfExperts):
             dim=dim,
             top_k=top_k,
             max_hops=max_hops,
+            router_mode=router_mode,
             router_noise=router_noise,
+            shared_fraction=shared_fraction,
+            block_shared_fraction=block_shared_fraction,
+            router_shared_fraction=router_shared_fraction,
+            hop_shared_fraction=hop_shared_fraction,
         )
 
         self.ulb_config = ulb_config
@@ -75,13 +90,6 @@ class MaskedDiffusionPoE(PoolOfExperts):
 
         # Output head: hidden state → vocab logits
         self.output_head = nn.Linear(dim, vocab_size, bias=False)
-
-        # pool_size experts + 1 exit slot
-        self.n_router_options = pool_size + 1
-        self.stem_router = nn.Linear(dim, self.n_router_options, bias=False)
-        self.expert_routers = nn.ModuleList([
-            nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
-        ])
 
         self.exit_ramp_scale = 10.0
 

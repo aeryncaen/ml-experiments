@@ -299,6 +299,13 @@ class PoolOfExperts(nn.Module):
         dim:          Model dimension.
         top_k:        Number of experts selected per hop (default 2).
         max_hops:     Loop bound on routing depth.  Default = 2 * pool_size.
+        router_mode:  Exit slot density in the router space:
+                      'squared' (default) — pool_size² options (pool_size expert + pool_size*(pool_size-1) exit).
+                          Random pick has 1/pool_size chance of expert.
+                      'single' — pool_size+1 options (pool_size expert + 1 exit).
+                          Minimal exit pressure.
+                      'half' — 2*pool_size options (pool_size expert + pool_size exit).
+                          50/50 expert-vs-exit odds at random.
         router_noise: Gaussian noise scale added to logits during training
                       (default 1.0).  Annealable via .router_noise_scale.
         router_dropout: Enables random exit-logit dropout during training.
@@ -312,20 +319,31 @@ class PoolOfExperts(nn.Module):
                       when the individual ones are not specified.
     """
 
-    # Index convention: router outputs logits over (pool_size²) options.
-    # Indices 0..pool_size-1 are experts, pool_size..pool_size²-1 are exit slots.
-    # Random selection has 1/pool_size chance of picking an expert — depth must be earned.
+    # Index convention: router outputs logits over n_router_options.
+    # Indices 0..pool_size-1 are experts, pool_size..n_router_options-1 are exit slots.
+    # Exit slot count depends on router_mode.
+
+    ROUTER_MODES = ('squared', 'single', 'half')
 
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
                  top_k: int = 2, max_hops: int | None = None,
+                 router_mode: str = 'squared',
                  router_noise: float = 1.0, router_dropout: float = 0.0,
                  shared_fraction: float = 0.0,
                  block_shared_fraction: float | None = None,
                  router_shared_fraction: float | None = None,
                  hop_shared_fraction: float | None = None):
         super().__init__()
+        if router_mode not in self.ROUTER_MODES:
+            raise ValueError(f"router_mode must be one of {self.ROUTER_MODES}, got {router_mode!r}")
         self.pool_size = pool_size
-        self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
+        self.router_mode = router_mode
+        if router_mode == 'squared':
+            self.n_router_options = pool_size * pool_size
+        elif router_mode == 'single':
+            self.n_router_options = pool_size + 1
+        elif router_mode == 'half':
+            self.n_router_options = 2 * pool_size
         self.top_k = top_k
         self.max_hops = max_hops if max_hops is not None else 2 * pool_size
         self.router_noise_scale = router_noise  # settable for annealing
