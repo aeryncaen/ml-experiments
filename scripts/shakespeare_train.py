@@ -784,17 +784,18 @@ def val_step_llada(model, batch: torch.Tensor):
 # MLM (BERT-style) training
 # ---------------------------------------------------------------------------
 
-def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float):
+def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
+                   mask_prob: float = 0.40):
     """BERT-style MLM training step.
 
-    Masks ~15% of positions randomly across the whole sequence.
+    Masks mask_prob fraction of positions randomly across the whole sequence.
     CE loss on masked positions only.
     """
     B, T = batch.shape
     device = batch.device
 
     # Random mask: each position independently masked with mask_prob
-    mask = torch.rand(B, T, device=device) < model.mask_prob
+    mask = torch.rand(B, T, device=device) < mask_prob
     # Ensure at least one masked position per sample
     if not mask.any():
         mask[0, 0] = True
@@ -821,12 +822,12 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float):
 
 
 @torch.no_grad()
-def val_step_mlm(model, batch: torch.Tensor):
-    """BERT-style MLM validation — same 15% masking as training."""
+def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
+    """BERT-style MLM validation."""
     B, T = batch.shape
     device = batch.device
 
-    mask = torch.rand(B, T, device=device) < model.mask_prob
+    mask = torch.rand(B, T, device=device) < mask_prob
     if not mask.any():
         mask[0, 0] = True
 
@@ -1108,7 +1109,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob={args.mask_prob}")
+        print(f"  mask_prob=0.15→{args.mask_prob} (curriculum)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1201,11 +1202,17 @@ def train(args):
             frac = (epoch - 1) / max(args.epochs - 1, 1)
             _router_module.router_noise_scale = args.router_noise * (1 - frac)
 
+        # MLM masking curriculum: ramp from 15% to mask_prob over training
+        if is_mlm:
+            frac = (epoch - 1) / max(args.epochs - 1, 1)
+            cur_mask_prob = 0.15 + frac * (args.mask_prob - 0.15)
+
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
 
             if is_mlm:
-                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip)
+                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
+                                           mask_prob=cur_mask_prob)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
@@ -1235,7 +1242,7 @@ def train(args):
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
             if is_mlm:
-                vl, va = val_step_mlm(model, batch)
+                vl, va = val_step_mlm(model, batch, mask_prob=cur_mask_prob)
             elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
@@ -1262,7 +1269,8 @@ def train(args):
                 'val_acc': val_acc,
             }, best_ckpt_path)
         best_marker = " *" if is_best else ""
-        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{best_marker}")
+        mask_info = f" mask={cur_mask_prob:.0%}" if is_mlm else ""
+        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{mask_info}{best_marker}")
 
         # Early stop on val accuracy
         if args.early_stop_acc > 0 and val_acc >= args.early_stop_acc:
@@ -1295,7 +1303,7 @@ def train(args):
                     # BERT-style sample: take real text, mask 40%, reconstruct
                     sample_batch = val_ds.sample_batch(1, device)  # (1, T)
                     T = sample_batch.shape[1]
-                    mask = torch.rand(1, T, device=device) < model.mask_prob
+                    mask = torch.rand(1, T, device=device) < cur_mask_prob
                     if not mask.any():
                         mask[0, 0] = True
                     logits = model(sample_batch, mask)
@@ -1470,8 +1478,8 @@ def main():
     parser.add_argument('--local-window', type=int, default=16, help='Local attention window (diffusion PoE)')
 
     # MLM (BERT-style)
-    parser.add_argument('--mask-prob', type=float, default=0.40,
-                        help='Mask probability per token (MLM, default 0.40)')
+    parser.add_argument('--mask-prob', type=float, default=0.80,
+                        help='Final mask probability (MLM, default 0.80, curriculum ramps from 0.15)')
 
     # LLaDA enhancements
     parser.add_argument('--time-cond', action='store_true', default=False,
