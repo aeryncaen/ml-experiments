@@ -388,6 +388,12 @@ class PoolOfExperts(nn.Module):
               ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply exit ramp, top-k selection, and exit detection.
 
+        Per-sample exit handling: if a sample picks exit in some but not all
+        top-k slots, the exit slots get zero weight and the real expert slots
+        are renormalized to sum to 1. The sample still runs its real experts
+        this hop. Only when ALL top-k slots are exit does the sample fully
+        exit (gets zero output).
+
         Args:
             logits: Router logits (B, n_router_options).
             hop: Current hop index (0-based).
@@ -395,7 +401,7 @@ class PoolOfExperts(nn.Module):
         Returns:
             topk_idx: Selected indices (B, top_k).
             topk_weights: Softmax weights over selected (B, top_k).
-            has_exit: Boolean per sample — True if any selected index is exit (B,).
+            has_exit: Boolean per sample — True if ALL selected indices are exit (B,).
         """
         exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
         if exit_bias > 0:
@@ -405,7 +411,15 @@ class PoolOfExperts(nn.Module):
 
         topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)
         topk_weights = F.softmax(topk_vals, dim=-1)
-        has_exit = (topk_idx >= self.pool_size).any(dim=-1)
+
+        # Zero out exit slot weights, renormalize real expert weights
+        is_exit = topk_idx >= self.pool_size  # (B, top_k)
+        topk_weights = topk_weights.masked_fill(is_exit, 0.0)
+        weight_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        topk_weights = topk_weights / weight_sum
+
+        # Full exit: ALL top-k slots are exit
+        has_exit = is_exit.all(dim=-1)
         return topk_idx, topk_weights, has_exit
 
     def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
