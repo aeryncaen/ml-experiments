@@ -320,7 +320,7 @@ def build_llada_mha(vocab_size: int, args) -> nn.Module:
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_seq_len=args.seq_len,
+        max_seq_len=args.seq_len + args.gen_len,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
@@ -335,7 +335,7 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_seq_len=args.seq_len,
+        max_seq_len=args.seq_len + args.gen_len,
         inner_ratio=args.inner_ratio,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
@@ -351,8 +351,9 @@ def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
     from mha import BidirectionalMHALayer
     from ulb.stack import MoEStackedULB
     from ulb.transformer import LLaDAModel
+    max_sl = args.seq_len + args.gen_len
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
     stacker = MoEStackedULB(
         make_layer=make_layer,
         n_layers=args.n_layers,
@@ -362,7 +363,7 @@ def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
         version=args.moe_version,
         router_mode=args.moe_router_mode,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
                       subs_parameterization=args.subs)
@@ -392,7 +393,7 @@ def build_llada_ulb_moe(vocab_size: int, args) -> nn.Module:
         version=args.moe_version,
         router_mode=args.moe_router_mode,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len + args.gen_len)
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
                       subs_parameterization=args.subs)
@@ -403,8 +404,9 @@ def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
     from mha import BidirectionalMHALayer
     from ulb.stack import PoolOfExperts
     from ulb.transformer import LLaDAModel
+    max_sl = args.seq_len + args.gen_len
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
     stacker = PoolOfExperts(
         make_layer=make_layer,
         pool_size=args.pool_size,
@@ -417,7 +419,7 @@ def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
         router_shared_fraction=args.router_shared_fraction,
         hop_shared_fraction=args.hop_shared_fraction,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
                       subs_parameterization=args.subs)
@@ -450,7 +452,7 @@ def build_llada_ulb_poe(vocab_size: int, args) -> nn.Module:
         router_shared_fraction=args.router_shared_fraction,
         hop_shared_fraction=args.hop_shared_fraction,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len + args.gen_len)
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
                       subs_parameterization=args.subs)
@@ -1140,7 +1142,7 @@ def interactive_generate(args):
     if mode == 'ar':
         max_prompt = saved_args.seq_len - 1
     elif mode == 'llada':
-        max_prompt = max(1, saved_args.seq_len - gen_len)  # leave room for gen_len masked tokens
+        max_prompt = saved_args.seq_len  # model has room for seq_len + gen_len
     else:
         max_prompt = saved_args.prompt_len
 
@@ -1301,7 +1303,7 @@ def main():
         if args.mode == 'ar':
             max_prompt = args.seq_len - 1
         elif args.mode == 'llada':
-            max_prompt = max(1, args.seq_len - gen_len)
+            max_prompt = args.seq_len  # model has room for seq_len + gen_len
         else:
             max_prompt = args.prompt_len
         prompt_text = prompt[-max_prompt:]
