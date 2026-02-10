@@ -31,8 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-def load_shakespeare(data_dir: str = "data") -> tuple[str, dict, dict]:
-    """Download and load Shakespeare text. Returns (text, char2idx, idx2char)."""
+VOCAB_SIZE = 256  # byte-level tokenization
+
+
+def load_shakespeare(data_dir: str = "data") -> str:
+    """Download and load Shakespeare text. Returns raw text."""
     data_path = Path(data_dir) / "shakespeare.txt"
     if not data_path.exists():
         print(f"Downloading Shakespeare -> {data_path}")
@@ -40,19 +43,15 @@ def load_shakespeare(data_dir: str = "data") -> tuple[str, dict, dict]:
         import urllib.request
         urllib.request.urlretrieve(SHAKESPEARE_URL, data_path)
 
-    text = data_path.read_text()
-    chars = sorted(set(text))
-    char2idx = {c: i for i, c in enumerate(chars)}
-    idx2char = {i: c for c, i in char2idx.items()}
-    return text, char2idx, idx2char
+    return data_path.read_text()
 
 
-def encode(text: str, char2idx: dict) -> torch.Tensor:
-    return torch.tensor([char2idx[c] for c in text], dtype=torch.long)
+def encode(text: str) -> torch.Tensor:
+    return torch.tensor(list(text.encode('utf-8')), dtype=torch.long)
 
 
-def decode(ids: torch.Tensor, idx2char: dict) -> str:
-    return ''.join(idx2char[i.item()] for i in ids)
+def decode(ids: torch.Tensor) -> str:
+    return bytes(ids.tolist()).decode('utf-8', errors='replace')
 
 
 class TextDataset:
@@ -125,10 +124,42 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_llada_mha(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with BidirectionalTransformer backbone."""
+    from ulb.transformer import BidirectionalTransformer, LLaDAModel
+    backbone = BidirectionalTransformer(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+    )
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
+def build_llada_ulb(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with CausalULB backbone (keeps causal attention)."""
+    from ulb.transformer import CausalULB, LLaDAModel
+    backbone = CausalULB(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+        inner_ratio=args.inner_ratio,
+    )
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
 ARCH_BUILDERS = {
     'mha': build_mha,
     'ulb': build_ulb,
     'ulb-poe': build_ulb_poe,
+}
+
+LLADA_BUILDERS = {
+    'mha': build_llada_mha,
+    'ulb': build_llada_ulb,
 }
 
 
@@ -246,15 +277,90 @@ def val_step_diffusion(model, batch: torch.Tensor, prompt_len: int, output_len: 
 
 
 # ---------------------------------------------------------------------------
+# LLaDA training (masked diffusion, Algorithm 1 from paper)
+# ---------------------------------------------------------------------------
+
+def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float):
+    """LLaDA masked diffusion training step.
+
+    Per the paper (Eq. 3): mask each token independently with probability t ~ U(0,1),
+    CE loss only on masked positions, weighted by 1/t.
+
+    batch is (B, T) tokens — the full sequence is both input and target.
+    """
+    B, T = batch.shape
+
+    # Random mask ratio t ~ U(0.01, 1.0) per sample (avoid t=0)
+    t = 0.01 + 0.99 * torch.rand(B, 1, device=batch.device)  # (B, 1)
+    mask = torch.rand(B, T, device=batch.device) < t  # (B, T) bool
+    # Ensure at least one token is masked per sample
+    force_idx = torch.randint(0, T, (B,), device=batch.device)
+    mask[torch.arange(B, device=batch.device), force_idx] = True
+
+    logits = model(batch, mask)  # (B, T, vocab_size)
+
+    # CE loss only on masked positions, weighted by 1/t
+    per_token_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        batch.reshape(-1),
+        reduction='none'
+    ).reshape(B, T)
+
+    masked_loss = per_token_loss * mask.float()
+    per_sample_loss = masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+    weighted_loss = (per_sample_loss / t.squeeze(-1)).mean()
+
+    optimizer.zero_grad()
+    weighted_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+
+    with torch.no_grad():
+        unweighted_loss = per_sample_loss.mean().item()
+        preds = logits.argmax(dim=-1)
+        correct = (preds == batch) & mask
+        acc = correct.sum().float() / mask.sum().float()
+
+    return unweighted_loss, acc.item()
+
+
+@torch.no_grad()
+def val_step_llada(model, batch: torch.Tensor):
+    """LLaDA validation step — fixed 50% mask ratio."""
+    B, T = batch.shape
+
+    mask = torch.rand(B, T, device=batch.device) < 0.5
+    # Ensure at least one masked
+    force_idx = torch.randint(0, T, (B,), device=batch.device)
+    mask[torch.arange(B, device=batch.device), force_idx] = True
+
+    logits = model(batch, mask)
+
+    per_token_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        batch.reshape(-1),
+        reduction='none'
+    ).reshape(B, T)
+
+    masked_loss = per_token_loss * mask.float()
+    loss = (masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)).mean().item()
+    preds = logits.argmax(dim=-1)
+    correct = (preds == batch) & mask
+    acc = (correct.sum().float() / mask.sum().float()).item()
+
+    return loss, acc
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_ar(model, prompt_text: str, gen_len: int, char2idx: dict, idx2char: dict,
+def generate_ar(model, prompt_text: str, gen_len: int,
                 device: torch.device, temperature: float = 0.8) -> str:
     """Autoregressive generation with temperature sampling."""
     model.eval()
-    ids = encode(prompt_text, char2idx).unsqueeze(0).to(device)  # (1, L)
+    ids = encode(prompt_text).unsqueeze(0).to(device)  # (1, L)
     max_ctx = model.max_seq_len  # don't exceed RoPE / pos embed range
 
     for _ in range(gen_len):
@@ -265,18 +371,17 @@ def generate_ar(model, prompt_text: str, gen_len: int, char2idx: dict, idx2char:
         next_id = torch.multinomial(probs, 1)    # (1, 1)
         ids = torch.cat([ids, next_id], dim=1)
 
-    generated = ids[0, len(prompt_text):]
-    return decode(generated, idx2char)
+    generated = ids[0, len(encode(prompt_text)):]
+    return decode(generated)
 
 
 @torch.no_grad()
-def generate_diffusion(model, prompt_text: str, gen_len: int, char2idx: dict,
-                       idx2char: dict, device: torch.device,
-                       n_steps: int = 20) -> str:
+def generate_diffusion(model, prompt_text: str, gen_len: int,
+                       device: torch.device, n_steps: int = 20) -> str:
     """Iterative demasking generation."""
     model.eval()
 
-    prompt_ids = encode(prompt_text, char2idx).unsqueeze(0).to(device)
+    prompt_ids = encode(prompt_text).unsqueeze(0).to(device)
     output_ids = torch.zeros(1, gen_len, dtype=torch.long, device=device)
     current_mask = torch.ones(1, gen_len, dtype=torch.bool, device=device)
 
@@ -304,7 +409,81 @@ def generate_diffusion(model, prompt_text: str, gen_len: int, char2idx: dict,
             new_mask.scatter_(1, sorted_idx[:, :n_to_keep_masked], True)
             current_mask = new_mask
 
-    return decode(output_ids[0], idx2char)
+    return decode(output_ids[0])
+
+
+@torch.no_grad()
+def generate_llada(model, prompt_text: str, gen_len: int,
+                   device: torch.device, n_steps: int = 64) -> str:
+    """LLaDA generation — iterative demasking with low-confidence remasking.
+
+    Following Algorithm 5 from the paper:
+    - Start with prompt (unmasked) + gen_len masked tokens
+    - At each step: predict all masked tokens, keep the most confident,
+      remask the least confident s/t fraction
+    """
+    model.eval()
+
+    prompt_ids = encode(prompt_text).to(device)  # (P,)
+    P = prompt_ids.shape[0]
+    T = P + gen_len
+
+    # Truncate prompt if needed
+    max_T = model.max_seq_len
+    if T > max_T:
+        # Keep as much prompt as possible
+        prompt_ids = prompt_ids[-(max_T - gen_len):]
+        P = prompt_ids.shape[0]
+        T = P + gen_len
+
+    # Build initial sequence: prompt (unmasked) + gen_len tokens (masked)
+    token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
+    token_ids[0, :P] = prompt_ids
+    mask = torch.zeros(1, T, dtype=torch.bool, device=device)
+    mask[0, P:] = True  # only response positions are masked
+
+    for step in range(n_steps):
+        logits = model(token_ids, mask)  # (1, T, vocab_size)
+
+        # Greedy prediction for masked positions
+        pred_ids = logits.argmax(dim=-1)  # (1, T)
+        # Confidence = max probability for each position
+        probs = F.softmax(logits, dim=-1)
+        confidence = probs.max(dim=-1).values  # (1, T)
+
+        # Fill in predictions for currently masked positions
+        token_ids = torch.where(mask, pred_ids, token_ids)
+
+        # How many should remain masked at next timestep?
+        n_masked = mask.sum().item()
+        if n_masked == 0:
+            break
+
+        t = 1.0 - step / n_steps
+        s = 1.0 - (step + 1) / n_steps
+        if s <= 0 or step == n_steps - 1:
+            # Final step — unmask everything
+            mask = torch.zeros_like(mask)
+        else:
+            # Low-confidence remasking: remask s/t fraction of currently masked
+            n_to_keep_masked = max(0, int(gen_len * s))
+            if n_to_keep_masked == 0:
+                mask = torch.zeros_like(mask)
+            else:
+                # Only consider response positions for remasking
+                conf = confidence.clone()
+                conf[0, :P] = float('inf')  # never remask prompt
+                conf[~mask] = float('inf')  # don't remask already-unmasked
+
+                # Remask the n_to_keep_masked positions with lowest confidence
+                _, sorted_idx = conf.sort(dim=-1)
+                new_mask = torch.zeros_like(mask)
+                new_mask.scatter_(1, sorted_idx[:, :n_to_keep_masked], True)
+                # Don't remask prompt
+                new_mask[0, :P] = False
+                mask = new_mask
+
+    return decode(token_ids[0, P:])
 
 
 # ---------------------------------------------------------------------------
@@ -314,11 +493,12 @@ def generate_diffusion(model, prompt_text: str, gen_len: int, char2idx: dict,
 def train(args):
     device = torch.device(args.device)
     is_diffusion = args.mode == 'diffusion'
+    is_llada = args.mode == 'llada'
 
     # Data
-    text, char2idx, idx2char = load_shakespeare()
-    data = encode(text, char2idx)
-    vocab_size = len(char2idx)
+    text = load_shakespeare()
+    data = encode(text)
+    vocab_size = VOCAB_SIZE
     print(f"Shakespeare: {len(text):,} chars, vocab_size={vocab_size}")
 
     n_train = int(0.9 * len(data))
@@ -333,11 +513,20 @@ def train(args):
         print("ERROR: MHA diffusion not yet implemented. Use --arch ulb-poe for diffusion.")
         sys.exit(1)
 
-    model = ARCH_BUILDERS[args.arch](vocab_size, args).to(device)
+    if is_llada:
+        if args.arch not in LLADA_BUILDERS:
+            print(f"ERROR: LLaDA mode not supported for arch '{args.arch}'. Use mha or ulb.")
+            sys.exit(1)
+        model = LLADA_BUILDERS[args.arch](vocab_size, args).to(device)
+    else:
+        model = ARCH_BUILDERS[args.arch](vocab_size, args).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
-    if is_diffusion:
+    if is_llada:
+        backbone_type = type(model.backbone).__name__
+        print(f"  backbone={backbone_type}")
+    elif is_diffusion:
         print(f"  prompt_len={args.prompt_len}, output_len={args.output_len}")
         print(f"  pool_size={args.pool_size}, top_k={args.top_k}, max_hops={getattr(model, 'max_hops', 'N/A')}")
         print(f"  router_mode={args.router_mode}, router_noise={args.router_noise}")
@@ -375,7 +564,9 @@ def train(args):
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
 
-            if is_diffusion:
+            if is_llada:
+                loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip)
+            elif is_diffusion:
                 loss, acc = train_step_diffusion(model, batch, optimizer, args.grad_clip,
                                                   prompt_len, output_len)
             else:
@@ -395,7 +586,9 @@ def train(args):
         n_val = args.val_batches
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
-            if is_diffusion:
+            if is_llada:
+                vl, va = val_step_llada(model, batch)
+            elif is_diffusion:
                 vl, va = val_step_diffusion(model, batch, prompt_len, output_len)
             else:
                 vl, va = val_step_ar(model, batch)
@@ -409,8 +602,7 @@ def train(args):
             torch.save({
                 'state_dict': model.state_dict(),
                 'args': vars(args),
-                'char2idx': char2idx,
-                'idx2char': idx2char,
+                'vocab_size': vocab_size,
                 'params': n_params,
                 'epoch': epoch,
                 'val_loss': val_loss,
@@ -440,7 +632,25 @@ def train(args):
             postfix['rtr'] = f"{model.router_noise_scale:.2f}"
         pbar.set_postfix(**postfix)
 
-    return model, char2idx, idx2char
+        # Generate a sample after each epoch
+        model.eval()
+        sample_prompt = "KING:\nO, "
+        sample_len = 64
+        try:
+            with torch.no_grad():
+                if is_llada:
+                    sample = generate_llada(model, sample_prompt, sample_len, device, n_steps=32)
+                elif is_diffusion:
+                    sample = generate_diffusion(model, sample_prompt, sample_len, device)
+                else:
+                    sample = generate_ar(model, sample_prompt, sample_len, device)
+            # Show on one line, escape newlines
+            preview = (sample_prompt + sample).replace('\n', '\\n')
+            tqdm.write(f"  [sample] {preview}")
+        except Exception:
+            pass  # don't crash training on generation errors
+
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +665,7 @@ def interactive_generate(args):
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_args = argparse.Namespace(**ckpt['args'])
-    char2idx = ckpt['char2idx']
-    idx2char = ckpt['idx2char']
-    vocab_size = len(char2idx)
+    vocab_size = ckpt.get('vocab_size', VOCAB_SIZE)
 
     # Use mode/arch from checkpoint, allow CLI overrides for gen params
     mode = saved_args.mode
@@ -471,11 +679,19 @@ def interactive_generate(args):
               f"val_loss={ckpt.get('val_loss', '?'):.4f}, val_acc={ckpt.get('val_acc', '?'):.1%}")
 
     # Rebuild model from saved args
-    model = ARCH_BUILDERS[arch](vocab_size, saved_args).to(device)
+    if mode == 'llada':
+        model = LLADA_BUILDERS[arch](vocab_size, saved_args).to(device)
+    else:
+        model = ARCH_BUILDERS[arch](vocab_size, saved_args).to(device)
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    max_prompt = saved_args.seq_len - 1 if mode == 'ar' else saved_args.prompt_len
+    if mode == 'ar':
+        max_prompt = saved_args.seq_len - 1
+    elif mode == 'llada':
+        max_prompt = saved_args.seq_len - gen_len  # leave room for gen_len masked tokens
+    else:
+        max_prompt = saved_args.prompt_len
 
     print(f"\nInteractive generation — type a prompt and press Enter.")
     print(f"  mode={mode}, temperature={temperature}, gen_len={gen_len}, max_prompt={max_prompt}")
@@ -499,18 +715,13 @@ def interactive_generate(args):
             prompt_text = prompt_text[-max_prompt:]
             print(f"  (truncated to last {max_prompt} chars)")
 
-        # Check all chars are in vocab
-        unknown = [c for c in prompt_text if c not in char2idx]
-        if unknown:
-            print(f"  Warning: unknown chars {unknown!r} — skipping")
-            continue
-
         if mode == 'ar':
-            gen = generate_ar(model, prompt_text, gen_len, char2idx, idx2char,
+            gen = generate_ar(model, prompt_text, gen_len,
                               device, temperature=temperature)
+        elif mode == 'llada':
+            gen = generate_llada(model, prompt_text, gen_len, device)
         else:
-            gen = generate_diffusion(model, prompt_text, gen_len, char2idx, idx2char,
-                                     device)
+            gen = generate_diffusion(model, prompt_text, gen_len, device)
 
         print(f"\n{prompt_text}\033[1m{gen}\033[0m\n")
 
@@ -523,8 +734,8 @@ def main():
                         help='Load checkpoint and run interactive generation (skip training)')
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature (AR)')
     parser.add_argument('--gen-len', type=int, default=256, help='Generation length')
-    parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion'],
-                        help='Training mode: autoregressive or masked diffusion')
+    parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada'],
+                        help='Training mode: autoregressive, masked diffusion (PoE), or llada')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
                         help='Model architecture')
 
@@ -581,7 +792,7 @@ def main():
     print(f"Shakespeare — {args.arch.upper()} / {args.mode.upper()}")
     print("=" * 60)
 
-    model, char2idx, idx2char = train(args)
+    model = train(args)
     device = next(model.parameters()).device
 
     # Generate samples
@@ -595,21 +806,29 @@ def main():
         "KING:\nOnce more unto the breach, dear friends,\n",
     ]
 
-    gen_len = args.output_len if args.mode == 'diffusion' else 128
+    if args.mode == 'diffusion':
+        gen_len = args.output_len
+    elif args.mode == 'llada':
+        gen_len = args.gen_len
+    else:
+        gen_len = 128
 
     for prompt in prompts:
         # Truncate prompt to fit within model's context
         if args.mode == 'ar':
-            # AR uses sliding window, but prompt should fit in one context
             max_prompt = args.seq_len - 1
+        elif args.mode == 'llada':
+            max_prompt = args.seq_len - gen_len
         else:
             max_prompt = args.prompt_len
         prompt_text = prompt[-max_prompt:]
 
         if args.mode == 'ar':
-            gen = generate_ar(model, prompt_text, gen_len, char2idx, idx2char, device)
+            gen = generate_ar(model, prompt_text, gen_len, device)
+        elif args.mode == 'llada':
+            gen = generate_llada(model, prompt_text, gen_len, device)
         else:
-            gen = generate_diffusion(model, prompt_text, gen_len, char2idx, idx2char, device)
+            gen = generate_diffusion(model, prompt_text, gen_len, device)
 
         print(f"\n--- Prompt ---\n{prompt_text}")
         print(f"--- Generated ---\n{gen}")
@@ -622,8 +841,7 @@ def main():
     torch.save({
         'state_dict': model.state_dict(),
         'args': vars(args),
-        'char2idx': char2idx,
-        'idx2char': idx2char,
+        'vocab_size': VOCAB_SIZE,
         'params': sum(p.numel() for p in model.parameters()),
     }, ckpt_path)
     print(f"Saved final checkpoint -> {ckpt_path}")
