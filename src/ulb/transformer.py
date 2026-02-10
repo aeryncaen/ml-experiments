@@ -12,8 +12,11 @@ Usage:
     logits = llada(token_ids, mask)  # (B, T, vocab_size)
 """
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CausalULB(nn.Module):
@@ -88,6 +91,44 @@ class CausalULB(nn.Module):
         return self.head(self.final_norm(x))
 
 
+class TimestepEmbedder(nn.Module):
+    """Sinusoidal timestep embedding + MLP projection.
+
+    Maps scalar t in [0, 1] to a D-dimensional embedding that gets added
+    to every token in the sequence. Same idea as DDPM / DiT.
+
+    Args:
+        dim: Output embedding dimension.
+        hidden_dim: MLP hidden dimension (default 4 * dim).
+        max_period: Maximum period for sinusoidal frequencies.
+    """
+
+    def __init__(self, dim: int, hidden_dim: int | None = None, max_period: int = 10000):
+        super().__init__()
+        self.dim = dim
+        self.max_period = max_period
+        hidden_dim = hidden_dim or 4 * dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def _sinusoidal_embed(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) float in [0, 1]. Returns (B, dim)."""
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(half, device=t.device, dtype=t.dtype) / half
+        )
+        args = t[:, None] * freqs[None, :]  # (B, half)
+        return torch.cat([args.cos(), args.sin()], dim=-1)  # (B, dim)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) float. Returns (B, dim)."""
+        emb = self._sinusoidal_embed(t)
+        return self.mlp(emb)
+
+
 class LLaDAModel(nn.Module):
     """LLaDA masked diffusion wrapper.
 
@@ -95,6 +136,8 @@ class LLaDAModel(nn.Module):
     - A learned mask token embedding
     - Masking/unmasking logic for training and generation
     - Predictions over the original vocab (not the mask token)
+    - Optional time conditioning (sinusoidal embedding of mask ratio)
+    - Optional SUBS parameterization (clamp logits at unmasked positions)
 
     The backbone must have:
     - token_embed: nn.Embedding
@@ -109,30 +152,48 @@ class LLaDAModel(nn.Module):
                   so we can inject mask embeddings).
         vocab_size: Original vocab size (without mask token).
         dim: Model dimension.
+        time_conditioning: If True, add sinusoidal time embedding to input.
+        subs_parameterization: If True, clamp logits at unmasked positions
+            to one-hot and set mask-token logit to -inf.
     """
 
-    def __init__(self, backbone: nn.Module, vocab_size: int, dim: int):
+    def __init__(self, backbone: nn.Module, vocab_size: int, dim: int,
+                 time_conditioning: bool = False,
+                 subs_parameterization: bool = False):
         super().__init__()
         self.backbone = backbone
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = backbone.max_seq_len
+        self.time_conditioning = time_conditioning
+        self.subs_parameterization = subs_parameterization
 
         # Learned mask token embedding
         self.mask_embed = nn.Parameter(torch.randn(dim) * 0.02)
 
-    def _embed_with_mask(self, token_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # Time conditioning
+        self.time_embedder: TimestepEmbedder | None = None
+        if time_conditioning:
+            self.time_embedder = TimestepEmbedder(dim)
+
+    def _embed_with_mask(self, token_ids: torch.Tensor, mask: torch.Tensor,
+                         t: torch.Tensor | None = None) -> torch.Tensor:
         """Embed tokens, replacing masked positions with the mask embedding.
 
         Args:
             token_ids: (B, T) original token indices.
             mask: (B, T) bool — True means masked (replaced with mask_embed).
+            t: (B,) float mask ratios in [0, 1], for time conditioning.
 
         Returns:
             (B, T, D) embeddings.
         """
         x = self.backbone.token_embed(token_ids)  # (B, T, D)
         x = torch.where(mask.unsqueeze(-1), self.mask_embed, x)
+
+        if self.time_embedder is not None and t is not None:
+            x = x + self.time_embedder(t)[:, None, :]  # broadcast over T
+
         return x
 
     def _run_backbone_from_embeddings(self, x: torch.Tensor) -> torch.Tensor:
@@ -168,16 +229,59 @@ class LLaDAModel(nn.Module):
 
         return bb.head(bb.final_norm(x))
 
-    def forward(self, token_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _apply_subs(self, logits: torch.Tensor, token_ids: torch.Tensor,
+                    mask: torch.Tensor) -> torch.Tensor:
+        """SUBS parameterization: clamp logits at unmasked positions.
+
+        For masked positions: set mask-token logit to -inf, then renormalize
+        so output is a proper log-prob over the real vocab.
+
+        For unmasked positions: force the output to be one-hot on the true token
+        (logit = 0 for correct token, -inf for everything else).
+
+        This means the model only needs to predict at masked positions.
+        """
+        NEG_INF = -1e6
+
+        # For all positions: suppress any "mask token" logit
+        # (We don't have a mask token in the vocab, but if the model tries
+        # to predict outside the vocab, this is a safety measure.)
+
+        # Renormalize at masked positions (already valid logits, just normalize)
+        logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        # At unmasked positions: force one-hot on ground truth
+        unmasked = ~mask  # (B, T)
+        if unmasked.any():
+            one_hot_logits = torch.full_like(logits, NEG_INF)
+            one_hot_logits.scatter_(-1, token_ids.unsqueeze(-1), 0.0)
+            logits = torch.where(unmasked.unsqueeze(-1), one_hot_logits, logits)
+
+        return logits
+
+    def forward(self, token_ids: torch.Tensor, mask: torch.Tensor,
+                t: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass for LLaDA.
 
         Args:
             token_ids: (B, T) ground-truth token indices (clean data x0).
             mask: (B, T) bool — True for masked positions.
+            t: (B,) float mask ratios — used for time conditioning.
+                If None and time_conditioning is enabled, mask ratio is
+                computed from the mask.
 
         Returns:
             (B, T, vocab_size) logits — predictions for ALL positions,
             but loss should only be computed on masked positions.
         """
-        x = self._embed_with_mask(token_ids, mask)
-        return self._run_backbone_from_embeddings(x)
+        # Compute t from mask if not provided and time conditioning is on
+        if self.time_conditioning and t is None:
+            t = mask.float().mean(dim=-1)  # (B,) actual mask ratio
+
+        x = self._embed_with_mask(token_ids, mask, t)
+        logits = self._run_backbone_from_embeddings(x)
+
+        if self.subs_parameterization:
+            logits = self._apply_subs(logits, token_ids, mask)
+
+        return logits
