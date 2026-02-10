@@ -19,6 +19,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 
 class SwiGLU(nn.Module):
     """SwiGLU feed-forward: gate * silu(gate) where both come from a single linear."""
@@ -175,8 +181,16 @@ class BidirectionalTransformerBlock(nn.Module):
         q = _apply_rope(q, rope_freqs)
         k = _apply_rope(k, rope_freqs)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        if HAS_FLASH_ATTN:
+            # flash_attn_func expects (B, T, H, D) in bf16/fp16
+            q = q.transpose(1, 2).to(torch.bfloat16)
+            k = k.transpose(1, 2).to(torch.bfloat16)
+            v = v.transpose(1, 2).to(torch.bfloat16)
+            attn_out = flash_attn_func(q, k, v, causal=False)
+            attn_out = attn_out.to(x.dtype).contiguous().view(B, T, D)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.o_proj(attn_out)
 
         # FFN
