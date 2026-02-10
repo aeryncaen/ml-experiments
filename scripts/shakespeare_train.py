@@ -95,7 +95,7 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
         max_seq_len=args.seq_len,
         inner_ratio=args.inner_ratio,
         q_mix=args.q_mix,
-        k_lerp=args.k_lerp,
+        k_mix=args.k_mix,
     )
 
 
@@ -150,7 +150,7 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         max_seq_len=args.seq_len,
         inner_ratio=args.inner_ratio,
         q_mix=args.q_mix,
-        k_lerp=args.k_lerp,
+        k_mix=args.k_mix,
     )
     return LLaDAModel(backbone, vocab_size, args.dim)
 
@@ -750,8 +750,8 @@ def main():
     parser.add_argument('--inner-ratio', type=float, default=1.75, help='Inner dim ratio (ULB)')
     parser.add_argument('--q-mix', type=str, default='lerp', choices=['none', 'lerp', 'conv2', 'conv3'],
                         help='Q temporal mixing mode (ULB)')
-    parser.add_argument('--k-lerp', type=lambda x: x.lower() != 'false', default=True,
-                        help='Enable K causal lerp (ULB, default True)')
+    parser.add_argument('--k-mix', type=str, default='lerp', choices=['none', 'lerp', 'conv2', 'conv3'],
+                        help='K temporal mixing mode (ULB, causal)')
     parser.add_argument('--seq-len', type=int, default=80, help='Total sequence length')
 
     # Diffusion-specific

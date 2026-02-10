@@ -1,16 +1,21 @@
 """Hybrid RoPE: fixed positional rotations + data-dependent rotations via cumsum.
 
 The head dimension is split into rotation pairs:
-  - First half of pairs: standard fixed-frequency RoPE
-  - Second half of pairs: data-dependent angles from cumsum(proj(x))
+  - First half: standard fixed-frequency RoPE
+  - Second half: data-dependent angles from cumsum(proj(x))
 
 The data-dependent rotation is the key SSM-equivalent mechanism:
 cumulative rotation angles act as complex-valued state transitions,
 giving the model state-tracking capability without sequential scans.
 
 Layout within head_dim:
-  [fixed_x1 (fp) | dd_x1 (dp) | fixed_x2 (fp) | dd_x2 (dp)]
+  [fixed_x1 (fp) | fixed_x2 (fp) | dd_x1 (dp) | dd_x2 (dp)]
 where fp = head_dim // 4 fixed pairs, dp = head_dim // 4 data-dependent pairs.
+
+This aligns DD rotations with the temporal mixing channels:
+  - 3rd quarter (Q-mix) gets DD rotation
+  - 4th quarter (K-mix) gets DD rotation
+  - 1st and 2nd quarters (static) get fixed RoPE
 """
 
 import torch
@@ -93,9 +98,9 @@ class HybridRoPE(nn.Module):
         T = qk.shape[1]
 
         # Split into fixed and data-dependent regions
-        # Layout: [fixed_x1 (fp) | dd_x1 (dp) | fixed_x2 (fp) | dd_x2 (dp)]
-        qk_fixed = torch.cat([qk[..., :fp], qk[..., fp + dp:fp + dp + fp]], dim=-1)  # (B,T,H,2*fp)
-        qk_dd = torch.cat([qk[..., fp:fp + dp], qk[..., fp + dp + fp:]], dim=-1)     # (B,T,H,2*dp)
+        # Layout: [fixed_x1 (fp) | fixed_x2 (fp) | dd_x1 (dp) | dd_x2 (dp)]
+        qk_fixed = torch.cat([qk[..., :fp], qk[..., fp:2*fp]], dim=-1)        # (B,T,H,2*fp)
+        qk_dd = torch.cat([qk[..., 2*fp:2*fp+dp], qk[..., 2*fp+dp:]], dim=-1)  # (B,T,H,2*dp)
 
         # Fixed RoPE
         t = torch.arange(T, device=qk.device, dtype=self.inv_freq.dtype)
@@ -109,9 +114,9 @@ class HybridRoPE(nn.Module):
         sin_d = dd_angles.sin()
         qk_dd = apply_rotary(qk_dd, cos_d, sin_d)
 
-        # Reassemble: [fixed_x1 | dd_x1 | fixed_x2 | dd_x2]
-        return torch.cat([qk_fixed[..., :fp], qk_dd[..., :dp],
-                          qk_fixed[..., fp:], qk_dd[..., dp:]], dim=-1)
+        # Reassemble: [fixed_x1 | fixed_x2 | dd_x1 | dd_x2]
+        return torch.cat([qk_fixed[..., :fp], qk_fixed[..., fp:],
+                          qk_dd[..., :dp], qk_dd[..., dp:]], dim=-1)
 
 
 class PairedRoPE(nn.Module):
@@ -173,23 +178,24 @@ class PairedRoPE(nn.Module):
         h1 = q_or_k[..., hd:]
 
         # h0: even positions
-        h0_fixed = torch.cat([h0[..., :fp], h0[..., fp + dp:fp + dp + fp]], dim=-1)
-        h0_dd = torch.cat([h0[..., fp:fp + dp], h0[..., fp + dp + fp:]], dim=-1)
+        # Layout: [fixed_x1 (fp) | fixed_x2 (fp) | dd_x1 (dp) | dd_x2 (dp)]
+        h0_fixed = torch.cat([h0[..., :fp], h0[..., fp:2*fp]], dim=-1)
+        h0_dd = torch.cat([h0[..., 2*fp:2*fp+dp], h0[..., 2*fp+dp:]], dim=-1)
         cos_f0 = freqs_even.cos()[None, :, None, :]
         sin_f0 = freqs_even.sin()[None, :, None, :]
         h0_fixed = apply_rotary(h0_fixed, cos_f0, sin_f0)
         h0_dd = apply_rotary(h0_dd, dd0.cos(), dd0.sin())
-        h0 = torch.cat([h0_fixed[..., :fp], h0_dd[..., :dp],
-                         h0_fixed[..., fp:], h0_dd[..., dp:]], dim=-1)
+        h0 = torch.cat([h0_fixed[..., :fp], h0_fixed[..., fp:],
+                         h0_dd[..., :dp], h0_dd[..., dp:]], dim=-1)
 
         # h1: odd positions
-        h1_fixed = torch.cat([h1[..., :fp], h1[..., fp + dp:fp + dp + fp]], dim=-1)
-        h1_dd = torch.cat([h1[..., fp:fp + dp], h1[..., fp + dp + fp:]], dim=-1)
+        h1_fixed = torch.cat([h1[..., :fp], h1[..., fp:2*fp]], dim=-1)
+        h1_dd = torch.cat([h1[..., 2*fp:2*fp+dp], h1[..., 2*fp+dp:]], dim=-1)
         cos_f1 = freqs_odd.cos()[None, :, None, :]
         sin_f1 = freqs_odd.sin()[None, :, None, :]
         h1_fixed = apply_rotary(h1_fixed, cos_f1, sin_f1)
         h1_dd = apply_rotary(h1_dd, dd1.cos(), dd1.sin())
-        h1 = torch.cat([h1_fixed[..., :fp], h1_dd[..., :dp],
-                         h1_fixed[..., fp:], h1_dd[..., dp:]], dim=-1)
+        h1 = torch.cat([h1_fixed[..., :fp], h1_fixed[..., fp:],
+                         h1_dd[..., :dp], h1_dd[..., dp:]], dim=-1)
 
         return torch.cat([h0, h1], dim=-1)

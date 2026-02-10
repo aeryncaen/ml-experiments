@@ -12,7 +12,7 @@ Architecture (forward pass):
     k = k_norm(k) * k_bias       # (Mamba-3 style BC bias, init ones)
 
     k = causal_lerp(k, x)        # last 1/4 of head_dim blended with t-1
-    q = acausal_lerp(q, x)       # last 1/2 of head_dim blended with t-1 and t+1
+    q = acausal_lerp(q, x)       # 3rd quarter of head_dim blended with t-1 and t+1
 
     dd_angles = rope.compute_dd_angles(x)
     q = rope(q, dd_angles)       # hybrid RoPE: fixed + data-dependent
@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .lerp import AcausalLerp, CausalLerp, QTemporalConv
+from .lerp import AcausalLerp, CausalLerp, KTemporalConv, QTemporalConv
 from .rope import HybridRoPE, PairedRoPE
 
 
@@ -75,7 +75,8 @@ class ULBConfig:
     q_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
     q_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
-    k_lerp: bool = True
+    k_mix: Literal['none', 'lerp', 'conv2', 'conv3'] = 'lerp'
+    k_lerp: bool = True  # legacy compat — overridden by k_mix if set
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
 
@@ -148,22 +149,35 @@ class ULBBlock(nn.Module):
         self.q_bias = nn.Parameter(torch.ones(head_dim))
         self.k_bias = nn.Parameter(torch.ones(head_dim))
 
-        # --- Temporal lerps ---
+        # --- Temporal mixing ---
         quarter_dim = head_dim // 4
-        half_dim = head_dim // 2
+
+        # K mixing (causal only)
         self.k_lerp: CausalLerp | None = None
-        if config.k_lerp:
+        self.k_conv: KTemporalConv | None = None
+        k_mix = config.k_mix
+        if k_mix == 'lerp':
             self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'conv2':
+            self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=2)
+        elif k_mix == 'conv3':
+            self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=3)
+        elif k_mix == 'none':
+            pass
+        else:
+            raise ValueError(f"Unknown k_mix mode: {k_mix}")
+
+        # Q mixing (acausal) — operates on 3rd quarter, non-overlapping with K-mix's last quarter
         self.q_lerp: AcausalLerp | None = None
         self.q_conv: QTemporalConv | None = None
         if config.q_mix == 'lerp':
-            self.q_lerp = AcausalLerp(d, n_heads, half_dim, init_bias=config.q_lerp_bias)
+            self.q_lerp = AcausalLerp(d, n_heads, quarter_dim, init_bias=config.q_lerp_bias)
         elif config.q_mix == 'none':
             pass
         elif config.q_mix == 'conv2':
-            self.q_conv = QTemporalConv(n_heads, half_dim, kernel_size=2)
+            self.q_conv = QTemporalConv(n_heads, quarter_dim, kernel_size=2)
         elif config.q_mix == 'conv3':
-            self.q_conv = QTemporalConv(n_heads, half_dim, kernel_size=3)
+            self.q_conv = QTemporalConv(n_heads, quarter_dim, kernel_size=3)
         else:
             raise ValueError(f"Unknown q_mix mode: {config.q_mix}")
 
@@ -212,6 +226,8 @@ class ULBBlock(nn.Module):
         """
         if self.k_lerp is not None:
             k = self.k_lerp(k, x)
+        elif self.k_conv is not None:
+            k = self.k_conv(k)
         if self.q_lerp is not None:
             q = self.q_lerp(q, x)
         elif self.q_conv is not None:

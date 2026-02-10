@@ -258,7 +258,7 @@ class CausalULB(nn.Module):
                  n_layers: int = 4, max_seq_len: int = 256,
                  paired: bool = True, attn_mode: str = 'blend',
                  inner_ratio: float = 1.75,
-                 q_mix: str = 'lerp', k_lerp: bool = True):
+                 q_mix: str = 'lerp', k_mix: str = 'lerp'):
         super().__init__()
         from .block import ULBBlock, ULBConfig
         from .norm import RMSNorm
@@ -276,7 +276,7 @@ class CausalULB(nn.Module):
             attn_mode=attn_mode,
             inner_ratio=inner_ratio,
             q_mix=q_mix,
-            k_lerp=k_lerp,
+            k_mix=k_mix,
         )
         self.blocks = nn.ModuleList([ULBBlock(config) for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])

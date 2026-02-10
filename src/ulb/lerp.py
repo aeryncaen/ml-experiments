@@ -69,7 +69,7 @@ class CausalLerp(nn.Module):
 
 
 class AcausalLerp(nn.Module):
-    """Acausal temporal lerp on the last half of channels.
+    """Acausal temporal lerp on the 3rd quarter of channels.
 
     Blends q[t] with both q[t-1] (backward) and q[t+1] (forward) via
     separate content-dependent gates:
@@ -79,22 +79,23 @@ class AcausalLerp(nn.Module):
     sequence, which is how FusedGate breaks past the ~50% causal ceiling
     on induction tasks.
 
-    Only applies to the last half_dim channels; the rest pass through.
+    Only applies to the 3rd quarter of head_dim (channels [-half_dim:-quarter_dim]),
+    leaving the last quarter for K-mix and the first half static.
     Last position gets zeros for forward neighbor (causal fallback).
 
     Args:
-        d_model:   Input dimension (for gate projections from x).
-        n_heads:   Number of attention heads.
-        half_dim:  Number of channels to lerp (head_dim // 2).
-        init_bias: Initial gate bias (default -2.0, sigmoid ~ 0.12).
+        d_model:      Input dimension (for gate projections from x).
+        n_heads:      Number of attention heads.
+        quarter_dim:  Number of channels to lerp (head_dim // 4).
+        init_bias:    Initial gate bias (default -2.0, sigmoid ~ 0.12).
     """
 
-    def __init__(self, d_model: int, n_heads: int, half_dim: int, init_bias: float = -2.0):
+    def __init__(self, d_model: int, n_heads: int, quarter_dim: int, init_bias: float = -2.0):
         super().__init__()
-        self.half_dim = half_dim
+        self.quarter_dim = quarter_dim
         self.n_heads = n_heads
-        self.gate_fwd_proj = nn.Linear(d_model, n_heads * half_dim, bias=True)
-        self.gate_bwd_proj = nn.Linear(d_model, n_heads * half_dim, bias=True)
+        self.gate_fwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
+        self.gate_bwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
         nn.init.zeros_(self.gate_fwd_proj.weight)
         nn.init.constant_(self.gate_fwd_proj.bias, init_bias)
         nn.init.zeros_(self.gate_bwd_proj.weight)
@@ -108,7 +109,7 @@ class AcausalLerp(nn.Module):
             x: (B, T, D) — original input (for gate computation).
 
         Returns:
-            Q with last half_dim channels blended with t-1 and t+1.
+            Q with 3rd quarter channels blended with t-1 and t+1.
         """
         b, t, _, _ = q.shape
         if t < 2:
@@ -116,42 +117,47 @@ class AcausalLerp(nn.Module):
             # Returning identity here preserves stable single-step behavior and
             # avoids artificial shrinking from zero-padding neighbors.
             return q
-        hd = self.half_dim
-        g_fwd = torch.sigmoid(self.gate_fwd_proj(x)).view(b, t, self.n_heads, hd)
-        g_bwd = torch.sigmoid(self.gate_bwd_proj(x)).view(b, t, self.n_heads, hd)
+        qd = self.quarter_dim
+        g_fwd = torch.sigmoid(self.gate_fwd_proj(x)).view(b, t, self.n_heads, qd)
+        g_bwd = torch.sigmoid(self.gate_bwd_proj(x)).view(b, t, self.n_heads, qd)
 
-        q_static = q[:, :, :, :-hd]
-        q_cur = q[:, :, :, -hd:]
+        # 3rd quarter: channels [-2*qd:-qd]
+        q_pre = q[:, :, :, :-2*qd]        # first half (static)
+        q_cur = q[:, :, :, -2*qd:-qd]     # 3rd quarter (Q-mix target)
+        q_post = q[:, :, :, -qd:]          # last quarter (K-mix territory, static)
         q_prev = F.pad(q_cur[:, :-1], (0, 0, 0, 0, 1, 0))   # causal: t-1
         q_next = F.pad(q_cur[:, 1:],  (0, 0, 0, 0, 0, 1))   # acausal: t+1, last pos gets zeros
         q_mixed = (1 - g_fwd - g_bwd) * q_cur + g_fwd * q_next + g_bwd * q_prev
-        return torch.cat([q_static, q_mixed], dim=-1)
+        return torch.cat([q_pre, q_mixed, q_post], dim=-1)
 
 
 class QTemporalConv(nn.Module):
-    """Depthwise temporal conv on the last half of Q channels.
+    """Depthwise temporal conv on the 3rd quarter of Q channels.
 
     This is a simple conv baseline for Q-peeking comparisons.
     It applies a depthwise 1D convolution over time on each head-channel
     independently, using right-padding so the output at position t can depend
     on future positions up to t + (kernel_size - 1).
 
+    Operates on the 3rd quarter of head_dim (channels [-2*qd:-qd]),
+    leaving the last quarter for K-mix and the first half static.
+
     - kernel_size=2 -> lookahead 1
     - kernel_size=3 -> lookahead 2
 
     Args:
         n_heads: Number of attention heads.
-        half_dim: Number of channels to mix (head_dim // 2).
+        quarter_dim: Number of channels to mix (head_dim // 4).
         kernel_size: Temporal kernel size (2 or 3).
     """
 
-    def __init__(self, n_heads: int, half_dim: int, kernel_size: int):
+    def __init__(self, n_heads: int, quarter_dim: int, kernel_size: int):
         super().__init__()
         assert kernel_size in (2, 3), f"kernel_size must be 2 or 3, got {kernel_size}"
         self.n_heads = n_heads
-        self.half_dim = half_dim
+        self.quarter_dim = quarter_dim
         self.kernel_size = kernel_size
-        channels = n_heads * half_dim
+        channels = n_heads * quarter_dim
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, groups=channels, bias=True)
 
         # Identity-like init: y_t ~= x_t at start
@@ -175,21 +181,88 @@ class QTemporalConv(nn.Module):
             q: (B, T, H, head_dim)
 
         Returns:
-            Q with last half_dim channels convolved over time.
+            Q with 3rd quarter channels convolved over time.
         """
         b, t, _, _ = q.shape
         if t < 2:
             return q
 
-        hd = self.half_dim
-        q_static = q[:, :, :, :-hd]
-        q_cur = q[:, :, :, -hd:]  # (B, T, H, hd)
+        qd = self.quarter_dim
+        q_pre = q[:, :, :, :-2*qd]        # first half (static)
+        q_cur = q[:, :, :, -2*qd:-qd]     # 3rd quarter (Q-mix target)
+        q_post = q[:, :, :, -qd:]          # last quarter (K-mix territory, static)
 
-        # (B, T, H, hd) -> (B, H*hd, T)
-        x = q_cur.permute(0, 2, 3, 1).reshape(b, self.n_heads * hd, t)
+        # (B, T, H, qd) -> (B, H*qd, T)
+        x = q_cur.permute(0, 2, 3, 1).reshape(b, self.n_heads * qd, t)
         x = F.pad(x, (0, self.kernel_size - 1))
         y = self.conv(x)[..., :t]
-        # (B, H*hd, T) -> (B, T, H, hd)
-        y = y.view(b, self.n_heads, hd, t).permute(0, 3, 1, 2)
+        # (B, H*qd, T) -> (B, T, H, qd)
+        y = y.view(b, self.n_heads, qd, t).permute(0, 3, 1, 2)
 
-        return torch.cat([q_static, y], dim=-1)
+        return torch.cat([q_pre, y, q_post], dim=-1)
+
+
+class KTemporalConv(nn.Module):
+    """Causal depthwise temporal conv on the last quarter of K channels.
+
+    Like QTemporalConv but causally padded (left-pad, no future leakage).
+    Position t can only see t and t-1 (kernel_size=2) or t, t-1, t-2 (kernel_size=3).
+
+    Operates on last quarter_dim channels (matching CausalLerp's convention).
+
+    Args:
+        n_heads: Number of attention heads.
+        quarter_dim: Number of channels to mix (head_dim // 4).
+        kernel_size: Temporal kernel size (2 or 3).
+    """
+
+    def __init__(self, n_heads: int, quarter_dim: int, kernel_size: int):
+        super().__init__()
+        assert kernel_size in (2, 3), f"kernel_size must be 2 or 3, got {kernel_size}"
+        self.n_heads = n_heads
+        self.quarter_dim = quarter_dim
+        self.kernel_size = kernel_size
+        channels = n_heads * quarter_dim
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, groups=channels, bias=True)
+
+        # Identity-like init: mostly current token, small backward influence
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            assert self.conv.bias is not None
+            self.conv.bias.zero_()
+            if kernel_size == 2:
+                # weight layout: [channels, 1, kernel_size], conv sees [t-1, t]
+                self.conv.weight[:, 0, 0] = 0.12  # t-1
+                self.conv.weight[:, 0, 1] = 0.88  # t
+            else:  # kernel_size == 3
+                # conv sees [t-2, t-1, t]
+                self.conv.weight[:, 0, 0] = 0.12  # t-2
+                self.conv.weight[:, 0, 1] = 0.12  # t-1
+                self.conv.weight[:, 0, 2] = 0.76  # t
+
+    def forward(self, k: torch.Tensor) -> torch.Tensor:
+        """Apply causal temporal conv to K.
+
+        Args:
+            k: (B, T, H, head_dim)
+
+        Returns:
+            K with last quarter_dim channels convolved over time (causal).
+        """
+        b, t, _, _ = k.shape
+        if t < 2:
+            return k
+
+        qd = self.quarter_dim
+        k_static = k[:, :, :, :-qd]
+        k_cur = k[:, :, :, -qd:]  # (B, T, H, qd)
+
+        # (B, T, H, qd) -> (B, H*qd, T)
+        x = k_cur.permute(0, 2, 3, 1).reshape(b, self.n_heads * qd, t)
+        # Left-pad for causal: position t sees [t-(ks-1), ..., t]
+        x = F.pad(x, (self.kernel_size - 1, 0))
+        y = self.conv(x)[..., :t]
+        # (B, H*qd, T) -> (B, T, H, qd)
+        y = y.view(b, self.n_heads, qd, t).permute(0, 3, 1, 2)
+
+        return torch.cat([k_static, y], dim=-1)
