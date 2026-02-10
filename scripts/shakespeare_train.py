@@ -1304,12 +1304,17 @@ def train(args):
                     original = sample_batch[0]
                     result = original.clone()
                     result[mask[0]] = preds[0][mask[0]]
+                    # Build masked view: replace masked positions with _
+                    masked_view = original.clone()
+                    masked_view[mask[0]] = ord('_')
+                    masked_text = decode(masked_view).replace('\n', '\\n')
                     orig_text = decode(original).replace('\n', '\\n')
                     recon_text = decode(result).replace('\n', '\\n')
                     n_masked = mask.sum().item()
                     n_correct = ((preds[0] == original) & mask[0]).sum().item()
                     tqdm.write(f"  [sample] {n_correct}/{n_masked} masked correct")
                     tqdm.write(f"    orig:  {orig_text[:80]}")
+                    tqdm.write(f"    mask:  {masked_text[:80]}")
                     tqdm.write(f"    recon: {recon_text[:80]}")
                 else:
                     sample_prompt = "KING:\nO, "
@@ -1537,12 +1542,16 @@ def main():
                 original = sample_batch[0]
                 result = original.clone()
                 result[mask[0]] = preds[0][mask[0]]
+                masked_view = original.clone()
+                masked_view[mask[0]] = ord('_')
                 n_masked = mask.sum().item()
                 n_correct = ((preds[0] == original) & mask[0]).sum().item()
                 orig_text = decode(original)
+                masked_text = decode(masked_view)
                 recon_text = decode(result)
                 print(f"\n--- Sample {i+1}: {n_correct}/{n_masked} masked correct ---")
                 print(f"Original:\n{orig_text[:200]}")
+                print(f"Masked:\n{masked_text[:200]}")
                 print(f"Reconstructed:\n{recon_text[:200]}")
                 print()
     else:
