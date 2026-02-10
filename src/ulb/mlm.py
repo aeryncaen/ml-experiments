@@ -83,13 +83,15 @@ class DeepMLM(nn.Module):
         self.aux_loss = 0.0
 
     def forward(self, prompt_ids: torch.Tensor,
-                target_ids: torch.Tensor) -> torch.Tensor:
+                target_ids: torch.Tensor,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass with learned internal diffusion.
 
         Args:
             prompt_ids: (B, P) prompt token indices.
             target_ids: (B, G) ground-truth output token indices.
-                        During generation, pass dummy ids (zeros).
+            mask: (B, G) bool — True = masked (predict), False = given (ground truth).
+                  If None, all output positions are masked.
 
         Returns:
             logits: (B, G, vocab_size) final layer predictions.
@@ -101,12 +103,19 @@ class DeepMLM(nn.Module):
         # Embed prompt
         prompt_x = self.token_embed(prompt_ids)  # (B, P, D)
 
-        # Embed output: all positions start masked
+        # Embed output: masked positions get mask_embed, unmasked get token_embed
         output_positions = torch.arange(P, P + G, device=device)
         pos_embeds = self.pos_embed(output_positions)  # (G, D)
-        mask_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds  # (B, G, D)
 
-        x = torch.cat([prompt_x, mask_x], dim=1)  # (B, P+G, D)
+        if mask is None:
+            # All masked
+            output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+        else:
+            gt_embeds = self.token_embed(target_ids) + pos_embeds  # (B, G, D)
+            mask_embeds = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+            output_x = torch.where(mask.unsqueeze(-1), mask_embeds, gt_embeds)
+
+        x = torch.cat([prompt_x, output_x], dim=1)  # (B, P+G, D)
 
         aux = 0.0
         ne = self.n_encoder
@@ -229,8 +238,13 @@ class DeepMLMMoE(nn.Module):
         return torch.cat([x[:, :P], new_output], dim=1)
 
     def forward(self, prompt_ids: torch.Tensor,
-                target_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MoE routing and learned internal diffusion."""
+                target_ids: torch.Tensor,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward pass with MoE routing and learned internal diffusion.
+
+        Args:
+            mask: (B, G) bool — True = masked, False = given. None = all masked.
+        """
         B, P = prompt_ids.shape
         G = target_ids.shape[1]
         T = P + G
@@ -242,7 +256,14 @@ class DeepMLMMoE(nn.Module):
         prompt_x = self.token_embed(prompt_ids)
         output_positions = torch.arange(P, P + G, device=device)
         pos_embeds = self.pos_embed(output_positions)  # (G, D)
-        output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+
+        if mask is None:
+            output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+        else:
+            gt_embeds = self.token_embed(target_ids) + pos_embeds
+            mask_embeds = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
+            output_x = torch.where(mask.unsqueeze(-1), mask_embeds, gt_embeds)
+
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, T, D)
 
         total_aux = 0.0

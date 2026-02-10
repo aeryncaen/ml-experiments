@@ -772,21 +772,37 @@ def val_step_llada(model, batch: torch.Tensor):
 # ---------------------------------------------------------------------------
 
 def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
-                   prompt_len: int, output_len: int):
-    """Deep MLM training step.
+                   prompt_len: int, output_len: int,
+                   epoch: int = 0, n_epochs: int = 1):
+    """Deep MLM training step with masking curriculum.
 
-    All output positions are masked. CE loss on all output positions.
-    No noise schedule, no mask ratio sampling, no 1/t weighting.
+    Curriculum: ramp number of masked output positions from 1 to output_len
+    over the first half of training. Random positions each batch.
+    Loss computed on masked positions only.
     """
     prompt = batch[:, :prompt_len]
     target = batch[:, prompt_len:]
     B = prompt.shape[0]
+    G = output_len
+    device = batch.device
 
-    logits = model(prompt, target)  # (B, output_len, vocab)
+    # Curriculum: linear ramp from 1 to G over first half of epochs
+    ramp_end = max(n_epochs // 2, 1)
+    progress = min(epoch / ramp_end, 1.0)
+    n_masked = max(1, int(progress * G + 0.5))
 
+    # Random mask: pick n_masked positions per sample
+    rand_scores = torch.rand(B, G, device=device)
+    _, mask_idx = rand_scores.topk(n_masked, dim=-1)
+    mask = torch.zeros(B, G, dtype=torch.bool, device=device)
+    mask.scatter_(1, mask_idx, True)
+
+    logits = model(prompt, target, mask)  # (B, G, vocab)
+
+    # Loss only on masked positions
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        target.reshape(-1),
+        logits[mask].reshape(-1, logits.shape[-1]),
+        target[mask].reshape(-1),
     ) + _get_aux_loss(model)
 
     optimizer.zero_grad()
@@ -796,18 +812,19 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
 
     with torch.no_grad():
         preds = logits.argmax(dim=-1)
-        acc = (preds == target).float().mean().item()
+        correct = (preds == target) & mask
+        acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
     return loss.item(), acc
 
 
 @torch.no_grad()
 def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
-    """Deep MLM validation step."""
+    """Deep MLM validation step — all positions masked (hardest case)."""
     prompt = batch[:, :prompt_len]
     target = batch[:, prompt_len:]
 
-    logits = model(prompt, target)
+    logits = model(prompt, target)  # mask=None → all masked
 
     loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
@@ -1176,7 +1193,8 @@ def train(args):
 
             if is_mlm:
                 loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
-                                           prompt_len, output_len)
+                                           prompt_len, output_len,
+                                           epoch=epoch - 1, n_epochs=args.epochs)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
