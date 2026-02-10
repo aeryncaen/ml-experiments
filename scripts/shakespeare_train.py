@@ -28,6 +28,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 # Data
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# EMA (Exponential Moving Average)
+# ---------------------------------------------------------------------------
+
+class EMA:
+    """Exponential moving average of model parameters.
+
+    Usage:
+        ema = EMA(model.parameters(), decay=0.9999)
+        # After each optimizer step:
+        ema.update(model.parameters())
+        # For validation:
+        ema.store(model.parameters())   # save current weights
+        ema.copy_to(model.parameters()) # load EMA weights
+        # ... validate ...
+        ema.restore(model.parameters()) # restore training weights
+    """
+
+    def __init__(self, parameters, decay: float = 0.9999):
+        self.decay = decay
+        self.num_updates = 0
+        self.shadow = [p.clone().detach() for p in parameters if p.requires_grad]
+        self.backup = []
+
+    def update(self, parameters):
+        self.num_updates += 1
+        # Warmup: effective decay ramps up from 0 to target
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        one_minus = 1.0 - decay
+        with torch.no_grad():
+            for s, p in zip(self.shadow, (p for p in parameters if p.requires_grad)):
+                s.sub_(one_minus * (s - p))
+
+    def copy_to(self, parameters):
+        for s, p in zip(self.shadow, (p for p in parameters if p.requires_grad)):
+            p.data.copy_(s.data)
+
+    def store(self, parameters):
+        self.backup = [p.clone() for p in parameters if p.requires_grad]
+
+    def restore(self, parameters):
+        for b, p in zip(self.backup, (p for p in parameters if p.requires_grad)):
+            p.data.copy_(b.data)
+        self.backup = []
+
+
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
@@ -276,7 +322,9 @@ def build_llada_mha(vocab_size: int, args) -> nn.Module:
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
     )
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 def build_llada_ulb(vocab_size: int, args) -> nn.Module:
@@ -293,7 +341,9 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
     )
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
@@ -313,7 +363,9 @@ def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
         router_mode=args.moe_router_mode,
     )
     backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 def build_llada_ulb_moe(vocab_size: int, args) -> nn.Module:
@@ -341,7 +393,9 @@ def build_llada_ulb_moe(vocab_size: int, args) -> nn.Module:
         router_mode=args.moe_router_mode,
     )
     backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
@@ -364,7 +418,9 @@ def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
         hop_shared_fraction=args.hop_shared_fraction,
     )
     backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 def build_llada_ulb_poe(vocab_size: int, args) -> nn.Module:
@@ -395,7 +451,9 @@ def build_llada_ulb_poe(vocab_size: int, args) -> nn.Module:
         hop_shared_fraction=args.hop_shared_fraction,
     )
     backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
-    return LLaDAModel(backbone, vocab_size, args.dim)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
 
 
 ARCH_BUILDERS = {
@@ -553,7 +611,8 @@ def val_step_diffusion(model, batch: torch.Tensor, prompt_len: int, output_len: 
 # LLaDA training (masked diffusion, Algorithm 1 from paper)
 # ---------------------------------------------------------------------------
 
-def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float):
+def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float,
+                     antithetic: bool = True):
     """LLaDA masked diffusion training step.
 
     Matches GSAI-ML/LLaDA GUIDELINES.md:
@@ -561,19 +620,30 @@ def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float):
     - mask each token independently with probability p_mask
     - CE on masked tokens, each divided by its p_mask
     - sum all, normalize by B*T
+
+    Enhancements from MDLM:
+    - Antithetic t-sampling: stratified t values across batch for lower variance
+    - Pass t to model for time conditioning (if model supports it)
     """
     B, T = batch.shape
     eps = 1e-3
 
+    # Sample t with optional antithetic (stratified) sampling
+    if antithetic:
+        # Stratified: each sample gets a different offset in [0, 1)
+        offset = torch.arange(B, device=batch.device, dtype=torch.float32) / B
+        t = (torch.rand(1, device=batch.device) / B + offset) % 1.0  # (B,)
+    else:
+        t = torch.rand(B, device=batch.device)
+
     # p_mask per sample: ranges from eps to 1.0
-    t = torch.rand(B, device=batch.device)
     p_mask = (1 - eps) * t + eps  # (B,)
     p_mask_expanded = p_mask[:, None].expand(B, T)  # (B, T)
 
     # Independent per-token masking
     mask = torch.rand(B, T, device=batch.device) < p_mask_expanded  # (B, T) bool
 
-    logits = model(batch, mask)  # (B, T, vocab_size)
+    logits = model(batch, mask, t)  # (B, T, vocab_size) — t for time conditioning
 
     # CE on masked tokens, each weighted by 1/p_mask, normalized by B*T
     per_token_loss = F.cross_entropy(
@@ -608,7 +678,8 @@ def val_step_llada(model, batch: torch.Tensor):
 
     mask = torch.rand(B, T, device=batch.device) < p_mask
 
-    logits = model(batch, mask)
+    t_val = torch.full((B,), p_mask, device=batch.device)
+    logits = model(batch, mask, t_val)
 
     per_token_loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
@@ -739,10 +810,13 @@ def generate_llada(model, prompt_text: str, gen_len: int,
 
     prompt_ids = encode(prompt_text).to(device)  # (P,)
     P = prompt_ids.shape[0]
+    max_T = model.max_seq_len
+
+    # Clamp gen_len so prompt + generation fits within max_seq_len
+    gen_len = min(gen_len, max_T - 1)  # leave room for at least 1 prompt token
     T = P + gen_len
 
-    # Truncate prompt if needed
-    max_T = model.max_seq_len
+    # Truncate prompt if still too long
     if T > max_T:
         prompt_ids = prompt_ids[-(max_T - gen_len):]
         P = prompt_ids.shape[0]
@@ -851,9 +925,28 @@ def train(args):
         print(f"  block_shared={args.block_shared_fraction}, router_shared={args.router_shared_fraction}, "
               f"hop_shared={args.hop_shared_fraction}")
 
+    if is_llada:
+        llada_features = []
+        if args.time_cond:
+            llada_features.append('time_cond')
+        if args.subs:
+            llada_features.append('subs')
+        if not args.no_antithetic:
+            llada_features.append('antithetic')
+        if args.ema > 0:
+            llada_features.append(f'ema={args.ema}')
+        if llada_features:
+            print(f"  llada: {', '.join(llada_features)}")
+
     if args.compile:
         print("Compiling model with torch.compile...")
         model = torch.compile(model, mode=args.compile_mode)
+
+    # EMA
+    ema = None
+    if args.ema > 0:
+        ema = EMA(model.parameters(), decay=args.ema)
+        print(f"  EMA enabled (decay={args.ema})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
@@ -912,13 +1005,16 @@ def train(args):
             batch = train_ds.sample_batch(args.batch_size, device)
 
             if is_llada:
-                loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip)
+                loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
+                                            antithetic=not args.no_antithetic)
             elif is_diffusion:
                 loss, acc = train_step_diffusion(model, batch, optimizer, args.grad_clip,
                                                   prompt_len, output_len)
             else:
                 loss, acc = train_step_ar(model, batch, optimizer, args.grad_clip)
 
+            if ema is not None:
+                ema.update(model.parameters())
             scheduler.step()
             epoch_loss += loss
             epoch_acc += acc
@@ -926,7 +1022,10 @@ def train(args):
         avg_loss = epoch_loss / args.steps_per_epoch
         avg_acc = epoch_acc / args.steps_per_epoch
 
-        # Validation
+        # Validation — use EMA weights if available
+        if ema is not None:
+            ema.store(model.parameters())
+            ema.copy_to(model.parameters())
         model.eval()
         val_loss = 0.0
         val_acc = 0.0
@@ -943,6 +1042,8 @@ def train(args):
             val_acc += va
         val_loss /= n_val
         val_acc /= n_val
+        if ema is not None:
+            ema.restore(model.parameters())
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -1039,7 +1140,7 @@ def interactive_generate(args):
     if mode == 'ar':
         max_prompt = saved_args.seq_len - 1
     elif mode == 'llada':
-        max_prompt = saved_args.seq_len - gen_len  # leave room for gen_len masked tokens
+        max_prompt = max(1, saved_args.seq_len - gen_len)  # leave room for gen_len masked tokens
     else:
         max_prompt = saved_args.prompt_len
 
@@ -1133,6 +1234,16 @@ def main():
     parser.add_argument('--output-len', type=int, default=16, help='Output length (diffusion)')
     parser.add_argument('--local-window', type=int, default=16, help='Local attention window (diffusion PoE)')
 
+    # LLaDA enhancements
+    parser.add_argument('--time-cond', action='store_true', default=False,
+                        help='Time conditioning: embed mask ratio and add to input (LLaDA)')
+    parser.add_argument('--subs', action='store_true', default=False,
+                        help='SUBS parameterization: clamp unmasked logits to one-hot (LLaDA)')
+    parser.add_argument('--no-antithetic', action='store_true', default=False,
+                        help='Disable antithetic (stratified) t-sampling (LLaDA)')
+    parser.add_argument('--ema', type=float, default=0.0,
+                        help='EMA decay (0 to disable, typical 0.9999)')
+
     # Training
     parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
     parser.add_argument('--steps-per-epoch', type=int, default=100, help='Steps per epoch')
@@ -1190,7 +1301,7 @@ def main():
         if args.mode == 'ar':
             max_prompt = args.seq_len - 1
         elif args.mode == 'llada':
-            max_prompt = args.seq_len - gen_len
+            max_prompt = max(1, args.seq_len - gen_len)
         else:
             max_prompt = args.prompt_len
         prompt_text = prompt[-max_prompt:]
