@@ -243,3 +243,108 @@ class BidirectionalTransformer(nn.Module):
             x = block(x, self.rope_freqs)
 
         return self.head(self.final_norm(x))
+
+
+# ---------------------------------------------------------------------------
+# Stacker-compatible MHA layers (single-arg forward, no internal residual/norm)
+# ---------------------------------------------------------------------------
+
+class CausalMHALayer(nn.Module):
+    """MHA + SwiGLU layer compatible with ULB stackers.
+
+    Unlike TransformerBlock, this:
+    - Takes a single arg (pre-normed x) — no rope_freqs arg
+    - Has NO internal pre-norm or residual — the stacker handles those
+    - Stores its own RoPE frequencies
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        max_seq_len: Maximum sequence length for RoPE.
+        ffn_expand: SwiGLU expansion ratio.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
+                 ffn_expand: float = 8/3):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert dim % n_heads == 0
+
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.ffn_norm = nn.RMSNorm(dim)
+        self.ffn = SwiGLU(dim, expand=ffn_expand)
+
+        head_dim = dim // n_heads
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x is pre-normed by the stacker. Returns delta (no residual add)."""
+        B, T, D = x.shape
+
+        qkv = self.qkv_proj(x).view(B, T, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q = _apply_rope(q, self.rope_freqs)
+        k = _apply_rope(k, self.rope_freqs)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.o_proj(attn_out)
+
+        # FFN (with its own norm, since stacker only norms the outer residual)
+        h = h + self.ffn(self.ffn_norm(h))
+        return h
+
+
+class BidirectionalMHALayer(nn.Module):
+    """Bidirectional MHA + SwiGLU layer compatible with ULB stackers.
+
+    Same as CausalMHALayer but without causal mask.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
+                 ffn_expand: float = 8/3):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert dim % n_heads == 0
+
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.ffn_norm = nn.RMSNorm(dim)
+        self.ffn = SwiGLU(dim, expand=ffn_expand)
+
+        head_dim = dim // n_heads
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x is pre-normed by the stacker. Returns delta (no residual add)."""
+        B, T, D = x.shape
+
+        qkv = self.qkv_proj(x).view(B, T, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q = _apply_rope(q, self.rope_freqs)
+        k = _apply_rope(k, self.rope_freqs)
+
+        if HAS_FLASH_ATTN:
+            q = q.transpose(1, 2).to(torch.bfloat16)
+            k = k.transpose(1, 2).to(torch.bfloat16)
+            v = v.transpose(1, 2).to(torch.bfloat16)
+            attn_out = flash_attn_func(q, k, v, causal=False)
+            attn_out = attn_out.to(x.dtype).contiguous().view(B, T, D)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.o_proj(attn_out)
+
+        h = h + self.ffn(self.ffn_norm(h))
+        return h

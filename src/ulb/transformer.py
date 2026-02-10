@@ -138,8 +138,10 @@ class LLaDAModel(nn.Module):
     def _run_backbone_from_embeddings(self, x: torch.Tensor) -> torch.Tensor:
         """Run the backbone's layers on pre-computed embeddings.
 
-        Handles both TransformerBlock-based (has rope_freqs)
-        and ULB-based (has norms + blocks) styles.
+        Handles:
+        - TransformerBlock-based (has rope_freqs): CausalTransformer, BidirectionalTransformer
+        - ULB-based (has norms + blocks): CausalULB
+        - StackedLM (has stacker): MoE/PoE wrapped models
 
         Args:
             x: (B, T, D) embeddings.
@@ -149,7 +151,11 @@ class LLaDAModel(nn.Module):
         """
         bb = self.backbone
 
-        if hasattr(bb, 'rope_freqs'):
+        if hasattr(bb, 'stacker'):
+            # StackedLM wrapping MoE/PoE stacker — stacker handles norms+residual
+            x = bb.stacker(x)
+            return bb.head(x)
+        elif hasattr(bb, 'rope_freqs'):
             # TransformerBlock-based (Causal or Bidirectional)
             for block in bb.blocks:
                 x = block(x, bb.rope_freqs)

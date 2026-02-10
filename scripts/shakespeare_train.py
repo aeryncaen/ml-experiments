@@ -72,6 +72,42 @@ class TextDataset:
 # Model builders
 # ---------------------------------------------------------------------------
 
+class StackedLM(nn.Module):
+    """Language model wrapper: embed + stacker + head.
+
+    Wraps any stacker (StackedULB, MoEStackedULB, PoolOfExperts) with
+    token embeddings and an output head. Weight-tied.
+
+    The stacker operates on (B, T, D) hidden states. This wrapper adds
+    the embed/head bookkeeping.
+
+    Args:
+        stacker: A stacker module (StackedULB, MoEStackedULB, or PoolOfExperts).
+        vocab_size: Token vocabulary size.
+        dim: Model dimension.
+        max_seq_len: Maximum sequence length (stored for generation).
+    """
+
+    def __init__(self, stacker: nn.Module, vocab_size: int, dim: int, max_seq_len: int):
+        super().__init__()
+        self.stacker = stacker
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        x = self.token_embed(token_ids)
+        x = self.stacker(x)
+        return self.head(x)
+
+
+# --- Plain (non-MoE, non-PoE) builders ---
+
 def build_mha(vocab_size: int, args) -> nn.Module:
     """Build a CausalTransformer (MHA + SwiGLU baseline)."""
     from mha import CausalTransformer
@@ -100,7 +136,107 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
     )
 
 
+# --- MoE builders ---
+
+def build_mha_moe(vocab_size: int, args) -> nn.Module:
+    """Build MoE-stacked MHA (CausalMHALayer blocks)."""
+    from mha import CausalMHALayer
+    from ulb.stack import MoEStackedULB
+    make_layer = lambda: CausalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+    stacker = MoEStackedULB(
+        make_layer=make_layer,
+        n_layers=args.n_layers,
+        dim=args.dim,
+        n_experts=args.n_experts,
+        top_k=args.top_k,
+        version=args.moe_version,
+        router_mode=args.moe_router_mode,
+    )
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
+def build_ulb_moe(vocab_size: int, args) -> nn.Module:
+    """Build MoE-stacked ULB blocks."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.stack import MoEStackedULB
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        attn_mode='blend',
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    make_layer = lambda: ULBBlock(config)
+    stacker = MoEStackedULB(
+        make_layer=make_layer,
+        n_layers=args.n_layers,
+        dim=args.dim,
+        n_experts=args.n_experts,
+        top_k=args.top_k,
+        version=args.moe_version,
+        router_mode=args.moe_router_mode,
+    )
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
+# --- PoE builders (AR) ---
+
+def build_mha_poe(vocab_size: int, args) -> nn.Module:
+    """Build PoolOfExperts with CausalMHALayer blocks."""
+    from mha import CausalMHALayer
+    from ulb.stack import PoolOfExperts
+    make_layer = lambda: CausalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+    stacker = PoolOfExperts(
+        make_layer=make_layer,
+        pool_size=args.pool_size,
+        dim=args.dim,
+        top_k=args.top_k,
+        max_hops=args.max_hops,
+        router_mode=args.router_mode,
+        router_noise=args.router_noise,
+        block_shared_fraction=args.block_shared_fraction,
+        router_shared_fraction=args.router_shared_fraction,
+        hop_shared_fraction=args.hop_shared_fraction,
+    )
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
 def build_ulb_poe(vocab_size: int, args) -> nn.Module:
+    """Build PoolOfExperts with ULB blocks (AR mode)."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.stack import PoolOfExperts
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        attn_mode='blend',
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    make_layer = lambda: ULBBlock(config)
+    stacker = PoolOfExperts(
+        make_layer=make_layer,
+        pool_size=args.pool_size,
+        dim=args.dim,
+        top_k=args.top_k,
+        max_hops=args.max_hops,
+        router_mode=args.router_mode,
+        router_noise=args.router_noise,
+        block_shared_fraction=args.block_shared_fraction,
+        router_shared_fraction=args.router_shared_fraction,
+        hop_shared_fraction=args.hop_shared_fraction,
+    )
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
+# --- Diffusion PoE builder (existing, for MaskedDiffusionPoE) ---
+
+def build_ulb_diffusion_poe(vocab_size: int, args) -> nn.Module:
     """Build a MaskedDiffusionPoE (ULB diffusion variant)."""
     from ulb.block import ULBConfig
     from ulb.diffusion import MaskedDiffusionPoE
@@ -126,6 +262,8 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
         hop_shared_fraction=args.hop_shared_fraction,
     )
 
+
+# --- LLaDA builders ---
 
 def build_llada_mha(vocab_size: int, args) -> nn.Module:
     """Build LLaDA with BidirectionalTransformer backbone."""
@@ -158,21 +296,148 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
     return LLaDAModel(backbone, vocab_size, args.dim)
 
 
+def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with MoE-stacked BidirectionalMHALayer backbone."""
+    from mha import BidirectionalMHALayer
+    from ulb.stack import MoEStackedULB
+    from ulb.transformer import LLaDAModel
+    make_layer = lambda: BidirectionalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+    stacker = MoEStackedULB(
+        make_layer=make_layer,
+        n_layers=args.n_layers,
+        dim=args.dim,
+        n_experts=args.n_experts,
+        top_k=args.top_k,
+        version=args.moe_version,
+        router_mode=args.moe_router_mode,
+    )
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
+def build_llada_ulb_moe(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with MoE-stacked ULB backbone."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.stack import MoEStackedULB
+    from ulb.transformer import LLaDAModel
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        attn_mode='blend',
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    make_layer = lambda: ULBBlock(config)
+    stacker = MoEStackedULB(
+        make_layer=make_layer,
+        n_layers=args.n_layers,
+        dim=args.dim,
+        n_experts=args.n_experts,
+        top_k=args.top_k,
+        version=args.moe_version,
+        router_mode=args.moe_router_mode,
+    )
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
+def build_llada_mha_poe(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with PoolOfExperts BidirectionalMHALayer backbone."""
+    from mha import BidirectionalMHALayer
+    from ulb.stack import PoolOfExperts
+    from ulb.transformer import LLaDAModel
+    make_layer = lambda: BidirectionalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+    stacker = PoolOfExperts(
+        make_layer=make_layer,
+        pool_size=args.pool_size,
+        dim=args.dim,
+        top_k=args.top_k,
+        max_hops=args.max_hops,
+        router_mode=args.router_mode,
+        router_noise=args.router_noise,
+        block_shared_fraction=args.block_shared_fraction,
+        router_shared_fraction=args.router_shared_fraction,
+        hop_shared_fraction=args.hop_shared_fraction,
+    )
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
+def build_llada_ulb_poe(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with PoolOfExperts ULB backbone."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.stack import PoolOfExperts
+    from ulb.transformer import LLaDAModel
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        attn_mode='blend',
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    make_layer = lambda: ULBBlock(config)
+    stacker = PoolOfExperts(
+        make_layer=make_layer,
+        pool_size=args.pool_size,
+        dim=args.dim,
+        top_k=args.top_k,
+        max_hops=args.max_hops,
+        router_mode=args.router_mode,
+        router_noise=args.router_noise,
+        block_shared_fraction=args.block_shared_fraction,
+        router_shared_fraction=args.router_shared_fraction,
+        hop_shared_fraction=args.hop_shared_fraction,
+    )
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return LLaDAModel(backbone, vocab_size, args.dim)
+
+
 ARCH_BUILDERS = {
     'mha': build_mha,
     'ulb': build_ulb,
+    'mha-moe': build_mha_moe,
+    'ulb-moe': build_ulb_moe,
+    'mha-poe': build_mha_poe,
     'ulb-poe': build_ulb_poe,
+    'ulb-diffusion-poe': build_ulb_diffusion_poe,
 }
 
 LLADA_BUILDERS = {
     'mha': build_llada_mha,
     'ulb': build_llada_ulb,
+    'mha-moe': build_llada_mha_moe,
+    'ulb-moe': build_llada_ulb_moe,
+    'mha-poe': build_llada_mha_poe,
+    'ulb-poe': build_llada_ulb_poe,
 }
 
 
 # ---------------------------------------------------------------------------
 # AR training
 # ---------------------------------------------------------------------------
+
+def _get_aux_loss(model):
+    """Collect aux_loss from MoE/PoE routing.
+
+    Looks for aux_loss on model itself, model.stacker, or model.backbone.stacker.
+    """
+    for obj in [model, getattr(model, 'stacker', None),
+                getattr(getattr(model, 'backbone', None), 'stacker', None)]:
+        if obj is not None:
+            aux = getattr(obj, 'aux_loss', 0.0)
+            if isinstance(aux, (int, float)):
+                if aux != 0.0:
+                    return aux
+            elif hasattr(aux, 'item'):
+                return aux
+    return 0.0
+
 
 def train_step_ar(model, batch: torch.Tensor, optimizer, grad_clip: float):
     """Standard next-token prediction step.
@@ -184,6 +449,7 @@ def train_step_ar(model, batch: torch.Tensor, optimizer, grad_clip: float):
 
     logits = model(x)    # (B, T-1, vocab)
     loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1))
+    loss = loss + _get_aux_loss(model)
 
     optimizer.zero_grad()
     loss.backward()
@@ -318,7 +584,7 @@ def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float):
 
     # 1/p_mask weighting per token, only on masked positions
     token_loss = per_token_loss[mask] / p_mask_expanded[mask]
-    loss = token_loss.sum() / (B * T)
+    loss = token_loss.sum() / (B * T) + _get_aux_loss(model)
 
     optimizer.zero_grad()
     loss.backward()
@@ -551,16 +817,20 @@ def train(args):
     val_ds = TextDataset(val_data, args.seq_len)
 
     # Model
-    if is_diffusion and args.arch == 'mha':
-        print("ERROR: MHA diffusion not yet implemented. Use --arch ulb-poe for diffusion.")
+    if is_diffusion and args.arch != 'ulb-diffusion-poe':
+        print(f"ERROR: Diffusion mode requires --arch ulb-diffusion-poe, got '{args.arch}'.")
         sys.exit(1)
 
     if is_llada:
         if args.arch not in LLADA_BUILDERS:
-            print(f"ERROR: LLaDA mode not supported for arch '{args.arch}'. Use mha or ulb.")
+            print(f"ERROR: LLaDA mode not supported for arch '{args.arch}'. "
+                  f"Available: {', '.join(LLADA_BUILDERS.keys())}")
             sys.exit(1)
         model = LLADA_BUILDERS[args.arch](vocab_size, args).to(device)
     else:
+        if args.arch not in ARCH_BUILDERS:
+            print(f"ERROR: Unknown arch '{args.arch}'. Available: {', '.join(ARCH_BUILDERS.keys())}")
+            sys.exit(1)
         model = ARCH_BUILDERS[args.arch](vocab_size, args).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
@@ -572,6 +842,14 @@ def train(args):
         print(f"  prompt_len={args.prompt_len}, output_len={args.output_len}")
         print(f"  pool_size={args.pool_size}, top_k={args.top_k}, max_hops={getattr(model, 'max_hops', 'N/A')}")
         print(f"  router_mode={args.router_mode}, router_noise={args.router_noise}")
+    if 'moe' in args.arch:
+        print(f"  n_experts={args.n_experts}, top_k={args.top_k}, moe_version={args.moe_version}, "
+              f"moe_router_mode={args.moe_router_mode}")
+    if 'poe' in args.arch:
+        print(f"  pool_size={args.pool_size}, top_k={args.top_k}, max_hops={args.max_hops}, "
+              f"router_mode={args.router_mode}, router_noise={args.router_noise}")
+        print(f"  block_shared={args.block_shared_fraction}, router_shared={args.router_shared_fraction}, "
+              f"hop_shared={args.hop_shared_fraction}")
 
     if args.compile:
         print("Compiling model with torch.compile...")
@@ -592,16 +870,32 @@ def train(args):
         assert prompt_len + output_len == args.seq_len, \
             f"prompt_len ({prompt_len}) + output_len ({output_len}) must equal seq_len ({args.seq_len})"
 
+    # Find the inner routing module for noise annealing and hops tracking.
+    # For StackedLM wrapping PoolOfExperts: model.stacker
+    # For MaskedDiffusionPoE: model itself
+    # For LLaDA wrapping StackedLM: model.backbone.stacker
+    _router_module = None
+    if hasattr(model, 'router_noise_scale'):
+        _router_module = model
+    elif hasattr(model, 'stacker') and hasattr(model.stacker, 'router_noise_scale'):
+        _router_module = model.stacker
+    elif hasattr(model, 'backbone'):
+        bb = model.backbone
+        if hasattr(bb, 'router_noise_scale'):
+            _router_module = bb
+        elif hasattr(bb, 'stacker') and hasattr(bb.stacker, 'router_noise_scale'):
+            _router_module = bb.stacker
+
     pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="ep")
     for epoch in pbar:
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
 
-        # Anneal router noise for diffusion
-        if is_diffusion and hasattr(model, 'router_noise_scale'):
+        # Anneal router noise for PoE models
+        if _router_module is not None:
             frac = (epoch - 1) / max(args.epochs - 1, 1)
-            model.router_noise_scale = args.router_noise * (1 - frac)
+            _router_module.router_noise_scale = args.router_noise * (1 - frac)
 
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
@@ -666,13 +960,15 @@ def train(args):
             val=f"{val_loss:.3f}",
             vacc=f"{val_acc:.1%}",
         )
-        if is_diffusion and hasattr(model, 'last_mean_hops'):
-            mean_hops = model.last_mean_hops
+        # Show hops for PoE models
+        _hops_src = _router_module  # PoolOfExperts tracks last_mean_hops
+        if _hops_src is not None and hasattr(_hops_src, 'last_mean_hops'):
+            mean_hops = _hops_src.last_mean_hops
             if isinstance(mean_hops, torch.Tensor):
                 mean_hops = mean_hops.item()
             postfix['hops'] = f"{mean_hops:.1f}"
-        if is_diffusion and hasattr(model, 'router_noise_scale'):
-            postfix['rtr'] = f"{model.router_noise_scale:.2f}"
+        if _router_module is not None:
+            postfix['rtr'] = f"{_router_module.router_noise_scale:.2f}"
         pbar.set_postfix(**postfix)
 
         # Generate a sample after each epoch
@@ -780,12 +1076,12 @@ def main():
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada'],
                         help='Training mode: autoregressive, masked diffusion (PoE), or llada')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
-                        help='Model architecture')
+                        help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-diffusion-poe')
 
     # Model
     parser.add_argument('--dim', type=int, default=128, help='Model dimension')
     parser.add_argument('--n-heads', type=int, default=4, help='Attention heads')
-    parser.add_argument('--n-layers', type=int, default=4, help='Number of layers (MHA) or passed to PoE')
+    parser.add_argument('--n-layers', type=int, default=4, help='Number of layers')
     parser.add_argument('--inner-ratio', type=float, default=1.75, help='Inner dim ratio (ULB)')
     parser.add_argument('--k-mix', type=str, default='lerp',
                         choices=['none', 'lerp', 'add', 'acausal_lerp', 'acausal_add', 'conv2', 'conv3'],
@@ -796,24 +1092,35 @@ def main():
                         help='Acausal lerp on token embeddings before blocks (ULB)')
     parser.add_argument('--seq-len', type=int, default=80, help='Total sequence length')
 
+    # MoE-specific
+    parser.add_argument('--n-experts', type=int, default=4, help='Number of MoE experts per layer')
+    parser.add_argument('--moe-version', type=int, default=1, choices=[1, 2],
+                        help='MoE routing version: 1=self-routed, 2=sender-routed')
+    parser.add_argument('--moe-router-mode', type=str, default='relu', choices=['topk', 'relu'],
+                        help='MoE routing mode: topk or relu (ReMoE)')
+
+    # PoE-specific
+    parser.add_argument('--pool-size', type=int, default=4, help='Expert pool size (PoE)')
+    parser.add_argument('--max-hops', type=int, default=None, help='Max routing depth (PoE)')
+    parser.add_argument('--router-mode', type=str, default='single',
+                        choices=['squared', 'single', 'half'],
+                        help='Router exit slot density (PoE)')
+    parser.add_argument('--router-noise', type=float, default=1.0,
+                        help='Starting router noise scale (PoE)')
+    parser.add_argument('--block-shared-fraction', type=float, default=0.0,
+                        help='Expert block weight sharing fraction (PoE)')
+    parser.add_argument('--router-shared-fraction', type=float, default=0.0,
+                        help='Router weight sharing fraction (PoE)')
+    parser.add_argument('--hop-shared-fraction', type=float, default=0.0,
+                        help='Hop embed/gate weight sharing fraction (PoE)')
+
+    # Shared between MoE and PoE
+    parser.add_argument('--top-k', type=int, default=2, help='Experts per hop/layer (MoE/PoE)')
+
     # Diffusion-specific
     parser.add_argument('--prompt-len', type=int, default=64, help='Prompt length (diffusion)')
     parser.add_argument('--output-len', type=int, default=16, help='Output length (diffusion)')
-    parser.add_argument('--pool-size', type=int, default=4, help='Expert pool size')
-    parser.add_argument('--top-k', type=int, default=2, help='Experts per hop')
-    parser.add_argument('--max-hops', type=int, default=None, help='Max routing depth')
-    parser.add_argument('--local-window', type=int, default=16, help='Local attention window')
-    parser.add_argument('--router-mode', type=str, default='single',
-                        choices=['squared', 'single', 'half'],
-                        help='Router exit slot density')
-    parser.add_argument('--router-noise', type=float, default=1.0,
-                        help='Starting router noise scale')
-    parser.add_argument('--block-shared-fraction', type=float, default=0.0,
-                        help='Expert block weight sharing fraction')
-    parser.add_argument('--router-shared-fraction', type=float, default=0.0,
-                        help='Router weight sharing fraction')
-    parser.add_argument('--hop-shared-fraction', type=float, default=0.0,
-                        help='Hop embed/gate weight sharing fraction')
+    parser.add_argument('--local-window', type=int, default=16, help='Local attention window (diffusion PoE)')
 
     # Training
     parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
