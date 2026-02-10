@@ -304,9 +304,12 @@ class PoolOfExperts(nn.Module):
         router_dropout: Enables random exit-logit dropout during training.
                       Drops a random number (0..75%) of exit logits per sample.
                       Expert logits are never dropped.
-        shared_fraction: Fraction of expert weights that are shared across all
-                      experts (0.0 = fully independent, 1.0 = fully shared).
-                      Each expert's effective weight = shared*alpha + private*(1-alpha).
+        block_shared_fraction: Fraction of expert block output dims shared across
+                      all experts (0.0 = independent, 1.0 = fully shared).
+        router_shared_fraction: Fraction of expert router output dims shared
+                      across all expert routers (0.0 = independent, 1.0 = fully shared).
+        shared_fraction: Convenience — sets both block and router fractions
+                      when the individual ones are not specified.
     """
 
     # Index convention: router outputs logits over (pool_size²) options.
@@ -316,7 +319,9 @@ class PoolOfExperts(nn.Module):
     def __init__(self, make_layer: Callable[[], nn.Module], pool_size: int, dim: int,
                  top_k: int = 2, max_hops: int | None = None,
                  router_noise: float = 1.0, router_dropout: float = 0.0,
-                 shared_fraction: float = 0.0):
+                 shared_fraction: float = 0.0,
+                 block_shared_fraction: float | None = None,
+                 router_shared_fraction: float | None = None):
         super().__init__()
         self.pool_size = pool_size
         self.n_router_options = pool_size * pool_size  # pool_size expert + pool_size*(pool_size-1) exit
@@ -351,12 +356,19 @@ class PoolOfExperts(nn.Module):
         self.final_norm = RMSNorm(dim)
 
         # Weight sharing across experts
-        self.shared_fraction = shared_fraction
-        if shared_fraction > 0.0:
-            from .shared import share_expert_weights
-            self._shared_params = share_expert_weights(self.experts, shared_fraction)
-        else:
-            self._shared_params = nn.ParameterDict()
+        _block_frac = block_shared_fraction if block_shared_fraction is not None else shared_fraction
+        _router_frac = router_shared_fraction if router_shared_fraction is not None else shared_fraction
+        self.block_shared_fraction = _block_frac
+        self.router_shared_fraction = _router_frac
+        from .shared import share_expert_weights, share_linear_list
+        self._shared_block_params = (
+            share_expert_weights(self.experts, _block_frac) if _block_frac > 0.0
+            else nn.ParameterDict()
+        )
+        self._shared_router_params = (
+            share_linear_list(self.expert_routers, _router_frac) if _router_frac > 0.0
+            else nn.ParameterDict()
+        )
 
         self.aux_loss = 0.0
         self.trace = False  # set True to record per-sample routing decisions

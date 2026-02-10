@@ -169,3 +169,51 @@ def share_expert_weights(experts: nn.ModuleList, fraction: float
                 _set_nested_attr(experts[i], name, replacement)
 
     return shared_params
+
+
+def share_linear_list(linears: nn.ModuleList, fraction: float,
+                      prefix: str = 'router') -> nn.ParameterDict:
+    """Share output dims across a list of nn.Linear modules.
+
+    Same split logic as share_expert_weights but operates on a flat
+    ModuleList of Linears (e.g. expert routers) instead of walking
+    submodules of expert blocks.
+
+    Args:
+        linears: ModuleList of nn.Linear modules (mutated in-place).
+        fraction: Fraction of output dims to share.
+        prefix: Name prefix for shared params in the returned dict.
+
+    Returns:
+        nn.ParameterDict of shared parameters.
+    """
+    if fraction <= 0.0:
+        return nn.ParameterDict()
+
+    n = len(linears)
+    shared_params = nn.ParameterDict()
+
+    orig0 = linears[0]
+    out_features = orig0.weight.shape[0]
+    shared_out = round(out_features * fraction)
+    if shared_out == 0:
+        return nn.ParameterDict()
+
+    shared_w = nn.Parameter(orig0.weight.data[:shared_out].clone())
+    shared_params[f'{prefix}_weight'] = shared_w
+
+    has_bias = orig0.bias is not None
+    shared_b = None
+    if has_bias:
+        shared_b = nn.Parameter(orig0.bias.data[:shared_out].clone())
+        shared_params[f'{prefix}_bias'] = shared_b
+
+    for i in range(n):
+        orig = linears[i]
+        priv_w = nn.Parameter(orig.weight.data[shared_out:].clone())
+        priv_b = None
+        if has_bias:
+            priv_b = nn.Parameter(orig.bias.data[shared_out:].clone())
+        linears[i] = SharedLinear(shared_w, shared_b, priv_w, priv_b)
+
+    return shared_params
