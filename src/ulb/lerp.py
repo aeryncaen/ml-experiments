@@ -195,13 +195,14 @@ class KAcausalAdd(nn.Module):
 
 
 class EmbeddingLerp(nn.Module):
-    """Acausal temporal lerp on the last quarter of embedding dims.
+    """Bidirectional temporal lerp on the last half of embedding dims.
 
-    Applied once to token embeddings before any blocks. Centered mixing:
-        x_mixed = (1 - g_fwd - g_bwd) * x[t] + g_fwd * x[t+1] + g_bwd * x[t-1]
+    Applied once to token embeddings before any blocks. Two separate
+    directional passes on non-overlapping channels:
+        - 3rd quarter (dims [-half:-quarter]): forward lerp from t-1
+        - 4th quarter (dims [-quarter:]): backward lerp from t+1
 
-    Operates on (B, T, D) directly — no head dimension.
-    Only touches the last quarter of D; first 3/4 pass through unchanged.
+    First half of dims passes through unchanged.
 
     Args:
         d_model:   Embedding dimension.
@@ -211,7 +212,9 @@ class EmbeddingLerp(nn.Module):
     def __init__(self, d_model: int, init_bias: float = -2.0):
         super().__init__()
         self.quarter_dim = d_model // 4
+        # Forward gate: blends with t-1
         self.gate_fwd_proj = nn.Linear(d_model, self.quarter_dim, bias=True)
+        # Backward gate: blends with t+1
         self.gate_bwd_proj = nn.Linear(d_model, self.quarter_dim, bias=True)
         nn.init.zeros_(self.gate_fwd_proj.weight)
         nn.init.constant_(self.gate_fwd_proj.bias, init_bias)
@@ -219,27 +222,32 @@ class EmbeddingLerp(nn.Module):
         nn.init.constant_(self.gate_bwd_proj.bias, init_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply acausal lerp to embeddings.
+        """Apply bidirectional lerp to embeddings.
 
         Args:
             x: (B, T, D) — token embeddings.
 
         Returns:
-            (B, T, D) with last quarter blended with t-1 and t+1.
+            (B, T, D) with 3rd quarter lerped from t-1, 4th quarter lerped from t+1.
         """
         b, t, _ = x.shape
         if t < 2:
             return x
         qd = self.quarter_dim
         g_fwd = torch.sigmoid(self.gate_fwd_proj(x))  # (B, T, qd)
-        g_bwd = torch.sigmoid(self.gate_bwd_proj(x))
+        g_bwd = torch.sigmoid(self.gate_bwd_proj(x))  # (B, T, qd)
 
-        x_static = x[:, :, :-qd]
-        x_cur = x[:, :, -qd:]
-        x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
-        x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
-        x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_next + g_bwd * x_prev
-        return torch.cat([x_static, x_mixed], dim=-1)
+        x_static = x[:, :, :-2*qd]           # first half — untouched
+        x_fwd_cur = x[:, :, -2*qd:-qd]       # 3rd quarter — forward (t-1)
+        x_bwd_cur = x[:, :, -qd:]            # 4th quarter — backward (t+1)
+
+        x_prev = F.pad(x_fwd_cur[:, :-1], (0, 0, 1, 0))
+        x_next = F.pad(x_bwd_cur[:, 1:],  (0, 0, 0, 1))
+
+        x_fwd_mixed = (1 - g_fwd) * x_fwd_cur + g_fwd * x_prev
+        x_bwd_mixed = (1 - g_bwd) * x_bwd_cur + g_bwd * x_next
+
+        return torch.cat([x_static, x_fwd_mixed, x_bwd_mixed], dim=-1)
 
 
 class KTemporalConv(nn.Module):
