@@ -478,64 +478,61 @@ LLADA_BUILDERS = {
 }
 
 
-# --- MLM (Deep Hybrid) builders ---
+# --- MLM (BERT-style) builders ---
 
 def build_mlm_mha(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with BidirectionalTransformer backbone (same as LLaDA MHA)."""
+    """Build BertMLM with BidirectionalTransformer backbone."""
     from mha import BidirectionalTransformer
-    from ulb.mlm import DeepMLM
-    max_sl = args.seq_len + args.gen_len
+    from ulb.mlm import BertMLM
     backbone = BidirectionalTransformer(
         vocab_size=vocab_size,
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_seq_len=max_sl,
+        max_seq_len=args.seq_len,
     )
-    return DeepMLM(backbone, vocab_size, args.dim)
+    return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
 
 
 def build_mlm_ulb(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with CausalULB backbone (same as LLaDA ULB)."""
+    """Build BertMLM with CausalULB backbone."""
     from ulb.transformer import CausalULB
-    from ulb.mlm import DeepMLM
-    max_sl = args.seq_len + args.gen_len
+    from ulb.mlm import BertMLM
     backbone = CausalULB(
         vocab_size=vocab_size,
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_seq_len=max_sl,
+        max_seq_len=args.seq_len,
         inner_ratio=args.inner_ratio,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
     )
-    return DeepMLM(backbone, vocab_size, args.dim)
+    return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
 
 
 def build_mlm_mha_moe(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with MoE-stacked BidirectionalMHALayer backbone (same as LLaDA MHA-MoE)."""
+    """Build BertMLM with MoE-stacked BidirectionalMHALayer backbone."""
     from mha import BidirectionalMHALayer
     from ulb.stack import MoEStackedULB
-    from ulb.mlm import DeepMLM
-    max_sl = args.seq_len + args.gen_len
+    from ulb.mlm import BertMLM
     make_layer = lambda: BidirectionalMHALayer(
-        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
     stacker = MoEStackedULB(
         make_layer=make_layer, n_layers=args.n_layers, dim=args.dim,
         n_experts=args.n_experts, top_k=args.top_k,
         version=args.moe_version, router_mode=args.moe_router_mode,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
-    return DeepMLM(backbone, vocab_size, args.dim)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
 
 
 def build_mlm_ulb_moe(vocab_size: int, args) -> nn.Module:
-    """Build DeepMLM with MoE-stacked ULBBlock backbone (same as LLaDA ULB-MoE)."""
+    """Build BertMLM with MoE-stacked ULBBlock backbone."""
     from ulb.block import ULBBlock, ULBConfig
     from ulb.stack import MoEStackedULB
-    from ulb.mlm import DeepMLM
+    from ulb.mlm import BertMLM
     config = ULBConfig(
         d_model=args.dim,
         n_heads=args.n_heads,
@@ -544,15 +541,14 @@ def build_mlm_ulb_moe(vocab_size: int, args) -> nn.Module:
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
     )
-    max_sl = args.seq_len + args.gen_len
     make_layer = lambda: ULBBlock(config)
     stacker = MoEStackedULB(
         make_layer=make_layer, n_layers=args.n_layers, dim=args.dim,
         n_experts=args.n_experts, top_k=args.top_k,
         version=args.moe_version, router_mode=args.moe_router_mode,
     )
-    backbone = StackedLM(stacker, vocab_size, args.dim, max_sl)
-    return DeepMLM(backbone, vocab_size, args.dim)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
 
 
 MLM_BUILDERS = {
@@ -785,41 +781,30 @@ def val_step_llada(model, batch: torch.Tensor):
 
 
 # ---------------------------------------------------------------------------
-# MLM (Deep Hybrid) training
+# MLM (BERT-style) training
 # ---------------------------------------------------------------------------
 
-def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
-                   prompt_len: int, output_len: int,
-                   epoch: int = 0, n_epochs: int = 1):
-    """Deep MLM training step with masking curriculum.
+def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float):
+    """BERT-style MLM training step.
 
-    Curriculum: ramp number of masked output positions from 1 to output_len
-    over the first half of training. Random positions each batch.
-    Loss computed on masked positions only.
+    Masks ~15% of positions randomly across the whole sequence.
+    CE loss on masked positions only.
     """
-    prompt = batch[:, :prompt_len]
-    target = batch[:, prompt_len:]
-    B = prompt.shape[0]
-    G = output_len
+    B, T = batch.shape
     device = batch.device
 
-    # Curriculum: linear ramp from 1 to G over first half of epochs
-    ramp_end = max(n_epochs // 2, 1)
-    progress = min(epoch / ramp_end, 1.0)
-    n_masked = max(1, int(progress * G + 0.5))
+    # Random mask: each position independently masked with mask_prob
+    mask = torch.rand(B, T, device=device) < model.mask_prob
+    # Ensure at least one masked position per sample
+    if not mask.any():
+        mask[0, 0] = True
 
-    # Random mask: pick n_masked positions per sample
-    rand_scores = torch.rand(B, G, device=device)
-    _, mask_idx = rand_scores.topk(n_masked, dim=-1)
-    mask = torch.zeros(B, G, dtype=torch.bool, device=device)
-    mask.scatter_(1, mask_idx, True)
-
-    logits = model(prompt, target, mask)  # (B, G, vocab)
+    logits = model(batch, mask)  # (B, T, vocab)
 
     # Loss only on masked positions
     loss = F.cross_entropy(
         logits[mask].reshape(-1, logits.shape[-1]),
-        target[mask].reshape(-1),
+        batch[mask].reshape(-1),
     ) + _get_aux_loss(model)
 
     optimizer.zero_grad()
@@ -829,27 +814,32 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
 
     with torch.no_grad():
         preds = logits.argmax(dim=-1)
-        correct = (preds == target) & mask
+        correct = (preds == batch) & mask
         acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
     return loss.item(), acc
 
 
 @torch.no_grad()
-def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
-    """Deep MLM validation step — all positions masked (hardest case)."""
-    prompt = batch[:, :prompt_len]
-    target = batch[:, prompt_len:]
+def val_step_mlm(model, batch: torch.Tensor):
+    """BERT-style MLM validation — same 15% masking as training."""
+    B, T = batch.shape
+    device = batch.device
 
-    logits = model(prompt, target)  # mask=None → all masked
+    mask = torch.rand(B, T, device=device) < model.mask_prob
+    if not mask.any():
+        mask[0, 0] = True
+
+    logits = model(batch, mask)
 
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        target.reshape(-1),
+        logits[mask].reshape(-1, logits.shape[-1]),
+        batch[mask].reshape(-1),
     ).item()
 
     preds = logits.argmax(dim=-1)
-    acc = (preds == target).float().mean().item()
+    correct = (preds == batch) & mask
+    acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
     return loss, acc
 
@@ -857,10 +847,13 @@ def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
 @torch.no_grad()
 def generate_mlm(model, prompt_text: str, gen_len: int,
                  device: torch.device) -> str:
-    """Deep MLM generation — single forward pass.
+    """BERT-style MLM generation.
+
+    Takes a prompt, appends gen_len mask tokens, does a single forward pass,
+    and takes argmax at the masked positions.
 
     Args:
-        model: DeepMLM model.
+        model: BertMLM model.
         prompt_text: Text prompt.
         gen_len: Number of tokens to generate.
         device: Torch device.
@@ -877,11 +870,18 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
         prompt_ids = prompt_ids[-(max_T - gen_len):]
         P = prompt_ids.shape[0]
 
-    # Dummy target ids (model ignores them — all positions are masked)
-    dummy_target = torch.zeros(1, gen_len, dtype=torch.long, device=device)
+    T = P + gen_len
 
-    logits = model(prompt_ids.unsqueeze(0), dummy_target)
-    output_ids = logits.argmax(dim=-1)[0]  # (gen_len,)
+    # Build input: prompt tokens + dummy tokens for generation region
+    token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
+    token_ids[0, :P] = prompt_ids
+
+    # Mask: prompt unmasked, generation region masked
+    mask = torch.zeros(1, T, dtype=torch.bool, device=device)
+    mask[0, P:] = True
+
+    logits = model(token_ids, mask)  # (1, T, vocab)
+    output_ids = logits[0, P:].argmax(dim=-1)  # (gen_len,)
 
     return decode(output_ids)
 
@@ -1067,9 +1067,7 @@ def train(args):
     is_llada = args.mode == 'llada'
     is_mlm = args.mode == 'mlm'
 
-    # MLM: seq_len is derived from prompt_len + output_len
-    if is_mlm:
-        args.seq_len = args.prompt_len + args.output_len
+    # MLM: uses seq_len directly (flat sequence, no prompt/output split)
 
     # Data
     text = load_shakespeare()
@@ -1110,8 +1108,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  prompt_len={args.prompt_len}, output_len={args.output_len}")
-        print(f"  n_layers={args.n_layers} (each layer predicts + re-embeds)")
+        print(f"  mask_prob={args.mask_prob}")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1170,13 +1167,12 @@ def train(args):
     best_val_loss = float('inf')
     best_ckpt_path = save_dir / 'best_model.pt'
 
-    # Diffusion / MLM -specific
-    if is_diffusion or is_mlm:
+    # Diffusion-specific
+    if is_diffusion:
         prompt_len = args.prompt_len
         output_len = args.output_len
-        if is_diffusion:
-            assert prompt_len + output_len == args.seq_len, \
-                f"prompt_len ({prompt_len}) + output_len ({output_len}) must equal seq_len ({args.seq_len})"
+        assert prompt_len + output_len == args.seq_len, \
+            f"prompt_len ({prompt_len}) + output_len ({output_len}) must equal seq_len ({args.seq_len})"
 
     # Find the inner routing module for noise annealing and hops tracking.
     # For StackedLM wrapping PoolOfExperts: model.stacker
@@ -1209,9 +1205,7 @@ def train(args):
             batch = train_ds.sample_batch(args.batch_size, device)
 
             if is_mlm:
-                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
-                                           prompt_len, output_len,
-                                           epoch=epoch - 1, n_epochs=args.epochs)
+                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
@@ -1241,7 +1235,7 @@ def train(args):
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
             if is_mlm:
-                vl, va = val_step_mlm(model, batch, prompt_len, output_len)
+                vl, va = val_step_mlm(model, batch)
             elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
@@ -1355,6 +1349,8 @@ def interactive_generate(args):
         max_prompt = saved_args.seq_len - 1
     elif mode == 'llada':
         max_prompt = saved_args.seq_len  # model has room for seq_len + gen_len
+    elif mode == 'mlm':
+        max_prompt = saved_args.seq_len - 1  # need room for at least 1 generated token
     else:
         max_prompt = saved_args.prompt_len
 
@@ -1402,7 +1398,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature (AR)')
     parser.add_argument('--gen-len', type=int, default=256, help='Generation length')
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada', 'mlm'],
-                        help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (deep hybrid)')
+                        help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (BERT-style)')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
                         help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-diffusion-poe')
 
@@ -1449,6 +1445,10 @@ def main():
     parser.add_argument('--prompt-len', type=int, default=64, help='Prompt length (diffusion)')
     parser.add_argument('--output-len', type=int, default=16, help='Output length (diffusion)')
     parser.add_argument('--local-window', type=int, default=16, help='Local attention window (diffusion PoE)')
+
+    # MLM (BERT-style)
+    parser.add_argument('--mask-prob', type=float, default=0.40,
+                        help='Mask probability per token (MLM, default 0.40)')
 
     # LLaDA enhancements
     parser.add_argument('--time-cond', action='store_true', default=False,
@@ -1505,8 +1505,10 @@ def main():
         "KING:\nOnce more unto the breach, dear friends,\n",
     ]
 
-    if args.mode in ('diffusion', 'mlm'):
+    if args.mode == 'diffusion':
         gen_len = args.output_len
+    elif args.mode == 'mlm':
+        gen_len = args.gen_len
     elif args.mode == 'llada':
         gen_len = args.gen_len
     else:
@@ -1518,6 +1520,8 @@ def main():
             max_prompt = args.seq_len - 1
         elif args.mode == 'llada':
             max_prompt = args.seq_len  # model has room for seq_len + gen_len
+        elif args.mode == 'mlm':
+            max_prompt = args.seq_len - 1
         else:
             max_prompt = args.prompt_len
         prompt_text = prompt[-max_prompt:]
