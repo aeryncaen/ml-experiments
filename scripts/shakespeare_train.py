@@ -782,10 +782,10 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     target = batch[:, prompt_len:]
     B = prompt.shape[0]
 
-    accum = model(prompt, target)  # (B, output_len, vocab) accumulated logits
+    logits = model(prompt, target)  # (B, output_len, vocab)
 
     loss = F.cross_entropy(
-        accum.reshape(-1, accum.shape[-1]),
+        logits.reshape(-1, logits.shape[-1]),
         target.reshape(-1),
     ) + _get_aux_loss(model)
 
@@ -795,7 +795,7 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     optimizer.step()
 
     with torch.no_grad():
-        preds = accum.argmax(dim=-1)
+        preds = logits.argmax(dim=-1)
         acc = (preds == target).float().mean().item()
 
     return loss.item(), acc
@@ -807,14 +807,14 @@ def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
     prompt = batch[:, :prompt_len]
     target = batch[:, prompt_len:]
 
-    accum = model(prompt, target)
+    logits = model(prompt, target)
 
     loss = F.cross_entropy(
-        accum.reshape(-1, accum.shape[-1]),
+        logits.reshape(-1, logits.shape[-1]),
         target.reshape(-1),
     ).item()
 
-    preds = accum.argmax(dim=-1)
+    preds = logits.argmax(dim=-1)
     acc = (preds == target).float().mean().item()
 
     return loss, acc
@@ -846,8 +846,8 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     # Dummy target ids (model ignores them — all positions are masked)
     dummy_target = torch.zeros(1, gen_len, dtype=torch.long, device=device)
 
-    accum = model(prompt_ids.unsqueeze(0), dummy_target)
-    output_ids = accum.argmax(dim=-1)[0]  # (gen_len,)
+    logits = model(prompt_ids.unsqueeze(0), dummy_target)
+    output_ids = logits.argmax(dim=-1)[0]  # (gen_len,)
 
     return decode(output_ids)
 

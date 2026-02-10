@@ -93,30 +93,26 @@ class DeepMLM(nn.Module):
 
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, P+G, D)
 
-        # Accumulated logits (logit residual stream)
-        accum = torch.zeros(B, G, self.vocab_size, device=device)
         aux = 0.0
 
         for norm, layer in zip(self.norms, self.layers):
             x = x + layer(norm(x))
             aux = aux + getattr(layer, 'aux_loss', 0.0)
 
-            # Predict at output positions and accumulate logits
+            # Predict at output positions
             out_logits = self.output_head(x[:, P:])  # (B, G, vocab)
-            accum = accum + out_logits
 
-            # Re-embed from accumulated predictions
-            pred_ids = accum.detach().argmax(dim=-1)  # (B, G)
+            # Re-embed from this layer's predictions
+            pred_ids = out_logits.detach().argmax(dim=-1)  # (B, G)
             new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
             x = torch.cat([x[:, :P], new_embeds], dim=1)
 
-        # Final layer prediction — accumulate and return
+        # Final prediction
         x = self.final_norm(x)
-        final_logits = self.output_head(x[:, P:])  # (B, G, vocab)
-        accum = accum + final_logits
+        logits = self.output_head(x[:, P:])  # (B, G, vocab)
 
         self.aux_loss = aux
-        return accum
+        return logits
 
 
 class DeepMLMMoE(nn.Module):
@@ -190,8 +186,6 @@ class DeepMLMMoE(nn.Module):
         output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + self.pos_embed(output_positions)
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, T, D)
 
-        # Accumulated logits (logit residual stream)
-        accum = torch.zeros(B, G, self.vocab_size, device=device)
         total_aux = 0.0
 
         # Stem layer (non-routed)
@@ -224,12 +218,11 @@ class DeepMLMMoE(nn.Module):
                 x = x + out
                 layer_outputs.append(x)
 
-                # Predict at output positions and accumulate logits
+                # Predict at output positions
                 out_logits = self.output_head(x[:, P:])
-                accum = accum + out_logits
 
-                # Re-embed from accumulated predictions
-                pred_ids = accum.detach().argmax(dim=-1)
+                # Re-embed from this layer's predictions
+                pred_ids = out_logits.detach().argmax(dim=-1)
                 new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
                 x = torch.cat([x[:, :P], new_embeds], dim=1)
                 layer_outputs[-1] = x
@@ -267,12 +260,11 @@ class DeepMLMMoE(nn.Module):
                 layer_outputs.append(x)
                 route_signal = x.mean(dim=1)
 
-                # Predict at output positions and accumulate logits
+                # Predict at output positions
                 out_logits = self.output_head(x[:, P:])
-                accum = accum + out_logits
 
-                # Re-embed from accumulated predictions
-                pred_ids = accum.detach().argmax(dim=-1)
+                # Re-embed from this layer's predictions
+                pred_ids = out_logits.detach().argmax(dim=-1)
                 new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
                 x = torch.cat([x[:, :P], new_embeds], dim=1)
                 layer_outputs[-1] = x
@@ -281,11 +273,10 @@ class DeepMLMMoE(nn.Module):
             w = F.softmax(stk.layer_weights, dim=0)
             x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
 
-        # Final norm + predict — accumulate and return
+        # Final prediction
         x = stk.final_norm(x)
-        final_logits = self.output_head(x[:, P:])
-        accum = accum + final_logits
+        logits = self.output_head(x[:, P:])
 
         self.aux_loss = total_aux
         stk.aux_loss = total_aux
-        return accum
+        return logits
