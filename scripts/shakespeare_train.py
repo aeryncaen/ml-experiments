@@ -1111,7 +1111,7 @@ def main():
                         help='MoE routing mode: topk or relu (ReMoE)')
 
     # PoE-specific
-    parser.add_argument('--pool-size', type=int, default=4, help='Expert pool size (PoE)')
+    parser.add_argument('--pool-size', type=int, default=None, help='Expert pool size (PoE, default=n_layers)')
     parser.add_argument('--max-hops', type=int, default=None, help='Max routing depth (PoE)')
     parser.add_argument('--router-mode', type=str, default='single',
                         choices=['squared', 'single', 'half'],
@@ -1150,6 +1150,10 @@ def main():
                         help='torch.compile mode')
 
     args = parser.parse_args()
+
+    # Default pool_size to n_layers if not set
+    if args.pool_size is None:
+        args.pool_size = args.n_layers
 
     # --generate mode: load checkpoint and run interactive prompt loop
     if args.generate:
