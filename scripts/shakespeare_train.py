@@ -418,15 +418,53 @@ def generate_diffusion(model, prompt_text: str, gen_len: int,
     return decode(output_ids[0])
 
 
+def _add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Gumbel noise for categorical sampling (per LLaDA reference).
+
+    Uses float64 for precision — low-precision Gumbel Max improves perplexity
+    but reduces generation quality (arXiv:2409.02908).
+    """
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    return logits.exp() / ((-torch.log(noise)) ** temperature)
+
+
+def _get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
+    """Precompute how many tokens to unmask at each step.
+
+    Distributes total masked tokens evenly across steps, with remainder
+    going to the first steps (so every token is accounted for).
+    """
+    mask_num = mask_index.sum(dim=1, keepdim=True)  # (B, 1)
+    base = mask_num // steps
+    remainder = mask_num % steps
+    num_transfer = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
+    for i in range(mask_num.size(0)):
+        num_transfer[i, :remainder[i]] += 1
+    return num_transfer
+
+
 @torch.no_grad()
 def generate_llada(model, prompt_text: str, gen_len: int,
-                   device: torch.device, n_steps: int = 64) -> str:
-    """LLaDA generation — iterative demasking with low-confidence remasking.
+                   device: torch.device, n_steps: int = 64,
+                   temperature: float = 0.0,
+                   remasking: str = 'low_confidence') -> str:
+    """LLaDA generation — matches reference implementation (GSAI-ML/LLaDA).
 
-    Following Algorithm 5 from the paper:
-    - Start with prompt (unmasked) + gen_len masked tokens
-    - At each step: predict all masked tokens, keep the most confident,
-      remask the least confident s/t fraction
+    Iterative demasking: at each step, predict all masked tokens, then
+    permanently unmask the most confident ones. Supports Gumbel noise
+    sampling and low_confidence or random remasking.
+
+    Args:
+        model: LLaDAModel.
+        prompt_text: Text prompt.
+        gen_len: Number of tokens to generate.
+        device: Torch device.
+        n_steps: Number of demasking steps (must be <= gen_len).
+        temperature: Gumbel noise temperature (0 = greedy).
+        remasking: 'low_confidence' or 'random'.
     """
     model.eval()
 
@@ -437,59 +475,54 @@ def generate_llada(model, prompt_text: str, gen_len: int,
     # Truncate prompt if needed
     max_T = model.max_seq_len
     if T > max_T:
-        # Keep as much prompt as possible
         prompt_ids = prompt_ids[-(max_T - gen_len):]
         P = prompt_ids.shape[0]
         T = P + gen_len
 
-    # Build initial sequence: prompt (unmasked) + gen_len tokens (masked)
-    token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
-    token_ids[0, :P] = prompt_ids
+    # Build initial sequence: prompt (unmasked) + gen_len masked tokens
+    # Use token 0 as placeholder for masked positions
+    x = torch.zeros(1, T, dtype=torch.long, device=device)
+    x[0, :P] = prompt_ids
     mask = torch.zeros(1, T, dtype=torch.bool, device=device)
-    mask[0, P:] = True  # only response positions are masked
+    mask[0, P:] = True
+
+    # Precompute how many tokens to unmask per step
+    num_transfer_tokens = _get_num_transfer_tokens(mask[:, P:], n_steps)  # (1, n_steps)
 
     for step in range(n_steps):
-        logits = model(token_ids, mask)  # (1, T, vocab_size)
+        mask_index = mask.clone()
 
-        # Greedy prediction for masked positions
-        pred_ids = logits.argmax(dim=-1)  # (1, T)
-        # Confidence = max probability for each position
-        probs = F.softmax(logits, dim=-1)
-        confidence = probs.max(dim=-1).values  # (1, T)
+        logits = model(x, mask)  # (1, T, vocab_size)
 
-        # Fill in predictions for currently masked positions
-        token_ids = torch.where(mask, pred_ids, token_ids)
+        # Token selection: greedy or Gumbel noise
+        logits_with_noise = _add_gumbel_noise(logits, temperature=temperature)
+        x0 = torch.argmax(logits_with_noise, dim=-1)  # (1, T)
 
-        # How many should remain masked at next timestep?
-        n_masked = mask.sum().item()
-        if n_masked == 0:
-            break
-
-        t = 1.0 - step / n_steps
-        s = 1.0 - (step + 1) / n_steps
-        if s <= 0 or step == n_steps - 1:
-            # Final step — unmask everything
-            mask = torch.zeros_like(mask)
+        # Confidence of chosen tokens
+        if remasking == 'low_confidence':
+            p = F.softmax(logits.float(), dim=-1)
+            x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (1, T)
+        elif remasking == 'random':
+            x0_p = torch.rand(1, T, device=device)
         else:
-            # Low-confidence remasking: remask s/t fraction of currently masked
-            n_to_keep_masked = max(0, int(gen_len * s))
-            if n_to_keep_masked == 0:
-                mask = torch.zeros_like(mask)
-            else:
-                # Only consider response positions for remasking
-                conf = confidence.clone()
-                conf[0, :P] = float('inf')  # never remask prompt
-                conf[~mask] = float('inf')  # don't remask already-unmasked
+            raise ValueError(f"Unknown remasking strategy: {remasking}")
 
-                # Remask the n_to_keep_masked positions with lowest confidence
-                _, sorted_idx = conf.sort(dim=-1)
-                new_mask = torch.zeros_like(mask)
-                new_mask.scatter_(1, sorted_idx[:, :n_to_keep_masked], True)
-                # Don't remask prompt
-                new_mask[0, :P] = False
-                mask = new_mask
+        # Only update masked positions
+        x0 = torch.where(mask_index, x0, x)
+        confidence = torch.where(mask_index, x0_p, -float('inf'))
 
-    return decode(token_ids[0, P:])
+        # Transfer the top-k most confident masked tokens (permanently unmask)
+        transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+        for j in range(confidence.shape[0]):
+            k = num_transfer_tokens[j, step].item()
+            if k > 0:
+                _, select_index = torch.topk(confidence[j], k=k)
+                transfer_index[j, select_index] = True
+        x[transfer_index] = x0[transfer_index]
+        # Update mask: transferred tokens are no longer masked
+        mask = mask & ~transfer_index
+
+    return decode(x[0, P:])
 
 
 # ---------------------------------------------------------------------------
