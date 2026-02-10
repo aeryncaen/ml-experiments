@@ -61,9 +61,13 @@ class DeepMLM(nn.Module):
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
 
-        # Per-layer mask gate: projects hidden state to 2 logits (mask, unmask)
+        # Only the second half of layers do diffusion
+        self.n_encoder = n_layers // 2
+        self.n_diffusion = n_layers - self.n_encoder
+
+        # Per-diffusion-layer mask gate: projects hidden state to 2 logits (mask, unmask)
         self.mask_gates = nn.ModuleList([
-            nn.Linear(dim, 2) for _ in range(n_layers)
+            nn.Linear(dim, 2) for _ in range(self.n_diffusion)
         ])
 
         # Embeddings
@@ -105,8 +109,15 @@ class DeepMLM(nn.Module):
         x = torch.cat([prompt_x, mask_x], dim=1)  # (B, P+G, D)
 
         aux = 0.0
+        ne = self.n_encoder
 
-        for norm, layer, gate in zip(self.norms, self.layers, self.mask_gates):
+        # First half: normal encoder layers (no predict/re-embed)
+        for norm, layer in zip(self.norms[:ne], self.layers[:ne]):
+            x = x + layer(norm(x))
+            aux = aux + getattr(layer, 'aux_loss', 0.0)
+
+        # Second half: diffusion layers with gumbel-softmax gating
+        for norm, layer, gate in zip(self.norms[ne:], self.layers[ne:], self.mask_gates):
             x = x + layer(norm(x))
             aux = aux + getattr(layer, 'aux_loss', 0.0)
 
@@ -180,10 +191,13 @@ class DeepMLMMoE(nn.Module):
             router_mode=router_mode,
         )
 
-        # Per-layer mask gates (applied after MoE merge)
-        # +1 for stem layer
+        # Only the second half of MoE layers do diffusion (stem is always encoder)
+        self.n_encoder = n_layers // 2
+        self.n_diffusion = n_layers - self.n_encoder
+
+        # Per-diffusion-layer mask gates
         self.mask_gates = nn.ModuleList([
-            nn.Linear(dim, 2) for _ in range(n_layers + 1)
+            nn.Linear(dim, 2) for _ in range(self.n_diffusion)
         ])
 
         # Embeddings
@@ -233,9 +247,10 @@ class DeepMLMMoE(nn.Module):
 
         total_aux = 0.0
 
-        # Stem layer (non-routed) + gate
+        ne = self.n_encoder
+
+        # Stem layer (non-routed, always encoder — no gate)
         x = x + stk.stem_layer(stk.stem_norm(x))
-        x = self._gate_and_reembed(x, P, G, self.mask_gates[0], pos_embeds, B)
 
         layer_outputs = [x]
 
@@ -263,9 +278,10 @@ class DeepMLMMoE(nn.Module):
                 x = x + out
                 layer_outputs.append(x)
 
-                # Gate and re-embed
-                x = self._gate_and_reembed(x, P, G, self.mask_gates[l + 1], pos_embeds, B)
-                layer_outputs[-1] = x
+                # Only diffusion layers get gated re-embed
+                if l >= ne:
+                    x = self._gate_and_reembed(x, P, G, self.mask_gates[l - ne], pos_embeds, B)
+                    layer_outputs[-1] = x
 
             # Learned layer weighting
             w = F.softmax(stk.layer_weights, dim=0)
@@ -300,9 +316,10 @@ class DeepMLMMoE(nn.Module):
                 layer_outputs.append(x)
                 route_signal = x.mean(dim=1)
 
-                # Gate and re-embed
-                x = self._gate_and_reembed(x, P, G, self.mask_gates[l + 1], pos_embeds, B)
-                layer_outputs[-1] = x
+                # Only diffusion layers get gated re-embed
+                if l >= ne:
+                    x = self._gate_and_reembed(x, P, G, self.mask_gates[l - ne], pos_embeds, B)
+                    layer_outputs[-1] = x
 
             # Learned layer weighting
             w = F.softmax(stk.layer_weights, dim=0)
