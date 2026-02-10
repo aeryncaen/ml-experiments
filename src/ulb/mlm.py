@@ -1,21 +1,21 @@
 """DeepMLM — Deep Hybrid Masked Language Model.
 
 No noise schedule, no diffusion. Every layer predicts tokens at masked
-(output) positions, re-embeds predictions back into the hidden state,
-and tracks confidence. Single-pass generation.
+(output) positions, accumulates logits into a secondary residual stream,
+and re-embeds the current best predictions. Single-pass generation.
 
 Architecture:
-    [prompt_tokens | MASK * gen_len] → embed → layer loop → final logits
+    [prompt_tokens | MASK * gen_len] → embed → layer loop → accumulated logits
 
 Each layer:
     1. Pre-norm residual: x = x + layer(norm(x))
     2. Predict logits at output positions via shared output head
-    3. Track confidence (max softmax prob across layers)
-    4. Re-embed: replace output hidden states with token_embed(argmax) + pos_embed
-       (full replace — next layer sees predicted tokens, not mask embeddings)
+    3. Accumulate logits: accum = accum + layer_logits
+    4. Re-embed: replace output hidden states with token_embed(argmax(accum)) + pos_embed
+       (full replace — next layer sees current best predictions)
 
-Training: CE loss on final layer logits vs ground-truth output tokens.
-Generation: Single forward pass, decode argmax of final logits.
+Training: CE loss on accumulated logits vs ground-truth output tokens.
+Generation: Single forward pass, decode argmax of accumulated logits.
 """
 
 from typing import Callable, Literal
@@ -65,7 +65,7 @@ class DeepMLM(nn.Module):
         self.aux_loss = 0.0
 
     def forward(self, prompt_ids: torch.Tensor,
-                target_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                target_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
@@ -75,8 +75,9 @@ class DeepMLM(nn.Module):
                         ignores them since all output positions are masked.
 
         Returns:
-            logits: (B, G, vocab_size) final predictions for output positions.
-            confidence: (B, G) max softmax confidence across all layers.
+            accum: (B, G, vocab_size) accumulated softmax distribution across
+                   all layers. This IS the prediction — argmax for token ids,
+                   log for loss computation.
         """
         B, P = prompt_ids.shape
         G = target_ids.shape[1]
@@ -92,37 +93,30 @@ class DeepMLM(nn.Module):
 
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, P+G, D)
 
-        confidence = torch.zeros(B, G, device=device)
+        # Accumulated logits (logit residual stream)
+        accum = torch.zeros(B, G, self.vocab_size, device=device)
         aux = 0.0
 
         for norm, layer in zip(self.norms, self.layers):
             x = x + layer(norm(x))
             aux = aux + getattr(layer, 'aux_loss', 0.0)
 
-            # Predict at output positions
+            # Predict at output positions and accumulate logits
             out_logits = self.output_head(x[:, P:])  # (B, G, vocab)
+            accum = accum + out_logits
 
-            # Track confidence
-            with torch.no_grad():
-                conf = F.softmax(out_logits, dim=-1).max(dim=-1).values  # (B, G)
-                confidence = torch.max(confidence, conf)
-
-            # Re-embed: full replace at output positions
-            # Detach argmax — gradients flow through residual stream, not re-embedding
-            pred_ids = out_logits.detach().argmax(dim=-1)  # (B, G)
+            # Re-embed from accumulated predictions
+            pred_ids = accum.detach().argmax(dim=-1)  # (B, G)
             new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
             x = torch.cat([x[:, :P], new_embeds], dim=1)
 
-        # Final prediction
+        # Final layer prediction — accumulate and return
         x = self.final_norm(x)
         final_logits = self.output_head(x[:, P:])  # (B, G, vocab)
-
-        with torch.no_grad():
-            conf = F.softmax(final_logits, dim=-1).max(dim=-1).values
-            confidence = torch.max(confidence, conf)
+        accum = accum + final_logits
 
         self.aux_loss = aux
-        return final_logits, confidence
+        return accum
 
 
 class DeepMLMMoE(nn.Module):
@@ -181,7 +175,7 @@ class DeepMLMMoE(nn.Module):
         self.aux_loss = 0.0
 
     def forward(self, prompt_ids: torch.Tensor,
-                target_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                target_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass with MoE routing and per-layer predict/re-embed."""
         B, P = prompt_ids.shape
         G = target_ids.shape[1]
@@ -196,7 +190,8 @@ class DeepMLMMoE(nn.Module):
         output_x = self.mask_embed.unsqueeze(0).expand(B, G, -1) + self.pos_embed(output_positions)
         x = torch.cat([prompt_x, output_x], dim=1)  # (B, T, D)
 
-        confidence = torch.zeros(B, G, device=device)
+        # Accumulated logits (logit residual stream)
+        accum = torch.zeros(B, G, self.vocab_size, device=device)
         total_aux = 0.0
 
         # Stem layer (non-routed)
@@ -229,18 +224,14 @@ class DeepMLMMoE(nn.Module):
                 x = x + out
                 layer_outputs.append(x)
 
-                # Predict at output positions
+                # Predict at output positions and accumulate logits
                 out_logits = self.output_head(x[:, P:])
+                accum = accum + out_logits
 
-                with torch.no_grad():
-                    conf = F.softmax(out_logits, dim=-1).max(dim=-1).values
-                    confidence = torch.max(confidence, conf)
-
-                # Re-embed
-                pred_ids = out_logits.detach().argmax(dim=-1)
+                # Re-embed from accumulated predictions
+                pred_ids = accum.detach().argmax(dim=-1)
                 new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
                 x = torch.cat([x[:, :P], new_embeds], dim=1)
-                # Update layer_outputs[-1] to reflect re-embedded state
                 layer_outputs[-1] = x
 
             # Learned layer weighting
@@ -276,15 +267,12 @@ class DeepMLMMoE(nn.Module):
                 layer_outputs.append(x)
                 route_signal = x.mean(dim=1)
 
-                # Predict at output positions
+                # Predict at output positions and accumulate logits
                 out_logits = self.output_head(x[:, P:])
+                accum = accum + out_logits
 
-                with torch.no_grad():
-                    conf = F.softmax(out_logits, dim=-1).max(dim=-1).values
-                    confidence = torch.max(confidence, conf)
-
-                # Re-embed
-                pred_ids = out_logits.detach().argmax(dim=-1)
+                # Re-embed from accumulated predictions
+                pred_ids = accum.detach().argmax(dim=-1)
                 new_embeds = self.token_embed(pred_ids) + self.pos_embed(output_positions)
                 x = torch.cat([x[:, :P], new_embeds], dim=1)
                 layer_outputs[-1] = x
@@ -293,14 +281,11 @@ class DeepMLMMoE(nn.Module):
             w = F.softmax(stk.layer_weights, dim=0)
             x = sum(w[i] * layer_outputs[i] for i in range(len(layer_outputs)))
 
-        # Final norm + predict
+        # Final norm + predict — accumulate and return
         x = stk.final_norm(x)
         final_logits = self.output_head(x[:, P:])
-
-        with torch.no_grad():
-            conf = F.softmax(final_logits, dim=-1).max(dim=-1).values
-            confidence = torch.max(confidence, conf)
+        accum = accum + final_logits
 
         self.aux_loss = total_aux
         stk.aux_loss = total_aux
-        return final_logits, confidence
+        return accum

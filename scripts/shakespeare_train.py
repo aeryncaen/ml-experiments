@@ -507,9 +507,42 @@ def build_mlm_ulb(vocab_size: int, args) -> nn.Module:
     return DeepMLM(make_layer, args.n_layers, vocab_size, args.dim, max_sl)
 
 
+def build_mlm_mha_moe(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLMMoE with BidirectionalMHALayer experts."""
+    from mha import BidirectionalMHALayer
+    from ulb.mlm import DeepMLMMoE
+    max_sl = args.seq_len + args.gen_len
+    make_layer = lambda: BidirectionalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+    return DeepMLMMoE(make_layer, args.n_layers, vocab_size, args.dim, max_sl,
+                      n_experts=args.n_experts, top_k=args.top_k,
+                      version=args.moe_version, router_mode=args.moe_router_mode)
+
+
+def build_mlm_ulb_moe(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLMMoE with ULBBlock experts."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.mlm import DeepMLMMoE
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    max_sl = args.seq_len + args.gen_len
+    make_layer = lambda: ULBBlock(config)
+    return DeepMLMMoE(make_layer, args.n_layers, vocab_size, args.dim, max_sl,
+                      n_experts=args.n_experts, top_k=args.top_k,
+                      version=args.moe_version, router_mode=args.moe_router_mode)
+
+
 MLM_BUILDERS = {
     'mha': build_mlm_mha,
     'ulb': build_mlm_ulb,
+    'mha-moe': build_mlm_mha_moe,
+    'ulb-moe': build_mlm_ulb_moe,
 }
 
 
@@ -749,10 +782,10 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     target = batch[:, prompt_len:]
     B = prompt.shape[0]
 
-    logits, _ = model(prompt, target)  # (B, output_len, vocab)
+    accum = model(prompt, target)  # (B, output_len, vocab) accumulated logits
 
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
+        accum.reshape(-1, accum.shape[-1]),
         target.reshape(-1),
     ) + _get_aux_loss(model)
 
@@ -762,7 +795,7 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     optimizer.step()
 
     with torch.no_grad():
-        preds = logits.argmax(dim=-1)
+        preds = accum.argmax(dim=-1)
         acc = (preds == target).float().mean().item()
 
     return loss.item(), acc
@@ -774,14 +807,14 @@ def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
     prompt = batch[:, :prompt_len]
     target = batch[:, prompt_len:]
 
-    logits, _ = model(prompt, target)
+    accum = model(prompt, target)
 
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
+        accum.reshape(-1, accum.shape[-1]),
         target.reshape(-1),
     ).item()
 
-    preds = logits.argmax(dim=-1)
+    preds = accum.argmax(dim=-1)
     acc = (preds == target).float().mean().item()
 
     return loss, acc
@@ -813,8 +846,8 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     # Dummy target ids (model ignores them — all positions are masked)
     dummy_target = torch.zeros(1, gen_len, dtype=torch.long, device=device)
 
-    logits, confidence = model(prompt_ids.unsqueeze(0), dummy_target)
-    output_ids = logits.argmax(dim=-1)[0]  # (gen_len,)
+    accum = model(prompt_ids.unsqueeze(0), dummy_target)
+    output_ids = accum.argmax(dim=-1)[0]  # (gen_len,)
 
     return decode(output_ids)
 
