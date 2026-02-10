@@ -13,7 +13,7 @@ Usage:
     # python scripts/shakespeare_train.py --mode diffusion --arch mha ...
 """
 
-import sys, argparse, os
+import sys, argparse, math, os
 from pathlib import Path
 
 import torch
@@ -856,7 +856,18 @@ def train(args):
         model = torch.compile(model, mode=args.compile_mode)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # LR schedule: linear warmup (1 epoch, from lr/10) then cosine decay to lr/20
+    warmup_steps = args.steps_per_epoch  # 1 epoch warmup
+    total_steps = args.steps_per_epoch * args.epochs
+    warmup_ratio = 0.1    # start at lr * 0.1
+    min_ratio = 0.05      # decay to lr * 0.05
+    def lr_schedule(step):
+        if step < warmup_steps:
+            return warmup_ratio + (1.0 - warmup_ratio) * step / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
     save_dir = Path(args.save_dir) if args.save_dir else Path(f'out/shakespeare_{args.arch}_{args.mode}')
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -908,10 +919,10 @@ def train(args):
             else:
                 loss, acc = train_step_ar(model, batch, optimizer, args.grad_clip)
 
+            scheduler.step()
             epoch_loss += loss
             epoch_acc += acc
 
-        scheduler.step()
         avg_loss = epoch_loss / args.steps_per_epoch
         avg_acc = epoch_acc / args.steps_per_epoch
 
