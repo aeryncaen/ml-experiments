@@ -289,56 +289,57 @@ def val_step_diffusion(model, batch: torch.Tensor, prompt_len: int, output_len: 
 def train_step_llada(model, batch: torch.Tensor, optimizer, grad_clip: float):
     """LLaDA masked diffusion training step.
 
-    Per the paper (Eq. 3): mask each token independently with probability t ~ U(0,1),
-    CE loss only on masked positions, weighted by 1/t.
-
-    batch is (B, T) tokens — the full sequence is both input and target.
+    Matches GSAI-ML/LLaDA GUIDELINES.md:
+    - t ~ U(0,1) per sample, p_mask = (1-eps)*t + eps
+    - mask each token independently with probability p_mask
+    - CE on masked tokens, each divided by its p_mask
+    - sum all, normalize by B*T
     """
     B, T = batch.shape
+    eps = 1e-3
 
-    # Random mask ratio t ~ U(0.01, 1.0) per sample (avoid t=0)
-    t = 0.01 + 0.99 * torch.rand(B, 1, device=batch.device)  # (B, 1)
-    mask = torch.rand(B, T, device=batch.device) < t  # (B, T) bool
-    # Ensure at least one token is masked per sample
-    force_idx = torch.randint(0, T, (B,), device=batch.device)
-    mask[torch.arange(B, device=batch.device), force_idx] = True
+    # p_mask per sample: ranges from eps to 1.0
+    t = torch.rand(B, device=batch.device)
+    p_mask = (1 - eps) * t + eps  # (B,)
+    p_mask_expanded = p_mask[:, None].expand(B, T)  # (B, T)
+
+    # Independent per-token masking
+    mask = torch.rand(B, T, device=batch.device) < p_mask_expanded  # (B, T) bool
 
     logits = model(batch, mask)  # (B, T, vocab_size)
 
-    # CE loss only on masked positions, weighted by 1/t
+    # CE on masked tokens, each weighted by 1/p_mask, normalized by B*T
     per_token_loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         batch.reshape(-1),
         reduction='none'
     ).reshape(B, T)
 
-    masked_loss = per_token_loss * mask.float()
-    per_sample_loss = masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-    weighted_loss = (per_sample_loss / t.squeeze(-1)).mean()
+    # 1/p_mask weighting per token, only on masked positions
+    token_loss = per_token_loss[mask] / p_mask_expanded[mask]
+    loss = token_loss.sum() / (B * T)
 
     optimizer.zero_grad()
-    weighted_loss.backward()
+    loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
 
     with torch.no_grad():
-        unweighted_loss = per_sample_loss.mean().item()
+        avg_loss = (per_token_loss[mask].sum() / mask.sum()).item() if mask.any() else 0.0
         preds = logits.argmax(dim=-1)
         correct = (preds == batch) & mask
-        acc = correct.sum().float() / mask.sum().float()
+        acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
-    return unweighted_loss, acc.item()
+    return avg_loss, acc
 
 
 @torch.no_grad()
 def val_step_llada(model, batch: torch.Tensor):
-    """LLaDA validation step — fixed 50% mask ratio."""
+    """LLaDA validation step — fixed 50% mask ratio, same normalization as training."""
     B, T = batch.shape
+    p_mask = 0.5
 
-    mask = torch.rand(B, T, device=batch.device) < 0.5
-    # Ensure at least one masked
-    force_idx = torch.randint(0, T, (B,), device=batch.device)
-    mask[torch.arange(B, device=batch.device), force_idx] = True
+    mask = torch.rand(B, T, device=batch.device) < p_mask
 
     logits = model(batch, mask)
 
@@ -348,11 +349,12 @@ def val_step_llada(model, batch: torch.Tensor):
         reduction='none'
     ).reshape(B, T)
 
-    masked_loss = per_token_loss * mask.float()
-    loss = (masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)).mean().item()
+    # Match training normalization: 1/p_mask per token, sum / (B*T)
+    token_loss = per_token_loss[mask] / p_mask
+    loss = (token_loss.sum() / (B * T)).item() if mask.any() else 0.0
     preds = logits.argmax(dim=-1)
     correct = (preds == batch) & mask
-    acc = (correct.sum().float() / mask.sum().float()).item()
+    acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
     return loss, acc
 
