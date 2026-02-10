@@ -1263,7 +1263,7 @@ def train(args):
             if is_mlm:
                 loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
                                            mask_prob=cur_mask_prob,
-                                           gen_len=args.gen_len)
+                                           gen_len=args.output_len)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
@@ -1294,7 +1294,7 @@ def train(args):
             batch = val_ds.sample_batch(args.batch_size, device)
             if is_mlm:
                 vl, va = val_step_mlm(model, batch, mask_prob=cur_mask_prob,
-                                      gen_len=args.gen_len)
+                                      gen_len=args.output_len)
             elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
@@ -1355,7 +1355,7 @@ def train(args):
                     # BERT-style sample: take real text, mask, reconstruct
                     sample_batch = val_ds.sample_batch(1, device)  # (1, T)
                     T = sample_batch.shape[1]
-                    mask = _make_mlm_mask(1, T, cur_mask_prob, args.gen_len, device)
+                    mask = _make_mlm_mask(1, T, cur_mask_prob, args.output_len, device)
                     logits = model(sample_batch, mask)
                     preds = logits.argmax(dim=-1)
                     # Build display: show original with masked positions replaced by predictions
@@ -1378,7 +1378,7 @@ def train(args):
                     # EOS-generation sample: contiguous chunk at end before EOS
                     sample_batch2 = val_ds.sample_batch(1, device)
                     T2 = sample_batch2.shape[1]
-                    chunk = min(args.gen_len, T2 - 2)
+                    chunk = min(args.output_len, T2 - 2)
                     mask2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
                     mask2[0, T2 - 1 - chunk:T2 - 1] = True  # right before EOS
                     logits2 = model(sample_batch2, mask2)
@@ -1612,7 +1612,7 @@ def main():
             for i in range(3):
                 sample_batch = val_ds_final.sample_batch(1, device)
                 T = sample_batch.shape[1]
-                mask = _make_mlm_mask(1, T, args.mask_prob, args.gen_len, device)
+                mask = _make_mlm_mask(1, T, args.mask_prob, args.output_len, device)
                 logits = model(sample_batch, mask)
                 preds = logits.argmax(dim=-1)
                 original = sample_batch[0]
