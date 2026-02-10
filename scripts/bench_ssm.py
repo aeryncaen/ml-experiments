@@ -1496,6 +1496,8 @@ if __name__ == '__main__':
     parser.add_argument('--compile-mode', type=str, default='default', 
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode')
+    parser.add_argument('--no-triton', action='store_true',
+                        help='Bypass Triton silu2 kernels, use reference impl')
     parser.add_argument('--dim', type=int, default=64, help='Model dimension')
     parser.add_argument('--layers', type=int, default=1, help='Number of layers')
     parser.add_argument('--max-epochs', type=int, default=100, help='Maximum training epochs')
@@ -1545,6 +1547,11 @@ if __name__ == '__main__':
 
     if args.moe and args.poe:
         parser.error("--moe and --poe are mutually exclusive")
+
+    if args.no_triton:
+        import ulb.attention as _attn
+        _attn.USE_TRITON = False
+        print("Triton silu2 kernels disabled — using reference impl")
 
     print(f"Device: {DEVICE}")
     if args.compile:

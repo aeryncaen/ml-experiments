@@ -28,6 +28,10 @@ try:
 except ImportError:
     pass
 
+# Global flag to force reference impl even when Triton is available.
+# Set to True to bypass Triton (e.g. for short sequences where it's slower).
+USE_TRITON = True
+
 
 def _silu2_attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Reference silu2 attention (materializes T^2 matrix). Used on CPU/MPS."""
@@ -50,7 +54,7 @@ def silu2_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     Returns:
         (B, H, T, D) attention output.
     """
-    if _HAS_TRITON and q.is_cuda:
+    if _HAS_TRITON and USE_TRITON and q.is_cuda:
         return silu2_attention_triton(q, k, v)
     return _silu2_attention_ref(q, k, v)
 

@@ -341,7 +341,14 @@ def main():
     parser.add_argument('--save-dir', type=str, default=None, help='Save dir')
     parser.add_argument('--compile', action='store_true', help='torch.compile the full model')
     parser.add_argument('--compile-blocks', action='store_true', help='torch.compile individual expert/stem/exit blocks')
+    parser.add_argument('--no-triton', action='store_true',
+                        help='Bypass Triton silu2 kernels, use reference impl')
     args = parser.parse_args()
+
+    if args.no_triton:
+        import ulb.attention as _attn
+        _attn.USE_TRITON = False
+        print("Triton silu2 kernels disabled — using reference impl")
 
     print("=" * 60)
     print("MaskedDiffusionPoE — Shakespeare")
