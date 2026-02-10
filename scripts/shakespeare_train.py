@@ -802,24 +802,51 @@ def val_step_llada(model, batch: torch.Tensor):
 # MLM (BERT-style) training
 # ---------------------------------------------------------------------------
 
+def _make_mlm_mask(B: int, T: int, mask_prob: float, gen_len: int,
+                   device: torch.device) -> torch.Tensor:
+    """Build MLM mask: 50% random, 50% contiguous chunk of gen_len.
+
+    Contiguous chunks are placed randomly: after BOS, in the middle, or before EOS.
+    BOS (position 0) and EOS (position T-1) are never masked.
+    If gen_len > content_len, contiguous chunk is clamped to content_len.
+    """
+    mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+    # Content region is positions 1..T-2 (between BOS and EOS)
+    content_len = T - 2
+    chunk_len = min(gen_len, content_len)
+
+    for i in range(B):
+        if torch.rand(1).item() < 0.5 and chunk_len > 0:
+            # Contiguous chunk: random start within content region
+            max_start = content_len - chunk_len
+            start = torch.randint(0, max_start + 1, (1,)).item() + 1  # +1 for BOS
+            mask[i, start:start + chunk_len] = True
+        else:
+            # Random masking
+            rand = torch.rand(T, device=device)
+            mask[i] = rand < mask_prob
+            mask[i, 0] = False   # BOS
+            mask[i, -1] = False  # EOS
+
+    # Ensure at least one masked position per sample
+    if not mask.any():
+        mask[0, 1] = True
+
+    return mask
+
+
 def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
-                   mask_prob: float = 0.40):
+                   mask_prob: float = 0.40, gen_len: int = 64):
     """BERT-style MLM training step.
 
-    Masks mask_prob fraction of positions randomly across the whole sequence.
+    50% of samples get random masking at mask_prob rate.
+    50% get a contiguous masked chunk of gen_len bytes.
     CE loss on masked positions only.
     """
     B, T = batch.shape
     device = batch.device
 
-    # Random mask: each position independently masked with mask_prob
-    mask = torch.rand(B, T, device=device) < mask_prob
-    # Never mask BOS (position 0) or EOS (position T-1)
-    mask[:, 0] = False
-    mask[:, -1] = False
-    # Ensure at least one masked position per sample
-    if not mask.any():
-        mask[0, 1] = True
+    mask = _make_mlm_mask(B, T, mask_prob, gen_len, device)
 
     logits = model(batch, mask)  # (B, T, vocab)
 
@@ -843,17 +870,13 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
 
 
 @torch.no_grad()
-def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
+def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40,
+                 gen_len: int = 64):
     """BERT-style MLM validation."""
     B, T = batch.shape
     device = batch.device
 
-    mask = torch.rand(B, T, device=device) < mask_prob
-    # Never mask BOS/EOS
-    mask[:, 0] = False
-    mask[:, -1] = False
-    if not mask.any():
-        mask[0, 1] = True
+    mask = _make_mlm_mask(B, T, mask_prob, gen_len, device)
 
     logits = model(batch, mask)
 
@@ -1239,7 +1262,8 @@ def train(args):
 
             if is_mlm:
                 loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
-                                           mask_prob=cur_mask_prob)
+                                           mask_prob=cur_mask_prob,
+                                           gen_len=args.gen_len)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
@@ -1269,7 +1293,8 @@ def train(args):
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
             if is_mlm:
-                vl, va = val_step_mlm(model, batch, mask_prob=cur_mask_prob)
+                vl, va = val_step_mlm(model, batch, mask_prob=cur_mask_prob,
+                                      gen_len=args.gen_len)
             elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
@@ -1330,12 +1355,7 @@ def train(args):
                     # BERT-style sample: take real text, mask, reconstruct
                     sample_batch = val_ds.sample_batch(1, device)  # (1, T)
                     T = sample_batch.shape[1]
-                    mask = torch.rand(1, T, device=device) < cur_mask_prob
-                    # Never mask BOS/EOS
-                    mask[:, 0] = False
-                    mask[:, -1] = False
-                    if not mask.any():
-                        mask[0, 1] = True
+                    mask = _make_mlm_mask(1, T, cur_mask_prob, args.gen_len, device)
                     logits = model(sample_batch, mask)
                     preds = logits.argmax(dim=-1)
                     # Build display: show original with masked positions replaced by predictions
@@ -1572,12 +1592,7 @@ def main():
             for i in range(3):
                 sample_batch = val_ds_final.sample_batch(1, device)
                 T = sample_batch.shape[1]
-                mask = torch.rand(1, T, device=device) < args.mask_prob
-                # Never mask BOS/EOS
-                mask[:, 0] = False
-                mask[:, -1] = False
-                if not mask.any():
-                    mask[0, 1] = True
+                mask = _make_mlm_mask(1, T, args.mask_prob, args.gen_len, device)
                 logits = model(sample_batch, mask)
                 preds = logits.argmax(dim=-1)
                 original = sample_batch[0]
