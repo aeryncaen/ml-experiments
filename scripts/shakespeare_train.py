@@ -478,6 +478,41 @@ LLADA_BUILDERS = {
 }
 
 
+# --- MLM (Deep Hybrid) builders ---
+
+def build_mlm_mha(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLM with BidirectionalMHALayer blocks."""
+    from mha import BidirectionalMHALayer
+    from ulb.mlm import DeepMLM
+    max_sl = args.seq_len + args.gen_len
+    make_layer = lambda: BidirectionalMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=max_sl)
+    return DeepMLM(make_layer, args.n_layers, vocab_size, args.dim, max_sl)
+
+
+def build_mlm_ulb(vocab_size: int, args) -> nn.Module:
+    """Build DeepMLM with ULBBlock blocks."""
+    from ulb.block import ULBBlock, ULBConfig
+    from ulb.mlm import DeepMLM
+    config = ULBConfig(
+        d_model=args.dim,
+        n_heads=args.n_heads,
+        paired=True,
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+    )
+    max_sl = args.seq_len + args.gen_len
+    make_layer = lambda: ULBBlock(config)
+    return DeepMLM(make_layer, args.n_layers, vocab_size, args.dim, max_sl)
+
+
+MLM_BUILDERS = {
+    'mha': build_mlm_mha,
+    'ulb': build_mlm_ulb,
+}
+
+
 # ---------------------------------------------------------------------------
 # AR training
 # ---------------------------------------------------------------------------
@@ -700,6 +735,91 @@ def val_step_llada(model, batch: torch.Tensor):
 
 
 # ---------------------------------------------------------------------------
+# MLM (Deep Hybrid) training
+# ---------------------------------------------------------------------------
+
+def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
+                   prompt_len: int, output_len: int):
+    """Deep MLM training step.
+
+    All output positions are masked. CE loss on all output positions.
+    No noise schedule, no mask ratio sampling, no 1/t weighting.
+    """
+    prompt = batch[:, :prompt_len]
+    target = batch[:, prompt_len:]
+    B = prompt.shape[0]
+
+    logits, _ = model(prompt, target)  # (B, output_len, vocab)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        target.reshape(-1),
+    ) + _get_aux_loss(model)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+
+    with torch.no_grad():
+        preds = logits.argmax(dim=-1)
+        acc = (preds == target).float().mean().item()
+
+    return loss.item(), acc
+
+
+@torch.no_grad()
+def val_step_mlm(model, batch: torch.Tensor, prompt_len: int, output_len: int):
+    """Deep MLM validation step."""
+    prompt = batch[:, :prompt_len]
+    target = batch[:, prompt_len:]
+
+    logits, _ = model(prompt, target)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        target.reshape(-1),
+    ).item()
+
+    preds = logits.argmax(dim=-1)
+    acc = (preds == target).float().mean().item()
+
+    return loss, acc
+
+
+@torch.no_grad()
+def generate_mlm(model, prompt_text: str, gen_len: int,
+                 device: torch.device) -> str:
+    """Deep MLM generation — single forward pass.
+
+    Args:
+        model: DeepMLM model.
+        prompt_text: Text prompt.
+        gen_len: Number of tokens to generate.
+        device: Torch device.
+    """
+    model.eval()
+
+    prompt_ids = encode(prompt_text).to(device)  # (P,)
+    P = prompt_ids.shape[0]
+    max_T = model.max_seq_len
+
+    # Clamp gen_len to fit
+    gen_len = min(gen_len, max_T - 1)
+    if P + gen_len > max_T:
+        prompt_ids = prompt_ids[-(max_T - gen_len):]
+        P = prompt_ids.shape[0]
+
+    # Dummy target ids (model ignores them — all positions are masked)
+    dummy_target = torch.zeros(1, gen_len, dtype=torch.long, device=device)
+
+    logits, confidence = model(prompt_ids.unsqueeze(0), dummy_target)
+    output_ids = logits.argmax(dim=-1)[0]  # (gen_len,)
+
+    return decode(output_ids)
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -878,6 +998,7 @@ def train(args):
     device = torch.device(args.device)
     is_diffusion = args.mode == 'diffusion'
     is_llada = args.mode == 'llada'
+    is_mlm = args.mode == 'mlm'
 
     # Data
     text = load_shakespeare()
@@ -897,7 +1018,13 @@ def train(args):
         print(f"ERROR: Diffusion mode requires --arch ulb-diffusion-poe, got '{args.arch}'.")
         sys.exit(1)
 
-    if is_llada:
+    if is_mlm:
+        if args.arch not in MLM_BUILDERS:
+            print(f"ERROR: MLM mode not supported for arch '{args.arch}'. "
+                  f"Available: {', '.join(MLM_BUILDERS.keys())}")
+            sys.exit(1)
+        model = MLM_BUILDERS[args.arch](vocab_size, args).to(device)
+    elif is_llada:
         if args.arch not in LLADA_BUILDERS:
             print(f"ERROR: LLaDA mode not supported for arch '{args.arch}'. "
                   f"Available: {', '.join(LLADA_BUILDERS.keys())}")
@@ -911,7 +1038,10 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
-    if is_llada:
+    if is_mlm:
+        print(f"  prompt_len={args.prompt_len}, output_len={args.output_len}")
+        print(f"  n_layers={args.n_layers} (each layer predicts + re-embeds)")
+    elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
     elif is_diffusion:
@@ -969,8 +1099,8 @@ def train(args):
     best_val_loss = float('inf')
     best_ckpt_path = save_dir / 'best_model.pt'
 
-    # Diffusion-specific
-    if is_diffusion:
+    # Diffusion / MLM -specific
+    if is_diffusion or is_mlm:
         prompt_len = args.prompt_len
         output_len = args.output_len
         assert prompt_len + output_len == args.seq_len, \
@@ -1006,7 +1136,10 @@ def train(args):
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
 
-            if is_llada:
+            if is_mlm:
+                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
+                                           prompt_len, output_len)
+            elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
             elif is_diffusion:
@@ -1034,7 +1167,9 @@ def train(args):
         n_val = args.val_batches
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
-            if is_llada:
+            if is_mlm:
+                vl, va = val_step_mlm(model, batch, prompt_len, output_len)
+            elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
                 vl, va = val_step_diffusion(model, batch, prompt_len, output_len)
@@ -1091,7 +1226,9 @@ def train(args):
         sample_len = 64
         try:
             with torch.no_grad():
-                if is_llada:
+                if is_mlm:
+                    sample = generate_mlm(model, sample_prompt, sample_len, device)
+                elif is_llada:
                     sample = generate_llada(model, sample_prompt, sample_len, device, n_steps=32)
                 elif is_diffusion:
                     sample = generate_diffusion(model, sample_prompt, sample_len, device)
@@ -1132,7 +1269,9 @@ def interactive_generate(args):
               f"val_loss={ckpt.get('val_loss', '?'):.4f}, val_acc={ckpt.get('val_acc', '?'):.1%}")
 
     # Rebuild model from saved args
-    if mode == 'llada':
+    if mode == 'mlm':
+        model = MLM_BUILDERS[arch](vocab_size, saved_args).to(device)
+    elif mode == 'llada':
         model = LLADA_BUILDERS[arch](vocab_size, saved_args).to(device)
     else:
         model = ARCH_BUILDERS[arch](vocab_size, saved_args).to(device)
@@ -1168,7 +1307,9 @@ def interactive_generate(args):
             prompt_text = prompt_text[-max_prompt:]
             print(f"  (truncated to last {max_prompt} chars)")
 
-        if mode == 'ar':
+        if mode == 'mlm':
+            gen = generate_mlm(model, prompt_text, gen_len, device)
+        elif mode == 'ar':
             gen = generate_ar(model, prompt_text, gen_len,
                               device, temperature=temperature)
         elif mode == 'llada':
@@ -1187,8 +1328,8 @@ def main():
                         help='Load checkpoint and run interactive generation (skip training)')
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature (AR)')
     parser.add_argument('--gen-len', type=int, default=256, help='Generation length')
-    parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada'],
-                        help='Training mode: autoregressive, masked diffusion (PoE), or llada')
+    parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada', 'mlm'],
+                        help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (deep hybrid)')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
                         help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-diffusion-poe')
 
@@ -1291,7 +1432,7 @@ def main():
         "KING:\nOnce more unto the breach, dear friends,\n",
     ]
 
-    if args.mode == 'diffusion':
+    if args.mode in ('diffusion', 'mlm'):
         gen_len = args.output_len
     elif args.mode == 'llada':
         gen_len = args.gen_len
@@ -1308,7 +1449,9 @@ def main():
             max_prompt = args.prompt_len
         prompt_text = prompt[-max_prompt:]
 
-        if args.mode == 'ar':
+        if args.mode == 'mlm':
+            gen = generate_mlm(model, prompt_text, gen_len, device)
+        elif args.mode == 'ar':
             gen = generate_ar(model, prompt_text, gen_len, device)
         elif args.mode == 'llada':
             gen = generate_llada(model, prompt_text, gen_len, device)
