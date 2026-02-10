@@ -98,22 +98,63 @@ def test_various_headdims():
     return all_ok
 
 
-def bench(B=4, H=8, D=32, seqlens=(64, 128, 256, 512, 1024, 2048, 4096),
-          warmup=10, iters=50):
-    """Benchmark Triton vs PyTorch reference, forward + backward."""
-    from triton_silu2 import silu2_attention_triton
+def _bench_fn(fn, q, k, v, grad, warmup, iters):
+    """Time forward, forward+backward, and peak memory for a given attention fn."""
     import time
 
+    # Forward warmup + timing
+    for _ in range(warmup):
+        o = fn(q, k, v)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        o = fn(q, k, v)
+    torch.cuda.synchronize()
+    fwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+    # Backward warmup + timing
+    for _ in range(warmup):
+        o = fn(q, k, v)
+        o.backward(grad)
+        q.grad = k.grad = v.grad = None
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        o = fn(q, k, v)
+        o.backward(grad)
+        q.grad = k.grad = v.grad = None
+    torch.cuda.synchronize()
+    bwd_ms = (time.perf_counter() - t0) / iters * 1000
+
+    # Peak memory
+    torch.cuda.reset_peak_memory_stats()
+    o = fn(q, k, v)
+    o.backward(grad)
+    q.grad = k.grad = v.grad = None
+    torch.cuda.synchronize()
+    mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    return fwd_ms, bwd_ms, mem_mb
+
+
+def bench(B=4, H=8, D=32, seqlens=(64, 128, 256, 512, 1024, 2048, 4096),
+          warmup=10, iters=50):
+    """Benchmark Triton vs PyTorch reference vs compiled reference."""
+    from triton_silu2 import silu2_attention_triton
+
+    # Compile the reference
+    compiled_ref = torch.compile(silu2_attention_ref)
+
     print(f"\nBenchmark: B={B} H={H} D={D}, warmup={warmup}, iters={iters}")
-    print(f"{'T':>6}  {'ref_fwd':>10}  {'tri_fwd':>10}  {'speedup':>8}  "
-          f"{'ref_bwd':>10}  {'tri_bwd':>10}  {'speedup':>8}  "
-          f"{'ref_mem':>10}  {'tri_mem':>10}")
-    print("-" * 110)
+    print(f"{'T':>6}  {'ref_fwd':>9} {'comp_fwd':>9} {'tri_fwd':>9}  "
+          f"{'ref_bwd':>9} {'comp_bwd':>9} {'tri_bwd':>9}  "
+          f"{'ref_mem':>9} {'comp_mem':>9} {'tri_mem':>9}  "
+          f"{'tri/comp':>8}")
+    print("-" * 140)
 
     for T in seqlens:
-        # Check if we can fit this
         elem = B * H * T * D
-        mem_est_gb = elem * 4 * 6 / 1e9  # rough: q,k,v,grad,out * float32
+        mem_est_gb = elem * 4 * 6 / 1e9
         if mem_est_gb > 40:
             print(f"{T:>6}  SKIPPED (estimated {mem_est_gb:.1f}GB)")
             continue
@@ -124,82 +165,31 @@ def bench(B=4, H=8, D=32, seqlens=(64, 128, 256, 512, 1024, 2048, 4096),
         v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
         grad = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
 
-        # --- Reference forward ---
-        for _ in range(warmup):
-            o = silu2_attention_ref(q, k, v)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            o = silu2_attention_ref(q, k, v)
-        torch.cuda.synchronize()
-        ref_fwd_ms = (time.perf_counter() - t0) / iters * 1000
+        # Reference (raw PyTorch)
+        ref_fwd, ref_bwd, ref_mem = _bench_fn(silu2_attention_ref, q, k, v, grad, warmup, iters)
 
-        # --- Reference backward ---
-        for _ in range(warmup):
-            o = silu2_attention_ref(q, k, v)
-            o.backward(grad)
-            q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            o = silu2_attention_ref(q, k, v)
-            o.backward(grad)
-            q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
-        ref_bwd_ms = (time.perf_counter() - t0) / iters * 1000
-
-        # Reference peak memory
-        torch.cuda.reset_peak_memory_stats()
-        o = silu2_attention_ref(q, k, v)
-        o.backward(grad)
-        q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
-        ref_mem_mb = torch.cuda.max_memory_allocated() / 1e6
-
-        # --- Triton forward ---
+        # Compiled reference
         q2 = q.detach().clone().requires_grad_(True)
         k2 = k.detach().clone().requires_grad_(True)
         v2 = v.detach().clone().requires_grad_(True)
+        comp_fwd, comp_bwd, comp_mem = _bench_fn(compiled_ref, q2, k2, v2, grad, warmup, iters)
 
-        for _ in range(warmup):
-            o = silu2_attention_triton(q2, k2, v2)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            o = silu2_attention_triton(q2, k2, v2)
-        torch.cuda.synchronize()
-        tri_fwd_ms = (time.perf_counter() - t0) / iters * 1000
+        # Triton
+        q3 = q.detach().clone().requires_grad_(True)
+        k3 = k.detach().clone().requires_grad_(True)
+        v3 = v.detach().clone().requires_grad_(True)
+        tri_fwd, tri_bwd, tri_mem = _bench_fn(silu2_attention_triton, q3, k3, v3, grad, warmup, iters)
 
-        # --- Triton backward ---
-        for _ in range(warmup):
-            o = silu2_attention_triton(q2, k2, v2)
-            o.backward(grad)
-            q2.grad = k2.grad = v2.grad = None
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            o = silu2_attention_triton(q2, k2, v2)
-            o.backward(grad)
-            q2.grad = k2.grad = v2.grad = None
-        torch.cuda.synchronize()
-        tri_bwd_ms = (time.perf_counter() - t0) / iters * 1000
+        # Triton vs compiled speedup (the comparison that matters)
+        tri_vs_comp_fwd = comp_fwd / tri_fwd
+        tri_vs_comp_bwd = comp_bwd / tri_bwd
 
-        # Triton peak memory
-        torch.cuda.reset_peak_memory_stats()
-        o = silu2_attention_triton(q2, k2, v2)
-        o.backward(grad)
-        q2.grad = k2.grad = v2.grad = None
-        torch.cuda.synchronize()
-        tri_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+        print(f"{T:>6}  {ref_fwd:>7.2f}ms {comp_fwd:>7.2f}ms {tri_fwd:>7.2f}ms  "
+              f"{ref_bwd:>7.2f}ms {comp_bwd:>7.2f}ms {tri_bwd:>7.2f}ms  "
+              f"{ref_mem:>7.1f}MB {comp_mem:>7.1f}MB {tri_mem:>7.1f}MB  "
+              f"{tri_vs_comp_bwd:>6.2f}x")
 
-        fwd_speedup = ref_fwd_ms / tri_fwd_ms
-        bwd_speedup = ref_bwd_ms / tri_bwd_ms
-
-        print(f"{T:>6}  {ref_fwd_ms:>8.2f}ms  {tri_fwd_ms:>8.2f}ms  {fwd_speedup:>7.2f}x  "
-              f"{ref_bwd_ms:>8.2f}ms  {tri_bwd_ms:>8.2f}ms  {bwd_speedup:>7.2f}x  "
-              f"{ref_mem_mb:>8.1f}MB  {tri_mem_mb:>8.1f}MB")
-
-        del q, k, v, q2, k2, v2, grad, o
+        del q, k, v, q2, k2, v2, q3, k3, v3, grad, o
         torch.cuda.empty_cache()
 
 
