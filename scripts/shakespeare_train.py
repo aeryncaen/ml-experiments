@@ -1352,48 +1352,40 @@ def train(args):
         try:
             with torch.no_grad():
                 if is_mlm:
-                    # BERT-style sample: take real text, mask, reconstruct
-                    sample_batch = val_ds.sample_batch(1, device)  # (1, T)
-                    T = sample_batch.shape[1]
-                    mask = _make_mlm_mask(1, T, cur_mask_prob, args.output_len, device)
-                    logits = model(sample_batch, mask)
-                    preds = logits.argmax(dim=-1)
-                    # Build display: show original with masked positions replaced by predictions
-                    original = sample_batch[0]
-                    result = original.clone()
-                    result[mask[0]] = preds[0][mask[0]]
-                    # Build masked view: replace masked positions with _
-                    masked_view = original.clone()
-                    masked_view[mask[0]] = ord('_')
-                    masked_text = decode(masked_view).replace('\n', '\\n')
-                    orig_text = decode(original).replace('\n', '\\n')
-                    recon_text = decode(result).replace('\n', '\\n')
-                    n_masked = mask.sum().item()
-                    n_correct = ((preds[0] == original) & mask[0]).sum().item()
-                    tqdm.write(f"  [sample rand] {n_correct}/{n_masked} masked correct")
-                    tqdm.write(f"    orig:  {orig_text[:80]}")
-                    tqdm.write(f"    mask:  {masked_text[:80]}")
-                    tqdm.write(f"    recon: {recon_text[:80]}")
+                    def _show_mlm_sample(label, sb, m):
+                        lg = model(sb, m)
+                        pr = lg.argmax(dim=-1)
+                        orig = sb[0]
+                        res = orig.clone()
+                        res[m[0]] = pr[0][m[0]]
+                        mv = orig.clone()
+                        mv[m[0]] = ord('_')
+                        nm = m.sum().item()
+                        nc = ((pr[0] == orig) & m[0]).sum().item()
+                        esc = lambda t: decode(t).replace('\n', '\\n')
+                        # Show last 80 chars so end-of-sequence chunks are visible
+                        tqdm.write(f"  [{label}] {nc}/{nm} masked correct")
+                        tqdm.write(f"    orig:  ...{esc(orig)[-80:]}")
+                        tqdm.write(f"    mask:  ...{esc(mv)[-80:]}")
+                        tqdm.write(f"    recon: ...{esc(res)[-80:]}")
+
+                    # Random masking sample (forced random, no contiguous)
+                    sb1 = val_ds.sample_batch(1, device)
+                    T1 = sb1.shape[1]
+                    m1 = torch.rand(1, T1, device=device) < cur_mask_prob
+                    m1[:, 0] = False
+                    m1[:, -1] = False
+                    if not m1.any():
+                        m1[0, 1] = True
+                    _show_mlm_sample("sample rand", sb1, m1)
 
                     # EOS-generation sample: contiguous chunk at end before EOS
-                    sample_batch2 = val_ds.sample_batch(1, device)
-                    T2 = sample_batch2.shape[1]
+                    sb2 = val_ds.sample_batch(1, device)
+                    T2 = sb2.shape[1]
                     chunk = min(args.output_len, T2 - 2)
-                    mask2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
-                    mask2[0, T2 - 1 - chunk:T2 - 1] = True  # right before EOS
-                    logits2 = model(sample_batch2, mask2)
-                    preds2 = logits2.argmax(dim=-1)
-                    original2 = sample_batch2[0]
-                    result2 = original2.clone()
-                    result2[mask2[0]] = preds2[0][mask2[0]]
-                    masked_view2 = original2.clone()
-                    masked_view2[mask2[0]] = ord('_')
-                    n_masked2 = mask2.sum().item()
-                    n_correct2 = ((preds2[0] == original2) & mask2[0]).sum().item()
-                    tqdm.write(f"  [sample gen] {n_correct2}/{n_masked2} masked correct")
-                    tqdm.write(f"    orig:  {decode(original2).replace(chr(10), chr(92)+'n')[:80]}")
-                    tqdm.write(f"    mask:  {decode(masked_view2).replace(chr(10), chr(92)+'n')[:80]}")
-                    tqdm.write(f"    recon: {decode(result2).replace(chr(10), chr(92)+'n')[:80]}")
+                    m2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
+                    m2[0, T2 - 1 - chunk:T2 - 1] = True
+                    _show_mlm_sample("sample gen", sb2, m2)
                 else:
                     sample_prompt = "KING:\nO, "
                     sample_len = 64
