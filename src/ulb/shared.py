@@ -1,17 +1,17 @@
 """Weight sharing for expert pools.
 
-SharedLinear and SharedParam allow experts to share a fraction of their
-weights via a common base parameter. Each expert has:
+SharedLinear splits output dimensions into shared and private slices.
+Given fraction=0.4 and a (out_features, in_features) weight:
+  - 40% of out_features come from a shared weight (same tensor across all experts)
+  - 60% come from a private weight (unique per expert)
+  - Forward: cat([shared(x), private(x)], dim=-1)
 
-    W_effective = shared * alpha + private * (1 - alpha)
-
-where alpha is the shared fraction (0.0 = fully independent, 1.0 = fully shared).
+Total params go DOWN because the shared slice is stored once instead of N times.
 
 Usage:
     share_expert_weights(expert_list, fraction=0.4)
-    # Mutates experts in-place, replacing nn.Linear and LearnableSwish
-    # with SharedLinear and SharedParam that reference common base params.
-    # Returns nn.ParameterDict of shared params (caller must register it).
+    # Mutates experts in-place. Returns nn.ParameterDict of shared params
+    # (caller must register it).
 """
 
 import torch
@@ -22,59 +22,50 @@ from .activations import LearnableSwish
 
 
 class SharedLinear(nn.Module):
-    """Linear layer with shared + private weight decomposition.
+    """Linear with output dims split into shared + private slices.
 
-    W_effective = shared_weight * alpha + private_weight * (1 - alpha)
-    Same for bias if present.
+    output = cat([F.linear(x, shared_weight, shared_bias),
+                  F.linear(x, private_weight, private_bias)], dim=-1)
 
     Args:
-        shared_weight: Reference to the shared nn.Parameter.
-        shared_bias: Reference to the shared bias nn.Parameter, or None.
-        private_weight: This expert's private nn.Parameter.
-        private_bias: This expert's private bias nn.Parameter, or None.
-        alpha: Shared fraction (0.0 = fully private, 1.0 = fully shared).
+        shared_weight: (shared_out, in_features) — same across all experts.
+        shared_bias: (shared_out,) or None.
+        private_weight: (private_out, in_features) — unique per expert.
+        private_bias: (private_out,) or None.
     """
 
     def __init__(self, shared_weight: nn.Parameter, shared_bias: nn.Parameter | None,
-                 private_weight: nn.Parameter, private_bias: nn.Parameter | None,
-                 alpha: float):
+                 private_weight: nn.Parameter, private_bias: nn.Parameter | None):
         super().__init__()
         self.shared_weight = shared_weight
         self.shared_bias = shared_bias
         self.private_weight = private_weight
         self.private_bias = private_bias
-        self.alpha = alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.alpha
-        w = self.shared_weight * a + self.private_weight * (1.0 - a)
-        b = None
-        if self.shared_bias is not None and self.private_bias is not None:
-            b = self.shared_bias * a + self.private_bias * (1.0 - a)
-        return F.linear(x, w, b)
+        shared_out = F.linear(x, self.shared_weight, self.shared_bias)
+        private_out = F.linear(x, self.private_weight, self.private_bias)
+        return torch.cat([shared_out, private_out], dim=-1)
 
 
 class SharedLearnableSwish(nn.Module):
-    """LearnableSwish with shared + private beta decomposition.
+    """LearnableSwish with beta split into shared + private slices.
 
-    beta_effective = shared_beta * alpha + private_beta * (1 - alpha)
+    beta = cat([shared_beta, private_beta])
+    output = x * sigmoid(beta * x)
 
     Args:
-        shared_beta: Reference to the shared nn.Parameter.
-        private_beta: This expert's private nn.Parameter.
-        alpha: Shared fraction.
+        shared_beta: (shared_dim,) — same across all experts.
+        private_beta: (private_dim,) — unique per expert.
     """
 
-    def __init__(self, shared_beta: nn.Parameter, private_beta: nn.Parameter,
-                 alpha: float):
+    def __init__(self, shared_beta: nn.Parameter, private_beta: nn.Parameter):
         super().__init__()
         self.shared_beta = shared_beta
         self.private_beta = private_beta
-        self.alpha = alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.alpha
-        beta = self.shared_beta * a + self.private_beta * (1.0 - a)
+        beta = torch.cat([self.shared_beta, self.private_beta])
         return x * torch.sigmoid(beta * x)
 
 
@@ -97,16 +88,20 @@ def share_expert_weights(experts: nn.ModuleList, fraction: float
                          ) -> nn.ParameterDict:
     """Replace Linear and LearnableSwish modules in experts with shared versions.
 
-    Walks each expert's submodules, finds nn.Linear and LearnableSwish instances,
-    creates one shared parameter per unique name (from expert 0's weights),
-    and replaces each expert's module with SharedLinear/SharedLearnableSwish.
+    For each Linear(out, in), splits out_features into:
+      shared_out = round(out * fraction)
+      private_out = out - shared_out
+    The shared slice is one parameter referenced by all experts.
+    The private slice is unique per expert.
 
-    The original weights become the private parameters. The shared parameters
-    are initialized as a copy of the mean across all experts.
+    For LearnableSwish(dim), splits dim the same way.
+
+    Shared params are initialized from expert 0. Private params are initialized
+    from each expert's original weights (the private slice portion).
 
     Args:
         experts: ModuleList of expert blocks (mutated in-place).
-        fraction: Shared weight fraction (0.0 = no sharing, 1.0 = fully shared).
+        fraction: Fraction of output dims to share (0.0 = no sharing, 1.0 = fully shared).
 
     Returns:
         nn.ParameterDict of shared parameters. Caller must register this
@@ -130,41 +125,47 @@ def share_expert_weights(experts: nn.ModuleList, fraction: float
         safe_name = name.replace('.', '_')
 
         if kind == 'linear':
-            # Average weights across experts for shared init
-            weights = [_get_nested_attr(experts[i], name).weight.data for i in range(pool_size)]
-            mean_w = torch.stack(weights).mean(dim=0)
-            shared_w = nn.Parameter(mean_w.clone())
+            orig0 = _get_nested_attr(experts[0], name)
+            out_features = orig0.weight.shape[0]
+            in_features = orig0.weight.shape[1]
+            shared_out = round(out_features * fraction)
+            if shared_out == 0:
+                continue  # fraction too small for this layer
+
+            # Shared slice: first shared_out rows, initialized from expert 0
+            shared_w = nn.Parameter(orig0.weight.data[:shared_out].clone())
             shared_params[f'{safe_name}_weight'] = shared_w
 
-            # Bias (may be None)
-            has_bias = _get_nested_attr(experts[0], name).bias is not None
+            has_bias = orig0.bias is not None
             shared_b = None
             if has_bias:
-                biases = [_get_nested_attr(experts[i], name).bias.data for i in range(pool_size)]
-                mean_b = torch.stack(biases).mean(dim=0)
-                shared_b = nn.Parameter(mean_b.clone())
+                shared_b = nn.Parameter(orig0.bias.data[:shared_out].clone())
                 shared_params[f'{safe_name}_bias'] = shared_b
 
             # Replace in each expert
             for i in range(pool_size):
                 orig = _get_nested_attr(experts[i], name)
-                priv_w = nn.Parameter(orig.weight.data.clone())
-                priv_b = nn.Parameter(orig.bias.data.clone()) if has_bias else None
-                replacement = SharedLinear(shared_w, shared_b, priv_w, priv_b, fraction)
+                priv_w = nn.Parameter(orig.weight.data[shared_out:].clone())
+                priv_b = None
+                if has_bias:
+                    priv_b = nn.Parameter(orig.bias.data[shared_out:].clone())
+                replacement = SharedLinear(shared_w, shared_b, priv_w, priv_b)
                 _set_nested_attr(experts[i], name, replacement)
 
         elif kind == 'swish':
-            # Average betas across experts
-            betas = [_get_nested_attr(experts[i], name).beta.data for i in range(pool_size)]
-            mean_beta = torch.stack(betas).mean(dim=0)
-            shared_beta = nn.Parameter(mean_beta.clone())
+            orig0 = _get_nested_attr(experts[0], name)
+            dim = orig0.beta.shape[0]
+            shared_dim = round(dim * fraction)
+            if shared_dim == 0:
+                continue
+
+            shared_beta = nn.Parameter(orig0.beta.data[:shared_dim].clone())
             shared_params[f'{safe_name}_beta'] = shared_beta
 
-            # Replace in each expert
             for i in range(pool_size):
                 orig = _get_nested_attr(experts[i], name)
-                priv_beta = nn.Parameter(orig.beta.data.clone())
-                replacement = SharedLearnableSwish(shared_beta, priv_beta, fraction)
+                priv_beta = nn.Parameter(orig.beta.data[shared_dim:].clone())
+                replacement = SharedLearnableSwish(shared_beta, priv_beta)
                 _set_nested_attr(experts[i], name, replacement)
 
     return shared_params
