@@ -346,8 +346,9 @@ class PoolOfExperts(nn.Module):
             nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
-        # Per-hop pre-norm (shared across hops)
+        # Per-hop pre-norm (shared across hops) + hop position embedding
         self.hop_norm = RMSNorm(dim)
+        self.hop_embed = nn.Embedding(self.max_hops, dim)
 
         # Exit: non-routed output layer
         self.exit_norm = RMSNorm(dim)
@@ -463,7 +464,7 @@ class PoolOfExperts(nn.Module):
             hop_aux: Accumulated aux loss from experts this hop.
         """
         B = x.shape[0]
-        h = self.hop_norm(x)
+        h = self.hop_norm(x) + self.hop_embed.weight[hop]  # broadcast (D,) over (B, T, D)
 
         # Find which experts are active this hop (indices < pool_size)
         active_eids = topk_idx.unique()

@@ -83,9 +83,6 @@ class MaskedDiffusionPoE(PoolOfExperts):
             nn.Linear(dim, self.n_router_options, bias=False) for _ in range(pool_size)
         ])
 
-        # Hop position embedding
-        self.hop_embed = nn.Embedding(self.max_hops, dim)
-
         self.exit_ramp_scale = 10.0
 
     def _set_input_len(self, n: int):
@@ -130,49 +127,6 @@ class MaskedDiffusionPoE(PoolOfExperts):
         pool = x.mean(dim=1)  # (B, D)
         logits = self._perturb_logits(self.stem_router(pool))
         return x, logits
-
-    def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
-                    topk_weights: torch.Tensor, hop: int = 0
-                    ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """Run selected experts with hop conditioning.
-
-        Standard PoE execute_hop but adds hop embedding to the hidden state.
-        Operates on (B, L, D) sequences.
-        """
-        B = x.shape[0]
-        h = self.hop_norm(x) + self.hop_embed.weight[hop]  # broadcast (D,) over (B, L, D)
-
-        active_eids = topk_idx.unique()
-        active_eids = active_eids[active_eids < self.pool_size]
-
-        hop_aux = 0.0
-        expert_outs = {}
-        expert_logits = {}
-        for eid in active_eids.tolist():
-            e_out = self.experts[eid](h)  # (B, L, D)
-            expert_outs[eid] = e_out
-            e_pool = e_out.mean(dim=1)  # (B, D)
-            expert_logits[eid] = self.expert_routers[eid](e_pool)
-
-            block_aux = getattr(self.experts[eid], 'aux_loss', 0.0)
-            hop_aux = hop_aux + block_aux
-
-        # Weighted merge
-        out = torch.zeros_like(x)
-        next_logits = torch.zeros(B, self.n_router_options, device=x.device, dtype=x.dtype)
-
-        for k_idx in range(self.top_k):
-            w = topk_weights[:, k_idx]
-            eids = topk_idx[:, k_idx]
-            for eid in active_eids.tolist():
-                mask = eids == eid
-                if not mask.any():
-                    continue
-                out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
-                next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
-
-        next_logits = self._perturb_logits(next_logits)
-        return out, next_logits, hop_aux
 
     def finalize(self, x: torch.Tensor) -> torch.Tensor:
         """Exit layer + final norm. Returns hidden states (not logits).
