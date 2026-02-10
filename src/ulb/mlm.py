@@ -119,7 +119,7 @@ class DeepMLM(nn.Module):
             # Mask gate: gumbel-softmax over (mask, unmask)
             gate_logits = gate(out_hidden)  # (B, G, 2)
             g = F.gumbel_softmax(gate_logits, tau=self.gumbel_tau,
-                                 hard=not self.training, dim=-1)
+                                 hard=True, dim=-1)
             g_unmask = g[:, :, 1:2]  # (B, G, 1) — probability of unmasking
 
             # Lerp: unmask → pred_embeds, mask → mask_embed + pos
@@ -206,7 +206,7 @@ class DeepMLMMoE(nn.Module):
 
         gate_logits = gate(out_hidden)  # (B, G, 2)
         g = F.gumbel_softmax(gate_logits, tau=self.gumbel_tau,
-                             hard=not self.training, dim=-1)
+                             hard=True, dim=-1)
         g_unmask = g[:, :, 1:2]  # (B, G, 1)
 
         masked = self.mask_embed.unsqueeze(0).expand(B, G, -1) + pos_embeds
