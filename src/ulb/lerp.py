@@ -115,6 +115,86 @@ class CausalAdd(nn.Module):
         return torch.cat([k_static, k_mixed], dim=-1)
 
 
+class KAcausalLerp(nn.Module):
+    """Acausal temporal lerp on the last quarter of K channels.
+
+    Like CausalLerp but also peeks at t+1:
+        k_mixed = (1 - g_fwd - g_bwd) * k[t] + g_fwd * k[t+1] + g_bwd * k[t-1]
+
+    Args:
+        d_model:     Input dimension (for gate projections from x).
+        n_heads:     Number of attention heads.
+        quarter_dim: Number of channels to lerp (head_dim // 4).
+        init_bias:   Initial gate bias (default -2.0, sigmoid ~ 0.12).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, quarter_dim: int, init_bias: float = -2.0):
+        super().__init__()
+        self.quarter_dim = quarter_dim
+        self.n_heads = n_heads
+        self.gate_fwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
+        self.gate_bwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
+        nn.init.zeros_(self.gate_fwd_proj.weight)
+        nn.init.constant_(self.gate_fwd_proj.bias, init_bias)
+        nn.init.zeros_(self.gate_bwd_proj.weight)
+        nn.init.constant_(self.gate_bwd_proj.bias, init_bias)
+
+    def forward(self, k: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        b, t, _, _ = k.shape
+        if t < 2:
+            return k
+        qd = self.quarter_dim
+        g_fwd = torch.sigmoid(self.gate_fwd_proj(x)).view(b, t, self.n_heads, qd)
+        g_bwd = torch.sigmoid(self.gate_bwd_proj(x)).view(b, t, self.n_heads, qd)
+
+        k_static = k[:, :, :, :-qd]
+        k_cur = k[:, :, :, -qd:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_next = F.pad(k_cur[:, 1:],  (0, 0, 0, 0, 0, 1))
+        k_mixed = (1 - g_fwd - g_bwd) * k_cur + g_fwd * k_next + g_bwd * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
+
+class KAcausalAdd(nn.Module):
+    """Acausal additive temporal mixing on the last quarter of K channels.
+
+    Like CausalAdd but also peeks at t+1:
+        k_mixed = k[t] + g_fwd * k[t+1] + g_bwd * k[t-1]
+
+    Args:
+        d_model:     Input dimension (for gate projections from x).
+        n_heads:     Number of attention heads.
+        quarter_dim: Number of channels to mix (head_dim // 4).
+        init_bias:   Initial gate bias (default -2.0, sigmoid ~ 0.12).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, quarter_dim: int, init_bias: float = -2.0):
+        super().__init__()
+        self.quarter_dim = quarter_dim
+        self.n_heads = n_heads
+        self.gate_fwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
+        self.gate_bwd_proj = nn.Linear(d_model, n_heads * quarter_dim, bias=True)
+        nn.init.zeros_(self.gate_fwd_proj.weight)
+        nn.init.constant_(self.gate_fwd_proj.bias, init_bias)
+        nn.init.zeros_(self.gate_bwd_proj.weight)
+        nn.init.constant_(self.gate_bwd_proj.bias, init_bias)
+
+    def forward(self, k: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        b, t, _, _ = k.shape
+        if t < 2:
+            return k
+        qd = self.quarter_dim
+        g_fwd = torch.sigmoid(self.gate_fwd_proj(x)).view(b, t, self.n_heads, qd)
+        g_bwd = torch.sigmoid(self.gate_bwd_proj(x)).view(b, t, self.n_heads, qd)
+
+        k_static = k[:, :, :, :-qd]
+        k_cur = k[:, :, :, -qd:]
+        k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
+        k_next = F.pad(k_cur[:, 1:],  (0, 0, 0, 0, 0, 1))
+        k_mixed = k_cur + g_fwd * k_next + g_bwd * k_prev
+        return torch.cat([k_static, k_mixed], dim=-1)
+
+
 class AcausalLerp(nn.Module):
     """Acausal temporal lerp on the 3rd quarter of channels.
 

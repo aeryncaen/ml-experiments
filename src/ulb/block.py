@@ -44,7 +44,8 @@ import torch.nn.functional as F
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .lerp import AcausalAdd, AcausalLerp, CausalAdd, CausalLerp, KTemporalConv, QTemporalConv
+from .lerp import (AcausalAdd, AcausalLerp, CausalAdd, CausalLerp,
+                    KAcausalAdd, KAcausalLerp, KTemporalConv, QTemporalConv)
 from .rope import HybridRoPE, PairedRoPE
 
 
@@ -75,7 +76,8 @@ class ULBConfig:
     q_lerp_bias: float = -2.0
     blend_gate_bias: float = -1.1
     q_mix: Literal['none', 'lerp', 'add', 'conv2', 'conv3'] = 'lerp'
-    k_mix: Literal['none', 'lerp', 'add', 'conv2', 'conv3'] = 'lerp'
+    k_mix: Literal['none', 'lerp', 'add', 'acausal_lerp', 'acausal_add', 'conv2', 'conv3'] = 'lerp'
+    is_causal: bool = True
     k_lerp: bool = True  # legacy compat — overridden by k_mix if set
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
@@ -152,14 +154,18 @@ class ULBBlock(nn.Module):
         # --- Temporal mixing ---
         quarter_dim = head_dim // 4
 
-        # K mixing (causal only)
-        self.k_lerp: CausalLerp | CausalAdd | None = None
+        # K mixing
+        self.k_lerp: CausalLerp | CausalAdd | KAcausalLerp | KAcausalAdd | None = None
         self.k_conv: KTemporalConv | None = None
         k_mix = config.k_mix
         if k_mix == 'lerp':
             self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'add':
             self.k_lerp = CausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'acausal_lerp':
+            self.k_lerp = KAcausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'acausal_add':
+            self.k_lerp = KAcausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'conv2':
             self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=2)
         elif k_mix == 'conv3':
@@ -204,14 +210,15 @@ class ULBBlock(nn.Module):
             q, k, v:    (B, H, T, D) — standard SDPA layout.
             blend_gate: (B, H, T, 1) — only used for 'blend' mode.
         """
+        is_causal = self.config.is_causal
         if self.config.attn_mode == 'silu2':
-            return silu2_attention(q, k, v)
+            return silu2_attention(q, k, v, is_causal=is_causal)
         elif self.config.attn_mode == 'blend':
             assert self.blend_attn is not None
             assert blend_gate is not None
-            return self.blend_attn(q, k, v, blend_gate)
+            return self.blend_attn(q, k, v, blend_gate, is_causal=is_causal)
         else:
-            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
     def preprocess_qk(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor
                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:

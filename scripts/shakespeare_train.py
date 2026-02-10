@@ -96,6 +96,7 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
         inner_ratio=args.inner_ratio,
         q_mix=args.q_mix,
         k_mix=args.k_mix,
+        is_causal=not args.no_causal,
     )
 
 
@@ -140,7 +141,7 @@ def build_llada_mha(vocab_size: int, args) -> nn.Module:
 
 
 def build_llada_ulb(vocab_size: int, args) -> nn.Module:
-    """Build LLaDA with CausalULB backbone (keeps causal attention)."""
+    """Build LLaDA with CausalULB backbone."""
     from ulb.transformer import CausalULB, LLaDAModel
     backbone = CausalULB(
         vocab_size=vocab_size,
@@ -151,6 +152,7 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         inner_ratio=args.inner_ratio,
         q_mix=args.q_mix,
         k_mix=args.k_mix,
+        is_causal=not args.no_causal,
     )
     return LLaDAModel(backbone, vocab_size, args.dim)
 
@@ -750,8 +752,11 @@ def main():
     parser.add_argument('--inner-ratio', type=float, default=1.75, help='Inner dim ratio (ULB)')
     parser.add_argument('--q-mix', type=str, default='lerp', choices=['none', 'lerp', 'add', 'conv2', 'conv3'],
                         help='Q temporal mixing mode (ULB)')
-    parser.add_argument('--k-mix', type=str, default='lerp', choices=['none', 'lerp', 'add', 'conv2', 'conv3'],
-                        help='K temporal mixing mode (ULB, causal)')
+    parser.add_argument('--k-mix', type=str, default='lerp',
+                        choices=['none', 'lerp', 'add', 'acausal_lerp', 'acausal_add', 'conv2', 'conv3'],
+                        help='K temporal mixing mode (ULB)')
+    parser.add_argument('--no-causal', action='store_true', default=False,
+                        help='Disable causal mask on attention (ULB)')
     parser.add_argument('--seq-len', type=int, default=80, help='Total sequence length')
 
     # Diffusion-specific

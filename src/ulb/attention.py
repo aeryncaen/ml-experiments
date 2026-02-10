@@ -19,26 +19,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def _silu2_attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _silu2_attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         is_causal: bool = True) -> torch.Tensor:
     """Reference silu2 attention (materializes T^2 matrix)."""
     scale = 1.0 / math.sqrt(q.shape[-1])
     logits = (q @ k.transpose(-2, -1)) * scale
     T = logits.shape[-1]
-    causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
-    weights = F.silu(logits) ** 2 * causal_mask
+    if is_causal:
+        causal_mask = torch.tril(torch.ones(T, T, device=logits.device, dtype=logits.dtype))
+        weights = F.silu(logits) ** 2 * causal_mask
+    else:
+        weights = F.silu(logits) ** 2
     return weights @ v
 
 
-def silu2_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """SiLU-squared attention: silu(logits)^2, unnormalized, causal.
+def silu2_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    is_causal: bool = True) -> torch.Tensor:
+    """SiLU-squared attention: silu(logits)^2, unnormalized.
 
     Args:
         q, k, v: (B, H, T, D) — standard SDPA layout.
+        is_causal: If True, apply causal mask.
 
     Returns:
         (B, H, T, D) attention output.
     """
-    return _silu2_attention_ref(q, k, v)
+    return _silu2_attention_ref(q, k, v, is_causal=is_causal)
 
 
 class BlendAttention(nn.Module):
@@ -79,16 +85,17 @@ class BlendAttention(nn.Module):
         return gate.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                gate: torch.Tensor) -> torch.Tensor:
+                gate: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         """Blended attention forward.
 
         Args:
             q, k, v: (B, H, T, D) — standard SDPA layout.
             gate:    (B, H, T, 1) — blend gate from compute_gate().
+            is_causal: If True, apply causal mask.
 
         Returns:
             (B, H, T, D) blended attention output.
         """
-        y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y_silu2 = self.silu2_norm(silu2_attention(q, k, v))
+        y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        y_silu2 = self.silu2_norm(silu2_attention(q, k, v, is_causal=is_causal))
         return (1 - gate) * y_softmax + gate * y_silu2
