@@ -77,7 +77,9 @@ class EMA:
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-VOCAB_SIZE = 256  # byte-level tokenization
+BOS_TOKEN = 256
+EOS_TOKEN = 257
+VOCAB_SIZE = 258  # byte-level (0-255) + BOS + EOS
 
 
 def load_shakespeare(data_dir: str = "data") -> str:
@@ -97,21 +99,37 @@ def encode(text: str) -> torch.Tensor:
 
 
 def decode(ids: torch.Tensor) -> str:
-    return bytes(ids.tolist()).decode('utf-8', errors='replace')
+    """Decode token ids to string, skipping BOS/EOS tokens."""
+    byte_ids = [i for i in ids.tolist() if i < 256]
+    return bytes(byte_ids).decode('utf-8', errors='replace')
 
 
 class TextDataset:
-    """Samples contiguous chunks from encoded text."""
+    """Samples contiguous chunks from encoded text.
+
+    Each chunk is [BOS, ...bytes..., EOS] of total length seq_len.
+    The inner content is seq_len - 2 bytes.
+    """
 
     def __init__(self, data: torch.Tensor, seq_len: int):
         self.data = data
         self.seq_len = seq_len
+        self.content_len = seq_len - 2  # room for BOS + EOS
 
     def sample_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Returns (B, seq_len) token chunks."""
-        max_start = len(self.data) - self.seq_len
+        """Returns (B, seq_len) token chunks with BOS/EOS."""
+        max_start = len(self.data) - self.content_len
         starts = torch.randint(0, max_start, (batch_size,))
-        return torch.stack([self.data[s:s + self.seq_len] for s in starts]).to(device)
+        chunks = []
+        for s in starts:
+            content = self.data[s:s + self.content_len]
+            chunk = torch.cat([
+                torch.tensor([BOS_TOKEN], dtype=torch.long),
+                content,
+                torch.tensor([EOS_TOKEN], dtype=torch.long),
+            ])
+            chunks.append(chunk)
+        return torch.stack(chunks).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -796,9 +814,12 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
 
     # Random mask: each position independently masked with mask_prob
     mask = torch.rand(B, T, device=device) < mask_prob
+    # Never mask BOS (position 0) or EOS (position T-1)
+    mask[:, 0] = False
+    mask[:, -1] = False
     # Ensure at least one masked position per sample
     if not mask.any():
-        mask[0, 0] = True
+        mask[0, 1] = True
 
     logits = model(batch, mask)  # (B, T, vocab)
 
@@ -828,8 +849,11 @@ def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
     device = batch.device
 
     mask = torch.rand(B, T, device=device) < mask_prob
+    # Never mask BOS/EOS
+    mask[:, 0] = False
+    mask[:, -1] = False
     if not mask.any():
-        mask[0, 0] = True
+        mask[0, 1] = True
 
     logits = model(batch, mask)
 
@@ -865,24 +889,26 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     P = prompt_ids.shape[0]
     max_T = model.max_seq_len
 
-    # Clamp gen_len to fit
-    gen_len = min(gen_len, max_T - 1)
-    if P + gen_len > max_T:
-        prompt_ids = prompt_ids[-(max_T - gen_len):]
+    # Clamp gen_len to fit: [BOS, prompt, masked..., EOS]
+    gen_len = min(gen_len, max_T - P - 2)  # -2 for BOS/EOS
+    if gen_len < 1:
+        prompt_ids = prompt_ids[-(max_T - 3):]
         P = prompt_ids.shape[0]
+        gen_len = 1
 
-    T = P + gen_len
-
-    # Build input: prompt tokens + dummy tokens for generation region
+    # Build: [BOS, prompt, dummy..., EOS]
+    T = 1 + P + gen_len + 1  # BOS + prompt + gen + EOS
     token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
-    token_ids[0, :P] = prompt_ids
+    token_ids[0, 0] = BOS_TOKEN
+    token_ids[0, 1:1+P] = prompt_ids
+    token_ids[0, -1] = EOS_TOKEN
 
-    # Mask: prompt unmasked, generation region masked
+    # Mask: only the generation region (between prompt and EOS)
     mask = torch.zeros(1, T, dtype=torch.bool, device=device)
-    mask[0, P:] = True
+    mask[0, 1+P:-1] = True
 
     logits = model(token_ids, mask)  # (1, T, vocab)
-    output_ids = logits[0, P:].argmax(dim=-1)  # (gen_len,)
+    output_ids = logits[0, 1+P:-1].argmax(dim=-1)  # (gen_len,)
 
     return decode(output_ids)
 
@@ -1301,12 +1327,15 @@ def train(args):
         try:
             with torch.no_grad():
                 if is_mlm:
-                    # BERT-style sample: take real text, mask 40%, reconstruct
+                    # BERT-style sample: take real text, mask, reconstruct
                     sample_batch = val_ds.sample_batch(1, device)  # (1, T)
                     T = sample_batch.shape[1]
                     mask = torch.rand(1, T, device=device) < cur_mask_prob
+                    # Never mask BOS/EOS
+                    mask[:, 0] = False
+                    mask[:, -1] = False
                     if not mask.any():
-                        mask[0, 0] = True
+                        mask[0, 1] = True
                     logits = model(sample_batch, mask)
                     preds = logits.argmax(dim=-1)
                     # Build display: show original with masked positions replaced by predictions
@@ -1543,9 +1572,12 @@ def main():
             for i in range(3):
                 sample_batch = val_ds_final.sample_batch(1, device)
                 T = sample_batch.shape[1]
-                mask = torch.rand(1, T, device=device) < model.mask_prob
+                mask = torch.rand(1, T, device=device) < args.mask_prob
+                # Never mask BOS/EOS
+                mask[:, 0] = False
+                mask[:, -1] = False
                 if not mask.any():
-                    mask[0, 0] = True
+                    mask[0, 1] = True
                 logits = model(sample_batch, mask)
                 preds = logits.argmax(dim=-1)
                 original = sample_batch[0]
