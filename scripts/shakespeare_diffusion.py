@@ -117,6 +117,20 @@ def train(args):
     print(f"Model: dim={args.dim}, heads={args.n_heads}, pool={args.pool_size}, "
           f"top_k={args.top_k}, max_hops={model.max_hops}, params={n_params:,}")
 
+    if args.compile:
+        print("Compiling full model with torch.compile...")
+        model = torch.compile(model)
+        print("Compilation will happen on first forward pass.")
+    elif args.compile_blocks:
+        n_compiled = 0
+        for i, expert in enumerate(model.experts):
+            model.experts[i] = torch.compile(expert)
+            n_compiled += 1
+        model.stem_layer = torch.compile(model.stem_layer)
+        model.exit_layer = torch.compile(model.exit_layer)
+        n_compiled += 2
+        print(f"Compiled {n_compiled} blocks (experts + stem + exit) with torch.compile.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -310,6 +324,8 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--device', type=str, default='cpu', help='Device')
     parser.add_argument('--save-dir', type=str, default=None, help='Save dir')
+    parser.add_argument('--compile', action='store_true', help='torch.compile the full model')
+    parser.add_argument('--compile-blocks', action='store_true', help='torch.compile individual expert/stem/exit blocks')
     args = parser.parse_args()
 
     print("=" * 60)
