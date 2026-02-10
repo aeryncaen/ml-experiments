@@ -1289,21 +1289,39 @@ def train(args):
 
         # Generate a sample after each epoch
         model.eval()
-        sample_prompt = "KING:\nO, "
-        sample_len = 64
         try:
             with torch.no_grad():
                 if is_mlm:
-                    sample = generate_mlm(model, sample_prompt, sample_len, device)
-                elif is_llada:
-                    sample = generate_llada(model, sample_prompt, sample_len, device, n_steps=32)
-                elif is_diffusion:
-                    sample = generate_diffusion(model, sample_prompt, sample_len, device)
+                    # BERT-style sample: take real text, mask 40%, reconstruct
+                    sample_batch = val_ds.sample_batch(1, device)  # (1, T)
+                    T = sample_batch.shape[1]
+                    mask = torch.rand(1, T, device=device) < model.mask_prob
+                    if not mask.any():
+                        mask[0, 0] = True
+                    logits = model(sample_batch, mask)
+                    preds = logits.argmax(dim=-1)
+                    # Build display: show original with masked positions replaced by predictions
+                    original = sample_batch[0]
+                    result = original.clone()
+                    result[mask[0]] = preds[0][mask[0]]
+                    orig_text = decode(original).replace('\n', '\\n')
+                    recon_text = decode(result).replace('\n', '\\n')
+                    n_masked = mask.sum().item()
+                    n_correct = ((preds[0] == original) & mask[0]).sum().item()
+                    tqdm.write(f"  [sample] {n_correct}/{n_masked} masked correct")
+                    tqdm.write(f"    orig:  {orig_text[:80]}")
+                    tqdm.write(f"    recon: {recon_text[:80]}")
                 else:
-                    sample = generate_ar(model, sample_prompt, sample_len, device)
-            # Show on one line, escape newlines
-            preview = (sample_prompt + sample).replace('\n', '\\n')
-            tqdm.write(f"  [sample] {preview}")
+                    sample_prompt = "KING:\nO, "
+                    sample_len = 64
+                    if is_llada:
+                        sample = generate_llada(model, sample_prompt, sample_len, device, n_steps=32)
+                    elif is_diffusion:
+                        sample = generate_diffusion(model, sample_prompt, sample_len, device)
+                    else:
+                        sample = generate_ar(model, sample_prompt, sample_len, device)
+                    preview = (sample_prompt + sample).replace('\n', '\\n')
+                    tqdm.write(f"  [sample] {preview}")
         except Exception:
             pass  # don't crash training on generation errors
 
@@ -1499,45 +1517,67 @@ def main():
     print("GENERATION SAMPLES")
     print("=" * 60)
 
-    prompts = [
-        "ROMEO:\nO, she doth teach the torches to burn bright!\n",
-        "HAMLET:\nTo be, or not to be, that is the question:\n",
-        "KING:\nOnce more unto the breach, dear friends,\n",
-    ]
-
-    if args.mode == 'diffusion':
-        gen_len = args.output_len
-    elif args.mode == 'mlm':
-        gen_len = args.gen_len
-    elif args.mode == 'llada':
-        gen_len = args.gen_len
+    if args.mode == 'mlm':
+        # BERT-style: take real text, mask, reconstruct
+        text = load_shakespeare()
+        data = encode(text)
+        n_train = int(0.9 * len(data))
+        val_data = data[n_train:]
+        val_ds_final = TextDataset(val_data, args.seq_len)
+        model.eval()
+        with torch.no_grad():
+            for i in range(3):
+                sample_batch = val_ds_final.sample_batch(1, device)
+                T = sample_batch.shape[1]
+                mask = torch.rand(1, T, device=device) < model.mask_prob
+                if not mask.any():
+                    mask[0, 0] = True
+                logits = model(sample_batch, mask)
+                preds = logits.argmax(dim=-1)
+                original = sample_batch[0]
+                result = original.clone()
+                result[mask[0]] = preds[0][mask[0]]
+                n_masked = mask.sum().item()
+                n_correct = ((preds[0] == original) & mask[0]).sum().item()
+                orig_text = decode(original)
+                recon_text = decode(result)
+                print(f"\n--- Sample {i+1}: {n_correct}/{n_masked} masked correct ---")
+                print(f"Original:\n{orig_text[:200]}")
+                print(f"Reconstructed:\n{recon_text[:200]}")
+                print()
     else:
-        gen_len = 128
+        prompts = [
+            "ROMEO:\nO, she doth teach the torches to burn bright!\n",
+            "HAMLET:\nTo be, or not to be, that is the question:\n",
+            "KING:\nOnce more unto the breach, dear friends,\n",
+        ]
 
-    for prompt in prompts:
-        # Truncate prompt to fit within model's context
-        if args.mode == 'ar':
-            max_prompt = args.seq_len - 1
+        if args.mode == 'diffusion':
+            gen_len = args.output_len
         elif args.mode == 'llada':
-            max_prompt = args.seq_len  # model has room for seq_len + gen_len
-        elif args.mode == 'mlm':
-            max_prompt = args.seq_len - 1
+            gen_len = args.gen_len
         else:
-            max_prompt = args.prompt_len
-        prompt_text = prompt[-max_prompt:]
+            gen_len = 128
 
-        if args.mode == 'mlm':
-            gen = generate_mlm(model, prompt_text, gen_len, device)
-        elif args.mode == 'ar':
-            gen = generate_ar(model, prompt_text, gen_len, device)
-        elif args.mode == 'llada':
-            gen = generate_llada(model, prompt_text, gen_len, device)
-        else:
-            gen = generate_diffusion(model, prompt_text, gen_len, device)
+        for prompt in prompts:
+            if args.mode == 'ar':
+                max_prompt = args.seq_len - 1
+            elif args.mode == 'llada':
+                max_prompt = args.seq_len
+            else:
+                max_prompt = args.prompt_len
+            prompt_text = prompt[-max_prompt:]
 
-        print(f"\n--- Prompt ---\n{prompt_text}")
-        print(f"--- Generated ---\n{gen}")
-        print()
+            if args.mode == 'ar':
+                gen = generate_ar(model, prompt_text, gen_len, device)
+            elif args.mode == 'llada':
+                gen = generate_llada(model, prompt_text, gen_len, device)
+            else:
+                gen = generate_diffusion(model, prompt_text, gen_len, device)
+
+            print(f"\n--- Prompt ---\n{prompt_text}")
+            print(f"--- Generated ---\n{gen}")
+            print()
 
     # Final save
     save_dir = Path(args.save_dir) if args.save_dir else Path(f'out/shakespeare_{args.arch}_{args.mode}')
