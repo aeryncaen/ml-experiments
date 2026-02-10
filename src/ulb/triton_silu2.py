@@ -415,21 +415,37 @@ def _silu2_attn_backward(do, q, k, v, softmax_scale=None):
 # Custom op registration for torch.compile compatibility
 # ---------------------------------------------------------------------------
 
-# Register as a custom op so torch.compile can see through it without
-# graph-breaking. The @torch.library.custom_op decorator handles both
-# the forward dispatch and the backward hookup via register_autograd.
+# Both forward and backward are registered as custom ops with fake impls,
+# so torch.compile/inductor never tries to trace into the Triton kernel
+# launches (which access .data_ptr() and would crash on FakeTensors).
 
-@torch.library.custom_op("ulb::silu2_attn", mutates_args=())
-def _silu2_attn_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+@torch.library.custom_op("ulb::silu2_attn_fwd", mutates_args=())
+def _silu2_attn_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
     D = q.shape[-1]
     scale = 1.0 / math.sqrt(D)
     return _silu2_attn_forward(q, k, v, scale)
 
 
-@_silu2_attn_op.register_fake
-def _silu2_attn_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+@_silu2_attn_fwd_op.register_fake
+def _silu2_attn_fwd_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(q)
+
+
+@torch.library.custom_op("ulb::silu2_attn_bwd", mutates_args=())
+def _silu2_attn_bwd_op(
+    grad_output: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    D = q.shape[-1]
+    scale = 1.0 / math.sqrt(D)
+    return _silu2_attn_backward(grad_output, q, k, v, scale)
+
+
+@_silu2_attn_bwd_op.register_fake
+def _silu2_attn_bwd_fake(
+    grad_output: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
 def _silu2_attn_setup_context(ctx, inputs, output):
@@ -439,13 +455,10 @@ def _silu2_attn_setup_context(ctx, inputs, output):
 
 def _silu2_attn_backward_impl(ctx, grad_output):
     q, k, v = ctx.saved_tensors
-    D = q.shape[-1]
-    scale = 1.0 / math.sqrt(D)
-    dq, dk, dv = _silu2_attn_backward(grad_output, q, k, v, scale)
-    return dq, dk, dv
+    return _silu2_attn_bwd_op(grad_output, q, k, v)
 
 
-_silu2_attn_op.register_autograd(
+_silu2_attn_fwd_op.register_autograd(
     _silu2_attn_backward_impl,
     setup_context=_silu2_attn_setup_context,
 )
@@ -454,7 +467,7 @@ _silu2_attn_op.register_autograd(
 def silu2_attention_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Drop-in replacement for silu2_attention using Triton kernels.
 
-    Registered as a torch custom op so torch.compile doesn't graph-break.
+    Registered as torch custom ops so torch.compile doesn't graph-break.
 
     Args:
         q, k, v: (B, H, T, D) — standard SDPA layout, CUDA tensors.
@@ -462,4 +475,4 @@ def silu2_attention_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
     Returns:
         (B, H, T, D) attention output.
     """
-    return _silu2_attn_op(q, k, v)
+    return _silu2_attn_fwd_op(q, k, v)
