@@ -1138,7 +1138,7 @@ def main():
     parser.add_argument('--steps-per-epoch', type=int, default=100, help='Steps per epoch')
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
     parser.add_argument('--val-batches', type=int, default=10, help='Validation batches')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--early-stop-acc', type=float, default=0.99,
                         help='Stop training when val acc exceeds this (0 to disable)')
