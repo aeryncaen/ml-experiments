@@ -412,33 +412,44 @@ def _silu2_attn_backward(do, q, k, v, softmax_scale=None):
 
 
 # ---------------------------------------------------------------------------
-# Autograd wrapper
+# Custom op registration for torch.compile compatibility
 # ---------------------------------------------------------------------------
 
-class Silu2AttentionFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, softmax_scale=None):
-        """
-        q, k, v: (B, H, T, D) — must be contiguous on last dim, CUDA.
-        """
-        q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
-        D = q.shape[-1]
-        softmax_scale = softmax_scale or (1.0 / math.sqrt(D))
-        o = _silu2_attn_forward(q, k, v, softmax_scale)
-        ctx.save_for_backward(q, k, v)
-        ctx.softmax_scale = softmax_scale
-        return o
+# Register as a custom op so torch.compile can see through it without
+# graph-breaking. The @torch.library.custom_op decorator handles both
+# the forward dispatch and the backward hookup via register_autograd.
 
-    @staticmethod
-    def backward(ctx, do):
-        q, k, v = ctx.saved_tensors
-        with torch.inference_mode():
-            dq, dk, dv = _silu2_attn_backward(do, q, k, v, ctx.softmax_scale)
-        return dq, dk, dv, None
+@torch.library.custom_op("ulb::silu2_attn", mutates_args=())
+def _silu2_attn_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
+    D = q.shape[-1]
+    scale = 1.0 / math.sqrt(D)
+    return _silu2_attn_forward(q, k, v, scale)
+
+
+def _silu2_attn_setup_context(ctx, inputs, output):
+    q, k, v = inputs
+    ctx.save_for_backward(q, k, v)
+
+
+def _silu2_attn_backward_impl(ctx, grad_output):
+    q, k, v = ctx.saved_tensors
+    D = q.shape[-1]
+    scale = 1.0 / math.sqrt(D)
+    dq, dk, dv = _silu2_attn_backward(grad_output, q, k, v, scale)
+    return dq, dk, dv
+
+
+_silu2_attn_op.register_autograd(
+    _silu2_attn_backward_impl,
+    setup_context=_silu2_attn_setup_context,
+)
 
 
 def silu2_attention_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Drop-in replacement for silu2_attention using Triton kernels.
+
+    Registered as a torch custom op so torch.compile doesn't graph-break.
 
     Args:
         q, k, v: (B, H, T, D) — standard SDPA layout, CUDA tensors.
@@ -446,4 +457,4 @@ def silu2_attention_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
     Returns:
         (B, H, T, D) attention output.
     """
-    return Silu2AttentionFunc.apply(q, k, v)
+    return _silu2_attn_op(q, k, v)
