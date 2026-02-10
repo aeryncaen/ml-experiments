@@ -340,7 +340,7 @@ def _silu2_attn_forward(q, k, v, softmax_scale=None):
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(D), 16)
-    BLOCK = 64
+    BLOCK = 32 if T <= 256 else 64
     num_warps = 4 if D <= 64 else 8
     grid = (triton.cdiv(T, BLOCK), B * H)
 
@@ -386,7 +386,7 @@ def _silu2_attn_backward(do, q, k, v, softmax_scale=None):
     dv = torch.empty_like(v)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(D), 16)
-    BLOCK = 64
+    BLOCK = 32 if T <= 256 else 64
     num_warps = 4 if D <= 64 else 8
     grid = (triton.cdiv(T, BLOCK), B * H)
 
