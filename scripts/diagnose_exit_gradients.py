@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Diagnose gradient behavior for fully-exited vs active samples across hops.
+"""Diagnose exit/routing behavior with pool^2 PoolOfExperts.
 
-With top_k=2, a sample can have one exit slot and one real expert.
-We classify samples into 3 categories per hop:
-  - full_active: neither top-k selection is exit (both are real experts)
-  - partial_exit: exactly one top-k is exit, one is real expert
-  - full_exit: both top-k selections are exit (truly done)
+Uses a plain PoolOfExperts (not MaskedDiffusionPoE) with external embed+head,
+same pattern as bench_ssm. This gets the pool^2 router space natively:
+  pool_size real expert slots + pool_size*(pool_size-1) exit slots.
+Random selection has 1/pool_size chance of picking an expert — depth must be earned.
 
-Only full_exit samples should get zero expert output. Partial exits still
-get real computation from their non-exit expert stream.
+Classifies samples into 3 categories per hop:
+  - full_active: all top-k are real experts
+  - partial_exit: mix of real experts and exit slots
+  - full_exit: all top-k are exit (truly done)
 
 Usage:
     python scripts/diagnose_exit_gradients.py [--device cuda]
@@ -18,42 +19,50 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
-from ulb.block import ULBConfig
-from ulb.diffusion import MaskedDiffusionPoE
+from ulb.block import ULBBlock, ULBConfig
+from ulb.stack import PoolOfExperts
 
 
-def diagnose(device='cuda'):
-    cfg = ULBConfig(d_model=64, n_heads=4, paired=True, attn_mode='blend', inner_ratio=1.75)
-    model = MaskedDiffusionPoE(
-        ulb_config=cfg, vocab_size=32, max_seq_len=128,
-        pool_size=4, top_k=2, max_hops=8, local_window=8, router_noise=1.0,
+VOCAB_SIZE = 64
+
+
+def diagnose(device='cuda', pool_size=4, top_k=2, max_hops=8, n_steps=10,
+             B=32, L=32, dim=64):
+    cfg = ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', inner_ratio=1.75)
+    make_layer = lambda: ULBBlock(cfg)
+    model = PoolOfExperts(
+        make_layer=make_layer, pool_size=pool_size, dim=dim,
+        top_k=top_k, max_hops=max_hops, router_noise=1.0,
     ).to(device)
-    pool_size = model.pool_size
 
-    B, L_in, L_out = 32, 64, 64
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    embed = nn.Embedding(VOCAB_SIZE, dim).to(device)
+    head = nn.Linear(dim, VOCAB_SIZE).to(device)
+
+    all_params = list(model.parameters()) + list(embed.parameters()) + list(head.parameters())
+    optimizer = torch.optim.AdamW(all_params, lr=3e-4)
+
+    n_router = model.n_router_options  # pool_size^2
+    n_exit = n_router - pool_size
 
     print("=" * 80)
-    print("Exit gradient diagnosis (per-stream)")
-    print(f"B={B}, L_in={L_in}, L_out={L_out}, pool={pool_size}, top_k=2, max_hops=8")
+    print("Exit gradient diagnosis (pool^2 PoolOfExperts)")
+    print(f"B={B}, L={L}, pool={pool_size}, top_k={top_k}, max_hops={max_hops}")
+    print(f"Router space: {n_router} ({pool_size} expert + {n_exit} exit)")
     print("=" * 80)
 
-    for step in range(5):
+    for step in range(n_steps):
         model.train()
-        prompt = torch.randint(0, 32, (B, L_in), device=device)
-        target = torch.randint(0, 32, (B, L_out), device=device)
-        t = 0.1 + 0.9 * torch.rand(B, 1, device=device)
-        mask = torch.rand(B, L_out, device=device) < t
-        mask[:, 0] = True
+        inp = torch.randint(0, VOCAB_SIZE, (B, L), device=device)
+        tgt = torch.randint(0, VOCAB_SIZE, (B, L), device=device)
 
         hop_data = []
         orig_route = model.route
         orig_execute = model.execute_hop
 
-        # Track cumulative full-exit (both streams chose exit)
         cumul_full_exit = torch.zeros(B, dtype=torch.bool, device=device)
 
         def patched_route(logits, hop):
@@ -62,13 +71,12 @@ def diagnose(device='cuda'):
 
             with torch.no_grad():
                 is_exit = topk_idx >= pool_size  # (B, top_k)
-                n_exit_streams = is_exit.sum(dim=-1)  # (B,) 0, 1, or 2
+                n_exit_streams = is_exit.sum(dim=-1)  # (B,) 0..top_k
 
                 full_active = n_exit_streams == 0
-                partial_exit = n_exit_streams == 1
-                full_exit = n_exit_streams == 2
+                partial_exit = (n_exit_streams > 0) & (n_exit_streams < top_k)
+                full_exit = n_exit_streams == top_k
 
-                # Only mark as truly done if BOTH streams exit
                 cumul_full_exit = cumul_full_exit | full_exit
 
                 hop_data.append({
@@ -87,7 +95,6 @@ def diagnose(device='cuda'):
             return topk_idx, topk_weights, has_exit
 
         def patched_execute(x, topk_idx, topk_weights, hop=0):
-            # Find the latest route data for this hop
             route_info = None
             for hd in reversed(hop_data):
                 if hd['hop'] == hop and hd['phase'] == 'route':
@@ -102,7 +109,7 @@ def diagnose(device='cuda'):
                 pe = route_info['partial_exit']
                 fe = route_info['full_exit']
                 cfe = route_info['cumul_full_exit']
-                prev_full_exit = cfe & ~fe  # samples that fully exited on a PREVIOUS hop
+                prev_full_exit = cfe & ~fe
 
                 out_fa = out[fa].norm(dim=-1).mean().item() if fa.any() else 0.0
                 out_pe = out[pe].norm(dim=-1).mean().item() if pe.any() else 0.0
@@ -129,24 +136,23 @@ def diagnose(device='cuda'):
         model.route = patched_route
         model.execute_hop = patched_execute
 
-        # Forward
-        logits_out, final_mask = model(prompt, target, mask)
+        # Forward: embed -> PoE -> head
+        x = embed(inp)
+        h = model(x)
+        logits_out = head(h)
 
         # Loss
-        per_token_loss = F.cross_entropy(
-            logits_out.reshape(-1, model.vocab_size),
-            target.reshape(-1),
-            reduction='none'
-        ).reshape(B, L_out)
-        masked_loss = per_token_loss * mask.float()
-        per_sample_loss = masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-        loss = per_sample_loss.mean()
+        loss = F.cross_entropy(logits_out.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+        aux_loss = getattr(model, 'aux_loss', 0.0)
+        total_loss = loss + aux_loss
 
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
 
         # ---- Report ----
-        print(f"\n--- Step {step} | loss={loss.item():.4f} ---")
+        mean_hops = model.last_mean_hops
+        hops_val = mean_hops.item() if hasattr(mean_hops, 'item') else mean_hops
+        print(f"\n--- Step {step} | loss={loss.item():.4f} | mean_hops={hops_val:.1f} ---")
 
         # Route timeline
         print(f"\n  Route decisions per hop:")
@@ -203,5 +209,14 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--pool-size', type=int, default=4)
+    parser.add_argument('--top-k', type=int, default=2)
+    parser.add_argument('--max-hops', type=int, default=8)
+    parser.add_argument('--steps', type=int, default=10)
+    parser.add_argument('--batch', type=int, default=32)
+    parser.add_argument('--seq-len', type=int, default=32)
+    parser.add_argument('--dim', type=int, default=64)
     args = parser.parse_args()
-    diagnose(args.device)
+    diagnose(args.device, pool_size=args.pool_size, top_k=args.top_k,
+             max_hops=args.max_hops, n_steps=args.steps, B=args.batch,
+             L=args.seq_len, dim=args.dim)
