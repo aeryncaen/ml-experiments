@@ -194,6 +194,54 @@ class KAcausalAdd(nn.Module):
         return torch.cat([k_static, k_mixed], dim=-1)
 
 
+class EmbeddingLerp(nn.Module):
+    """Acausal temporal lerp on the last quarter of embedding dims.
+
+    Applied once to token embeddings before any blocks. Centered mixing:
+        x_mixed = (1 - g_fwd - g_bwd) * x[t] + g_fwd * x[t+1] + g_bwd * x[t-1]
+
+    Operates on (B, T, D) directly — no head dimension.
+    Only touches the last quarter of D; first 3/4 pass through unchanged.
+
+    Args:
+        d_model:   Embedding dimension.
+        init_bias: Initial gate bias (default -2.0, sigmoid ~ 0.12).
+    """
+
+    def __init__(self, d_model: int, init_bias: float = -2.0):
+        super().__init__()
+        self.quarter_dim = d_model // 4
+        self.gate_fwd_proj = nn.Linear(d_model, self.quarter_dim, bias=True)
+        self.gate_bwd_proj = nn.Linear(d_model, self.quarter_dim, bias=True)
+        nn.init.zeros_(self.gate_fwd_proj.weight)
+        nn.init.constant_(self.gate_fwd_proj.bias, init_bias)
+        nn.init.zeros_(self.gate_bwd_proj.weight)
+        nn.init.constant_(self.gate_bwd_proj.bias, init_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply acausal lerp to embeddings.
+
+        Args:
+            x: (B, T, D) — token embeddings.
+
+        Returns:
+            (B, T, D) with last quarter blended with t-1 and t+1.
+        """
+        b, t, _ = x.shape
+        if t < 2:
+            return x
+        qd = self.quarter_dim
+        g_fwd = torch.sigmoid(self.gate_fwd_proj(x))  # (B, T, qd)
+        g_bwd = torch.sigmoid(self.gate_bwd_proj(x))
+
+        x_static = x[:, :, :-qd]
+        x_cur = x[:, :, -qd:]
+        x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
+        x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
+        x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_next + g_bwd * x_prev
+        return torch.cat([x_static, x_mixed], dim=-1)
+
+
 class KTemporalConv(nn.Module):
     """Causal depthwise temporal conv on the last quarter of K channels.
 

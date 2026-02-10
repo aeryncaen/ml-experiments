@@ -259,9 +259,11 @@ class CausalULB(nn.Module):
                  paired: bool = True, attn_mode: str = 'blend',
                  inner_ratio: float = 1.75,
                  k_mix: str = 'lerp',
-                 is_causal: bool = True):
+                 is_causal: bool = True,
+                 embed_lerp: bool = False):
         super().__init__()
         from .block import ULBBlock, ULBConfig
+        from .lerp import EmbeddingLerp
         from .norm import RMSNorm
 
         self.vocab_size = vocab_size
@@ -269,6 +271,7 @@ class CausalULB(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.token_embed = nn.Embedding(vocab_size, dim)
+        self.embed_lerp: EmbeddingLerp | None = EmbeddingLerp(dim) if embed_lerp else None
 
         config = ULBConfig(
             d_model=dim,
@@ -297,6 +300,8 @@ class CausalULB(nn.Module):
         """
         B, T = token_ids.shape
         x = self.token_embed(token_ids)
+        if self.embed_lerp is not None:
+            x = self.embed_lerp(x)
 
         for norm, block in zip(self.norms, self.blocks):
             x = x + block(norm(x))

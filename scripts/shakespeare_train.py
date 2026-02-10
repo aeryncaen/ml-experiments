@@ -96,6 +96,7 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
         inner_ratio=args.inner_ratio,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
+        embed_lerp=args.embed_lerp,
     )
 
 
@@ -151,6 +152,7 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
         inner_ratio=args.inner_ratio,
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
+        embed_lerp=args.embed_lerp,
     )
     return LLaDAModel(backbone, vocab_size, args.dim)
 
@@ -753,6 +755,8 @@ def main():
                         help='K temporal mixing mode (ULB)')
     parser.add_argument('--no-causal', action='store_true', default=False,
                         help='Disable causal mask on attention (ULB)')
+    parser.add_argument('--embed-lerp', action='store_true', default=False,
+                        help='Acausal lerp on token embeddings before blocks (ULB)')
     parser.add_argument('--seq-len', type=int, default=80, help='Total sequence length')
 
     # Diffusion-specific
