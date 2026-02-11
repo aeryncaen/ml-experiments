@@ -2,7 +2,7 @@
 
 Wraps any backbone (BidirectionalTransformer, CausalULB, StackedLM, etc.)
 and adds a learned mask embedding. Masks random positions plus a single
-end-of-sequence token for next-byte prediction.
+end-of-sequence token for next-token prediction.
 
 Training: CE loss on masked positions only.
 Generation: mask a region, forward pass, argmax at masked positions.

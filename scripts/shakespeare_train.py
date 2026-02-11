@@ -77,9 +77,35 @@ class EMA:
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-BOS_TOKEN = 256
-EOS_TOKEN = 257
-VOCAB_SIZE = 258  # byte-level (0-255) + BOS + EOS
+NULL_CHAR = 0  # NULL symbol index (used for BOS/EOS in bigrams)
+ALPHABET_SIZE = 66  # 65 Shakespeare chars + NULL
+VOCAB_SIZE = ALPHABET_SIZE * ALPHABET_SIZE  # 4356 bigram tokens
+
+# Character <-> index mapping (built lazily from data)
+_char_to_idx: dict[str, int] = {}
+_idx_to_char: dict[int, str] = {0: ''}  # NULL -> empty string
+
+
+def _build_char_map(text: str) -> None:
+    """Build char<->index mapping from Shakespeare text. Call once."""
+    global _char_to_idx, _idx_to_char
+    if _char_to_idx:
+        return  # already built
+    chars = sorted(set(text))
+    for i, c in enumerate(chars, start=1):  # 1-indexed, 0 = NULL
+        _char_to_idx[c] = i
+        _idx_to_char[i] = c
+    assert len(chars) == 65, f"Expected 65 unique chars, got {len(chars)}"
+
+
+def _bigram_token(a: int, b: int) -> int:
+    """Encode two char indices into a single bigram token."""
+    return a * ALPHABET_SIZE + b
+
+
+def _unbigram(token: int) -> tuple[int, int]:
+    """Decode a bigram token into two char indices."""
+    return token // ALPHABET_SIZE, token % ALPHABET_SIZE
 
 
 def load_shakespeare(data_dir: str = "data") -> str:
@@ -91,44 +117,85 @@ def load_shakespeare(data_dir: str = "data") -> str:
         import urllib.request
         urllib.request.urlretrieve(SHAKESPEARE_URL, data_path)
 
-    return data_path.read_text()
+    text = data_path.read_text()
+    _build_char_map(text)
+    return text
 
 
-def encode(text: str) -> torch.Tensor:
-    return torch.tensor(list(text.encode('utf-8')), dtype=torch.long)
+def encode(text: str, align: str = 'left') -> torch.Tensor:
+    """Encode text to bigram token IDs.
+
+    align='left':  [NULL, c0, c1, ...] paired up (BOS = NULL-leading bigram)
+    align='right': [c0, c1, ..., NULL] paired up (EOS = NULL-trailing bigram)
+
+    If the char sequence (after prepend/append) is odd, pad with an extra NULL.
+    """
+    char_ids = [_char_to_idx[c] for c in text]
+
+    if align == 'left':
+        char_ids = [NULL_CHAR] + char_ids
+    else:
+        char_ids = char_ids + [NULL_CHAR]
+
+    # Pad to even length
+    if len(char_ids) % 2 != 0:
+        char_ids.append(NULL_CHAR)
+
+    tokens = []
+    for i in range(0, len(char_ids), 2):
+        tokens.append(_bigram_token(char_ids[i], char_ids[i + 1]))
+
+    return torch.tensor(tokens, dtype=torch.long)
 
 
 def decode(ids: torch.Tensor) -> str:
-    """Decode token ids to string, skipping BOS/EOS tokens."""
-    byte_ids = [i for i in ids.tolist() if i < 256]
-    return bytes(byte_ids).decode('utf-8', errors='replace')
+    """Decode bigram token IDs to string, dropping NULL chars."""
+    chars = []
+    for token in ids.tolist():
+        a, b = _unbigram(token)
+        if a != NULL_CHAR:
+            chars.append(_idx_to_char[a])
+        if b != NULL_CHAR:
+            chars.append(_idx_to_char[b])
+    return ''.join(chars)
 
 
 class TextDataset:
-    """Samples contiguous chunks from encoded text.
+    """Samples contiguous chunks from raw text and bigram-encodes them.
 
-    Each chunk is [BOS, ...bytes..., EOS] of total length seq_len.
-    The inner content is seq_len - 2 bytes.
+    Each chunk is bigram-encoded with random left/right alignment.
+    seq_len is the number of bigram tokens per sample.
+    Each bigram token covers 2 characters, so content is ~seq_len*2 chars
+    (minus 1 for the NULL at the start or end).
     """
 
-    def __init__(self, data: torch.Tensor, seq_len: int):
-        self.data = data
+    def __init__(self, text: str, seq_len: int):
+        self.text = text
         self.seq_len = seq_len
-        self.content_len = seq_len - 2  # room for BOS + EOS
+        # Content chars per sample: seq_len bigrams = 2*seq_len char slots,
+        # minus 1 for the NULL (BOS or EOS), minus possible padding NULL
+        # Use 2*seq_len - 1 as the content length to always fit
+        self.content_len = 2 * seq_len - 1
 
     def sample_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Returns (B, seq_len) token chunks with BOS/EOS."""
-        max_start = len(self.data) - self.content_len
-        starts = torch.randint(0, max_start, (batch_size,))
+        """Returns (B, seq_len) bigram token chunks with random alignment."""
+        max_start = len(self.text) - self.content_len
+        starts = torch.randint(0, max(1, max_start), (batch_size,))
         chunks = []
         for s in starts:
-            content = self.data[s:s + self.content_len]
-            chunk = torch.cat([
-                torch.tensor([BOS_TOKEN], dtype=torch.long),
-                content,
-                torch.tensor([EOS_TOKEN], dtype=torch.long),
-            ])
-            chunks.append(chunk)
+            content = self.text[s:s + self.content_len]
+            align = 'left' if torch.rand(1).item() < 0.5 else 'right'
+            tokens = encode(content, align=align)
+            # Truncate or pad to exactly seq_len
+            if tokens.shape[0] > self.seq_len:
+                tokens = tokens[:self.seq_len]
+            elif tokens.shape[0] < self.seq_len:
+                # Pad with NULL-NULL bigrams
+                pad = torch.full((self.seq_len - tokens.shape[0],),
+                                 _bigram_token(NULL_CHAR, NULL_CHAR),
+                                 dtype=torch.long)
+                tokens = torch.cat([tokens, pad])
+            chunks.append(tokens)
         return torch.stack(chunks).to(device)
 
 
@@ -889,30 +956,24 @@ def _make_mlm_mask(B: int, T: int, mask_prob: float, gen_len: int,
                    device: torch.device) -> torch.Tensor:
     """Build MLM mask: 50% random, 50% contiguous chunk at end.
 
-    Contiguous chunks are placed right before EOS (end-only).
-    BOS (position 0) and EOS (position T-1) are never masked.
-    If gen_len > content_len, contiguous chunk is clamped to content_len.
+    With bigram tokens, all positions are maskable (BOS/EOS are embedded
+    in bigrams, not separate tokens).
     """
     mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-    # Content region is positions 1..T-2 (between BOS and EOS)
-    content_len = T - 2
-    chunk_len = min(gen_len, content_len)
+    chunk_len = min(gen_len, T)
 
     for i in range(B):
         if torch.rand(1).item() < 0.5 and chunk_len > 0:
-            # Contiguous chunk at end: right before EOS
-            end = T - 1  # EOS position
-            mask[i, end - chunk_len:end] = True
+            # Contiguous chunk at end
+            mask[i, T - chunk_len:T] = True
         else:
             # Random masking
             rand = torch.rand(T, device=device)
             mask[i] = rand < mask_prob
-            mask[i, 0] = False   # BOS
-            mask[i, -1] = False  # EOS
 
     # Ensure at least one masked position per sample
     if not mask.any():
-        mask[0, 1] = True
+        mask[0, 0] = True
 
     return mask
 
@@ -922,7 +983,7 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     """MLM training step.
 
     50% of samples get random masking at mask_prob rate.
-    50% get a single masked byte at end-of-sequence (next-byte prediction).
+    50% get a single masked bigram at end-of-sequence (next-token prediction).
     CE loss on masked positions only.
     """
     B, T = batch.shape
@@ -976,28 +1037,24 @@ def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
 @torch.no_grad()
 def generate_mlm(model, prompt_text: str, gen_len: int,
                  device: torch.device, tokens_per_step: int = 4) -> str:
-    """AR-style MLM generation: multiple tokens per forward pass.
+    """AR-style MLM generation: multiple bigram tokens per forward pass.
 
     Each step:
-      1. Build [BOS, prompt, generated_so_far, MASK*N, EOS]
-      2. Mask N positions at the end (before EOS)
+      1. Build [prompt_bigrams, generated_so_far, MASK*N]
+      2. Mask N positions at the end
       3. Forward pass -> argmax at all masked positions
       4. Append predicted tokens and repeat
 
-    Args:
-        model: BertMLM model.
-        prompt_text: Text prompt.
-        gen_len: Number of tokens to generate.
-        device: Torch device.
-        tokens_per_step: How many masked positions per forward pass.
+    Prompt is left-aligned (first bigram = [NULL, first_char] = BOS).
+    gen_len is number of bigram tokens to generate.
     """
     model.eval()
 
-    prompt_ids = encode(prompt_text).to(device)  # (P,)
+    prompt_ids = encode(prompt_text, align='left').to(device)  # (P,)
     max_T = model.max_seq_len
 
-    # Trim prompt if needed: BOS + prompt + tokens_per_step mask slots + EOS
-    max_prompt = max_T - 2 - tokens_per_step
+    # Trim prompt if needed
+    max_prompt = max_T - tokens_per_step
     if prompt_ids.shape[0] > max_prompt:
         prompt_ids = prompt_ids[-max_prompt:]
 
@@ -1006,28 +1063,25 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     while len(generated) < gen_len:
         n_gen = len(generated)
         remaining = gen_len - n_gen
-        # How many slots we can fit this step
-        room = max_T - (1 + prompt_ids.shape[0] + n_gen + 1)  # BOS+prompt+gen+EOS
+        room = max_T - (prompt_ids.shape[0] + n_gen)
         n_mask = min(tokens_per_step, remaining, room)
         if n_mask < 1:
             break
 
-        # Total seq: BOS + prompt + generated_so_far + n_mask slots + EOS
-        T = 1 + prompt_ids.shape[0] + n_gen + n_mask + 1
+        # Total seq: prompt + generated_so_far + n_mask slots
+        T = prompt_ids.shape[0] + n_gen + n_mask
         token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
-        token_ids[0, 0] = BOS_TOKEN
-        token_ids[0, 1:1+prompt_ids.shape[0]] = prompt_ids
+        token_ids[0, :prompt_ids.shape[0]] = prompt_ids
         if generated:
-            token_ids[0, 1+prompt_ids.shape[0]:1+prompt_ids.shape[0]+n_gen] = \
+            token_ids[0, prompt_ids.shape[0]:prompt_ids.shape[0]+n_gen] = \
                 torch.tensor(generated, dtype=torch.long, device=device)
-        # mask slots are zeros (dummy), EOS at the end
-        token_ids[0, -1] = EOS_TOKEN
+        # mask slots are zeros (dummy)
 
         mask = torch.zeros(1, T, dtype=torch.bool, device=device)
-        mask[0, -(1+n_mask):-1] = True  # mask the n_mask slots before EOS
+        mask[0, -n_mask:] = True  # mask the last n_mask slots
 
         logits = model(token_ids, mask)  # (1, T, vocab)
-        new_tokens = logits[0, -(1+n_mask):-1].argmax(dim=-1).tolist()
+        new_tokens = logits[0, -n_mask:].argmax(dim=-1).tolist()
         generated.extend(new_tokens)
 
     return decode(torch.tensor(generated[:gen_len], dtype=torch.long))
@@ -1040,10 +1094,11 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
 @torch.no_grad()
 def generate_ar(model, prompt_text: str, gen_len: int,
                 device: torch.device, temperature: float = 0.8) -> str:
-    """Autoregressive generation with temperature sampling."""
+    """Autoregressive generation with temperature sampling (bigram vocab)."""
     model.eval()
-    ids = encode(prompt_text).unsqueeze(0).to(device)  # (1, L)
-    max_ctx = model.max_seq_len  # don't exceed RoPE / pos embed range
+    prompt_ids = encode(prompt_text, align='left')
+    ids = prompt_ids.unsqueeze(0).to(device)  # (1, L)
+    max_ctx = model.max_seq_len
 
     for _ in range(gen_len):
         ctx = ids[:, -max_ctx:]                  # sliding window
@@ -1053,7 +1108,7 @@ def generate_ar(model, prompt_text: str, gen_len: int,
         next_id = torch.multinomial(probs, 1)    # (1, 1)
         ids = torch.cat([ids, next_id], dim=1)
 
-    generated = ids[0, len(encode(prompt_text)):]
+    generated = ids[0, len(prompt_ids):]
     return decode(generated)
 
 
@@ -1063,7 +1118,7 @@ def generate_diffusion(model, prompt_text: str, gen_len: int,
     """Iterative demasking generation."""
     model.eval()
 
-    prompt_ids = encode(prompt_text).unsqueeze(0).to(device)
+    prompt_ids = encode(prompt_text, align='left').unsqueeze(0).to(device)
     output_ids = torch.zeros(1, gen_len, dtype=torch.long, device=device)
     current_mask = torch.ones(1, gen_len, dtype=torch.bool, device=device)
 
@@ -1144,7 +1199,7 @@ def generate_llada(model, prompt_text: str, gen_len: int,
     """
     model.eval()
 
-    prompt_ids = encode(prompt_text).to(device)  # (P,)
+    prompt_ids = encode(prompt_text, align='left').to(device)  # (P,)
     P = prompt_ids.shape[0]
     max_T = model.max_seq_len
 
@@ -1218,16 +1273,16 @@ def train(args):
 
     # Data
     text = load_shakespeare()
-    data = encode(text)
     vocab_size = VOCAB_SIZE
-    print(f"Shakespeare: {len(text):,} chars, vocab_size={vocab_size}")
+    print(f"Shakespeare: {len(text):,} chars, alphabet={ALPHABET_SIZE}, "
+          f"vocab_size={vocab_size} (bigram)")
 
-    n_train = int(0.9 * len(data))
-    train_data, val_data = data[:n_train], data[n_train:]
-    print(f"Train: {len(train_data):,} chars, Val: {len(val_data):,} chars")
+    n_train = int(0.9 * len(text))
+    train_text, val_text = text[:n_train], text[n_train:]
+    print(f"Train: {len(train_text):,} chars, Val: {len(val_text):,} chars")
 
-    train_ds = TextDataset(train_data, args.seq_len)
-    val_ds = TextDataset(val_data, args.seq_len)
+    train_ds = TextDataset(train_text, args.seq_len)
+    val_ds = TextDataset(val_text, args.seq_len)
 
     # Model
     if is_diffusion and args.arch != 'ulb-diffusion-poe':
@@ -1255,7 +1310,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-byte)")
+        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-bigram)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1484,25 +1539,28 @@ def train(args):
                         orig = sb[0]
                         res = orig.clone()
                         res[m[0]] = pr[0][m[0]]
-                        mv = orig.clone()
-                        mv[m[0]] = ord('_')
                         nm = m.sum().item()
                         nc = ((pr[0] == orig) & m[0]).sum().item()
                         esc = lambda t: decode(t).replace('\n', '\\n')
-                        # Show last 80 chars so end-of-sequence chunks are visible
+                        # Build masked view: decode each bigram, replace masked with '__'
+                        mv_parts = []
+                        for j in range(orig.shape[0]):
+                            if m[0, j]:
+                                mv_parts.append('__')
+                            else:
+                                mv_parts.append(decode(orig[j:j+1]))
+                        mv_str = ''.join(mv_parts).replace('\n', '\\n')
                         tqdm.write(f"  [{label}] {nc}/{nm} masked correct")
                         tqdm.write(f"    orig:  ...{esc(orig)[-80:]}")
-                        tqdm.write(f"    mask:  ...{esc(mv)[-80:]}")
+                        tqdm.write(f"    mask:  ...{mv_str[-80:]}")
                         tqdm.write(f"    recon: ...{esc(res)[-80:]}")
 
                     # Random masking sample (forced random, no contiguous)
                     sb1 = val_ds.sample_batch(1, device)
                     T1 = sb1.shape[1]
                     m1 = torch.rand(1, T1, device=device) < cur_mask_prob
-                    m1[:, 0] = False
-                    m1[:, -1] = False
                     if not m1.any():
-                        m1[0, 1] = True
+                        m1[0, 0] = True
                     _show_mlm_sample("sample rand", sb1, m1)
 
                     # AR-style generation sample
@@ -1533,6 +1591,9 @@ def train(args):
 
 def interactive_generate(args):
     """Load a checkpoint and run an interactive generation loop."""
+    # Ensure char map is built (needed for bigram encode/decode)
+    load_shakespeare()
+
     ckpt_path = args.generate
     device = torch.device(args.device)
 
@@ -1562,17 +1623,14 @@ def interactive_generate(args):
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    if mode == 'ar':
-        max_prompt = saved_args.seq_len - 1
-    elif mode == 'llada':
-        max_prompt = saved_args.seq_len  # model has room for seq_len + gen_len
-    elif mode == 'mlm':
-        max_prompt = saved_args.seq_len - 1  # need room for at least 1 generated token
-    else:
-        max_prompt = saved_args.prompt_len
+    # max_prompt in chars (~2x bigram seq_len since each bigram = 2 chars)
+    max_prompt_chars = (saved_args.seq_len - 1) * 2
+    if mode == 'llada':
+        max_prompt_chars = saved_args.seq_len * 2
 
     print(f"\nInteractive generation — type a prompt and press Enter.")
-    print(f"  mode={mode}, temperature={temperature}, gen_len={gen_len}, max_prompt={max_prompt}")
+    print(f"  mode={mode}, temperature={temperature}, gen_len={gen_len}, "
+          f"max_prompt~={max_prompt_chars} chars")
     print(f"  (Ctrl+C or empty line to quit)\n")
 
     while True:
@@ -1588,10 +1646,10 @@ def interactive_generate(args):
         # Allow \n in input for multi-line prompts
         prompt_text = prompt_text.replace('\\n', '\n')
 
-        # Truncate to fit
-        if len(prompt_text) > max_prompt:
-            prompt_text = prompt_text[-max_prompt:]
-            print(f"  (truncated to last {max_prompt} chars)")
+        # Truncate to fit (generate functions handle exact truncation internally)
+        if len(prompt_text) > max_prompt_chars:
+            prompt_text = prompt_text[-max_prompt_chars:]
+            print(f"  (truncated to last {max_prompt_chars} chars)")
 
         if mode == 'mlm':
             gen = generate_mlm(model, prompt_text, gen_len, device)
@@ -1777,21 +1835,13 @@ def main():
 
         for prompt in prompts:
             if args.mode == 'ar':
-                max_prompt = args.seq_len - 1
+                gen = generate_ar(model, prompt, gen_len, device)
             elif args.mode == 'llada':
-                max_prompt = args.seq_len
+                gen = generate_llada(model, prompt, gen_len, device)
             else:
-                max_prompt = args.prompt_len
-            prompt_text = prompt[-max_prompt:]
+                gen = generate_diffusion(model, prompt, gen_len, device)
 
-            if args.mode == 'ar':
-                gen = generate_ar(model, prompt_text, gen_len, device)
-            elif args.mode == 'llada':
-                gen = generate_llada(model, prompt_text, gen_len, device)
-            else:
-                gen = generate_diffusion(model, prompt_text, gen_len, device)
-
-            print(f"\n--- Prompt ---\n{prompt_text}")
+            print(f"\n--- Prompt ---\n{prompt.rstrip()}")
             print(f"--- Generated ---\n{gen}")
             print()
 
