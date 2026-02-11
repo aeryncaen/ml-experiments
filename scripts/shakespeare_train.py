@@ -79,8 +79,8 @@ SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/da
 
 NULL_CHAR = 0  # NULL symbol index (used for BOS/EOS in trigrams)
 ALPHABET_SIZE = 66  # 65 Shakespeare chars + NULL
-NGRAM = 3  # trigram tokenization
-VOCAB_SIZE = ALPHABET_SIZE ** NGRAM  # 287,496 trigram tokens
+NGRAM = 2  # bigram tokenization
+VOCAB_SIZE = ALPHABET_SIZE ** NGRAM  # 4,356 bigram tokens
 
 # Character <-> index mapping (built lazily from data)
 _char_to_idx: dict[str, int] = {}
