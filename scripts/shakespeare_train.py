@@ -918,33 +918,25 @@ def _make_mlm_mask(B: int, T: int, mask_prob: float, gen_len: int,
 
 
 def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
-                   mask_prob: float = 0.40, gen_len: int = 64):
-    """Dual-objective MLM + next-token training step.
+                   mask_prob: float = 0.40):
+    """MLM training step.
 
     50% of samples get random masking at mask_prob rate.
-    50% get a contiguous masked chunk of gen_len bytes.
-    MLM CE loss on masked positions + AR CE loss on next-token prediction.
+    50% get a single masked byte at end-of-sequence (next-byte prediction).
+    CE loss on masked positions only.
     """
     B, T = batch.shape
     device = batch.device
 
-    mask = _make_mlm_mask(B, T, mask_prob, gen_len, device)
+    mask = _make_mlm_mask(B, T, mask_prob, gen_len=1, device=device)
 
-    mlm_logits, ar_logits = model(batch, mask)  # both (B, T, vocab)
+    logits = model(batch, mask)  # (B, T, vocab)
 
     # MLM loss: CE on masked positions only
-    mlm_loss = F.cross_entropy(
-        mlm_logits[mask].reshape(-1, mlm_logits.shape[-1]),
+    loss = F.cross_entropy(
+        logits[mask].reshape(-1, logits.shape[-1]),
         batch[mask].reshape(-1),
-    )
-
-    # AR loss: predict next token (shift by 1)
-    ar_loss = F.cross_entropy(
-        ar_logits[:, :-1].reshape(-1, ar_logits.shape[-1]),
-        batch[:, 1:].reshape(-1),
-    )
-
-    loss = mlm_loss + ar_loss + _get_aux_loss(model)
+    ) + _get_aux_loss(model)
 
     optimizer.zero_grad()
     loss.backward()
@@ -952,45 +944,33 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     optimizer.step()
 
     with torch.no_grad():
-        mlm_preds = mlm_logits.argmax(dim=-1)
-        mlm_correct = (mlm_preds == batch) & mask
-        mlm_acc = (mlm_correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
+        preds = logits.argmax(dim=-1)
+        correct = (preds == batch) & mask
+        acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
-        ar_preds = ar_logits[:, :-1].argmax(dim=-1)
-        ar_acc = (ar_preds == batch[:, 1:]).float().mean().item()
-
-    return loss.item(), mlm_acc, ar_acc
+    return loss.item(), acc
 
 
 @torch.no_grad()
-def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40,
-                 gen_len: int = 64):
-    """Dual-objective MLM + next-token validation."""
+def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
+    """MLM validation step."""
     B, T = batch.shape
     device = batch.device
 
-    mask = _make_mlm_mask(B, T, mask_prob, gen_len, device)
+    mask = _make_mlm_mask(B, T, mask_prob, gen_len=1, device=device)
 
-    mlm_logits, ar_logits = model(batch, mask)
+    logits = model(batch, mask)
 
-    mlm_loss = F.cross_entropy(
-        mlm_logits[mask].reshape(-1, mlm_logits.shape[-1]),
+    loss = F.cross_entropy(
+        logits[mask].reshape(-1, logits.shape[-1]),
         batch[mask].reshape(-1),
     ).item()
 
-    ar_loss = F.cross_entropy(
-        ar_logits[:, :-1].reshape(-1, ar_logits.shape[-1]),
-        batch[:, 1:].reshape(-1),
-    ).item()
+    preds = logits.argmax(dim=-1)
+    correct = (preds == batch) & mask
+    acc = (correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
 
-    mlm_preds = mlm_logits.argmax(dim=-1)
-    mlm_correct = (mlm_preds == batch) & mask
-    mlm_acc = (mlm_correct.sum().float() / mask.sum().float()).item() if mask.any() else 0.0
-
-    ar_preds = ar_logits[:, :-1].argmax(dim=-1)
-    ar_acc = (ar_preds == batch[:, 1:]).float().mean().item()
-
-    return mlm_loss + ar_loss, mlm_acc, ar_acc
+    return loss, acc
 
 
 @torch.no_grad()
@@ -1031,8 +1011,8 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     mask = torch.zeros(1, T, dtype=torch.bool, device=device)
     mask[0, 1+P:-1] = True
 
-    mlm_logits, _ = model(token_ids, mask)  # (1, T, vocab)
-    output_ids = mlm_logits[0, 1+P:-1].argmax(dim=-1)  # (gen_len,)
+    logits = model(token_ids, mask)  # (1, T, vocab)
+    output_ids = logits[0, 1+P:-1].argmax(dim=-1)  # (gen_len,)
 
     return decode(output_ids)
 
@@ -1259,7 +1239,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob=0.15→{args.mask_prob}, gen_len=1→{args.output_len} over first half (curriculum)")
+        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-byte)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1372,28 +1352,24 @@ def train(args):
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
-        epoch_ar_acc = 0.0
 
         # Anneal router noise for PoE models
         if _router_module is not None:
             frac = (epoch - 1) / max(args.epochs - 1, 1)
             _router_module.router_noise_scale = args.router_noise * (1 - frac)
 
-        # MLM curriculum: ramp mask_prob 15%→target and gen_len 1→output_len over first half
+        # MLM curriculum: ramp mask_prob 15%→target over first half
         if is_mlm:
             ramp_end = max(args.epochs // 2, 1)
             frac = min((epoch - 1) / ramp_end, 1.0)
             cur_mask_prob = 0.15 + frac * (args.mask_prob - 0.15)
-            cur_gen_len = max(1, int(1 + frac * (args.output_len - 1)))
 
         for step in range(args.steps_per_epoch):
             batch = train_ds.sample_batch(args.batch_size, device)
 
             if is_mlm:
-                loss, acc, ar_acc_step = train_step_mlm(model, batch, optimizer, args.grad_clip,
-                                                        mask_prob=cur_mask_prob,
-                                                        gen_len=cur_gen_len)
-                epoch_ar_acc += ar_acc_step
+                loss, acc = train_step_mlm(model, batch, optimizer, args.grad_clip,
+                                           mask_prob=cur_mask_prob)
             elif is_llada:
                 loss, acc = train_step_llada(model, batch, optimizer, args.grad_clip,
                                             antithetic=not args.no_antithetic)
@@ -1419,14 +1395,11 @@ def train(args):
         model.eval()
         val_loss = 0.0
         val_acc = 0.0
-        val_ar_acc = 0.0
         n_val = args.val_batches
         for _ in range(n_val):
             batch = val_ds.sample_batch(args.batch_size, device)
             if is_mlm:
-                vl, va, va_ar = val_step_mlm(model, batch, mask_prob=cur_mask_prob,
-                                             gen_len=cur_gen_len)
-                val_ar_acc += va_ar
+                vl, va = val_step_mlm(model, batch, mask_prob=cur_mask_prob)
             elif is_llada:
                 vl, va = val_step_llada(model, batch)
             elif is_diffusion:
@@ -1437,7 +1410,6 @@ def train(args):
             val_acc += va
         val_loss /= n_val
         val_acc /= n_val
-        val_ar_acc /= n_val
         if ema is not None:
             ema.restore(model.parameters())
 
@@ -1457,9 +1429,8 @@ def train(args):
                 'best_val_loss': best_val_loss,
             }, best_ckpt_path)
         best_marker = " *" if is_best else ""
-        mask_info = f" mask={cur_mask_prob:.0%} gen={cur_gen_len}" if is_mlm else ""
-        ar_info = f" ar_acc={val_ar_acc:.1%}" if is_mlm else ""
-        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{ar_info}{mask_info}{best_marker}")
+        mask_info = f" mask={cur_mask_prob:.0%}" if is_mlm else ""
+        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{mask_info}{best_marker}")
 
         # Early stop on val accuracy
         if args.early_stop_acc > 0 and val_acc >= args.early_stop_acc:
@@ -1474,9 +1445,7 @@ def train(args):
             vacc=f"{val_acc:.1%}",
         )
         if is_mlm:
-            avg_ar_acc = epoch_ar_acc / args.steps_per_epoch
-            postfix['ar'] = f"{avg_ar_acc:.1%}"
-            postfix['var'] = f"{val_ar_acc:.1%}"
+            postfix['mask'] = f"{cur_mask_prob:.0%}"
         # Show hops for PoE models
         _hops_src = _router_module  # PoolOfExperts tracks last_mean_hops
         if _hops_src is not None and hasattr(_hops_src, 'last_mean_hops'):
@@ -1494,7 +1463,7 @@ def train(args):
             with torch.no_grad():
                 if is_mlm:
                     def _show_mlm_sample(label, sb, m):
-                        lg, _ = model(sb, m)
+                        lg = model(sb, m)
                         pr = lg.argmax(dim=-1)
                         orig = sb[0]
                         res = orig.clone()
@@ -1520,12 +1489,11 @@ def train(args):
                         m1[0, 1] = True
                     _show_mlm_sample("sample rand", sb1, m1)
 
-                    # EOS-generation sample: contiguous chunk at end before EOS
+                    # EOS-generation sample: single masked byte at end before EOS
                     sb2 = val_ds.sample_batch(1, device)
                     T2 = sb2.shape[1]
-                    chunk = min(cur_gen_len, T2 - 2)
                     m2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
-                    m2[0, T2 - 1 - chunk:T2 - 1] = True
+                    m2[0, T2 - 2] = True
                     _show_mlm_sample("sample gen", sb2, m2)
                 else:
                     sample_prompt = "KING:\nO, "
@@ -1777,7 +1745,7 @@ def main():
             for i in range(3):
                 sample_batch = val_ds_final.sample_batch(1, device)
                 T = sample_batch.shape[1]
-                mask = _make_mlm_mask(1, T, args.mask_prob, args.output_len, device)
+                mask = _make_mlm_mask(1, T, args.mask_prob, gen_len=1, device=device)
                 logits = model(sample_batch, mask)
                 preds = logits.argmax(dim=-1)
                 original = sample_batch[0]

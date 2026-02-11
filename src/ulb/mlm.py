@@ -1,10 +1,10 @@
 """BERT-style Masked Language Model.
 
 Wraps any backbone (BidirectionalTransformer, CausalULB, StackedLM, etc.)
-and adds a learned mask embedding. Masks random positions across the ENTIRE
-input sequence — no prompt/output split.
+and adds a learned mask embedding. Masks random positions plus a single
+end-of-sequence token for next-byte prediction.
 
-Training: mask ~15% of positions, CE loss on masked positions only.
+Training: CE loss on masked positions only.
 Generation: mask a region, forward pass, argmax at masked positions.
 """
 
@@ -48,12 +48,8 @@ class BertMLM(nn.Module):
         self.pred_act = nn.SiLU()
         self.pred_norm = nn.RMSNorm(dim)
 
-        # Next-token prediction head (AR objective)
-        self.next_token_head = nn.Linear(dim, vocab_size, bias=False)
-
-        # Init heads with trunc_normal like other input projections
+        # Init head with trunc_normal like other input projections
         nn.init.trunc_normal_(self.pred_dense.weight, std=0.02, a=-0.04, b=0.04)
-        nn.init.trunc_normal_(self.next_token_head.weight, std=0.02, a=-0.04, b=0.04)
 
         self.aux_loss = 0.0
 
@@ -124,7 +120,7 @@ class BertMLM(nn.Module):
         return x
 
     def forward(self, token_ids: torch.Tensor,
-                mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                mask: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
@@ -132,8 +128,7 @@ class BertMLM(nn.Module):
             mask: (B, T) bool — True = masked (predict these).
 
         Returns:
-            mlm_logits: (B, T, vocab_size) — MLM predictions (loss on masked positions).
-            ar_logits:  (B, T, vocab_size) — next-token predictions (shift by 1 for loss).
+            (B, T, vocab_size) MLM logits — loss on masked positions only.
         """
         x = self._embed_with_mask(token_ids, mask)
         h = self._run_backbone(x)
@@ -143,13 +138,10 @@ class BertMLM(nn.Module):
             self.pred_norm(self.pred_act(self.pred_dense(h)))
         )
 
-        # AR head: direct projection from hidden states
-        ar_logits = self.next_token_head(h)
-
         # Collect aux_loss from backbone
         if hasattr(self.backbone, 'stacker'):
             self.aux_loss = getattr(self.backbone.stacker, 'aux_loss', 0.0)
         else:
             self.aux_loss = 0.0
 
-        return mlm_logits, ar_logits
+        return mlm_logits
