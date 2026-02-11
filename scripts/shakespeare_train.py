@@ -1249,6 +1249,23 @@ def train(args):
     save_dir.mkdir(parents=True, exist_ok=True)
     best_val_loss = float('inf')
     best_ckpt_path = save_dir / 'best_model.pt'
+    start_epoch = 0
+
+    # Resume from checkpoint
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['state_dict'])
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        if 'epoch' in ckpt:
+            start_epoch = ckpt['epoch'] + 1
+            print(f"  Resuming from epoch {start_epoch}")
+        if 'best_val_loss' in ckpt:
+            best_val_loss = ckpt['best_val_loss']
+            print(f"  Best val_loss so far: {best_val_loss:.4f}")
 
     # Diffusion-specific
     if is_diffusion:
@@ -1273,7 +1290,7 @@ def train(args):
         elif hasattr(bb, 'stacker') and hasattr(bb.stacker, 'router_noise_scale'):
             _router_module = bb.stacker
 
-    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="ep")
+    pbar = tqdm(range(start_epoch + 1, args.epochs + 1), desc="Training", unit="ep")
     for epoch in pbar:
         model.train()
         epoch_loss = 0.0
@@ -1352,12 +1369,15 @@ def train(args):
             best_val_loss = val_loss
             torch.save({
                 'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
                 'args': vars(args),
                 'vocab_size': vocab_size,
                 'params': n_params,
                 'epoch': epoch,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
+                'best_val_loss': best_val_loss,
             }, best_ckpt_path)
         best_marker = " *" if is_best else ""
         mask_info = f" mask={cur_mask_prob:.0%} gen={cur_gen_len}" if is_mlm else ""
@@ -1608,6 +1628,8 @@ def main():
                         help='Stop training when val acc exceeds this (0 to disable)')
     parser.add_argument('--device', type=str, default='cpu', help='Device')
     parser.add_argument('--save-dir', type=str, default=None, help='Save directory')
+    parser.add_argument('--resume', type=str, default=None, metavar='CKPT',
+                        help='Resume training from checkpoint (path to .pt file)')
     parser.add_argument('--compile', action='store_true', help='torch.compile the model')
     parser.add_argument('--compile-mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
@@ -1706,9 +1728,13 @@ def main():
     ckpt_path = save_dir / 'final_model.pt'
     torch.save({
         'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
         'args': vars(args),
         'vocab_size': VOCAB_SIZE,
         'params': sum(p.numel() for p in model.parameters()),
+        'epoch': args.epochs,
+        'best_val_loss': best_val_loss,
     }, ckpt_path)
     print(f"Saved final checkpoint -> {ckpt_path}")
 
