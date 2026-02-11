@@ -274,6 +274,8 @@ class ByteChunkVAE(nn.Module):
         self.cfg = cfg
         self.encoder = Encoder(cfg)
         self.decoder = Decoder(cfg)
+        # Tie decoder head to encoder embedding
+        self.decoder.head.weight = self.encoder.embed.weight
 
     def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         if self.training:
