@@ -32,7 +32,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET, PAD
-from vae.data import ByteShardStream, ShakespeareStream, detokenize_shards
+from vae.data import ByteShardStream, ShakespeareStream, detokenize_shards, build_byte_token_map, build_token_byte_map
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ def evaluate(model, val_stream, device, args):
 # Sample reconstruction display
 # ---------------------------------------------------------------------------
 
-def show_reconstruction(model, val_stream, device):
+def show_reconstruction(model, val_stream, device, tok2byte=None):
     """Show a few reconstructed chunks for qualitative inspection."""
     model.eval()
     x = val_stream.next_batch(device)[:4]
@@ -170,11 +170,15 @@ def show_reconstruction(model, val_stream, device):
     logits = raw.decoder(mu)  # deterministic
     preds = logits.argmax(dim=-1)
 
+    def tokens_to_str(tokens, tok2byte):
+        if tok2byte is not None:
+            return bytes(tok2byte.get(t.item(), 0) for t in tokens if t.item() >= BYTE_OFFSET).decode("utf-8", errors="replace")
+        else:
+            return bytes(t.item() - BYTE_OFFSET for t in tokens if t.item() >= BYTE_OFFSET).decode("utf-8", errors="replace")
+
     for i in range(min(4, x.shape[0])):
-        orig_bytes = [t.item() - BYTE_OFFSET for t in x[i] if t.item() >= BYTE_OFFSET]
-        pred_bytes = [t.item() - BYTE_OFFSET for t in preds[i] if t.item() >= BYTE_OFFSET]
-        orig_str = bytes(orig_bytes).decode("utf-8", errors="replace")
-        pred_str = bytes(pred_bytes).decode("utf-8", errors="replace")
+        orig_str = tokens_to_str(x[i], tok2byte)
+        pred_str = tokens_to_str(preds[i], tok2byte)
         print(f"  [{i}] orig: {repr(orig_str)}")
         print(f"  [{i}] pred: {repr(pred_str)}")
     model.train()
@@ -199,10 +203,15 @@ def main():
     print0(rank, f"  batch_size={args.batch_size} lr={args.lr} steps={args.train_steps}")
 
     # --- Data ---
+    tok2byte = None  # for reconstruction display
     if args.shakespeare:
         print0(rank, "Using tinyshakespeare dataset")
         train_stream = ShakespeareStream(args.chunk_size, args.batch_size, split="train")
         val_stream = ShakespeareStream(args.chunk_size, args.batch_size, split="val")
+        # Build inverse map for readable reconstruction display
+        from vae.data import load_shakespeare_bytes
+        _, byte_map = load_shakespeare_bytes()
+        tok2byte = build_token_byte_map(byte_map)
     else:
         byte_dir = Path(args.byte_dir)
         train_pattern = str(byte_dir / "fineweb_train_*_bytes.bin")
@@ -279,7 +288,7 @@ def main():
             val_recon, val_kl, val_acc = evaluate(model, val_stream, device, args)
             print0(rank, f"\nstep {step:5d} | val_recon {val_recon:.4f} val_kl {val_kl:.4f} val_acc {val_acc:.4f}")
             if step > 0 and rank == 0:
-                show_reconstruction(model, val_stream, device)
+                show_reconstruction(model, val_stream, device, tok2byte)
             # Best checkpoint
             if val_acc > best_val_acc and rank == 0:
                 best_val_acc = val_acc

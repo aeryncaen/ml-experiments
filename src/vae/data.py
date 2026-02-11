@@ -35,6 +35,16 @@ def build_byte_token_map(unique_bytes: np.ndarray | None = None) -> np.ndarray:
     return table
 
 
+def build_token_byte_map(byte_map: np.ndarray) -> dict[int, int]:
+    """Invert a byte_map (byte->token) to get token->byte for decoding."""
+    inv = {}
+    for byte_val in range(256):
+        tok = int(byte_map[byte_val])
+        if tok >= BYTE_OFFSET:
+            inv[tok] = byte_val
+    return inv
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: BPE .bin -> raw byte .bin conversion
 # ---------------------------------------------------------------------------
