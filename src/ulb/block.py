@@ -5,9 +5,9 @@ SSM-equivalent capabilities (state tracking, pattern matching) purely through
 attention preprocessing, with zero sequential scan.
 
 Architecture (forward pass):
-    h_up = up_act(up_proj(x))                           # thin linear + Swish
+    h_up = up_act(up_proj(x))                           # thin d→d linear + Swish
 
-    q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up)
+    q, k, v = q_proj(h_up), k_proj(h_up), v_proj(h_up) # d→inner_dim (upscale)
     q = q_norm(q) * q_bias       # per-head RMSNorm + post-norm bias
     k = k_norm(k) * k_bias       # (Mamba-3 style BC bias, init ones)
 
@@ -18,9 +18,10 @@ Architecture (forward pass):
     k = rope(k, dd_angles)
 
     y = attend(q, k, v)          # softmax, silu2, or blend
+    y = o_proj(y)                 # inner_dim→d (downscale)
 
     y = attn_norm(y) * h_up      # skip-MULTIPLY (not skip-add)
-    y = down_proj(down_act(y))                          # thin linear + Swish
+    y = down_proj(down_act(y))                          # thin d→d linear + Swish
     return y                      # caller does x = x + block(x)
 
 Key design decisions (preserved from FusedGateBlock):
@@ -28,10 +29,10 @@ Key design decisions (preserved from FusedGateBlock):
     - No internal residual — block returns delta only
     - V is left alone — no V blending
     - KV have bias, Q has no bias
-    - Optional inner_dim expansion for wider QKV / attention
+    - QKV projections handle inner_dim expansion (d→inner), o_proj compresses back
+    - Up/down are thin d→d linears with Swish activation
     - No conv — hurts retrieval
     - Learnable Swish (per-channel beta), not SiLU
-    - Up/down are thin linears (d → inner_dim) with Swish activation
 """
 
 import math
@@ -119,13 +120,13 @@ class ULBBlock(nn.Module):
         n_heads = config.n_heads
         head_dim = config.head_dim
 
-        # --- Up/down projections (thin linear + activation) ---
-        self.up_proj = nn.Linear(d, inner, bias=False)
-        self.down_proj = nn.Linear(inner, d, bias=False)
+        # --- Up/down projections (thin linear + activation, both at d_model) ---
+        self.up_proj = nn.Linear(d, d, bias=False)
+        self.down_proj = nn.Linear(d, d, bias=False)
 
         if config.swish_mode == 'learnable':
-            self.up_act = LearnableSwish(inner)
-            self.down_act = LearnableSwish(inner)
+            self.up_act = LearnableSwish(d)
+            self.down_act = LearnableSwish(d)
         elif config.swish_mode == 'silu':
             self.up_act = nn.SiLU()
             self.down_act = nn.SiLU()
@@ -134,13 +135,16 @@ class ULBBlock(nn.Module):
 
         self.aux_loss = 0.0
 
-        # QKV: KV have bias, Q does not
-        self.q_proj = nn.Linear(inner, inner, bias=False)
-        self.k_proj = nn.Linear(inner, inner, bias=True)
-        self.v_proj = nn.Linear(inner, inner, bias=True)
+        # QKV: project from d_model up to inner_dim. KV have bias, Q does not.
+        self.q_proj = nn.Linear(d, inner, bias=False)
+        self.k_proj = nn.Linear(d, inner, bias=True)
+        self.v_proj = nn.Linear(d, inner, bias=True)
 
-        # --- Post-attention norm (before skip-multiply) ---
-        self.attn_norm = nn.RMSNorm(inner)
+        # Output projection: inner_dim back to d_model
+        self.o_proj = nn.Linear(inner, d, bias=False)
+
+        # --- Post-attention norm (before skip-multiply, at d_model) ---
+        self.attn_norm = nn.RMSNorm(d)
 
         # --- QK norm + post-norm bias (Mamba-3 style BC bias, init ones) ---
         self.q_norm = nn.RMSNorm(head_dim)
@@ -307,6 +311,9 @@ class ULBBlock(nn.Module):
         # --- Attention ---
         y = self.attend(q, k, v, dd_angles, blend_gate)
         y = y.contiguous().view(b, t, cfg.inner_dim)
+
+        # --- Output projection (inner_dim → d_model) ---
+        y = self.o_proj(y)
 
         # --- Skip-multiply (NOT skip-add) ---
         y = self.attn_norm(y) * h_up
