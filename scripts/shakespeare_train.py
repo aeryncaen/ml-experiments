@@ -161,46 +161,59 @@ def decode(ids: torch.Tensor) -> str:
     return ''.join(chars)
 
 
+def _pretokenize(text: str, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pretokenize text into two bigram streams (even and odd parity).
+
+    Even parity: encode full text with even char count → seq_len bigrams each.
+    Odd parity:  encode full text with odd char count (skip first char).
+
+    Both streams are (N, seq_len) tensors of contiguous non-overlapping chunks,
+    each bookended with BOS (NULL,x) and EOS (x,NULL).
+    """
+    content_len_even = 2 * seq_len - 2  # even content chars per sample
+    content_len_odd = content_len_even - 1  # odd content chars per sample
+
+    def _chunkify(content_len):
+        n_samples = len(text) // content_len
+        chunks = []
+        for i in range(n_samples):
+            start = i * content_len
+            content = text[start:start + content_len]
+            tokens = encode(content)
+            if tokens.shape[0] == seq_len:
+                chunks.append(tokens)
+        if chunks:
+            return torch.stack(chunks)
+        return torch.zeros(0, seq_len, dtype=torch.long)
+
+    even = _chunkify(content_len_even)
+    odd = _chunkify(content_len_odd)
+    return even, odd
+
+
 class TextDataset:
-    """Samples contiguous chunks from raw text and bigram-encodes them.
+    """Pretokenized bigram dataset with both alignment parities.
 
-    Every sample is bookended: [NULL, content..., NULL] → bigrams.
-    seq_len is the number of bigram tokens per sample.
-
-    Randomly samples odd or even content lengths to produce both
-    alignment patterns (shifting which chars pair together).
+    Stores two tensors of pretokenized chunks (even and odd content lengths).
+    sample_batch randomly draws from both.
     """
 
     def __init__(self, text: str, seq_len: int):
-        self.text = text
         self.seq_len = seq_len
-        # Max content chars that fit: seq_len bigrams = 2*seq_len char slots,
-        # minus 2 for the bookend NULLs. Even content uses exactly this;
-        # odd content uses one fewer char (extra NULL pads to even).
-        self.max_content = 2 * seq_len - 2
+        self.even, self.odd = _pretokenize(text, seq_len)
+        print(f"  TextDataset: {len(self.even)} even + {len(self.odd)} odd "
+              f"= {len(self.even) + len(self.odd)} pretokenized chunks")
 
     def sample_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Returns (B, seq_len) bigram token chunks with random alignment."""
-        max_start = len(self.text) - self.max_content
-        starts = torch.randint(0, max(1, max_start), (batch_size,))
+        """Returns (B, seq_len) bigram token chunks, randomly from even/odd."""
         chunks = []
-        for s in starts:
-            # Randomly pick even or odd content length for alignment diversity
-            if torch.rand(1).item() < 0.5:
-                content_len = self.max_content      # even
+        for _ in range(batch_size):
+            if torch.rand(1).item() < 0.5 and len(self.even) > 0:
+                idx = torch.randint(0, len(self.even), (1,)).item()
+                chunks.append(self.even[idx])
             else:
-                content_len = self.max_content - 1  # odd
-            content = self.text[s:s + content_len]
-            tokens = encode(content)
-            # Truncate or pad to exactly seq_len
-            if tokens.shape[0] > self.seq_len:
-                tokens = tokens[:self.seq_len]
-            elif tokens.shape[0] < self.seq_len:
-                pad = torch.full((self.seq_len - tokens.shape[0],),
-                                 _bigram_token(NULL_CHAR, NULL_CHAR),
-                                 dtype=torch.long)
-                tokens = torch.cat([tokens, pad])
-            chunks.append(tokens)
+                idx = torch.randint(0, len(self.odd), (1,)).item()
+                chunks.append(self.odd[idx])
         return torch.stack(chunks).to(device)
 
 
