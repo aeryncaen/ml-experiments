@@ -41,8 +41,9 @@ def parse_args():
                     help="Directory with fineweb byte .bin shards")
 
     # VAE
-    p.add_argument("--vae-checkpoint", type=str, required=True,
-                    help="Path to frozen VAE checkpoint (vae_best.pt)")
+    p.add_argument("--vae-checkpoint", type=str,
+                    default=str(Path(__file__).resolve().parent.parent / "out/vae/vae_best.pt"),
+                    help="Path to frozen VAE checkpoint")
 
     # STLG model
     p.add_argument("--d-model", type=int, default=128, help="STLG transformer hidden dim")
