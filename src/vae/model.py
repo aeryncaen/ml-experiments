@@ -143,21 +143,25 @@ class EmbeddingPreprocessor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Fused attention block (ULB-style, no per-layer RoPE/lerp)
+# Fused attention block (ULB-style, with per-layer HybridRoPE + K-lerp)
 # ---------------------------------------------------------------------------
 
 class FusedBlock(nn.Module):
     """ULB-style fused attention+gate block for the VAE.
 
-    No per-layer RoPE, DD-RoPE, or K-lerp — the embedding preprocessor
-    handles all of that once before the layers. These blocks just do
-    plain bidirectional attention with gated skip-multiply.
+    Each layer has its own HybridRoPE (fixed + DD-RoPE) and acausal K-lerp,
+    so every attention computation is position-aware and content-phase-aware.
+    Bidirectional (is_causal=False).
 
     Flow:
         h_up = swish(up_proj(norm(x)))
         q, k, v = qkv_proj(h_up)       # d -> inner (1.75x expansion)
         q, k = qk_norm(q, k)
-        y = SDPA(q, k, v)               # bidirectional, no causal mask
+        k = acausal_k_lerp(k, x)       # temporal neighbor blending on last 1/4 head_dim
+        dd_angles = rope.compute_dd_angles(x)
+        q = rope(q, dd_angles)          # hybrid: fixed RoPE + DD-RoPE
+        k = rope(k, dd_angles)
+        y = SDPA(q, k, v)               # bidirectional
         y = o_proj(y)                    # inner -> d
         y = attn_norm(y) * h_up         # skip-MULTIPLY
         y = down_proj(swish(y))
@@ -168,6 +172,9 @@ class FusedBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
+        from ulb.rope import HybridRoPE
+        from ulb.lerp import KAcausalLerp
+
         # Snap inner_dim to nearest multiple of n_heads*4 (head_dim divisible by 4)
         snap = n_heads * 4
         inner_dim = round(d_model * self.INNER_RATIO / snap) * snap
@@ -196,6 +203,13 @@ class FusedBlock(nn.Module):
         # Post-attention norm (before skip-multiply, at d_model)
         self.attn_norm = RMSNorm(d_model)
 
+        # Per-layer HybridRoPE (fixed + DD-RoPE on QK)
+        self.rope = HybridRoPE(d_model, n_heads, self.head_dim)
+
+        # Per-layer acausal K-lerp (last 1/4 of head_dim)
+        quarter_dim = self.head_dim // 4
+        self.k_lerp = KAcausalLerp(d_model, n_heads, quarter_dim, init_bias=-2.0)
+
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, K, D = x.shape
         H = self.n_heads
@@ -214,6 +228,14 @@ class FusedBlock(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
+        # K temporal mixing (acausal lerp on last 1/4 head_dim)
+        k = self.k_lerp(k, x)
+
+        # Hybrid RoPE (fixed + data-dependent)
+        dd_angles = self.rope.compute_dd_angles(x)
+        q = self.rope(q, dd_angles)
+        k = self.rope(k, dd_angles)
+
         # SDPA (bidirectional)
         q = q.transpose(1, 2)  # (B, H, K, hd)
         k = k.transpose(1, 2)
@@ -222,8 +244,6 @@ class FusedBlock(nn.Module):
         # Build attention mask from pad_mask if needed
         attn_mask = None
         if pad_mask is not None:
-            # pad_mask: (B, K) True where padded
-            # Need (B, 1, 1, K) for broadcasting with (B, H, K, K)
             attn_mask = pad_mask.unsqueeze(1).unsqueeze(2).expand(B, H, K, K)
             attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
 
