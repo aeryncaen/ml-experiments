@@ -1,8 +1,8 @@
 """Train STLG — Straight-Through Latent Generator.
 
-Causal transformer that predicts the next latent vector from a frozen
-ByteChunkVAE. Loss is CE against target byte chunks, computed by decoding
-predicted latents through the frozen VAE decoder.
+Causal transformer that predicts the next latent vector, jointly trained
+with a ByteChunkVAE. Loss is CE against target byte chunks, computed by
+decoding predicted latents through the VAE decoder. Grad flows end-to-end.
 
 Usage:
     PYTHONPATH=src python experiments/train_stlg.py \
@@ -45,7 +45,7 @@ def parse_args():
     # VAE
     p.add_argument("--vae-checkpoint", type=str,
                     default=str(Path(__file__).resolve().parent.parent / "out/vae/vae_best.pt"),
-                    help="Path to frozen VAE checkpoint")
+                    help="Path to pretrained VAE checkpoint")
 
     # STLG model
     p.add_argument("--d-model", type=int, default=128, help="STLG transformer hidden dim")
@@ -113,23 +113,22 @@ def unwrap_model(model):
     return raw
 
 
-def load_frozen_vae(path: str, device: torch.device) -> ByteChunkVAE:
+def load_vae(path: str, device: torch.device) -> ByteChunkVAE:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     vae = ByteChunkVAE(cfg).to(device)
     vae.load_state_dict(ckpt["model"])
-    vae.eval()
-    for p in vae.parameters():
-        p.requires_grad_(False)
     return vae
 
 
 def save_checkpoint(model, stlg_cfg, vae_cfg, step, path):
     raw = unwrap_model(model)
-    # Only save STLG params, not the frozen VAE
+    # Save both STLG and VAE params (VAE is jointly trained)
     stlg_state = {k: v for k, v in raw.state_dict().items() if not k.startswith("vae.")}
+    vae_state = {k: v for k, v in raw.state_dict().items() if k.startswith("vae.")}
     torch.save({
         "model": stlg_state,
+        "vae_model": vae_state,
         "config": stlg_cfg,
         "vae_config": vae_cfg,
         "step": step,
@@ -203,9 +202,9 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    # Load frozen VAE
-    print0(rank, f"Loading frozen VAE from {args.vae_checkpoint}")
-    vae = load_frozen_vae(args.vae_checkpoint, device)
+    # Load VAE (jointly trained)
+    print0(rank, f"Loading VAE from {args.vae_checkpoint}")
+    vae = load_vae(args.vae_checkpoint, device)
     vae_cfg = vae.cfg
     print0(rank, f"  VAE: chunk_size={vae_cfg.chunk_size} d_latent={vae_cfg.d_latent}")
 
@@ -231,7 +230,7 @@ def main():
     piece_bytes = vae_cfg.chunk_size * 16
     seq_len = (piece_bytes + 2 + vae_cfg.chunk_size - 1) // vae_cfg.chunk_size
 
-    # STLG model (includes frozen VAE)
+    # STLG model (includes VAE, jointly trained)
     stlg_cfg = STLGConfig(
         d_latent=vae_cfg.d_latent,
         d_model=args.d_model,
@@ -242,22 +241,20 @@ def main():
     )
     model = STLG(stlg_cfg, vae).to(device)
 
-    # Count only trainable params (not frozen VAE)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_stlg_params = sum(p.numel() for n, p in model.named_parameters() if not n.startswith("vae."))
     n_vae_params = sum(p.numel() for p in vae.parameters())
+    n_total = n_stlg_params + n_vae_params
 
     print0(rank, f"STLG trainer | rank={rank} world_size={world_size} device={device}")
     print0(rank, f"  d_model={args.d_model} n_heads={args.n_heads} n_layers={args.n_layers}")
     print0(rank, f"  seq_len={seq_len} d_latent={vae_cfg.d_latent}")
     print0(rank, f"  batch_size={args.batch_size} lr={args.lr} steps={args.train_steps}")
-    print0(rank, f"  STLG parameters: {n_params:,} (VAE frozen: {n_vae_params:,})")
+    print0(rank, f"  STLG: {n_stlg_params:,} params | VAE: {n_vae_params:,} params | total: {n_total:,}")
 
-    # Optimizer (only trainable params)
+    # Optimizer (STLG + VAE jointly)
     decay_params = []
     no_decay_params = []
     for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
         if p.ndim <= 1:
             no_decay_params.append(p)
         else:

@@ -1,9 +1,9 @@
 """STLG — Straight-Through Latent Generator.
 
-Causal transformer that operates on continuous latent vectors from a frozen
+Causal transformer that operates on continuous latent vectors from a
 ByteChunkVAE. Given a sequence of byte chunks, encodes them to latents via
-the frozen VAE encoder, predicts the next latent at each position, and
-decodes predicted latents through the frozen VAE decoder.
+the VAE encoder, predicts the next latent at each position, and decodes
+predicted latents through the VAE decoder. VAE weights are jointly trained.
 
 Training loss: CE against target byte chunks (not MSE on latents).
 No embedding lookup — continuous latent vectors go straight in.
@@ -68,20 +68,21 @@ class CausalBlock(nn.Module):
 class STLG(nn.Module):
     """Straight-Through Latent Generator.
 
-    Contains a frozen VAE (encoder + decoder) and a causal transformer.
+    Contains a VAE (encoder + decoder) and a causal transformer.
     Forward takes raw byte chunk pieces (B, S, K), returns loss + accuracy.
+    VAE weights are jointly trained with the STLG.
 
     Flow:
-        1. Frozen VAE encoder: chunks -> latents
+        1. VAE encoder: chunks -> latents
         2. Causal transformer: latents[:-1] -> predicted latents for [1:]
-        3. Frozen VAE decoder: predicted latents -> logits
+        3. VAE decoder: predicted latents -> logits
         4. CE loss against target chunks[1:]
     """
 
     def __init__(self, cfg: STLGConfig, vae: ByteChunkVAE):
         super().__init__()
         self.cfg = cfg
-        self.vae = vae  # frozen, no grad
+        self.vae = vae  # jointly trained
 
         # Input projection (identity if d_latent == d_model)
         if cfg.d_latent != cfg.d_model:
@@ -128,17 +129,16 @@ class STLG(nn.Module):
         """
         B, S, K = pieces.shape
 
-        # 1. Encode all chunks through frozen VAE encoder
+        # 1. Encode all chunks through VAE encoder
         flat_chunks = pieces.reshape(B * S, K)
-        with torch.no_grad():
-            flat_mu, _ = self.vae.encoder(flat_chunks)
+        flat_mu, _ = self.vae.encoder(flat_chunks)
         latents = flat_mu.reshape(B, S, -1)  # (B, S, d_latent)
 
         # 2. Predict next latent from context
         pred_latents = self.predict_latents(latents[:, :-1])  # (B, S-1, d_latent)
 
-        # 3. Decode predicted latents through frozen VAE decoder
-        # Grad flows through pred_latents -> decoder -> logits -> loss -> back to STLG
+        # 3. Decode predicted latents through VAE decoder
+        # Grad flows through entire path: encoder -> STLG -> decoder -> loss
         pred_flat = pred_latents.reshape(B * (S - 1), -1)
         V = self.vae.cfg.vocab_size
         logits = self.vae.decoder(pred_flat)  # (B*(S-1), K, V)
