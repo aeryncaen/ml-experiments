@@ -77,9 +77,10 @@ class EMA:
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-NULL_CHAR = 0  # NULL symbol index (used for BOS/EOS in bigrams)
+NULL_CHAR = 0  # NULL symbol index (used for BOS/EOS in trigrams)
 ALPHABET_SIZE = 66  # 65 Shakespeare chars + NULL
-VOCAB_SIZE = ALPHABET_SIZE * ALPHABET_SIZE  # 4356 bigram tokens
+NGRAM = 3  # trigram tokenization
+VOCAB_SIZE = ALPHABET_SIZE ** NGRAM  # 287,496 trigram tokens
 
 # Character <-> index mapping (built lazily from data)
 _char_to_idx: dict[str, int] = {}
@@ -98,14 +99,21 @@ def _build_char_map(text: str) -> None:
     assert len(chars) == 65, f"Expected 65 unique chars, got {len(chars)}"
 
 
-def _bigram_token(a: int, b: int) -> int:
-    """Encode two char indices into a single bigram token."""
-    return a * ALPHABET_SIZE + b
+def _ngram_token(chars: list[int]) -> int:
+    """Encode NGRAM char indices into a single token."""
+    token = 0
+    for c in chars:
+        token = token * ALPHABET_SIZE + c
+    return token
 
 
-def _unbigram(token: int) -> tuple[int, int]:
-    """Decode a bigram token into two char indices."""
-    return token // ALPHABET_SIZE, token % ALPHABET_SIZE
+def _ungram(token: int) -> list[int]:
+    """Decode a token into NGRAM char indices."""
+    chars = []
+    for _ in range(NGRAM):
+        chars.append(token % ALPHABET_SIZE)
+        token //= ALPHABET_SIZE
+    return chars[::-1]
 
 
 def load_shakespeare(data_dir: str = "data") -> str:
@@ -123,57 +131,60 @@ def load_shakespeare(data_dir: str = "data") -> str:
 
 
 def encode(text: str) -> torch.Tensor:
-    """Encode text to bigram token IDs with BOS and EOS.
+    """Encode text to trigram token IDs with BOS and EOS.
 
     Always bookended: [NULL, content..., NULL].
-    First bigram is always (NULL, x) = BOS-type.
-    Last bigram is always (x, NULL) = EOS-type.
+    First trigram starts with NULL (BOS-type).
+    Last trigram ends with NULL (EOS-type).
 
-    If total char count (content + 2 NULLs) is odd, an extra NULL is
-    inserted before the final NULL to pad to even length.
+    Pads with extra NULLs before the final NULL so total length
+    is divisible by NGRAM.
     """
     char_ids = [_char_to_idx[c] for c in text]
 
     # Bookend with NULLs
     char_ids = [NULL_CHAR] + char_ids + [NULL_CHAR]
 
-    # Pad to even length if needed
-    if len(char_ids) % 2 != 0:
-        # Insert extra NULL before the final NULL
-        char_ids.insert(-1, NULL_CHAR)
+    # Pad to multiple of NGRAM
+    remainder = len(char_ids) % NGRAM
+    if remainder != 0:
+        # Insert NULLs before the final NULL
+        for _ in range(NGRAM - remainder):
+            char_ids.insert(-1, NULL_CHAR)
 
     tokens = []
-    for i in range(0, len(char_ids), 2):
-        tokens.append(_bigram_token(char_ids[i], char_ids[i + 1]))
+    for i in range(0, len(char_ids), NGRAM):
+        tokens.append(_ngram_token(char_ids[i:i + NGRAM]))
 
     return torch.tensor(tokens, dtype=torch.long)
 
 
 def decode(ids: torch.Tensor) -> str:
-    """Decode bigram token IDs to string, dropping NULL chars."""
+    """Decode trigram token IDs to string, dropping NULL chars."""
     chars = []
     for token in ids.tolist():
-        a, b = _unbigram(token)
-        if a != NULL_CHAR:
-            chars.append(_idx_to_char[a])
-        if b != NULL_CHAR:
-            chars.append(_idx_to_char[b])
+        for c in _ungram(token):
+            if c != NULL_CHAR:
+                chars.append(_idx_to_char[c])
     return ''.join(chars)
 
 
-def _pretokenize(text: str, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pretokenize text into two bigram streams (even and odd parity).
+def _pretokenize(text: str, seq_len: int) -> list[torch.Tensor]:
+    """Pretokenize text into NGRAM parity streams.
 
-    Even parity: encode full text with even char count → seq_len bigrams each.
-    Odd parity:  encode full text with odd char count (skip first char).
+    For trigrams (NGRAM=3), creates 3 streams with content lengths that
+    are 0, 1, 2 mod 3 relative to the max, producing different char
+    alignments within each trigram token.
 
-    Both streams are (N, seq_len) tensors of contiguous non-overlapping chunks,
-    each bookended with BOS (NULL,x) and EOS (x,NULL).
+    Each stream is (N, seq_len) tensor of contiguous non-overlapping chunks,
+    each bookended with BOS/EOS NULLs.
     """
-    content_len_even = 2 * seq_len - 2  # even content chars per sample
-    content_len_odd = content_len_even - 1  # odd content chars per sample
+    # Max content chars: seq_len tokens * NGRAM chars - 2 NULLs
+    max_content = NGRAM * seq_len - 2
 
     def _chunkify(content_len):
+        if content_len < 1:
+            return torch.zeros(0, seq_len, dtype=torch.long)
         n_samples = len(text) // content_len
         chunks = []
         for i in range(n_samples):
@@ -186,34 +197,36 @@ def _pretokenize(text: str, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
             return torch.stack(chunks)
         return torch.zeros(0, seq_len, dtype=torch.long)
 
-    even = _chunkify(content_len_even)
-    odd = _chunkify(content_len_odd)
-    return even, odd
+    streams = []
+    for offset in range(NGRAM):
+        streams.append(_chunkify(max_content - offset))
+    return streams
 
 
 class TextDataset:
-    """Pretokenized bigram dataset with both alignment parities.
+    """Pretokenized trigram dataset with NGRAM alignment parities.
 
-    Stores two tensors of pretokenized chunks (even and odd content lengths).
-    sample_batch randomly draws from both.
+    Stores NGRAM tensors of pretokenized chunks (different content lengths).
+    sample_batch randomly draws from all parities.
     """
 
     def __init__(self, text: str, seq_len: int):
         self.seq_len = seq_len
-        self.even, self.odd = _pretokenize(text, seq_len)
-        print(f"  TextDataset: {len(self.even)} even + {len(self.odd)} odd "
-              f"= {len(self.even) + len(self.odd)} pretokenized chunks")
+        self.streams = _pretokenize(text, seq_len)
+        counts = [len(s) for s in self.streams]
+        total = sum(counts)
+        desc = " + ".join(str(c) for c in counts)
+        print(f"  TextDataset: {desc} = {total} pretokenized chunks "
+              f"({NGRAM} parities)")
 
     def sample_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Returns (B, seq_len) bigram token chunks, randomly from even/odd."""
+        """Returns (B, seq_len) trigram token chunks, randomly from all parities."""
+        nonempty = [s for s in self.streams if len(s) > 0]
         chunks = []
         for _ in range(batch_size):
-            if torch.rand(1).item() < 0.5 and len(self.even) > 0:
-                idx = torch.randint(0, len(self.even), (1,)).item()
-                chunks.append(self.even[idx])
-            else:
-                idx = torch.randint(0, len(self.odd), (1,)).item()
-                chunks.append(self.odd[idx])
+            stream = nonempty[torch.randint(0, len(nonempty), (1,)).item()]
+            idx = torch.randint(0, len(stream), (1,)).item()
+            chunks.append(stream[idx])
         return torch.stack(chunks).to(device)
 
 
@@ -974,8 +987,8 @@ def _make_mlm_mask(B: int, T: int, mask_prob: float, gen_len: int,
                    device: torch.device) -> torch.Tensor:
     """Build MLM mask: 50% random, 50% contiguous chunk at end.
 
-    With bigram tokens, all positions are maskable (BOS/EOS are embedded
-    in bigrams, not separate tokens).
+    With trigram tokens, all positions are maskable (BOS/EOS are embedded
+    in trigrams, not separate tokens).
     """
     mask = torch.zeros(B, T, dtype=torch.bool, device=device)
     chunk_len = min(gen_len, T)
@@ -1001,7 +1014,7 @@ def train_step_mlm(model, batch: torch.Tensor, optimizer, grad_clip: float,
     """MLM training step.
 
     50% of samples get random masking at mask_prob rate.
-    50% get a single masked bigram at end-of-sequence (next-token prediction).
+    50% get a single masked trigram at end-of-sequence (next-token prediction).
     CE loss on masked positions only.
     """
     B, T = batch.shape
@@ -1054,17 +1067,17 @@ def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
 
 @torch.no_grad()
 def generate_mlm(model, prompt_text: str, gen_len: int,
-                 device: torch.device, tokens_per_step: int = 4) -> str:
-    """AR-style MLM generation: multiple bigram tokens per forward pass.
+                 device: torch.device, tokens_per_step: int = 1) -> str:
+    """AR-style MLM generation: one trigram token per forward pass.
 
     Each step:
-      1. Build [prompt_bigrams, generated_so_far, MASK*N]
+      1. Build [prompt_trigrams, generated_so_far, MASK*N]
       2. Mask N positions at the end
       3. Forward pass -> argmax at all masked positions
       4. Append predicted tokens and repeat
 
-    Prompt is left-aligned (first bigram = [NULL, first_char] = BOS).
-    gen_len is number of bigram tokens to generate.
+    Prompt is left-aligned (first trigram = [NULL, first_char] = BOS).
+    gen_len is number of trigram tokens to generate.
     """
     model.eval()
 
@@ -1112,7 +1125,7 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
 @torch.no_grad()
 def generate_ar(model, prompt_text: str, gen_len: int,
                 device: torch.device, temperature: float = 0.8) -> str:
-    """Autoregressive generation with temperature sampling (bigram vocab)."""
+    """Autoregressive generation with temperature sampling (trigram vocab)."""
     model.eval()
     prompt_ids = encode(prompt_text)
     ids = prompt_ids.unsqueeze(0).to(device)  # (1, L)
@@ -1293,7 +1306,7 @@ def train(args):
     text = load_shakespeare()
     vocab_size = VOCAB_SIZE
     print(f"Shakespeare: {len(text):,} chars, alphabet={ALPHABET_SIZE}, "
-          f"vocab_size={vocab_size} (bigram)")
+          f"vocab_size={vocab_size} (trigram)")
 
     n_train = int(0.9 * len(text))
     train_text, val_text = text[:n_train], text[n_train:]
@@ -1328,7 +1341,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-bigram)")
+        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-trigram)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1560,11 +1573,11 @@ def train(args):
                         nm = m.sum().item()
                         nc = ((pr[0] == orig) & m[0]).sum().item()
                         esc = lambda t: decode(t).replace('\n', '\\n')
-                        # Build masked view: decode each bigram, replace masked with '__'
+                        # Build masked view: decode each trigram, replace masked with '___'
                         mv_parts = []
                         for j in range(orig.shape[0]):
                             if m[0, j]:
-                                mv_parts.append('__')
+                                mv_parts.append('_' * NGRAM)
                             else:
                                 mv_parts.append(decode(orig[j:j+1]))
                         mv_str = ''.join(mv_parts).replace('\n', '\\n')
@@ -1609,7 +1622,7 @@ def train(args):
 
 def interactive_generate(args):
     """Load a checkpoint and run an interactive generation loop."""
-    # Ensure char map is built (needed for bigram encode/decode)
+    # Ensure char map is built (needed for trigram encode/decode)
     load_shakespeare()
 
     ckpt_path = args.generate
@@ -1641,10 +1654,10 @@ def interactive_generate(args):
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    # max_prompt in chars (~2x bigram seq_len since each bigram = 2 chars)
-    max_prompt_chars = (saved_args.seq_len - 1) * 2
+    # max_prompt in chars (~NGRAM * seq_len since each trigram = 3 chars)
+    max_prompt_chars = (saved_args.seq_len - 1) * NGRAM
     if mode == 'llada':
-        max_prompt_chars = saved_args.seq_len * 2
+        max_prompt_chars = saved_args.seq_len * NGRAM
 
     print(f"\nInteractive generation — type a prompt and press Enter.")
     print(f"  mode={mode}, temperature={temperature}, gen_len={gen_len}, "
