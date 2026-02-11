@@ -59,6 +59,7 @@ def parse_args():
     p.add_argument("--dec-layers", type=int, default=4, help="Decoder transformer depth")
     p.add_argument("--beta", type=float, default=0.01, help="KL weight (beta-VAE)")
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--fused", action="store_true", help="Use ULB-style fused blocks instead of transformer")
 
     # Training
     p.add_argument("--train-steps", type=int, default=10000)
@@ -191,7 +192,7 @@ def main():
 
     print0(rank, f"ByteChunkVAE trainer | rank={rank} world_size={world_size} device={device}")
     print0(rank, f"  chunk_size={args.chunk_size} d_model={args.d_model} d_latent={args.d_latent}")
-    print0(rank, f"  enc_layers={args.enc_layers} dec_layers={args.dec_layers} beta={args.beta}")
+    print0(rank, f"  enc_layers={args.enc_layers} dec_layers={args.dec_layers} beta={args.beta} fused={args.fused}")
     print0(rank, f"  batch_size={args.batch_size} lr={args.lr} steps={args.train_steps}")
 
     # --- Ensure byte shards exist ---
@@ -229,6 +230,7 @@ def main():
         dec_layers=args.dec_layers,
         beta=args.beta,
         dropout=args.dropout,
+        use_fused=args.fused,
     )
     model = ByteChunkVAE(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())

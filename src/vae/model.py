@@ -44,6 +44,7 @@ class VAEConfig:
     dec_layers: int = 4        # decoder transformer depth
     beta: float = 0.01         # KL weight (beta-VAE)
     dropout: float = 0.0
+    use_fused: bool = False    # use ULB-style fused blocks instead of transformer blocks
 
 
 class RMSNorm(nn.Module):
@@ -177,6 +178,83 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# ULB-style fused attention+gate block (bidirectional)
+# ---------------------------------------------------------------------------
+
+class FusedBlock(nn.Module):
+    """ULB-style fused attention+gate block.
+
+    Replaces separate MHA + MLP with a single fused path:
+        h_up = swish(up_proj(norm(x)))
+        q, k, v = qkv_proj(h_up)
+        q, k = qk_norm(q, k)
+        y = SDPA(q, k, v)               # bidirectional
+        y = o_proj(y)
+        y = attn_norm(y) * h_up         # skip-MULTIPLY
+        y = down_proj(swish(y))
+        return x + y
+    """
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.norm = RMSNorm(d_model)
+
+        # Gate path
+        self.up_proj = nn.Linear(d_model, d_model, bias=False)
+        self.down_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # QKV (all at d_model, no expansion)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # QK norm (Mamba-3 style)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+        # Post-attention norm (before skip-multiply)
+        self.attn_norm = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, K, D = x.shape
+        H = self.n_heads
+        hd = self.head_dim
+
+        h = self.norm(x)
+        h_up = F.silu(self.up_proj(h))
+
+        q = self.q_proj(h_up).view(B, K, H, hd)
+        k = self.k_proj(h_up).view(B, K, H, hd)
+        v = self.v_proj(h_up).view(B, K, H, hd)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)  # (B, H, K, hd)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        attn_mask = None
+        if mask is not None:
+            attn_mask = mask.unsqueeze(1).unsqueeze(2).expand(B, H, K, K)
+            attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
+
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        y = y.transpose(1, 2).contiguous().view(B, K, D)
+
+        y = self.o_proj(y)
+        y = self.attn_norm(y) * h_up
+        y = self.down_proj(F.silu(y))
+
+        return x + y
+
+
+# ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
 
@@ -191,8 +269,10 @@ class Encoder(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(VOCAB_SIZE, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
+        Block = FusedBlock if cfg.use_fused else TransformerBlock
+        block_args = (cfg.d_model, cfg.n_heads) if cfg.use_fused else (cfg.d_model, cfg.n_heads, cfg.dropout)
         self.layers = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            Block(*block_args)
             for _ in range(cfg.enc_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
@@ -234,8 +314,10 @@ class Decoder(nn.Module):
         self.chunk_size = cfg.chunk_size
         self.z_proj = nn.Linear(cfg.d_latent, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
+        Block = FusedBlock if cfg.use_fused else TransformerBlock
+        block_args = (cfg.d_model, cfg.n_heads) if cfg.use_fused else (cfg.d_model, cfg.n_heads, cfg.dropout)
         self.layers = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            Block(*block_args)
             for _ in range(cfg.dec_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
