@@ -975,57 +975,62 @@ def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
 
 @torch.no_grad()
 def generate_mlm(model, prompt_text: str, gen_len: int,
-                 device: torch.device) -> str:
-    """AR-style MLM generation: one token at a time.
+                 device: torch.device, tokens_per_step: int = 4) -> str:
+    """AR-style MLM generation: multiple tokens per forward pass.
 
     Each step:
-      1. Build [BOS, prompt, generated_so_far, MASK, EOS]
-      2. Mask only the single next-token position
-      3. Forward pass -> argmax at masked position
-      4. Append predicted token and repeat
+      1. Build [BOS, prompt, generated_so_far, MASK*N, EOS]
+      2. Mask N positions at the end (before EOS)
+      3. Forward pass -> argmax at all masked positions
+      4. Append predicted tokens and repeat
 
     Args:
         model: BertMLM model.
         prompt_text: Text prompt.
         gen_len: Number of tokens to generate.
         device: Torch device.
+        tokens_per_step: How many masked positions per forward pass.
     """
     model.eval()
 
     prompt_ids = encode(prompt_text).to(device)  # (P,)
     max_T = model.max_seq_len
 
-    # Trim prompt if needed to leave room for at least 1 gen token + BOS + EOS
-    max_prompt = max_T - 3  # BOS + prompt + mask_slot + EOS
+    # Trim prompt if needed: BOS + prompt + tokens_per_step mask slots + EOS
+    max_prompt = max_T - 2 - tokens_per_step
     if prompt_ids.shape[0] > max_prompt:
         prompt_ids = prompt_ids[-max_prompt:]
 
     generated = []
 
-    for _ in range(gen_len):
+    while len(generated) < gen_len:
         n_gen = len(generated)
-        # Total seq: BOS + prompt + generated_so_far + mask_slot + EOS
-        T = 1 + prompt_ids.shape[0] + n_gen + 1 + 1
-        if T > max_T:
-            break  # can't fit any more
+        remaining = gen_len - n_gen
+        # How many slots we can fit this step
+        room = max_T - (1 + prompt_ids.shape[0] + n_gen + 1)  # BOS+prompt+gen+EOS
+        n_mask = min(tokens_per_step, remaining, room)
+        if n_mask < 1:
+            break
 
+        # Total seq: BOS + prompt + generated_so_far + n_mask slots + EOS
+        T = 1 + prompt_ids.shape[0] + n_gen + n_mask + 1
         token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
         token_ids[0, 0] = BOS_TOKEN
         token_ids[0, 1:1+prompt_ids.shape[0]] = prompt_ids
-        for j, tok in enumerate(generated):
-            token_ids[0, 1 + prompt_ids.shape[0] + j] = tok
-        # mask_slot position is at T-2 (before EOS)
-        token_ids[0, -2] = 0  # dummy, will be masked
+        if generated:
+            token_ids[0, 1+prompt_ids.shape[0]:1+prompt_ids.shape[0]+n_gen] = \
+                torch.tensor(generated, dtype=torch.long, device=device)
+        # mask slots are zeros (dummy), EOS at the end
         token_ids[0, -1] = EOS_TOKEN
 
         mask = torch.zeros(1, T, dtype=torch.bool, device=device)
-        mask[0, -2] = True  # mask only the next-token slot
+        mask[0, -(1+n_mask):-1] = True  # mask the n_mask slots before EOS
 
         logits = model(token_ids, mask)  # (1, T, vocab)
-        next_token = logits[0, -2].argmax(dim=-1).item()
-        generated.append(next_token)
+        new_tokens = logits[0, -(1+n_mask):-1].argmax(dim=-1).tolist()
+        generated.extend(new_tokens)
 
-    return decode(torch.tensor(generated, dtype=torch.long))
+    return decode(torch.tensor(generated[:gen_len], dtype=torch.long))
 
 
 # ---------------------------------------------------------------------------
