@@ -140,9 +140,12 @@ class STLG(nn.Module):
         pred_flat = pred_latents.reshape(B * (S - 1), -1)
         logits = self.vae.decoder(pred_flat)  # (B*(S-1), K, VOCAB_SIZE)
 
-        # 4. CE loss against target chunks
+        # 4. CE loss against target chunks (downweight PAD and space)
+        SPACE_TOKEN = 32 + 3  # space byte (0x20) + BYTE_OFFSET
         target_chunks = pieces[:, 1:].reshape(B * (S - 1), K)
-        mask = (target_chunks != PAD)
+        mask = (target_chunks != PAD).float()
+        # Downweight spaces to 0.1
+        mask = mask * torch.where(target_chunks == SPACE_TOKEN, 0.1, 1.0)
         ce = F.cross_entropy(
             logits.reshape(-1, VOCAB_SIZE),
             target_chunks.reshape(-1),
@@ -151,8 +154,9 @@ class STLG(nn.Module):
         loss = (ce * mask).sum() / mask.sum().clamp(min=1)
 
         with torch.no_grad():
+            non_pad = (target_chunks != PAD)
             preds = logits.argmax(dim=-1)
-            correct = ((preds == target_chunks) & mask).sum()
-            accuracy = correct.float() / mask.sum().clamp(min=1)
+            correct = ((preds == target_chunks) & non_pad).sum()
+            accuracy = correct.float() / non_pad.sum().clamp(min=1)
 
         return loss, accuracy
