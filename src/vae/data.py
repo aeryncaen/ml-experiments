@@ -101,13 +101,14 @@ def detokenize_shards(
 # ---------------------------------------------------------------------------
 
 class ByteShardStream:
-    """Streams random fixed-size byte chunks from pre-converted byte shards.
+    """Streams fixed-size byte chunks from pre-converted byte shards.
 
-    Each chunk is framed as: [BOS, b0+3, b1+3, ..., EOS, PAD...]
-    where content length = chunk_size - 2.
+    Takes contiguous pieces of chunk_size*16 bytes from the shard, frames each
+    as [BOS, bytes+3, bytes+3, ..., EOS], then chunks that sequence into
+    chunk_size-width pieces. The first chunk starts with BOS, the last chunk
+    has EOS followed by PAD, and all middle chunks are pure byte content.
 
-    Loads one shard at a time into memory, serves random chunks from it,
-    advances to next shard when exhausted.
+    Each next_batch() call returns batch_size chunks drawn from these pieces.
     """
 
     def __init__(
@@ -122,23 +123,53 @@ class ByteShardStream:
         if not self.files:
             raise FileNotFoundError(f"No byte shards matched: {shard_pattern}")
         self.chunk_size = chunk_size
-        self.content_len = chunk_size - 2  # space for BOS + EOS
+        self.piece_bytes = chunk_size * 16  # raw bytes per piece
         self.batch_size = batch_size
         self.rank = rank
         self.world_size = world_size
 
         # Shard state
-        self.file_idx = rank % len(self.files)  # start at different shards per rank
+        self.file_idx = rank % len(self.files)
         self.data: np.ndarray = np.array([], dtype=np.uint8)
-        self.n_chunks = 0
+        self.chunks: torch.Tensor = torch.empty(0)  # pre-chunked buffer
         self.pos = 0
         self._load_shard()
 
     def _load_shard(self):
         path = Path(self.files[self.file_idx])
         self.data = load_byte_shard(path)
-        self.n_chunks = len(self.data) // self.content_len
+        self.chunks = self._make_chunks()
         self.pos = 0
+
+    def _make_chunks(self) -> torch.Tensor:
+        """Convert raw byte shard into chunked training data."""
+        K = self.chunk_size
+        pb = self.piece_bytes
+        n_pieces = len(self.data) // pb
+
+        if n_pieces == 0:
+            return torch.empty(0, K, dtype=torch.long)
+
+        # Trim to whole pieces
+        raw = self.data[: n_pieces * pb].reshape(n_pieces, pb)
+
+        # Frame each piece: [BOS, byte+3, byte+3, ..., EOS]
+        # Total token length = pb + 2, chunked into ceil((pb+2)/K) chunks
+        seq_len = pb + 2
+        n_chunks_per_piece = (seq_len + K - 1) // K
+        padded_len = n_chunks_per_piece * K  # pad to multiple of chunk_size
+
+        # Build full token sequences (n_pieces, padded_len)
+        seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
+        seqs[:, 0] = BOS
+        seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+        seqs[:, pb + 1] = EOS
+
+        # Reshape into chunks: (n_pieces, n_chunks_per_piece, K)
+        seqs = seqs.reshape(n_pieces, n_chunks_per_piece, K)
+
+        # Flatten to (n_pieces * n_chunks_per_piece, K)
+        return torch.from_numpy(seqs.reshape(-1, K))
 
     def _advance_shard(self):
         self.file_idx = (self.file_idx + self.world_size) % len(self.files)
@@ -146,24 +177,12 @@ class ByteShardStream:
 
     def next_batch(self, device: torch.device) -> torch.Tensor:
         """Returns (batch_size, chunk_size) long tensor of byte token IDs."""
-        if self.pos + self.batch_size > self.n_chunks:
+        if self.pos + self.batch_size > len(self.chunks):
             self._advance_shard()
 
-        B, K, C = self.batch_size, self.chunk_size, self.content_len
-
-        # Grab contiguous byte block and reshape
-        start = self.pos * C
-        raw = self.data[start : start + B * C].reshape(B, C)
-
-        # Build chunks: [BOS, bytes+OFFSET, EOS, PAD...]
-        # All chunks are full-length (no partial last chunk in the middle of a shard)
-        chunks = torch.full((B, K), PAD, dtype=torch.long)
-        chunks[:, 0] = BOS
-        chunks[:, 1 : C + 1] = torch.from_numpy(raw.astype(np.int64)) + BYTE_OFFSET
-        chunks[:, C + 1] = EOS
-
-        self.pos += B
-        return chunks.to(device)
+        batch = self.chunks[self.pos : self.pos + self.batch_size]
+        self.pos += self.batch_size
+        return batch.to(device)
 
 
 # ---------------------------------------------------------------------------
