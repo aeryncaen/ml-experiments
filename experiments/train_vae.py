@@ -315,16 +315,17 @@ def main():
             )
         optimizer.step()
 
-        # tqdm update
-        mining = "H" if hard_mining_active else ""
-        pbar.set_postfix(
-            loss=f"{loss.item():.3f}",
-            recon=f"{recon_loss.item():.3f}",
-            kl=f"{kl_loss.item():.3f}",
-            acc=f"{accuracy.item():.3f}",
-            lr=f"{lr:.1e}",
-            m=mining,
-        )
+        # tqdm update (every 100 steps to avoid overhead)
+        if step % 100 == 0:
+            mining = "H" if hard_mining_active else ""
+            pbar.set_postfix(
+                loss=f"{loss.item():.3f}",
+                recon=f"{recon_loss.item():.3f}",
+                kl=f"{kl_loss.item():.3f}",
+                acc=f"{accuracy.item():.3f}",
+                lr=f"{lr:.1e}",
+                m=mining,
+            )
 
         # Periodic save
         if step > 0 and step % args.save_every == 0 and rank == 0:
