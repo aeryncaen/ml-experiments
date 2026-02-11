@@ -63,7 +63,7 @@ def parse_args():
     # Training
     p.add_argument("--train-steps", type=int, default=10000)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -76,7 +76,7 @@ def parse_args():
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
 
     # Hard example mining
-    p.add_argument("--hard-mining-threshold", type=float, default=0.97,
+    p.add_argument("--hard-mining-threshold", type=float, default=0.95,
                     help="Val acc threshold to activate hard mining")
     p.add_argument("--hard-mining-ratio", type=int, default=4,
                     help="Oversample ratio: fetch N*batch, keep hardest batch")

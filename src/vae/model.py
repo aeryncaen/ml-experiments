@@ -3,14 +3,15 @@
 Architecture:
     Encoder preprocessing (before bottleneck):
         1. Byte embedding (B, K) -> (B, K, D)
-        2. Fixed RoPE on first half of dims
-        3. Data-dependent RoPE (cumsum angles) on second half of dims
-        4. Acausal lerp on last quarter of dims (bidirectional neighbor blend)
-        5. Full bidirectional attention (enc_layers deep)
-        6. Mean-pool -> mu, log_var -> z
+        2. Acausal lerp on last quarter of dims (bidirectional neighbor blend)
+        3. Full bidirectional attention with ALiBi (enc_layers deep)
+        4. Mean-pool -> mu, log_var -> z
 
     Decoder:
-        z -> broadcast + RoPE + DD-RoPE + lerp -> bidir attention -> byte logits
+        z -> broadcast + acausal lerp -> bidir attention with ALiBi -> byte logits
+
+    ALiBi provides position information through attention bias (zero extra params,
+    zero data-dependent state to compress through the bottleneck).
 
 Vocab (259):
     0 = PAD
@@ -20,6 +21,7 @@ Vocab (259):
 """
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -57,48 +59,44 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Embedding preprocessing: fixed RoPE + DD-RoPE + acausal lerp
+# ALiBi: linear attention bias (zero params, position via attention scores)
 # ---------------------------------------------------------------------------
 
-def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate paired dims: x[..., :d] and x[..., d:] by (cos, sin)."""
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+def build_alibi_bias(n_heads: int, max_len: int) -> torch.Tensor:
+    """Build ALiBi bias matrix: (n_heads, max_len, max_len).
 
+    Each head gets a different slope. Bias[i,j] = -slope * |i - j|.
+    Bidirectional (symmetric) since this is not causal.
+    """
+    # Slopes: geometric sequence from 2^(-8/n_heads) to 2^(-8)
+    # Following the ALiBi paper's head slope schedule
+    ratio = 2 ** (-8.0 / n_heads)
+    slopes = torch.tensor([ratio ** (i + 1) for i in range(n_heads)])  # (H,)
+
+    pos = torch.arange(max_len)
+    dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()  # (L, L)
+    bias = -dist.unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)  # (H, L, L)
+    return bias
+
+
+# ---------------------------------------------------------------------------
+# Embedding preprocessing: acausal lerp (no RoPE — ALiBi handles position)
+# ---------------------------------------------------------------------------
 
 class EmbeddingPreprocessor(nn.Module):
-    """Enriches embeddings with positional and temporal structure.
+    """Acausal lerp on last quarter of embedding dims.
 
-    Applied to (B, K, D) embeddings before the transformer layers.
-
-    Dim layout: [fixed_x1 (D/4) | fixed_x2 (D/4) | dd_x1 (D/4) | dd_x2 (D/4)]
-
-    1. Fixed RoPE on first half (D/2) — standard positional frequencies
-    2. Data-dependent RoPE on second half (D/2) — cumsum of learned angle deltas
-    3. Acausal lerp on last quarter (D/4) — bidirectional neighbor blending
+    Bidirectional neighbor blending so each position is informed by
+    its neighbors before attention sees it. No RoPE — ALiBi provides
+    position info through attention bias instead.
 
     d_model must be divisible by 4.
     """
 
-    def __init__(self, d_model: int, rope_base: float = 10000.0, init_bias: float = -2.0):
+    def __init__(self, d_model: int, init_bias: float = -2.0):
         super().__init__()
         assert d_model % 4 == 0, f"d_model must be divisible by 4, got {d_model}"
-        self.d_model = d_model
-        self.fixed_pairs = d_model // 4    # rotation pairs for fixed RoPE
-        self.dd_pairs = d_model // 4       # rotation pairs for DD-RoPE
-        self.quarter_dim = d_model // 4    # lerp channels
-
-        # Fixed RoPE inverse frequencies
-        inv_freq = 1.0 / (rope_base ** (
-            torch.arange(0, self.fixed_pairs * 2, 2).float() / (d_model // 2)
-        ))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
-
-        # DD-RoPE: project embedding to per-position angle deltas, then cumsum
-        self.dd_proj = nn.Linear(d_model, self.dd_pairs, bias=True)
-        nn.init.zeros_(self.dd_proj.weight)
-        nn.init.zeros_(self.dd_proj.bias)
+        self.quarter_dim = d_model // 4
 
         # Acausal lerp gates (last quarter of dims)
         self.gate_fwd = nn.Linear(d_model, self.quarter_dim, bias=True)
@@ -109,57 +107,39 @@ class EmbeddingPreprocessor(nn.Module):
         nn.init.constant_(self.gate_bwd.bias, init_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, K, D). Returns (B, K, D) with RoPE + DD-RoPE + acausal lerp."""
+        """x: (B, K, D). Returns (B, K, D) with acausal lerp on last quarter."""
         B, K, D = x.shape
-        fp = self.fixed_pairs
-        dp = self.dd_pairs
         qd = self.quarter_dim
 
-        # --- 1. Fixed RoPE on first half ---
-        x_fixed = torch.cat([x[..., :fp], x[..., fp:2*fp]], dim=-1)  # (B, K, 2*fp)
-        t = torch.arange(K, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)       # (K, fp)
-        cos_f = freqs.cos()[None, :, :]              # (1, K, fp)
-        sin_f = freqs.sin()[None, :, :]
-        x_fixed = _apply_rotary(x_fixed, cos_f, sin_f)
+        if K < 2:
+            return x
 
-        # --- 2. DD-RoPE on second half ---
-        x_dd = torch.cat([x[..., 2*fp:2*fp+dp], x[..., 2*fp+dp:]], dim=-1)  # (B, K, 2*dp)
-        dd_angles = self.dd_proj(x).cumsum(dim=1)   # (B, K, dp)
-        x_dd = _apply_rotary(x_dd, dd_angles.cos(), dd_angles.sin())
+        g_fwd = torch.sigmoid(self.gate_fwd(x))  # (B, K, qd)
+        g_bwd = torch.sigmoid(self.gate_bwd(x))
 
-        # Reassemble
-        x = torch.cat([x_fixed[..., :fp], x_fixed[..., fp:],
-                        x_dd[..., :dp], x_dd[..., dp:]], dim=-1)
+        x_static = x[..., :-qd]
+        x_cur = x[..., -qd:]
+        x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
+        x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
+        x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_prev + g_bwd * x_next
 
-        # --- 3. Acausal lerp on last quarter ---
-        if K >= 2:
-            g_fwd = torch.sigmoid(self.gate_fwd(x))  # (B, K, qd)
-            g_bwd = torch.sigmoid(self.gate_bwd(x))
-
-            x_static = x[..., :-qd]
-            x_cur = x[..., -qd:]
-            x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
-            x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
-            x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_prev + g_bwd * x_next
-            x = torch.cat([x_static, x_mixed], dim=-1)
-
-        return x
+        return torch.cat([x_static, x_mixed], dim=-1)
 
 
 # ---------------------------------------------------------------------------
-# Transformer block (bidirectional, pre-norm)
+# Transformer block with ALiBi (bidirectional, pre-norm)
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block (bidirectional)."""
+    """Pre-norm transformer block with ALiBi attention bias."""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
         self.norm1 = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True,
-        )
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
         self.norm2 = RMSNorm(d_model)
         hidden = 4 * d_model
         self.mlp = nn.Sequential(
@@ -167,11 +147,44 @@ class TransformerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, d_model, bias=False),
         )
+        self.dropout = dropout
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        alibi_bias: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, K, D = x.shape
+        H = self.n_heads
+        hd = self.head_dim
+
         h = self.norm1(x)
-        h, _ = self.attn(h, h, h, key_padding_mask=mask, need_weights=False)
-        x = x + h
+        qkv = self.qkv(h).reshape(B, K, 3, H, hd)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]  # each (B, K, H, hd)
+
+        # Attention scores with ALiBi bias
+        q = q.transpose(1, 2)  # (B, H, K, hd)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        scale = 1.0 / math.sqrt(hd)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, K, K)
+        attn = attn + alibi_bias[:, :K, :K]  # (H, K, K) broadcast over B
+
+        if pad_mask is not None:
+            # pad_mask: (B, K) True where padded — expand to (B, 1, 1, K)
+            attn = attn.masked_fill(pad_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+        attn = F.softmax(attn, dim=-1)
+        if self.dropout > 0 and self.training:
+            attn = F.dropout(attn, p=self.dropout)
+
+        out = torch.matmul(attn, v)  # (B, H, K, hd)
+        out = out.transpose(1, 2).reshape(B, K, D)
+        out = self.o_proj(out)
+
+        x = x + out
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -183,8 +196,8 @@ class TransformerBlock(nn.Module):
 class Encoder(nn.Module):
     """Encodes a byte chunk (B, K) -> mu (B, D_latent), log_var (B, D_latent).
 
-    Pipeline: embed -> preprocess (RoPE + DD-RoPE + acausal lerp) ->
-              full bidirectional attention -> mean-pool -> bottleneck.
+    Pipeline: embed -> acausal lerp -> full bidirectional attention (ALiBi) ->
+              mean-pool -> bottleneck.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -199,6 +212,10 @@ class Encoder(nn.Module):
         self.to_mu = nn.Linear(cfg.d_model, cfg.d_latent)
         self.to_logvar = nn.Linear(cfg.d_model, cfg.d_latent)
 
+        # ALiBi bias (registered as buffer, not a parameter)
+        alibi = build_alibi_bias(cfg.n_heads, cfg.chunk_size)
+        self.register_buffer('alibi_bias', alibi, persistent=False)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x: (B, K) byte token IDs. Returns mu, log_var each (B, D_latent)."""
         B, K = x.shape
@@ -208,7 +225,7 @@ class Encoder(nn.Module):
         h = self.preprocess(h)
 
         for layer in self.layers:
-            h = layer(h, mask=pad_mask)
+            h = layer(h, self.alibi_bias, pad_mask)
         h = self.norm(h)
 
         # Mean-pool over non-pad positions
@@ -226,7 +243,7 @@ class Decoder(nn.Module):
     """Decodes latent z (B, D_latent) -> byte logits (B, K, VOCAB_SIZE).
 
     Same preprocessing as encoder: z broadcast to K positions gets
-    RoPE + DD-RoPE + acausal lerp before transformer layers.
+    acausal lerp + ALiBi attention.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -241,6 +258,9 @@ class Decoder(nn.Module):
         self.norm = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, VOCAB_SIZE)
 
+        alibi = build_alibi_bias(cfg.n_heads, cfg.chunk_size)
+        self.register_buffer('alibi_bias', alibi, persistent=False)
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z: (B, D_latent). Returns logits (B, K, VOCAB_SIZE)."""
         B = z.shape[0]
@@ -250,7 +270,7 @@ class Decoder(nn.Module):
         h = self.preprocess(h)
 
         for layer in self.layers:
-            h = layer(h)
+            h = layer(h, self.alibi_bias)
         h = self.norm(h)
 
         return self.head(h)
