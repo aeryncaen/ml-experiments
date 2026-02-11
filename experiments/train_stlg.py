@@ -24,7 +24,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vae.model import ByteChunkVAE, VAEConfig, VOCAB_SIZE, PAD, BYTE_OFFSET
-from vae.data import PieceStream
+from vae.data import PieceStream, ShakespearePieceStream
 from stlg.model import STLG, STLGConfig
 
 
@@ -39,6 +39,8 @@ def parse_args():
     p.add_argument("--byte-dir", type=str,
                     default=str(Path(__file__).resolve().parent.parent / "data/fineweb_bytes"),
                     help="Directory with fineweb byte .bin shards")
+    p.add_argument("--shakespeare", action="store_true",
+                    help="Train on tinyshakespeare instead of fineweb")
 
     # VAE
     p.add_argument("--vae-checkpoint", type=str,
@@ -208,17 +210,22 @@ def main():
     print0(rank, f"  VAE: chunk_size={vae_cfg.chunk_size} d_latent={vae_cfg.d_latent}")
 
     # Data
-    byte_dir = Path(args.byte_dir)
-    train_pattern = str(byte_dir / "fineweb_train_*_bytes.bin")
-    val_pattern = str(byte_dir / "fineweb_val_*_bytes.bin")
+    if args.shakespeare:
+        print0(rank, "Using tinyshakespeare dataset")
+        train_stream = ShakespearePieceStream(vae_cfg.chunk_size, args.batch_size, split="train")
+        val_stream = ShakespearePieceStream(vae_cfg.chunk_size, args.batch_size, split="val")
+    else:
+        byte_dir = Path(args.byte_dir)
+        train_pattern = str(byte_dir / "fineweb_train_*_bytes.bin")
+        val_pattern = str(byte_dir / "fineweb_val_*_bytes.bin")
 
-    train_stream = PieceStream(
-        train_pattern, vae_cfg.chunk_size, args.batch_size, rank, world_size,
-    )
-    val_stream = PieceStream(
-        val_pattern, vae_cfg.chunk_size, args.batch_size, rank, world_size,
-        shuffle=True,
-    )
+        train_stream = PieceStream(
+            train_pattern, vae_cfg.chunk_size, args.batch_size, rank, world_size,
+        )
+        val_stream = PieceStream(
+            val_pattern, vae_cfg.chunk_size, args.batch_size, rank, world_size,
+            shuffle=True,
+        )
 
     # Compute sequence length from VAE config
     piece_bytes = vae_cfg.chunk_size * 16

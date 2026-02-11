@@ -301,6 +301,160 @@ class PieceStream:
 
 
 # ---------------------------------------------------------------------------
+# Shakespeare data loader
+# ---------------------------------------------------------------------------
+
+SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+
+def load_shakespeare_bytes(data_dir: str = "data") -> np.ndarray:
+    """Download tinyshakespeare and return as uint8 numpy array."""
+    data_path = Path(data_dir) / "shakespeare.txt"
+    if not data_path.exists():
+        print(f"Downloading Shakespeare -> {data_path}")
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        import urllib.request
+        urllib.request.urlretrieve(SHAKESPEARE_URL, data_path)
+    text = data_path.read_text()
+    return np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+
+
+def _make_chunks_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
+    """Convert raw bytes into chunked training data with BOS/EOS/PAD framing.
+
+    Same logic as ByteShardStream._make_chunks: takes pieces of chunk_size*16
+    bytes, frames as [BOS, bytes+3, ..., EOS], chunks into chunk_size-width.
+    """
+    K = chunk_size
+    pb = K * 16  # piece bytes
+    n_pieces = len(data) // pb
+
+    if n_pieces == 0:
+        return torch.empty(0, K, dtype=torch.long)
+
+    raw = data[: n_pieces * pb].reshape(n_pieces, pb)
+    seq_len = pb + 2
+    n_chunks_per_piece = (seq_len + K - 1) // K
+    padded_len = n_chunks_per_piece * K
+
+    seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
+    seqs[:, 0] = BOS
+    seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+    seqs[:, pb + 1] = EOS
+
+    return torch.from_numpy(seqs.reshape(-1, K))
+
+
+def _make_pieces_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
+    """Convert raw bytes into pieces (n_pieces, n_chunks_per_piece, chunk_size)."""
+    K = chunk_size
+    pb = K * 16
+    n_pieces = len(data) // pb
+
+    if n_pieces == 0:
+        return torch.empty(0, 1, K, dtype=torch.long)
+
+    raw = data[: n_pieces * pb].reshape(n_pieces, pb)
+    seq_len = pb + 2
+    n_chunks = (seq_len + K - 1) // K
+    padded_len = n_chunks * K
+
+    seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
+    seqs[:, 0] = BOS
+    seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+    seqs[:, pb + 1] = EOS
+
+    return torch.from_numpy(seqs.reshape(n_pieces, n_chunks, K))
+
+
+class ShakespeareStream:
+    """Streams shuffled byte chunks from tinyshakespeare for VAE training.
+
+    Same chunk format as ByteShardStream. Splits data 90/10 train/val.
+    """
+
+    def __init__(self, chunk_size: int, batch_size: int, split: str = "train",
+                 data_dir: str = "data"):
+        data = load_shakespeare_bytes(data_dir)
+        n = len(data)
+        split_idx = int(n * 0.9)
+
+        if split == "train":
+            data = data[:split_idx]
+        else:
+            data = data[split_idx:]
+
+        self.chunks = _make_chunks_from_bytes(data, chunk_size)
+        self.batch_size = batch_size
+        self.chunk_size = chunk_size
+        self.pos = 0
+        self._shuffle()
+
+    def _shuffle(self):
+        perm = torch.randperm(len(self.chunks))
+        self.chunks = self.chunks[perm]
+        self.pos = 0
+
+    def next_batch(self, device: torch.device) -> torch.Tensor:
+        if self.pos + self.batch_size > len(self.chunks):
+            self._shuffle()
+
+        batch = self.chunks[self.pos : self.pos + self.batch_size].clone()
+        self.pos += self.batch_size
+
+        # 10% augmentation (same as ByteShardStream)
+        K = self.chunk_size
+        n_aug = max(1, self.batch_size // 10)
+        aug_idx = torch.randperm(self.batch_size)[:n_aug]
+        n_pad = n_aug // 2
+
+        for i in aug_idx[:n_pad]:
+            cut = torch.randint(1, K, (1,)).item()
+            batch[i, cut] = EOS
+            batch[i, cut + 1:] = PAD
+
+        for i in aug_idx[n_pad:]:
+            row = batch[i]
+            batch[i, 1:] = row[:-1].clone()
+            batch[i, 0] = BOS
+
+        return batch.to(device)
+
+
+class ShakespearePieceStream:
+    """Streams full pieces from tinyshakespeare for STLG training."""
+
+    def __init__(self, chunk_size: int, batch_size: int, split: str = "train",
+                 data_dir: str = "data"):
+        data = load_shakespeare_bytes(data_dir)
+        n = len(data)
+        split_idx = int(n * 0.9)
+
+        if split == "train":
+            data = data[:split_idx]
+        else:
+            data = data[split_idx:]
+
+        self.pieces = _make_pieces_from_bytes(data, chunk_size)
+        self.batch_size = batch_size
+        self.pos = 0
+        self._shuffle()
+
+    def _shuffle(self):
+        perm = torch.randperm(len(self.pieces))
+        self.pieces = self.pieces[perm]
+        self.pos = 0
+
+    def next_batch(self, device: torch.device) -> torch.Tensor:
+        if self.pos + self.batch_size > len(self.pieces):
+            self._shuffle()
+
+        batch = self.pieces[self.pos : self.pos + self.batch_size]
+        self.pos += self.batch_size
+        return batch.to(device)
+
+
+# ---------------------------------------------------------------------------
 # CLI: python -m vae.data --bpe-pattern "path/to/*.bin" --output-dir "path/to/bytes"
 # ---------------------------------------------------------------------------
 

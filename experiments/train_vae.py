@@ -32,7 +32,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET, VOCAB_SIZE, PAD
-from vae.data import ByteShardStream, detokenize_shards
+from vae.data import ByteShardStream, ShakespeareStream, detokenize_shards
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +49,8 @@ def parse_args():
     p.add_argument("--byte-dir", type=str,
                     default=str(Path(__file__).resolve().parent.parent / "data/fineweb_bytes"),
                     help="Directory with fineweb byte .bin shards")
+    p.add_argument("--shakespeare", action="store_true",
+                    help="Train on tinyshakespeare instead of fineweb")
 
     # Model
     p.add_argument("--chunk-size", type=int, default=16, help="Bytes per chunk (including BOS/EOS)")
@@ -195,30 +197,34 @@ def main():
     print0(rank, f"  enc_layers={args.enc_layers} dec_layers={args.dec_layers} beta={args.beta} fused={args.fused}")
     print0(rank, f"  batch_size={args.batch_size} lr={args.lr} steps={args.train_steps}")
 
-    # --- Ensure byte shards exist ---
-    byte_dir = Path(args.byte_dir)
-    train_pattern = str(byte_dir / "fineweb_train_*_bytes.bin")
-    val_pattern = str(byte_dir / "fineweb_val_*_bytes.bin")
-
-    if not glob.glob(train_pattern):
-        print0(rank, "No byte shards found. Converting BPE shards...")
-        if rank == 0:
-            bpe_train = os.path.join(args.bpe_dir, "fineweb_train_*.bin")
-            bpe_val = os.path.join(args.bpe_dir, "fineweb_val_*.bin")
-            detokenize_shards(bpe_train, str(byte_dir))
-            detokenize_shards(bpe_val, str(byte_dir))
-        if world_size > 1:
-            dist.barrier()
-        print0(rank, "Byte shard conversion done.")
-
     # --- Data ---
-    train_stream = ByteShardStream(
-        train_pattern, args.chunk_size, args.batch_size, rank, world_size,
-    )
-    val_stream = ByteShardStream(
-        val_pattern, args.chunk_size, args.batch_size, rank, world_size,
-        shuffle=True,
-    )
+    if args.shakespeare:
+        print0(rank, "Using tinyshakespeare dataset")
+        train_stream = ShakespeareStream(args.chunk_size, args.batch_size, split="train")
+        val_stream = ShakespeareStream(args.chunk_size, args.batch_size, split="val")
+    else:
+        byte_dir = Path(args.byte_dir)
+        train_pattern = str(byte_dir / "fineweb_train_*_bytes.bin")
+        val_pattern = str(byte_dir / "fineweb_val_*_bytes.bin")
+
+        if not glob.glob(train_pattern):
+            print0(rank, "No byte shards found. Converting BPE shards...")
+            if rank == 0:
+                bpe_train = os.path.join(args.bpe_dir, "fineweb_train_*.bin")
+                bpe_val = os.path.join(args.bpe_dir, "fineweb_val_*.bin")
+                detokenize_shards(bpe_train, str(byte_dir))
+                detokenize_shards(bpe_val, str(byte_dir))
+            if world_size > 1:
+                dist.barrier()
+            print0(rank, "Byte shard conversion done.")
+
+        train_stream = ByteShardStream(
+            train_pattern, args.chunk_size, args.batch_size, rank, world_size,
+        )
+        val_stream = ByteShardStream(
+            val_pattern, args.chunk_size, args.batch_size, rank, world_size,
+            shuffle=True,
+        )
 
     # --- Model ---
     cfg = VAEConfig(
