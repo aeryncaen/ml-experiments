@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vae.model import ByteChunkVAE, VAEConfig, VOCAB_SIZE, PAD
+from vae.model import ByteChunkVAE, VAEConfig, PAD
 
 
 @dataclass
@@ -138,7 +138,8 @@ class STLG(nn.Module):
         # 3. Decode predicted latents through frozen VAE decoder
         # Grad flows through pred_latents -> decoder -> logits -> loss -> back to STLG
         pred_flat = pred_latents.reshape(B * (S - 1), -1)
-        logits = self.vae.decoder(pred_flat)  # (B*(S-1), K, VOCAB_SIZE)
+        V = self.vae.cfg.vocab_size
+        logits = self.vae.decoder(pred_flat)  # (B*(S-1), K, V)
 
         # 4. CE loss against target chunks (downweight PAD and space)
         SPACE_TOKEN = 32 + 3  # space byte (0x20) + BYTE_OFFSET
@@ -147,7 +148,7 @@ class STLG(nn.Module):
         # Downweight spaces to 0.1
         mask = mask * torch.where(target_chunks == SPACE_TOKEN, 0.1, 1.0)
         ce = F.cross_entropy(
-            logits.reshape(-1, VOCAB_SIZE),
+            logits.reshape(-1, V),
             target_chunks.reshape(-1),
             reduction='none',
         ).reshape(target_chunks.shape)

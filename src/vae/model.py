@@ -45,6 +45,7 @@ class VAEConfig:
     beta: float = 0.01         # KL weight (beta-VAE)
     dropout: float = 0.0
     use_fused: bool = False    # use ULB-style fused blocks instead of transformer blocks
+    vocab_size: int = VOCAB_SIZE  # 259 for bytes, 68 for shakespeare, etc.
 
 
 class RMSNorm(nn.Module):
@@ -274,7 +275,7 @@ class Encoder(nn.Module):
 
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.embed = nn.Embedding(VOCAB_SIZE, cfg.d_model)
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         Block = FusedBlock if cfg.use_fused else TransformerBlock
         block_args = (cfg.d_model, cfg.n_heads) if cfg.use_fused else (cfg.d_model, cfg.n_heads, cfg.dropout)
@@ -328,7 +329,7 @@ class Decoder(nn.Module):
             for _ in range(cfg.dec_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, VOCAB_SIZE)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z: (B, D_latent). Returns logits (B, K, VOCAB_SIZE)."""
@@ -384,12 +385,13 @@ class ByteChunkVAE(nn.Module):
         """
         mu, log_var = self.encoder(x)
         z = self.reparameterize(mu, log_var)
-        logits = self.decoder(z)  # (B, K, VOCAB_SIZE)
+        logits = self.decoder(z)  # (B, K, vocab_size)
+        V = self.cfg.vocab_size
 
         # Reconstruction loss: CE on non-PAD positions
         mask = (x != PAD)  # (B, K)
         ce = F.cross_entropy(
-            logits.reshape(-1, VOCAB_SIZE),
+            logits.reshape(-1, V),
             x.reshape(-1),
             reduction='none',
         ).reshape(x.shape)
@@ -422,7 +424,7 @@ class ByteChunkVAE(nn.Module):
             logits = self.decoder(mu)  # deterministic, no reparameterize
             mask = (x != PAD)
             ce = F.cross_entropy(
-                logits.reshape(-1, VOCAB_SIZE),
+                logits.reshape(-1, self.cfg.vocab_size),
                 x.reshape(-1),
                 reduction='none',
             ).reshape(x.shape)

@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET, VOCAB_SIZE, PAD
+from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET, PAD
 from vae.data import ByteShardStream, ShakespeareStream, detokenize_shards
 
 
@@ -62,6 +62,7 @@ def parse_args():
     p.add_argument("--beta", type=float, default=0.01, help="KL weight (beta-VAE)")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--fused", action="store_true", help="Use ULB-style fused blocks instead of transformer")
+    p.add_argument("--vocab-size", type=int, default=259, help="Vocab size (259 for bytes, 68 for shakespeare)")
 
     # Training
     p.add_argument("--train-steps", type=int, default=10000)
@@ -237,6 +238,7 @@ def main():
         beta=args.beta,
         dropout=args.dropout,
         use_fused=args.fused,
+        vocab_size=args.vocab_size,
     )
     model = ByteChunkVAE(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())

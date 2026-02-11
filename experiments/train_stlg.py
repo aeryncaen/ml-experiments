@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from vae.model import ByteChunkVAE, VAEConfig, VOCAB_SIZE, PAD, BYTE_OFFSET
+from vae.model import ByteChunkVAE, VAEConfig, PAD, BYTE_OFFSET
 from vae.data import PieceStream, ShakespearePieceStream
 from stlg.model import STLG, STLGConfig
 
