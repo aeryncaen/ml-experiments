@@ -1231,7 +1231,7 @@ def train(args):
         ema = EMA(model.parameters(), decay=args.ema)
         print(f"  EMA enabled (decay={args.ema})")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # LR schedule: linear warmup (1 epoch, from lr/10) then cosine decay to lr/20
     warmup_steps = args.steps_per_epoch  # 1 epoch warmup
@@ -1623,6 +1623,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
     parser.add_argument('--val-batches', type=int, default=10, help='Validation batches')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--early-stop-acc', type=float, default=0.99,
                         help='Stop training when val acc exceeds this (0 to disable)')
