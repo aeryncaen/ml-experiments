@@ -195,25 +195,32 @@ class FusedBlock(nn.Module):
         return x + y
     """
 
+    INNER_RATIO = 1.75
+
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
-        assert d_model % n_heads == 0
+        # Snap inner_dim to nearest multiple of n_heads*4 (head_dim divisible by 4)
+        snap = n_heads * 4
+        inner_dim = round(d_model * self.INNER_RATIO / snap) * snap
+        assert inner_dim > 0
+
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
+        self.inner_dim = inner_dim
+        self.head_dim = inner_dim // n_heads
 
         self.norm = RMSNorm(d_model)
 
-        # Gate path
+        # Gate path (thin, at d_model)
         self.up_proj = nn.Linear(d_model, d_model, bias=False)
         self.down_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # QKV (all at d_model, no expansion)
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=True)
-        self.v_proj = nn.Linear(d_model, d_model, bias=True)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        # QKV: d -> inner (1.75x expansion)
+        self.q_proj = nn.Linear(d_model, inner_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, inner_dim, bias=True)
+        self.v_proj = nn.Linear(d_model, inner_dim, bias=True)
+        self.o_proj = nn.Linear(inner_dim, d_model, bias=False)
 
-        # QK norm (Mamba-3 style)
+        # QK norm (Mamba-3 style, at head_dim)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
 
@@ -245,7 +252,7 @@ class FusedBlock(nn.Module):
             attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(B, K, D)
+        y = y.transpose(1, 2).contiguous().view(B, K, self.inner_dim)
 
         y = self.o_proj(y)
         y = self.attn_norm(y) * h_up
