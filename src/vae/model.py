@@ -1,8 +1,16 @@
 """ByteChunkVAE — compresses fixed-size byte chunks into continuous latent vectors.
 
 Architecture:
-    Encoder: byte embedding -> bidirectional transformer -> mean-pool -> mu, log_var -> z
-    Decoder: z -> learned positional queries + broadcast z -> transformer -> byte logits
+    Encoder preprocessing (before bottleneck):
+        1. Byte embedding (B, K) -> (B, K, D)
+        2. Fixed RoPE on first half of dims
+        3. Data-dependent RoPE (cumsum angles) on second half of dims
+        4. Acausal lerp on last quarter of dims (bidirectional neighbor blend)
+        5. Full bidirectional attention (enc_layers deep)
+        6. Mean-pool -> mu, log_var -> z
+
+    Decoder:
+        z -> broadcast + RoPE + DD-RoPE + lerp -> bidir attention -> byte logits
 
 Vocab (259):
     0 = PAD
@@ -34,7 +42,7 @@ class VAEConfig:
     n_heads: int = 4           # attention heads
     enc_layers: int = 4        # encoder transformer depth
     dec_layers: int = 4        # decoder transformer depth
-    beta: float = 0.01         # KL weight (β-VAE)
+    beta: float = 0.01         # KL weight (beta-VAE)
     dropout: float = 0.0
 
 
@@ -47,6 +55,101 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
+
+# ---------------------------------------------------------------------------
+# Embedding preprocessing: fixed RoPE + DD-RoPE + acausal lerp
+# ---------------------------------------------------------------------------
+
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate paired dims: x[..., :d] and x[..., d:] by (cos, sin)."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+
+class EmbeddingPreprocessor(nn.Module):
+    """Enriches embeddings with positional and temporal structure.
+
+    Applied to (B, K, D) embeddings before the transformer layers.
+
+    Dim layout: [fixed_x1 (D/4) | fixed_x2 (D/4) | dd_x1 (D/4) | dd_x2 (D/4)]
+
+    1. Fixed RoPE on first half (D/2) — standard positional frequencies
+    2. Data-dependent RoPE on second half (D/2) — cumsum of learned angle deltas
+    3. Acausal lerp on last quarter (D/4) — bidirectional neighbor blending
+
+    d_model must be divisible by 4.
+    """
+
+    def __init__(self, d_model: int, rope_base: float = 10000.0, init_bias: float = -2.0):
+        super().__init__()
+        assert d_model % 4 == 0, f"d_model must be divisible by 4, got {d_model}"
+        self.d_model = d_model
+        self.fixed_pairs = d_model // 4    # rotation pairs for fixed RoPE
+        self.dd_pairs = d_model // 4       # rotation pairs for DD-RoPE
+        self.quarter_dim = d_model // 4    # lerp channels
+
+        # Fixed RoPE inverse frequencies
+        inv_freq = 1.0 / (rope_base ** (
+            torch.arange(0, self.fixed_pairs * 2, 2).float() / (d_model // 2)
+        ))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # DD-RoPE: project embedding to per-position angle deltas, then cumsum
+        self.dd_proj = nn.Linear(d_model, self.dd_pairs, bias=True)
+        nn.init.zeros_(self.dd_proj.weight)
+        nn.init.zeros_(self.dd_proj.bias)
+
+        # Acausal lerp gates (last quarter of dims)
+        self.gate_fwd = nn.Linear(d_model, self.quarter_dim, bias=True)
+        self.gate_bwd = nn.Linear(d_model, self.quarter_dim, bias=True)
+        nn.init.zeros_(self.gate_fwd.weight)
+        nn.init.constant_(self.gate_fwd.bias, init_bias)
+        nn.init.zeros_(self.gate_bwd.weight)
+        nn.init.constant_(self.gate_bwd.bias, init_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, K, D). Returns (B, K, D) with RoPE + DD-RoPE + acausal lerp."""
+        B, K, D = x.shape
+        fp = self.fixed_pairs
+        dp = self.dd_pairs
+        qd = self.quarter_dim
+
+        # --- 1. Fixed RoPE on first half ---
+        x_fixed = torch.cat([x[..., :fp], x[..., fp:2*fp]], dim=-1)  # (B, K, 2*fp)
+        t = torch.arange(K, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)       # (K, fp)
+        cos_f = freqs.cos()[None, :, :]              # (1, K, fp)
+        sin_f = freqs.sin()[None, :, :]
+        x_fixed = _apply_rotary(x_fixed, cos_f, sin_f)
+
+        # --- 2. DD-RoPE on second half ---
+        x_dd = torch.cat([x[..., 2*fp:2*fp+dp], x[..., 2*fp+dp:]], dim=-1)  # (B, K, 2*dp)
+        dd_angles = self.dd_proj(x).cumsum(dim=1)   # (B, K, dp)
+        x_dd = _apply_rotary(x_dd, dd_angles.cos(), dd_angles.sin())
+
+        # Reassemble
+        x = torch.cat([x_fixed[..., :fp], x_fixed[..., fp:],
+                        x_dd[..., :dp], x_dd[..., dp:]], dim=-1)
+
+        # --- 3. Acausal lerp on last quarter ---
+        if K >= 2:
+            g_fwd = torch.sigmoid(self.gate_fwd(x))  # (B, K, qd)
+            g_bwd = torch.sigmoid(self.gate_bwd(x))
+
+            x_static = x[..., :-qd]
+            x_cur = x[..., -qd:]
+            x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
+            x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
+            x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_prev + g_bwd * x_next
+            x = torch.cat([x_static, x_mixed], dim=-1)
+
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Transformer block (bidirectional, pre-norm)
+# ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block (bidirectional)."""
@@ -73,13 +176,21 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
+
 class Encoder(nn.Module):
-    """Encodes a byte chunk (B, K) -> mu (B, D_latent), log_var (B, D_latent)."""
+    """Encodes a byte chunk (B, K) -> mu (B, D_latent), log_var (B, D_latent).
+
+    Pipeline: embed -> preprocess (RoPE + DD-RoPE + acausal lerp) ->
+              full bidirectional attention -> mean-pool -> bottleneck.
+    """
 
     def __init__(self, cfg: VAEConfig):
         super().__init__()
         self.embed = nn.Embedding(VOCAB_SIZE, cfg.d_model)
-        self.pos_embed = nn.Embedding(cfg.chunk_size, cfg.d_model)
+        self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
             TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.enc_layers)
@@ -91,30 +202,38 @@ class Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x: (B, K) byte token IDs. Returns mu, log_var each (B, D_latent)."""
         B, K = x.shape
-        pad_mask = (x == PAD)  # True where padded
+        pad_mask = (x == PAD)
 
-        pos = torch.arange(K, device=x.device)
-        h = self.embed(x) + self.pos_embed(pos)
+        h = self.embed(x)
+        h = self.preprocess(h)
 
         for layer in self.layers:
             h = layer(h, mask=pad_mask)
         h = self.norm(h)
 
         # Mean-pool over non-pad positions
-        valid = (~pad_mask).unsqueeze(-1).float()  # (B, K, 1)
-        pooled = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # (B, D)
+        valid = (~pad_mask).unsqueeze(-1).float()
+        pooled = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
         return self.to_mu(pooled), self.to_logvar(pooled)
 
 
+# ---------------------------------------------------------------------------
+# Decoder
+# ---------------------------------------------------------------------------
+
 class Decoder(nn.Module):
-    """Decodes latent z (B, D_latent) -> byte logits (B, K, VOCAB_SIZE)."""
+    """Decodes latent z (B, D_latent) -> byte logits (B, K, VOCAB_SIZE).
+
+    Same preprocessing as encoder: z broadcast to K positions gets
+    RoPE + DD-RoPE + acausal lerp before transformer layers.
+    """
 
     def __init__(self, cfg: VAEConfig):
         super().__init__()
         self.chunk_size = cfg.chunk_size
         self.z_proj = nn.Linear(cfg.d_latent, cfg.d_model)
-        self.pos_embed = nn.Embedding(cfg.chunk_size, cfg.d_model)
+        self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
             TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.dec_layers)
@@ -127,17 +246,19 @@ class Decoder(nn.Module):
         B = z.shape[0]
         K = self.chunk_size
 
-        # Broadcast z to all positions + add positional embedding
         h = self.z_proj(z).unsqueeze(1).expand(B, K, -1)  # (B, K, D)
-        pos = torch.arange(K, device=z.device)
-        h = h + self.pos_embed(pos)
+        h = self.preprocess(h)
 
         for layer in self.layers:
             h = layer(h)
         h = self.norm(h)
 
-        return self.head(h)  # (B, K, VOCAB_SIZE)
+        return self.head(h)
 
+
+# ---------------------------------------------------------------------------
+# Full VAE
+# ---------------------------------------------------------------------------
 
 class ByteChunkVAE(nn.Module):
     """Full VAE: byte chunk -> latent -> reconstructed byte chunk.
