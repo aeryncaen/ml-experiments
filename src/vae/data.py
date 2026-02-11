@@ -220,6 +220,87 @@ class ByteShardStream:
 
 
 # ---------------------------------------------------------------------------
+# Piece-level loader for STLG training (serves full pieces, not individual chunks)
+# ---------------------------------------------------------------------------
+
+class PieceStream:
+    """Streams full pieces (B, n_chunks, chunk_size) for STLG training.
+
+    Each piece is a sequence of chunks that belong together — the STLG
+    needs to see the full ordered sequence to do next-latent prediction.
+    """
+
+    def __init__(
+        self,
+        shard_pattern: str,
+        chunk_size: int,
+        batch_size: int,
+        rank: int = 0,
+        world_size: int = 1,
+        shuffle: bool = False,
+    ):
+        self.files = sorted(glob.glob(shard_pattern))
+        if not self.files:
+            raise FileNotFoundError(f"No byte shards matched: {shard_pattern}")
+        self.chunk_size = chunk_size
+        self.piece_bytes = chunk_size * 16
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+
+        self.file_idx = rank % len(self.files)
+        self.pieces: torch.Tensor = torch.empty(0)
+        self.pos = 0
+        self._load_shard()
+
+    def _load_shard(self):
+        path = Path(self.files[self.file_idx])
+        data = load_byte_shard(path)
+        K = self.chunk_size
+        pb = self.piece_bytes
+        n_pieces = len(data) // pb
+
+        if n_pieces == 0:
+            self.pieces = torch.empty(0, 1, K, dtype=torch.long)
+            self.pos = 0
+            return
+
+        raw = data[: n_pieces * pb].reshape(n_pieces, pb)
+
+        seq_len = pb + 2
+        n_chunks = (seq_len + K - 1) // K
+        padded_len = n_chunks * K
+
+        seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
+        seqs[:, 0] = BOS
+        seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+        seqs[:, pb + 1] = EOS
+
+        # (n_pieces, n_chunks, K)
+        self.pieces = torch.from_numpy(seqs.reshape(n_pieces, n_chunks, K))
+        self.n_chunks = n_chunks
+
+        if self.shuffle:
+            perm = torch.randperm(len(self.pieces))
+            self.pieces = self.pieces[perm]
+        self.pos = 0
+
+    def _advance_shard(self):
+        self.file_idx = (self.file_idx + self.world_size) % len(self.files)
+        self._load_shard()
+
+    def next_batch(self, device: torch.device) -> torch.Tensor:
+        """Returns (batch_size, n_chunks, chunk_size) long tensor."""
+        if self.pos + self.batch_size > len(self.pieces):
+            self._advance_shard()
+
+        batch = self.pieces[self.pos : self.pos + self.batch_size]
+        self.pos += self.batch_size
+        return batch.to(device)
+
+
+# ---------------------------------------------------------------------------
 # CLI: python -m vae.data --bpe-pattern "path/to/*.bin" --output-dir "path/to/bytes"
 # ---------------------------------------------------------------------------
 
