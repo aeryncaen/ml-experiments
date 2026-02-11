@@ -56,8 +56,10 @@ class CausalBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[1]
+        mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
         h = self.norm1(x)
-        h, _ = self.attn(h, h, h, need_weights=False, is_causal=True)
+        h, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False, is_causal=True)
         x = x + h
         x = x + self.mlp(self.norm2(x))
         return x
