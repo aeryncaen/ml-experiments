@@ -181,12 +181,41 @@ class ByteShardStream:
         self._load_shard()
 
     def next_batch(self, device: torch.device) -> torch.Tensor:
-        """Returns (batch_size, chunk_size) long tensor of byte token IDs."""
+        """Returns (batch_size, chunk_size) long tensor of byte token IDs.
+
+        10% of the batch is replaced with augmented chunks:
+        - Half get random right-PAD (content truncated, EOS placed, rest PAD)
+        - Half get BOS prepended (content shifted right, first byte becomes BOS)
+        """
         if self.pos + self.batch_size > len(self.chunks):
             self._advance_shard()
 
-        batch = self.chunks[self.pos : self.pos + self.batch_size]
+        batch = self.chunks[self.pos : self.pos + self.batch_size].clone()
         self.pos += self.batch_size
+
+        K = self.chunk_size
+        n_aug = max(1, self.batch_size // 10)
+
+        # Pick random indices to augment
+        aug_idx = torch.randperm(self.batch_size)[:n_aug]
+        n_pad = n_aug // 2
+        n_bos = n_aug - n_pad
+
+        # --- Right-PAD augmentation: truncate at random position, place EOS, PAD rest ---
+        for i in aug_idx[:n_pad]:
+            # Find how many content bytes (non-special) are in this chunk
+            row = batch[i]
+            # Pick a random truncation point: keep 1..K-2 tokens, leave room for EOS
+            cut = torch.randint(1, K, (1,)).item()
+            batch[i, cut] = EOS
+            batch[i, cut + 1:] = PAD
+
+        # --- BOS augmentation: prepend BOS, shift content right, drop last byte ---
+        for i in aug_idx[n_pad:]:
+            row = batch[i]
+            batch[i, 1:] = row[:-1].clone()
+            batch[i, 0] = BOS
+
         return batch.to(device)
 
 
