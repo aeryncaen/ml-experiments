@@ -976,10 +976,13 @@ def val_step_mlm(model, batch: torch.Tensor, mask_prob: float = 0.40):
 @torch.no_grad()
 def generate_mlm(model, prompt_text: str, gen_len: int,
                  device: torch.device) -> str:
-    """BERT-style MLM generation.
+    """AR-style MLM generation: one token at a time.
 
-    Takes a prompt, appends gen_len mask tokens, does a single forward pass,
-    and takes argmax at the masked positions.
+    Each step:
+      1. Build [BOS, prompt, generated_so_far, MASK, EOS]
+      2. Mask only the single next-token position
+      3. Forward pass -> argmax at masked position
+      4. Append predicted token and repeat
 
     Args:
         model: BertMLM model.
@@ -990,31 +993,39 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     model.eval()
 
     prompt_ids = encode(prompt_text).to(device)  # (P,)
-    P = prompt_ids.shape[0]
     max_T = model.max_seq_len
 
-    # Clamp gen_len to fit: [BOS, prompt, masked..., EOS]
-    gen_len = min(gen_len, max_T - P - 2)  # -2 for BOS/EOS
-    if gen_len < 1:
-        prompt_ids = prompt_ids[-(max_T - 3):]
-        P = prompt_ids.shape[0]
-        gen_len = 1
+    # Trim prompt if needed to leave room for at least 1 gen token + BOS + EOS
+    max_prompt = max_T - 3  # BOS + prompt + mask_slot + EOS
+    if prompt_ids.shape[0] > max_prompt:
+        prompt_ids = prompt_ids[-max_prompt:]
 
-    # Build: [BOS, prompt, dummy..., EOS]
-    T = 1 + P + gen_len + 1  # BOS + prompt + gen + EOS
-    token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
-    token_ids[0, 0] = BOS_TOKEN
-    token_ids[0, 1:1+P] = prompt_ids
-    token_ids[0, -1] = EOS_TOKEN
+    generated = []
 
-    # Mask: only the generation region (between prompt and EOS)
-    mask = torch.zeros(1, T, dtype=torch.bool, device=device)
-    mask[0, 1+P:-1] = True
+    for _ in range(gen_len):
+        n_gen = len(generated)
+        # Total seq: BOS + prompt + generated_so_far + mask_slot + EOS
+        T = 1 + prompt_ids.shape[0] + n_gen + 1 + 1
+        if T > max_T:
+            break  # can't fit any more
 
-    logits = model(token_ids, mask)  # (1, T, vocab)
-    output_ids = logits[0, 1+P:-1].argmax(dim=-1)  # (gen_len,)
+        token_ids = torch.zeros(1, T, dtype=torch.long, device=device)
+        token_ids[0, 0] = BOS_TOKEN
+        token_ids[0, 1:1+prompt_ids.shape[0]] = prompt_ids
+        for j, tok in enumerate(generated):
+            token_ids[0, 1 + prompt_ids.shape[0] + j] = tok
+        # mask_slot position is at T-2 (before EOS)
+        token_ids[0, -2] = 0  # dummy, will be masked
+        token_ids[0, -1] = EOS_TOKEN
 
-    return decode(output_ids)
+        mask = torch.zeros(1, T, dtype=torch.bool, device=device)
+        mask[0, -2] = True  # mask only the next-token slot
+
+        logits = model(token_ids, mask)  # (1, T, vocab)
+        next_token = logits[0, -2].argmax(dim=-1).item()
+        generated.append(next_token)
+
+    return decode(torch.tensor(generated, dtype=torch.long))
 
 
 # ---------------------------------------------------------------------------
@@ -1489,12 +1500,11 @@ def train(args):
                         m1[0, 1] = True
                     _show_mlm_sample("sample rand", sb1, m1)
 
-                    # EOS-generation sample: single masked byte at end before EOS
-                    sb2 = val_ds.sample_batch(1, device)
-                    T2 = sb2.shape[1]
-                    m2 = torch.zeros(1, T2, dtype=torch.bool, device=device)
-                    m2[0, T2 - 2] = True
-                    _show_mlm_sample("sample gen", sb2, m2)
+                    # AR-style generation sample
+                    sample_prompt = "KING:\nO, "
+                    sample = generate_mlm(model, sample_prompt, 64, device)
+                    preview = (sample_prompt + sample).replace('\n', '\\n')
+                    tqdm.write(f"  [sample gen] {preview}")
                 else:
                     sample_prompt = "KING:\nO, "
                     sample_len = 64
@@ -1734,35 +1744,18 @@ def main():
     print("=" * 60)
 
     if args.mode == 'mlm':
-        # BERT-style: take real text, mask, reconstruct
-        text = load_shakespeare()
-        data = encode(text)
-        n_train = int(0.9 * len(data))
-        val_data = data[n_train:]
-        val_ds_final = TextDataset(val_data, args.seq_len)
-        model.eval()
-        with torch.no_grad():
-            for i in range(3):
-                sample_batch = val_ds_final.sample_batch(1, device)
-                T = sample_batch.shape[1]
-                mask = _make_mlm_mask(1, T, args.mask_prob, gen_len=1, device=device)
-                logits = model(sample_batch, mask)
-                preds = logits.argmax(dim=-1)
-                original = sample_batch[0]
-                result = original.clone()
-                result[mask[0]] = preds[0][mask[0]]
-                masked_view = original.clone()
-                masked_view[mask[0]] = ord('_')
-                n_masked = mask.sum().item()
-                n_correct = ((preds[0] == original) & mask[0]).sum().item()
-                orig_text = decode(original)
-                masked_text = decode(masked_view)
-                recon_text = decode(result)
-                print(f"\n--- Sample {i+1}: {n_correct}/{n_masked} masked correct ---")
-                print(f"Original:\n{orig_text[:200]}")
-                print(f"Masked:\n{masked_text[:200]}")
-                print(f"Reconstructed:\n{recon_text[:200]}")
-                print()
+        # AR-style generation using MLM (one token at a time)
+        prompts = [
+            "ROMEO:\nO, she doth teach the torches to burn bright!\n",
+            "HAMLET:\nTo be, or not to be, that is the question:\n",
+            "KING:\nOnce more unto the breach, dear friends,\n",
+        ]
+        gen_len = 128
+        for prompt in prompts:
+            gen = generate_mlm(model, prompt, gen_len, device)
+            print(f"\n--- Prompt: {prompt.rstrip()!r} ---")
+            print(f"Generated:\n{gen}")
+            print()
     else:
         prompts = [
             "ROMEO:\nO, she doth teach the torches to burn bright!\n",
