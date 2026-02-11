@@ -122,24 +122,25 @@ def load_shakespeare(data_dir: str = "data") -> str:
     return text
 
 
-def encode(text: str, align: str = 'left') -> torch.Tensor:
-    """Encode text to bigram token IDs.
+def encode(text: str) -> torch.Tensor:
+    """Encode text to bigram token IDs with BOS and EOS.
 
-    align='left':  [NULL, c0, c1, ...] paired up (BOS = NULL-leading bigram)
-    align='right': [c0, c1, ..., NULL] paired up (EOS = NULL-trailing bigram)
+    Always bookended: [NULL, content..., NULL].
+    First bigram is always (NULL, x) = BOS-type.
+    Last bigram is always (x, NULL) = EOS-type.
 
-    If the char sequence (after prepend/append) is odd, pad with an extra NULL.
+    If total char count (content + 2 NULLs) is odd, an extra NULL is
+    inserted before the final NULL to pad to even length.
     """
     char_ids = [_char_to_idx[c] for c in text]
 
-    if align == 'left':
-        char_ids = [NULL_CHAR] + char_ids
-    else:
-        char_ids = char_ids + [NULL_CHAR]
+    # Bookend with NULLs
+    char_ids = [NULL_CHAR] + char_ids + [NULL_CHAR]
 
-    # Pad to even length
+    # Pad to even length if needed
     if len(char_ids) % 2 != 0:
-        char_ids.append(NULL_CHAR)
+        # Insert extra NULL before the final NULL
+        char_ids.insert(-1, NULL_CHAR)
 
     tokens = []
     for i in range(0, len(char_ids), 2):
@@ -163,34 +164,38 @@ def decode(ids: torch.Tensor) -> str:
 class TextDataset:
     """Samples contiguous chunks from raw text and bigram-encodes them.
 
-    Each chunk is bigram-encoded with random left/right alignment.
+    Every sample is bookended: [NULL, content..., NULL] → bigrams.
     seq_len is the number of bigram tokens per sample.
-    Each bigram token covers 2 characters, so content is ~seq_len*2 chars
-    (minus 1 for the NULL at the start or end).
+
+    Randomly samples odd or even content lengths to produce both
+    alignment patterns (shifting which chars pair together).
     """
 
     def __init__(self, text: str, seq_len: int):
         self.text = text
         self.seq_len = seq_len
-        # Content chars per sample: seq_len bigrams = 2*seq_len char slots,
-        # minus 1 for the NULL (BOS or EOS), minus possible padding NULL
-        # Use 2*seq_len - 1 as the content length to always fit
-        self.content_len = 2 * seq_len - 1
+        # Max content chars that fit: seq_len bigrams = 2*seq_len char slots,
+        # minus 2 for the bookend NULLs. Even content uses exactly this;
+        # odd content uses one fewer char (extra NULL pads to even).
+        self.max_content = 2 * seq_len - 2
 
     def sample_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Returns (B, seq_len) bigram token chunks with random alignment."""
-        max_start = len(self.text) - self.content_len
+        max_start = len(self.text) - self.max_content
         starts = torch.randint(0, max(1, max_start), (batch_size,))
         chunks = []
         for s in starts:
-            content = self.text[s:s + self.content_len]
-            align = 'left' if torch.rand(1).item() < 0.5 else 'right'
-            tokens = encode(content, align=align)
+            # Randomly pick even or odd content length for alignment diversity
+            if torch.rand(1).item() < 0.5:
+                content_len = self.max_content      # even
+            else:
+                content_len = self.max_content - 1  # odd
+            content = self.text[s:s + content_len]
+            tokens = encode(content)
             # Truncate or pad to exactly seq_len
             if tokens.shape[0] > self.seq_len:
                 tokens = tokens[:self.seq_len]
             elif tokens.shape[0] < self.seq_len:
-                # Pad with NULL-NULL bigrams
                 pad = torch.full((self.seq_len - tokens.shape[0],),
                                  _bigram_token(NULL_CHAR, NULL_CHAR),
                                  dtype=torch.long)
@@ -1050,7 +1055,7 @@ def generate_mlm(model, prompt_text: str, gen_len: int,
     """
     model.eval()
 
-    prompt_ids = encode(prompt_text, align='left').to(device)  # (P,)
+    prompt_ids = encode(prompt_text).to(device)  # (P,)
     max_T = model.max_seq_len
 
     # Trim prompt if needed
@@ -1096,7 +1101,7 @@ def generate_ar(model, prompt_text: str, gen_len: int,
                 device: torch.device, temperature: float = 0.8) -> str:
     """Autoregressive generation with temperature sampling (bigram vocab)."""
     model.eval()
-    prompt_ids = encode(prompt_text, align='left')
+    prompt_ids = encode(prompt_text)
     ids = prompt_ids.unsqueeze(0).to(device)  # (1, L)
     max_ctx = model.max_seq_len
 
@@ -1118,7 +1123,7 @@ def generate_diffusion(model, prompt_text: str, gen_len: int,
     """Iterative demasking generation."""
     model.eval()
 
-    prompt_ids = encode(prompt_text, align='left').unsqueeze(0).to(device)
+    prompt_ids = encode(prompt_text).unsqueeze(0).to(device)
     output_ids = torch.zeros(1, gen_len, dtype=torch.long, device=device)
     current_mask = torch.ones(1, gen_len, dtype=torch.bool, device=device)
 
@@ -1199,7 +1204,7 @@ def generate_llada(model, prompt_text: str, gen_len: int,
     """
     model.eval()
 
-    prompt_ids = encode(prompt_text, align='left').to(device)  # (P,)
+    prompt_ids = encode(prompt_text).to(device)  # (P,)
     P = prompt_ids.shape[0]
     max_T = model.max_seq_len
 
