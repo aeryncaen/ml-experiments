@@ -216,6 +216,7 @@ def main():
     )
     val_stream = ByteShardStream(
         val_pattern, args.chunk_size, args.batch_size, rank, world_size,
+        shuffle=True,
     )
 
     # --- Model ---

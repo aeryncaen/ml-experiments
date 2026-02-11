@@ -118,6 +118,7 @@ class ByteShardStream:
         batch_size: int,
         rank: int = 0,
         world_size: int = 1,
+        shuffle: bool = False,
     ):
         self.files = sorted(glob.glob(shard_pattern))
         if not self.files:
@@ -127,6 +128,7 @@ class ByteShardStream:
         self.batch_size = batch_size
         self.rank = rank
         self.world_size = world_size
+        self.shuffle = shuffle
 
         # Shard state
         self.file_idx = rank % len(self.files)
@@ -139,6 +141,9 @@ class ByteShardStream:
         path = Path(self.files[self.file_idx])
         self.data = load_byte_shard(path)
         self.chunks = self._make_chunks()
+        if self.shuffle:
+            perm = torch.randperm(len(self.chunks))
+            self.chunks = self.chunks[perm]
         self.pos = 0
 
     def _make_chunks(self) -> torch.Tensor:
