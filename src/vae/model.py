@@ -143,32 +143,95 @@ class EmbeddingPreprocessor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer block (bidirectional, pre-norm)
+# Fused attention block (ULB-style, no per-layer RoPE/lerp)
 # ---------------------------------------------------------------------------
 
-class TransformerBlock(nn.Module):
-    """Pre-norm transformer block (bidirectional)."""
+class FusedBlock(nn.Module):
+    """ULB-style fused attention+gate block for the VAE.
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    No per-layer RoPE, DD-RoPE, or K-lerp — the embedding preprocessor
+    handles all of that once before the layers. These blocks just do
+    plain bidirectional attention with gated skip-multiply.
+
+    Flow:
+        h_up = swish(up_proj(norm(x)))
+        q, k, v = qkv_proj(h_up)       # d -> d (no inner_dim expansion)
+        q, k = qk_norm(q, k)
+        y = SDPA(q, k, v)               # bidirectional, no causal mask
+        y = o_proj(y)
+        y = attn_norm(y) * h_up         # skip-MULTIPLY
+        y = down_proj(swish(y))
+        return x + y                     # residual
+    """
+
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
-        self.norm1 = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True,
-        )
-        self.norm2 = RMSNorm(d_model)
-        hidden = 4 * d_model
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden, d_model, bias=False),
-        )
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        h = self.norm1(x)
-        h, _ = self.attn(h, h, h, key_padding_mask=mask, need_weights=False)
-        x = x + h
-        x = x + self.mlp(self.norm2(x))
-        return x
+        self.norm = RMSNorm(d_model)
+
+        # Gate path
+        self.up_proj = nn.Linear(d_model, d_model, bias=False)
+        self.down_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # QKV (all at d_model, no expansion)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # QK norm + post-norm bias (Mamba-3 style)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+        # Post-attention norm (before skip-multiply)
+        self.attn_norm = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, K, D = x.shape
+        H = self.n_heads
+        hd = self.head_dim
+
+        h = self.norm(x)
+
+        # Gate
+        h_up = F.silu(self.up_proj(h))
+
+        # QKV from gated representation
+        q = self.q_proj(h_up).view(B, K, H, hd)
+        k = self.k_proj(h_up).view(B, K, H, hd)
+        v = self.v_proj(h_up).view(B, K, H, hd)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # SDPA (bidirectional)
+        q = q.transpose(1, 2)  # (B, H, K, hd)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Build attention mask from pad_mask if needed
+        attn_mask = None
+        if pad_mask is not None:
+            # pad_mask: (B, K) True where padded
+            # Need (B, 1, 1, K) for broadcasting with (B, H, K, K)
+            attn_mask = pad_mask.unsqueeze(1).unsqueeze(2).expand(B, H, K, K)
+            attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
+
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        y = y.transpose(1, 2).contiguous().view(B, K, D)
+
+        y = self.o_proj(y)
+
+        # Skip-multiply (not skip-add)
+        y = self.attn_norm(y) * h_up
+
+        # Down projection
+        y = self.down_proj(F.silu(y))
+
+        return x + y
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +242,7 @@ class Encoder(nn.Module):
     """Encodes a byte chunk (B, K) -> mu (B, D_latent), log_var (B, D_latent).
 
     Pipeline: embed -> preprocess (passthrough|RoPE|DD-RoPE|lerp) ->
-              full bidirectional attention -> mean-pool -> bottleneck.
+              fused ULB-style blocks -> mean-pool -> bottleneck.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -187,7 +250,7 @@ class Encoder(nn.Module):
         self.embed = nn.Embedding(VOCAB_SIZE, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            FusedBlock(cfg.d_model, cfg.n_heads)
             for _ in range(cfg.enc_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
@@ -203,7 +266,7 @@ class Encoder(nn.Module):
         h = self.preprocess(h)
 
         for layer in self.layers:
-            h = layer(h, mask=pad_mask)
+            h = layer(h, pad_mask=pad_mask)
         h = self.norm(h)
 
         # Mean-pool over non-pad positions
@@ -221,7 +284,7 @@ class Decoder(nn.Module):
     """Decodes latent z (B, D_latent) -> byte logits (B, K, VOCAB_SIZE).
 
     Same preprocessing as encoder: z broadcast to K positions gets
-    passthrough|RoPE|DD-RoPE|lerp before transformer layers.
+    passthrough|RoPE|DD-RoPE|lerp before fused ULB-style blocks.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -230,7 +293,7 @@ class Decoder(nn.Module):
         self.z_proj = nn.Linear(cfg.d_latent, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            FusedBlock(cfg.d_model, cfg.n_heads)
             for _ in range(cfg.dec_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
