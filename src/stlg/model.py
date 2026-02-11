@@ -97,11 +97,13 @@ class STLG(nn.Module):
         ])
         self.norm = RMSNorm(cfg.d_model)
 
-        # Output projection back to d_latent
-        if cfg.d_latent != cfg.d_model:
-            self.out_proj = nn.Linear(cfg.d_model, cfg.d_latent, bias=False)
-        else:
-            self.out_proj = nn.Identity()
+        # Output head: MLP from d_model -> d_latent
+        self.out_head = nn.Sequential(
+            RMSNorm(cfg.d_model),
+            nn.Linear(cfg.d_model, 4 * cfg.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(4 * cfg.d_model, cfg.d_latent, bias=False),
+        )
 
     def predict_latents(self, z: torch.Tensor) -> torch.Tensor:
         """z: (B, T, d_latent). Returns (B, T, d_latent) predicted next latents."""
@@ -115,7 +117,7 @@ class STLG(nn.Module):
             h = layer(h)
         h = self.norm(h)
 
-        return self.out_proj(h)
+        return self.out_head(h)
 
     def forward(self, pieces: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """pieces: (B, S, K) — S chunks per piece, K = chunk_size.
