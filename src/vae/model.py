@@ -317,6 +317,28 @@ class ByteChunkVAE(nn.Module):
 
         return loss, recon_loss, kl_loss, accuracy
 
+    def per_sample_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample reconstruction loss (no grad, for hard mining).
+
+        Args:
+            x: (B, K) byte token IDs.
+
+        Returns:
+            (B,) per-sample mean CE over non-PAD positions.
+        """
+        with torch.no_grad():
+            mu, _ = self.encoder(x)
+            logits = self.decoder(mu)  # deterministic, no reparameterize
+            mask = (x != PAD)
+            ce = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                x.reshape(-1),
+                reduction='none',
+            ).reshape(x.shape)
+            # Per-sample mean CE
+            per_sample = (ce * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+        return per_sample
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode byte chunks to latent vectors (deterministic, uses mu)."""
         mu, _ = self.encoder(x)

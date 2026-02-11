@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET
+from vae.model import ByteChunkVAE, VAEConfig, BYTE_OFFSET, VOCAB_SIZE, PAD
 from vae.data import ByteShardStream, detokenize_shards
 
 
@@ -75,6 +75,12 @@ def parse_args():
                     default=str(Path(__file__).resolve().parent.parent / "out/vae"))
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
 
+    # Hard example mining
+    p.add_argument("--hard-mining-threshold", type=float, default=0.97,
+                    help="Val acc threshold to activate hard mining")
+    p.add_argument("--hard-mining-ratio", type=int, default=4,
+                    help="Oversample ratio: fetch N*batch, keep hardest batch")
+
     return p.parse_args()
 
 
@@ -99,10 +105,13 @@ def print0(rank: int, s: str):
 
 
 def lr_for_step(step: int, args) -> float:
+    """Cosine LR: warmup from lr*0.1 to lr, then cosine decay to lr*0.05."""
+    warmup_ratio = 0.1
+    min_ratio = 0.05
     if step < args.warmup_steps:
-        return args.lr * (step + 1) / max(1, args.warmup_steps)
-    t = (step - args.warmup_steps) / max(1, args.train_steps - args.warmup_steps)
-    return args.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
+        return args.lr * (warmup_ratio + (1.0 - warmup_ratio) * step / max(1, args.warmup_steps))
+    progress = (step - args.warmup_steps) / max(1, args.train_steps - args.warmup_steps)
+    return args.lr * (min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress)))
 
 
 def unwrap_model(model):
@@ -250,6 +259,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
     best_path = os.path.join(args.save_dir, "vae_best.pt")
+    hard_mining_active = False
 
     pbar = tqdm(range(args.train_steps + 1), desc="train", disable=(rank != 0))
     for step in pbar:
@@ -264,6 +274,10 @@ def main():
                 best_val_acc = val_acc
                 save_checkpoint(model, cfg, step, best_path)
                 print0(rank, f"  new best val_acc {val_acc:.4f} -> {best_path}")
+            # Activate hard mining once threshold is crossed
+            if val_acc >= args.hard_mining_threshold and not hard_mining_active:
+                hard_mining_active = True
+                print0(rank, f"  hard mining activated (val_acc {val_acc:.4f} >= {args.hard_mining_threshold})")
             if step == args.train_steps:
                 break
 
@@ -272,8 +286,20 @@ def main():
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Forward
-        x = train_stream.next_batch(device)
+        # Forward (with optional hard example mining)
+        if hard_mining_active:
+            # Fetch oversized batch, score, keep hardest
+            raw_model = unwrap_model(model)
+            candidates = []
+            for _ in range(args.hard_mining_ratio):
+                candidates.append(train_stream.next_batch(device))
+            x_big = torch.cat(candidates, dim=0)  # (ratio*B, K)
+            per_loss = raw_model.per_sample_loss(x_big)  # (ratio*B,)
+            _, hard_idx = per_loss.topk(args.batch_size)
+            x = x_big[hard_idx]
+        else:
+            x = train_stream.next_batch(device)
+
         if device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss, recon_loss, kl_loss, accuracy = model(x)
@@ -290,22 +316,15 @@ def main():
         optimizer.step()
 
         # tqdm update
+        mining = "H" if hard_mining_active else ""
         pbar.set_postfix(
             loss=f"{loss.item():.3f}",
             recon=f"{recon_loss.item():.3f}",
             kl=f"{kl_loss.item():.3f}",
             acc=f"{accuracy.item():.3f}",
             lr=f"{lr:.1e}",
+            m=mining,
         )
-
-        # Periodic log (print full line every log_every)
-        if step % args.log_every == 0 and step > 0:
-            loss_t = loss.detach()
-            if world_size > 1:
-                dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
-            dt = (time.time() - pbar.start_t) / max(1, step) if hasattr(pbar, 'start_t') else 0
-            # tqdm handles the display, but print for logging
-            pass
 
         # Periodic save
         if step > 0 and step % args.save_every == 0 and rank == 0:
