@@ -324,6 +324,217 @@ class ULBBlock(nn.Module):
         return y
 
 
+class UniversalSequenceBlock(nn.Module):
+    """ULBBlock stripped of up/down projections — pure attention compute.
+
+    Used as sequence-pool experts in TriplePoolGraphLearner.
+    The databank token pools handle the MLP-like enrichment/refinement,
+    so this block only does QKV→attention→o_proj with skip-multiply.
+
+    Architecture:
+        q, k, v = q_proj(x), k_proj(x), v_proj(x)   # d→inner (upscale)
+        q = q_norm(q) * q_bias
+        k = k_norm(k) * k_bias
+        k = k_mix(k, x)
+        q, k = rope(q, k, dd_angles)
+        y = attend(q, k, v)
+        y = o_proj(y)                                  # inner→d (downscale)
+        y = attn_norm(y) * x                           # skip-multiply against input
+        return y
+
+    Args:
+        config: ULBConfig instance, or will be constructed from kwargs.
+    """
+
+    def __init__(self, config: ULBConfig | None = None, **kwargs):
+        super().__init__()
+        if config is None:
+            config = ULBConfig(**kwargs)
+        self.config = config
+
+        d = config.d_model
+        inner = config.inner_dim
+        n_heads = config.n_heads
+        head_dim = config.head_dim
+
+        self.aux_loss = 0.0
+
+        # QKV: project from d_model up to inner_dim. KV have bias, Q does not.
+        self.q_proj = nn.Linear(d, inner, bias=False)
+        self.k_proj = nn.Linear(d, inner, bias=True)
+        self.v_proj = nn.Linear(d, inner, bias=True)
+
+        # Output projection: inner_dim back to d_model
+        self.o_proj = nn.Linear(inner, d, bias=False)
+
+        # --- Post-attention norm (before skip-multiply, at d_model) ---
+        self.attn_norm = nn.RMSNorm(d)
+
+        # --- QK norm + post-norm bias (Mamba-3 style BC bias, init ones) ---
+        self.q_norm = nn.RMSNorm(head_dim)
+        self.k_norm = nn.RMSNorm(head_dim)
+        self.q_bias = nn.Parameter(torch.ones(head_dim))
+        self.k_bias = nn.Parameter(torch.ones(head_dim))
+
+        # --- Temporal mixing ---
+        quarter_dim = head_dim // 4
+
+        # K mixing
+        self.k_lerp: CausalLerp | CausalAdd | KAcausalLerp | KAcausalAdd | None = None
+        self.k_conv: KTemporalConv | None = None
+        k_mix = config.k_mix
+        if k_mix == 'lerp':
+            self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'add':
+            self.k_lerp = CausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'acausal_lerp':
+            self.k_lerp = KAcausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'acausal_add':
+            self.k_lerp = KAcausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+        elif k_mix == 'conv2':
+            self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=2)
+        elif k_mix == 'conv3':
+            self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=3)
+        elif k_mix == 'none':
+            pass
+        else:
+            raise ValueError(f"Unknown k_mix mode: {k_mix}")
+
+        # --- Hybrid RoPE ---
+        self.rope = HybridRoPE(d, n_heads, head_dim, rope_base=config.rope_base)
+        if config.paired:
+            self.paired_rope = PairedRoPE(n_heads, head_dim, rope_base=config.rope_base)
+
+        # --- Attention ---
+        self.blend_attn: BlendAttention | None = None
+        if config.attn_mode == 'blend':
+            self.blend_attn = BlendAttention(
+                d, n_heads, head_dim, init_bias=config.blend_gate_bias)
+
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                blend_gate: torch.Tensor | None = None) -> torch.Tensor:
+        is_causal = self.config.is_causal
+        if self.config.attn_mode == 'silu2':
+            return silu2_attention(q, k, v, is_causal=is_causal)
+        elif self.config.attn_mode == 'blend':
+            assert self.blend_attn is not None
+            assert blend_gate is not None
+            return self.blend_attn(q, k, v, blend_gate, is_causal=is_causal)
+        else:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+
+    def preprocess_qk(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.k_lerp is not None:
+            k = self.k_lerp(k, x)
+        elif self.k_conv is not None:
+            k = self.k_conv(k)
+        dd_angles = self.rope.compute_dd_angles(x)
+        blend_gate = None
+        if self.config.attn_mode == 'blend':
+            assert self.blend_attn is not None
+            blend_gate = self.blend_attn.compute_gate(x)
+        return q, k, dd_angles, blend_gate
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               dd_angles: torch.Tensor, blend_gate: torch.Tensor | None
+               ) -> torch.Tensor:
+        cfg = self.config
+        b, t = q.shape[:2]
+        n_heads = cfg.n_heads
+        head_dim = cfg.head_dim
+
+        if cfg.paired:
+            n2 = n_heads // 2
+            q = q.view(b, t, n2, head_dim * 2)
+            k = k.view(b, t, n2, head_dim * 2)
+            q = self.paired_rope(q, dd_angles)
+            k = self.paired_rope(k, dd_angles)
+            q = q.view(b, t * 2, n2, head_dim)
+            k = k.view(b, t * 2, n2, head_dim)
+            v = v.reshape(b, t * 2, n2, head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            if blend_gate is not None:
+                bg = blend_gate.view(b, n2, 2, t, 1)
+                blend_gate = bg.permute(0, 1, 3, 2, 4).reshape(b, n2, t * 2, 1)
+            y = self._attend(q, k, v, blend_gate)
+            y = y.transpose(1, 2).contiguous().view(b, t, n_heads, head_dim)
+        else:
+            q = self.rope(q, dd_angles)
+            k = self.rope(k, dd_angles)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = self._attend(q, k, v, blend_gate)
+            y = y.transpose(1, 2)
+
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: (B, T, D) — pre-normed input.
+
+        Returns:
+            (B, T, D) block output.
+        """
+        cfg = self.config
+        b, t, d = x.shape
+        n_heads = cfg.n_heads
+        head_dim = cfg.head_dim
+
+        # --- QKV projections + norm + bias (directly from input) ---
+        q = self.q_proj(x).view(b, t, n_heads, head_dim)
+        k = self.k_proj(x).view(b, t, n_heads, head_dim)
+        v = self.v_proj(x).view(b, t, n_heads, head_dim)
+        q = self.q_norm(q) * self.q_bias
+        k = self.k_norm(k) * self.k_bias
+
+        # --- Preprocessing (lerps, RoPE angles, blend gate) ---
+        q, k, dd_angles, blend_gate = self.preprocess_qk(q, k, x)
+
+        # --- Attention ---
+        y = self.attend(q, k, v, dd_angles, blend_gate)
+        y = y.contiguous().view(b, t, cfg.inner_dim)
+
+        # --- Output projection (inner_dim → d_model) ---
+        y = self.o_proj(y)
+
+        # --- Skip-multiply against input (NOT skip-add) ---
+        y = self.attn_norm(y) * x
+
+        return y
+
+
+class UniversalTokenBlock(nn.Module):
+    """Activated linear databank unit — d→d with activation.
+
+    Used as token-pool experts in TriplePoolGraphLearner.
+    These recall and compute over trained data, enriching inputs to
+    or refining outputs from the sequence attention experts.
+
+    Architecture:
+        y = act(linear(x))
+
+    Args:
+        dim: Model dimension.
+        swish_mode: 'learnable' or 'silu'.
+    """
+
+    def __init__(self, dim: int, swish_mode: str = 'learnable'):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim, bias=False)
+        if swish_mode == 'learnable':
+            self.act = LearnableSwish(dim)
+        elif swish_mode == 'silu':
+            self.act = nn.SiLU()
+        else:
+            raise ValueError(f"Unknown swish_mode: {swish_mode}")
+        self.aux_loss = 0.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.linear(x))
+
+
 def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
                        cutoff_factor: float = 2.0):
     """Full Megatron init for ULB-based models.

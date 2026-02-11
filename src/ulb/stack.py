@@ -1,4 +1,4 @@
-"""Stacking models: StackedULB, MoEStackedULB, and PoolOfExperts.
+"""Stacking models: StackedULB, MoEStackedULB, PoolOfExperts, TriplePoolGraphLearner.
 
 StackedULB: simple pre-norm residual stacking.
     x = x + block(norm(x))  for each layer
@@ -18,6 +18,12 @@ MoEStackedULB: Mixture-of-Experts grid (n_experts x n_layers).
     Sample-level router supports 'topk' or 'relu' (ReMoE) mode.
     When router_mode='relu', adaptive L1 sparsity regularization controls
     computational cost. aux_loss is stored on the module after each forward.
+
+TriplePoolGraphLearner: Three-pool architecture separating sequence compute
+    from token-level data recall.
+    - SequencePool: UniversalSequenceBlock experts (sample-routed, attention)
+    - Pre-TokenPool: UniversalTokenBlock experts (token-routed, enriches inputs)
+    - Post-TokenPool: UniversalTokenBlock experts (token-routed, refines outputs)
 """
 
 from typing import Callable, Literal
@@ -569,6 +575,428 @@ class PoolOfExperts(nn.Module):
 
         for hop in range(self.max_hops):
             topk_idx, topk_weights, has_exit = self.route(logits, hop)
+
+            if self.trace:
+                trace_hops.append({
+                    'topk_idx': topk_idx.detach().cpu(),
+                    'topk_weights': topk_weights.detach().cpu(),
+                    'has_exit': has_exit.detach().cpu(),
+                })
+
+            non_exit_decisions += (~has_exit).sum()
+
+            if has_exit.all():
+                break
+
+            out, logits, hop_aux = self.execute_hop(x, topk_idx, topk_weights, hop)
+            x = x + out
+            total_aux = total_aux + hop_aux
+
+        # Exit
+        x = self.finalize(x)
+
+        self.aux_loss = total_aux
+        self.last_mean_hops = non_exit_decisions / B
+        if self.trace:
+            self.last_trace = trace_hops
+        return x
+
+
+class TriplePoolGraphLearner(nn.Module):
+    """Three-pool architecture: SequencePool + pre-TokenPool + post-TokenPool.
+
+    Separates sequence-level compute (attention) from token-level data recall
+    (databank MLPs). The SequencePool contains UniversalSequenceBlock experts
+    that are sample-routed. The TokenPools contain UniversalTokenBlock experts
+    that are token-routed.
+
+    Per-hop flow:
+        1. Sample-route to sequence experts (same as PoolOfExperts)
+        2. For each active sequence expert:
+           a. Pre-norm the input
+           b. Token-route to pre-TokenPool (enrich), with exit option
+           c. Run UniversalSequenceBlock (attention)
+           d. Token-route to post-TokenPool (refine), with exit option
+        3. Weighted-merge expert outputs, residual add
+        4. Merge outbound router logits, pick next hop or exit
+
+    Token routing mirrors sample routing: top-k over pool_size + exit slots,
+    softmax merge, exit slots get zero weight and renormalize. When all top-k
+    are exit, the token passes through unchanged.
+
+    Args:
+        make_seq_block: Callable creating an UniversalSequenceBlock (no args).
+        make_pre_block: Callable creating a pre-TokenPool UniversalTokenBlock.
+        make_post_block: Callable creating a post-TokenPool UniversalTokenBlock.
+        seq_pool_size: Number of sequence experts.
+        pre_pool_size: Number of pre-TokenPool databank units.
+        post_pool_size: Number of post-TokenPool databank units.
+        dim: Model dimension.
+        seq_top_k: Top-k for sequence routing (default 2).
+        pre_top_k: Top-k for pre-TokenPool token routing (default 2).
+        post_top_k: Top-k for post-TokenPool token routing (default 2).
+        max_hops: Loop bound on routing depth (default 2 * seq_pool_size).
+        seq_router_mode: Exit slot density for sequence router.
+        pre_router_mode: Exit slot density for pre-token router.
+        post_router_mode: Exit slot density for post-token router.
+        router_noise: Gaussian noise scale for all routers during training.
+        seq_shared_fraction: Block weight sharing for sequence pool.
+        seq_router_shared_fraction: Router weight sharing for sequence pool.
+        seq_hop_shared_fraction: Hop embed/gate sharing for sequence pool.
+        pre_shared_fraction: Block weight sharing for pre-TokenPool.
+        pre_router_shared_fraction: Router weight sharing for pre-TokenPool.
+        post_shared_fraction: Block weight sharing for post-TokenPool.
+        post_router_shared_fraction: Router weight sharing for post-TokenPool.
+    """
+
+    ROUTER_MODES = ('squared', 'single', 'half')
+
+    def __init__(self,
+                 make_seq_block: Callable[[], nn.Module],
+                 make_pre_block: Callable[[], nn.Module],
+                 make_post_block: Callable[[], nn.Module],
+                 seq_pool_size: int,
+                 pre_pool_size: int,
+                 post_pool_size: int,
+                 dim: int,
+                 seq_top_k: int = 2,
+                 pre_top_k: int = 2,
+                 post_top_k: int = 2,
+                 max_hops: int | None = None,
+                 seq_router_mode: str = 'single',
+                 pre_router_mode: str = 'single',
+                 post_router_mode: str = 'single',
+                 router_noise: float = 1.0,
+                 seq_shared_fraction: float = 0.0,
+                 seq_router_shared_fraction: float = 0.0,
+                 seq_hop_shared_fraction: float = 0.0,
+                 pre_shared_fraction: float = 0.0,
+                 pre_router_shared_fraction: float = 0.0,
+                 post_shared_fraction: float = 0.0,
+                 post_router_shared_fraction: float = 0.0):
+        super().__init__()
+        for mode in (seq_router_mode, pre_router_mode, post_router_mode):
+            if mode not in self.ROUTER_MODES:
+                raise ValueError(f"router_mode must be one of {self.ROUTER_MODES}, got {mode!r}")
+
+        self.seq_pool_size = seq_pool_size
+        self.pool_size = seq_pool_size  # alias for StackedLM megatron init
+        self.pre_pool_size = pre_pool_size
+        self.post_pool_size = post_pool_size
+        self.seq_top_k = seq_top_k
+        self.pre_top_k = pre_top_k
+        self.post_top_k = post_top_k
+        self.max_hops = max_hops if max_hops is not None else 2 * seq_pool_size
+        self.router_noise_scale = router_noise
+        self.exit_ramp_scale = 3.0
+
+        # --- Router option counts ---
+        def _n_options(pool_size: int, mode: str) -> int:
+            if mode == 'squared':
+                return pool_size * pool_size
+            elif mode == 'single':
+                return pool_size + 1
+            elif mode == 'half':
+                return 2 * pool_size
+            raise ValueError(mode)
+
+        self.seq_n_options = _n_options(seq_pool_size, seq_router_mode)
+        self.pre_n_options = _n_options(pre_pool_size, pre_router_mode)
+        self.post_n_options = _n_options(post_pool_size, post_router_mode)
+        self.seq_router_mode = seq_router_mode
+        self.pre_router_mode = pre_router_mode
+        self.post_router_mode = post_router_mode
+
+        # --- Stem: non-routed entry layer ---
+        self.stem_norm = RMSNorm(dim)
+        self.stem_layer = make_seq_block()
+
+        # --- Stem router: kicks off the first hop (sequence-level) ---
+        self.stem_router = nn.Linear(dim, self.seq_n_options, bias=False)
+
+        # --- Sequence pool (sample-routed) ---
+        self.seq_experts = nn.ModuleList([make_seq_block() for _ in range(seq_pool_size)])
+        self.seq_routers = nn.ModuleList([
+            nn.Linear(dim, self.seq_n_options, bias=False) for _ in range(seq_pool_size)
+        ])
+
+        # Per-hop pre-norm (shared across hops)
+        self.hop_norm = RMSNorm(dim)
+
+        # Per-expert hop conditioning
+        hop_gate_dim = min(dim, 12)
+        self.hop_gate_dim = hop_gate_dim
+        from .shared import ParamHolder
+        self.hop_embeds = nn.ModuleList([
+            ParamHolder(torch.randn(self.max_hops, dim) * 0.02) for _ in range(seq_pool_size)
+        ])
+        self.hop_gates = nn.ModuleList([
+            nn.Linear(hop_gate_dim, 1, bias=False) for _ in range(seq_pool_size)
+        ])
+
+        # --- Pre-TokenPool (token-routed) ---
+        self.pre_experts = nn.ModuleList([make_pre_block() for _ in range(pre_pool_size)])
+        # Per-sequence-expert pre-token router
+        self.pre_routers = nn.ModuleList([
+            nn.Linear(dim, self.pre_n_options, bias=False) for _ in range(seq_pool_size)
+        ])
+
+        # --- Post-TokenPool (token-routed) ---
+        self.post_experts = nn.ModuleList([make_post_block() for _ in range(post_pool_size)])
+        # Per-sequence-expert post-token router
+        self.post_routers = nn.ModuleList([
+            nn.Linear(dim, self.post_n_options, bias=False) for _ in range(seq_pool_size)
+        ])
+
+        # --- Exit: non-routed output layer ---
+        self.exit_norm = RMSNorm(dim)
+        self.exit_layer = make_seq_block()
+        self.final_norm = RMSNorm(dim)
+
+        # --- Weight sharing ---
+        from .shared import share_expert_weights, share_linear_list, share_parameter_list
+
+        # Sequence pool sharing
+        self._shared_seq_params = (
+            share_expert_weights(self.seq_experts, seq_shared_fraction)
+            if seq_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+        self._shared_seq_router_params = (
+            share_linear_list(self.seq_routers, seq_router_shared_fraction, prefix='seq_router')
+            if seq_router_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+        self._shared_hop_embed_params = (
+            share_parameter_list(self.hop_embeds, seq_hop_shared_fraction, prefix='hop_embed')
+            if seq_hop_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+        self._shared_hop_gate_params = (
+            share_linear_list(self.hop_gates, seq_hop_shared_fraction, prefix='hop_gate')
+            if seq_hop_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+
+        # Pre-TokenPool sharing
+        self._shared_pre_params = (
+            share_expert_weights(self.pre_experts, pre_shared_fraction)
+            if pre_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+        self._shared_pre_router_params = (
+            share_linear_list(self.pre_routers, pre_router_shared_fraction, prefix='pre_router')
+            if pre_router_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+
+        # Post-TokenPool sharing
+        self._shared_post_params = (
+            share_expert_weights(self.post_experts, post_shared_fraction)
+            if post_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+        self._shared_post_router_params = (
+            share_linear_list(self.post_routers, post_router_shared_fraction, prefix='post_router')
+            if post_router_shared_fraction > 0.0 else nn.ParameterDict()
+        )
+
+        self.aux_loss = 0.0
+        self.trace = False
+        self.last_trace = None
+        self.last_mean_hops = 0
+
+    # --- Router helpers ---
+
+    def _perturb_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian noise to router logits during training."""
+        if not self.training or self.router_noise_scale <= 0:
+            return logits
+        return logits + self.router_noise_scale * torch.randn_like(logits)
+
+    def _route_sample(self, logits: torch.Tensor, pool_size: int, top_k: int, hop: int
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample-level routing with exit ramp. Same as PoolOfExperts.route().
+
+        Args:
+            logits: (B, n_options) router logits.
+            pool_size: Number of real experts.
+            top_k: Top-k selection.
+            hop: Current hop (for exit ramp).
+
+        Returns:
+            topk_idx: (B, top_k)
+            topk_weights: (B, top_k)
+            has_exit: (B,) bool — True if ALL slots are exit.
+        """
+        exit_bias = self.exit_ramp_scale * (hop / self.max_hops)
+        if exit_bias > 0:
+            bias = torch.zeros_like(logits)
+            bias[:, pool_size:] = exit_bias
+            logits = logits + bias
+
+        topk_vals, topk_idx = logits.topk(top_k, dim=-1)
+        topk_weights = F.softmax(topk_vals, dim=-1)
+
+        is_exit = topk_idx >= pool_size
+        topk_weights = topk_weights.masked_fill(is_exit, 0.0)
+        weight_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        topk_weights = topk_weights / weight_sum
+
+        has_exit = is_exit.all(dim=-1)
+        return topk_idx, topk_weights, has_exit
+
+    def _route_tokens(self, x: torch.Tensor, router: nn.Module,
+                      experts: nn.ModuleList, pool_size: int, top_k: int
+                      ) -> torch.Tensor:
+        """Token-level routing through a databank pool.
+
+        Routes each token independently. Exit slots → token passes through
+        unchanged (identity). No exit ramp — databanks have no pressure to exit.
+
+        Args:
+            x: (B, T, D) input tokens.
+            router: Linear(D, n_options) for this databank.
+            experts: ModuleList of databank units.
+            pool_size: Number of real experts in this pool.
+            top_k: Top-k selection per token.
+
+        Returns:
+            (B, T, D) output — enriched/refined tokens.
+        """
+        B, T, D = x.shape
+        # Flatten to (B*T, D) for per-token routing
+        x_flat = x.view(B * T, D)
+        logits = self._perturb_logits(router(x_flat))  # (B*T, n_options)
+
+        topk_vals, topk_idx = logits.topk(top_k, dim=-1)  # (B*T, top_k)
+        topk_weights = F.softmax(topk_vals, dim=-1)  # (B*T, top_k)
+
+        # Zero out exit slot weights, renormalize
+        is_exit = topk_idx >= pool_size  # (B*T, top_k)
+        topk_weights = topk_weights.masked_fill(is_exit, 0.0)
+        weight_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        topk_weights = topk_weights / weight_sum
+
+        # All-exit tokens pass through unchanged
+        all_exit = is_exit.all(dim=-1)  # (B*T,)
+
+        # Find active experts
+        active_eids = topk_idx.unique()
+        active_eids = active_eids[active_eids < pool_size]
+
+        # Run active experts on full token set, weighted merge
+        out_flat = torch.zeros_like(x_flat)  # (B*T, D)
+
+        expert_outs = {}
+        for eid in active_eids.tolist():
+            expert_outs[eid] = experts[eid](x_flat)  # (B*T, D)
+
+        for k_idx in range(top_k):
+            w = topk_weights[:, k_idx]  # (B*T,)
+            eids = topk_idx[:, k_idx]  # (B*T,)
+            for eid in active_eids.tolist():
+                mask = eids == eid
+                if not mask.any():
+                    continue
+                out_flat = out_flat + (mask[:, None].float() * w[:, None]) * expert_outs[eid]
+
+        # All-exit tokens: use original input (identity)
+        out_flat = torch.where(all_exit[:, None], x_flat, out_flat)
+
+        return out_flat.view(B, T, D)
+
+    # --- Main forward ---
+
+    def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run stem layer and produce initial sequence router logits."""
+        x = x + self.stem_layer(self.stem_norm(x))
+        stem_pool = x.mean(dim=1)  # (B, D)
+        logits = self._perturb_logits(self.stem_router(stem_pool))
+        return x, logits
+
+    def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                    topk_weights: torch.Tensor, hop: int
+                    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Run selected sequence experts with pre/post token routing.
+
+        Args:
+            x: (B, T, D) current hidden state.
+            topk_idx: (B, seq_top_k) selected expert/exit indices.
+            topk_weights: (B, seq_top_k) softmax weights.
+            hop: Current hop index.
+
+        Returns:
+            out: (B, T, D) weighted-merged expert output.
+            next_logits: (B, seq_n_options) merged outbound logits.
+            hop_aux: Accumulated aux loss.
+        """
+        B = x.shape[0]
+        h = self.hop_norm(x)
+
+        active_eids = topk_idx.unique()
+        active_eids = active_eids[active_eids < self.seq_pool_size]
+
+        hop_aux = 0.0
+        expert_outs = {}
+        expert_logits = {}
+
+        for eid in active_eids.tolist():
+            # Hop conditioning
+            gate = torch.sigmoid(self.hop_gates[eid](h[..., :self.hop_gate_dim]))
+            hop_cond = gate * self.hop_embeds[eid][hop]
+            h_expert = h + hop_cond
+
+            # Pre-TokenPool: enrich input tokens
+            h_expert = self._route_tokens(
+                h_expert, self.pre_routers[eid], self.pre_experts,
+                self.pre_pool_size, self.pre_top_k)
+
+            # Sequence expert: attention compute
+            e_out = self.seq_experts[eid](h_expert)
+            expert_outs[eid] = e_out
+
+            # Post-TokenPool: refine output tokens
+            e_out_refined = self._route_tokens(
+                e_out, self.post_routers[eid], self.post_experts,
+                self.post_pool_size, self.post_top_k)
+            expert_outs[eid] = e_out_refined
+
+            # Outbound router logits (from refined output)
+            e_pool = e_out_refined.mean(dim=1)
+            expert_logits[eid] = self.seq_routers[eid](e_pool)
+
+            block_aux = getattr(self.seq_experts[eid], 'aux_loss', 0.0)
+            hop_aux = hop_aux + block_aux
+
+        # Weighted merge
+        out = torch.zeros_like(x)
+        next_logits = torch.zeros(B, self.seq_n_options, device=x.device, dtype=x.dtype)
+
+        for k_idx in range(self.seq_top_k):
+            w = topk_weights[:, k_idx]
+            eids = topk_idx[:, k_idx]
+            for eid in active_eids.tolist():
+                mask = eids == eid
+                if not mask.any():
+                    continue
+                out = out + (mask[:, None, None].float() * w[:, None, None]) * expert_outs[eid]
+                next_logits = next_logits + (mask[:, None].float() * w[:, None]) * expert_logits[eid]
+
+        next_logits = self._perturb_logits(next_logits)
+        return out, next_logits, hop_aux
+
+    def finalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Run exit layer and final norm."""
+        x = x + self.exit_layer(self.exit_norm(x))
+        return self.final_norm(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+
+        # Stem
+        x, logits = self.stem(x)
+
+        total_aux = 0.0
+        non_exit_decisions = 0
+        trace_hops: list[dict] = []
+
+        for hop in range(self.max_hops):
+            topk_idx, topk_weights, has_exit = self._route_sample(
+                logits, self.seq_pool_size, self.seq_top_k, hop)
 
             if self.trace:
                 trace_hops.append({

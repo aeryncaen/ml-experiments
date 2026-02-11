@@ -20,20 +20,23 @@ Usage:
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .block import ULBBlock, ULBConfig
+from .block import ULBBlock, ULBConfig, UniversalSequenceBlock, UniversalTokenBlock
 from .lerp import CausalLerp, CausalAdd, KAcausalLerp, KAcausalAdd, KTemporalConv
 from .norm import RMSNorm
 from .rope import HybridRoPE, PairedRoPE, apply_rotary
-from .stack import MoEStackedULB, PoolOfExperts, StackedULB
+from .stack import MoEStackedULB, PoolOfExperts, StackedULB, TriplePoolGraphLearner
 
 __all__ = [
     # Core
     "ULBBlock",
     "ULBConfig",
+    "UniversalSequenceBlock",
+    "UniversalTokenBlock",
     # Stacking
     "StackedULB",
     "MoEStackedULB",
     "PoolOfExperts",
+    "TriplePoolGraphLearner",
     # Components (for independent use)
     "RMSNorm",
     "LearnableSwish",

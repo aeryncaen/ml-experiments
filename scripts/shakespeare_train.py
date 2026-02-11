@@ -308,6 +308,71 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
     return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
 
 
+# --- TPGL (TriplePoolGraphLearner) builders ---
+
+def _make_tpgl_stacker(args, dim: int, is_causal: bool):
+    """Build a TriplePoolGraphLearner stacker from CLI args."""
+    from ulb.block import ULBConfig, UniversalSequenceBlock, UniversalTokenBlock
+    from ulb.stack import TriplePoolGraphLearner
+    config = ULBConfig(
+        d_model=dim,
+        n_heads=args.n_heads,
+        paired=True,
+        attn_mode='blend',
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=is_causal,
+    )
+    return TriplePoolGraphLearner(
+        make_seq_block=lambda: UniversalSequenceBlock(config),
+        make_pre_block=lambda: UniversalTokenBlock(dim, swish_mode=args.swish_mode),
+        make_post_block=lambda: UniversalTokenBlock(dim, swish_mode=args.swish_mode),
+        seq_pool_size=args.pool_size,
+        pre_pool_size=args.pre_pool_size,
+        post_pool_size=args.post_pool_size,
+        dim=dim,
+        seq_top_k=args.top_k,
+        pre_top_k=args.pre_top_k,
+        post_top_k=args.post_top_k,
+        max_hops=args.max_hops,
+        seq_router_mode=args.router_mode,
+        pre_router_mode=args.pre_router_mode,
+        post_router_mode=args.post_router_mode,
+        router_noise=args.router_noise,
+        seq_shared_fraction=args.block_shared_fraction,
+        seq_router_shared_fraction=args.router_shared_fraction,
+        seq_hop_shared_fraction=args.hop_shared_fraction,
+        pre_shared_fraction=args.pre_shared_fraction,
+        pre_router_shared_fraction=args.pre_router_shared_fraction,
+        post_shared_fraction=args.post_shared_fraction,
+        post_router_shared_fraction=args.post_router_shared_fraction,
+    )
+
+
+def build_ulb_tpgl(vocab_size: int, args) -> nn.Module:
+    """Build TriplePoolGraphLearner (AR mode)."""
+    stacker = _make_tpgl_stacker(args, args.dim, is_causal=not args.no_causal)
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
+def build_llada_ulb_tpgl(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with TriplePoolGraphLearner backbone."""
+    from ulb.transformer import LLaDAModel
+    stacker = _make_tpgl_stacker(args, args.dim, is_causal=not args.no_causal)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len + args.gen_len)
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
+
+
+def build_mlm_ulb_tpgl(vocab_size: int, args) -> nn.Module:
+    """Build BertMLM with TriplePoolGraphLearner backbone."""
+    from ulb.mlm import BertMLM
+    stacker = _make_tpgl_stacker(args, args.dim, is_causal=not args.no_causal)
+    backbone = StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+    return BertMLM(backbone, vocab_size, args.dim, mask_prob=args.mask_prob)
+
+
 # --- Diffusion PoE builder (existing, for MaskedDiffusionPoE) ---
 
 def build_ulb_diffusion_poe(vocab_size: int, args) -> nn.Module:
@@ -496,6 +561,7 @@ ARCH_BUILDERS = {
     'ulb-moe': build_ulb_moe,
     'mha-poe': build_mha_poe,
     'ulb-poe': build_ulb_poe,
+    'ulb-tpgl': build_ulb_tpgl,
     'ulb-diffusion-poe': build_ulb_diffusion_poe,
 }
 
@@ -506,6 +572,7 @@ LLADA_BUILDERS = {
     'ulb-moe': build_llada_ulb_moe,
     'mha-poe': build_llada_mha_poe,
     'ulb-poe': build_llada_ulb_poe,
+    'ulb-tpgl': build_llada_ulb_tpgl,
 }
 
 
@@ -589,6 +656,7 @@ MLM_BUILDERS = {
     'ulb': build_mlm_ulb,
     'mha-moe': build_mlm_mha_moe,
     'ulb-moe': build_mlm_ulb_moe,
+    'ulb-tpgl': build_mlm_ulb_tpgl,
 }
 
 
@@ -1207,6 +1275,15 @@ def train(args):
               f"router_mode={args.router_mode}, router_noise={args.router_noise}")
         print(f"  block_shared={args.block_shared_fraction}, router_shared={args.router_shared_fraction}, "
               f"hop_shared={args.hop_shared_fraction}")
+    if 'tpgl' in args.arch:
+        print(f"  seq_pool={args.pool_size}, pre_pool={args.pre_pool_size}, post_pool={args.post_pool_size}")
+        print(f"  seq_top_k={args.top_k}, pre_top_k={args.pre_top_k}, post_top_k={args.post_top_k}")
+        print(f"  max_hops={args.max_hops}, router_noise={args.router_noise}")
+        print(f"  seq_router={args.router_mode}, pre_router={args.pre_router_mode}, post_router={args.post_router_mode}")
+        print(f"  seq_shared={args.block_shared_fraction}, seq_router_shared={args.router_shared_fraction}, "
+              f"hop_shared={args.hop_shared_fraction}")
+        print(f"  pre_shared={args.pre_shared_fraction}, pre_router_shared={args.pre_router_shared_fraction}")
+        print(f"  post_shared={args.post_shared_fraction}, post_router_shared={args.post_router_shared_fraction}")
 
     if is_llada:
         llada_features = []
@@ -1464,7 +1541,7 @@ def train(args):
         except Exception:
             pass  # don't crash training on generation errors
 
-    return model
+    return model, optimizer, scheduler, best_val_loss
 
 
 # ---------------------------------------------------------------------------
@@ -1557,7 +1634,7 @@ def main():
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada', 'mlm'],
                         help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (BERT-style)')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
-                        help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-diffusion-poe')
+                        help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-tpgl, ulb-diffusion-poe')
 
     # Model
     parser.add_argument('--dim', type=int, default=128, help='Model dimension')
@@ -1594,9 +1671,33 @@ def main():
                         help='Router weight sharing fraction (PoE)')
     parser.add_argument('--hop-shared-fraction', type=float, default=0.0,
                         help='Hop embed/gate weight sharing fraction (PoE)')
+    parser.add_argument('--swish-mode', type=str, default='learnable', choices=['learnable', 'silu'],
+                        help='Activation mode for ULB/databank (learnable Swish or SiLU)')
+
+    # TPGL-specific (TriplePoolGraphLearner)
+    parser.add_argument('--pre-pool-size', type=int, default=None,
+                        help='Pre-TokenPool databank size (TPGL, default=pool_size)')
+    parser.add_argument('--post-pool-size', type=int, default=None,
+                        help='Post-TokenPool databank size (TPGL, default=pool_size)')
+    parser.add_argument('--pre-top-k', type=int, default=2, help='Top-k for pre-TokenPool routing (TPGL)')
+    parser.add_argument('--post-top-k', type=int, default=2, help='Top-k for post-TokenPool routing (TPGL)')
+    parser.add_argument('--pre-router-mode', type=str, default='single',
+                        choices=['squared', 'single', 'half'],
+                        help='Pre-TokenPool router exit slot density (TPGL)')
+    parser.add_argument('--post-router-mode', type=str, default='single',
+                        choices=['squared', 'single', 'half'],
+                        help='Post-TokenPool router exit slot density (TPGL)')
+    parser.add_argument('--pre-shared-fraction', type=float, default=0.0,
+                        help='Pre-TokenPool block weight sharing fraction (TPGL)')
+    parser.add_argument('--pre-router-shared-fraction', type=float, default=0.0,
+                        help='Pre-TokenPool router weight sharing fraction (TPGL)')
+    parser.add_argument('--post-shared-fraction', type=float, default=0.0,
+                        help='Post-TokenPool block weight sharing fraction (TPGL)')
+    parser.add_argument('--post-router-shared-fraction', type=float, default=0.0,
+                        help='Post-TokenPool router weight sharing fraction (TPGL)')
 
     # Shared between MoE and PoE
-    parser.add_argument('--top-k', type=int, default=2, help='Experts per hop/layer (MoE/PoE)')
+    parser.add_argument('--top-k', type=int, default=2, help='Experts per hop/layer (MoE/PoE/TPGL seq pool)')
 
     # Diffusion-specific
     parser.add_argument('--prompt-len', type=int, default=64, help='Prompt length (diffusion)')
@@ -1641,6 +1742,11 @@ def main():
     # Default pool_size to n_layers if not set
     if args.pool_size is None:
         args.pool_size = args.n_layers
+    # Default TPGL token pool sizes to pool_size if not set
+    if args.pre_pool_size is None:
+        args.pre_pool_size = args.pool_size
+    if args.post_pool_size is None:
+        args.post_pool_size = args.pool_size
 
     # --generate mode: load checkpoint and run interactive prompt loop
     if args.generate:
@@ -1651,7 +1757,7 @@ def main():
     print(f"Shakespeare — {args.arch.upper()} / {args.mode.upper()}")
     print("=" * 60)
 
-    model = train(args)
+    model, optimizer, scheduler, best_val_loss = train(args)
     device = next(model.parameters()).device
 
     # Generate samples
