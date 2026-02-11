@@ -1,14 +1,16 @@
 """ByteChunkVAE — compresses fixed-size byte chunks into continuous latent vectors.
 
 Architecture:
-    Embedding dim layout (each quarter = D/4):
-        Q1: passthrough (raw embedding, untouched)
-        Q2: fixed RoPE (standard positional frequencies)
-        Q3: DD-RoPE (data-dependent cumsum angles)
-        Q4: acausal K-lerp (bidirectional neighbor blend)
+    Encoder preprocessing (before bottleneck):
+        1. Byte embedding (B, K) -> (B, K, D)
+        2. Fixed RoPE on first half of dims
+        3. Data-dependent RoPE (cumsum angles) on second half of dims
+        4. Acausal lerp on last quarter of dims (bidirectional neighbor blend)
+        5. Full bidirectional attention (enc_layers deep)
+        6. Mean-pool -> mu, log_var -> z
 
-    Encoder: embed -> preprocess (4-quarter layout) -> bidir attention -> mean-pool -> mu/logvar -> z
-    Decoder: z -> broadcast -> preprocess -> bidir attention -> byte logits
+    Decoder:
+        z -> broadcast + RoPE + DD-RoPE + lerp -> bidir attention -> byte logits
 
 Vocab (259):
     0 = PAD
@@ -18,7 +20,6 @@ Vocab (259):
 """
 
 from dataclasses import dataclass
-import math
 
 import torch
 import torch.nn as nn
@@ -56,7 +57,7 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Embedding preprocessing: passthrough | RoPE | DD-RoPE | acausal lerp
+# Embedding preprocessing: fixed RoPE + DD-RoPE + acausal lerp
 # ---------------------------------------------------------------------------
 
 def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -67,13 +68,15 @@ def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
 
 
 class EmbeddingPreprocessor(nn.Module):
-    """Four-quarter preprocessing on (B, K, D) embeddings.
+    """Enriches embeddings with positional and temporal structure.
 
-    Dim layout:
-        Q1 [0 : D/4]       — passthrough (untouched)
-        Q2 [D/4 : D/2]     — fixed RoPE (standard positional frequencies)
-        Q3 [D/2 : 3D/4]    — DD-RoPE (data-dependent cumsum angle rotations)
-        Q4 [3D/4 : D]      — acausal K-lerp (bidirectional neighbor blend)
+    Applied to (B, K, D) embeddings before the transformer layers.
+
+    Dim layout: [fixed_x1 (D/4) | fixed_x2 (D/4) | dd_x1 (D/4) | dd_x2 (D/4)]
+
+    1. Fixed RoPE on first half (D/2) — standard positional frequencies
+    2. Data-dependent RoPE on second half (D/2) — cumsum of learned angle deltas
+    3. Acausal lerp on last quarter (D/4) — bidirectional neighbor blending
 
     d_model must be divisible by 4.
     """
@@ -82,183 +85,95 @@ class EmbeddingPreprocessor(nn.Module):
         super().__init__()
         assert d_model % 4 == 0, f"d_model must be divisible by 4, got {d_model}"
         self.d_model = d_model
-        self.qd = d_model // 4  # quarter dim
+        self.fixed_pairs = d_model // 4    # rotation pairs for fixed RoPE
+        self.dd_pairs = d_model // 4       # rotation pairs for DD-RoPE
+        self.quarter_dim = d_model // 4    # lerp channels
 
-        # Fixed RoPE: qd dims = qd/2 rotation pairs
-        self.rope_pairs = self.qd // 2
+        # Fixed RoPE inverse frequencies
         inv_freq = 1.0 / (rope_base ** (
-            torch.arange(0, self.qd, 2).float() / self.qd
+            torch.arange(0, self.fixed_pairs * 2, 2).float() / (d_model // 2)
         ))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
-        # DD-RoPE: project from full embedding to angle deltas, then cumsum
-        self.dd_pairs = self.qd // 2
+        # DD-RoPE: project embedding to per-position angle deltas, then cumsum
         self.dd_proj = nn.Linear(d_model, self.dd_pairs, bias=True)
         nn.init.zeros_(self.dd_proj.weight)
         nn.init.zeros_(self.dd_proj.bias)
 
-        # Acausal lerp gates (on Q4)
-        self.gate_fwd = nn.Linear(d_model, self.qd, bias=True)
-        self.gate_bwd = nn.Linear(d_model, self.qd, bias=True)
+        # Acausal lerp gates (last quarter of dims)
+        self.gate_fwd = nn.Linear(d_model, self.quarter_dim, bias=True)
+        self.gate_bwd = nn.Linear(d_model, self.quarter_dim, bias=True)
         nn.init.zeros_(self.gate_fwd.weight)
         nn.init.constant_(self.gate_fwd.bias, init_bias)
         nn.init.zeros_(self.gate_bwd.weight)
         nn.init.constant_(self.gate_bwd.bias, init_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, K, D). Returns (B, K, D) preprocessed."""
+        """x: (B, K, D). Returns (B, K, D) with RoPE + DD-RoPE + acausal lerp."""
         B, K, D = x.shape
-        qd = self.qd
-
-        # Split into quarters
-        q1 = x[..., :qd]              # passthrough
-        q2 = x[..., qd:2*qd]         # fixed RoPE
-        q3 = x[..., 2*qd:3*qd]       # DD-RoPE
-        q4 = x[..., 3*qd:]           # acausal lerp
-
-        # --- Q2: fixed RoPE ---
-        rp = self.rope_pairs
-        q2_pairs = torch.cat([q2[..., :rp], q2[..., rp:]], dim=-1)  # (B, K, 2*rp)
-        t = torch.arange(K, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)   # (K, rp)
-        q2_pairs = _apply_rotary(q2_pairs, freqs.cos()[None], freqs.sin()[None])
-        q2 = torch.cat([q2_pairs[..., :rp], q2_pairs[..., rp:]], dim=-1)
-
-        # --- Q3: DD-RoPE ---
+        fp = self.fixed_pairs
         dp = self.dd_pairs
-        q3_pairs = torch.cat([q3[..., :dp], q3[..., dp:]], dim=-1)  # (B, K, 2*dp)
-        dd_angles = self.dd_proj(x).cumsum(dim=1)  # (B, K, dp)
-        q3_pairs = _apply_rotary(q3_pairs, dd_angles.cos(), dd_angles.sin())
-        q3 = torch.cat([q3_pairs[..., :dp], q3_pairs[..., dp:]], dim=-1)
+        qd = self.quarter_dim
 
-        # --- Q4: acausal lerp ---
+        # --- 1. Fixed RoPE on first half ---
+        x_fixed = torch.cat([x[..., :fp], x[..., fp:2*fp]], dim=-1)  # (B, K, 2*fp)
+        t = torch.arange(K, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)       # (K, fp)
+        cos_f = freqs.cos()[None, :, :]              # (1, K, fp)
+        sin_f = freqs.sin()[None, :, :]
+        x_fixed = _apply_rotary(x_fixed, cos_f, sin_f)
+
+        # --- 2. DD-RoPE on second half ---
+        x_dd = torch.cat([x[..., 2*fp:2*fp+dp], x[..., 2*fp+dp:]], dim=-1)  # (B, K, 2*dp)
+        dd_angles = self.dd_proj(x).cumsum(dim=1)   # (B, K, dp)
+        x_dd = _apply_rotary(x_dd, dd_angles.cos(), dd_angles.sin())
+
+        # Reassemble
+        x = torch.cat([x_fixed[..., :fp], x_fixed[..., fp:],
+                        x_dd[..., :dp], x_dd[..., dp:]], dim=-1)
+
+        # --- 3. Acausal lerp on last quarter ---
         if K >= 2:
             g_fwd = torch.sigmoid(self.gate_fwd(x))  # (B, K, qd)
             g_bwd = torch.sigmoid(self.gate_bwd(x))
-            q4_prev = F.pad(q4[:, :-1], (0, 0, 1, 0))
-            q4_next = F.pad(q4[:, 1:],  (0, 0, 0, 1))
-            q4 = (1 - g_fwd - g_bwd) * q4 + g_fwd * q4_prev + g_bwd * q4_next
 
-        return torch.cat([q1, q2, q3, q4], dim=-1)
+            x_static = x[..., :-qd]
+            x_cur = x[..., -qd:]
+            x_prev = F.pad(x_cur[:, :-1], (0, 0, 1, 0))
+            x_next = F.pad(x_cur[:, 1:],  (0, 0, 0, 1))
+            x_mixed = (1 - g_fwd - g_bwd) * x_cur + g_fwd * x_prev + g_bwd * x_next
+            x = torch.cat([x_static, x_mixed], dim=-1)
+
+        return x
 
 
 # ---------------------------------------------------------------------------
-# Fused attention block (ULB-style, with per-layer HybridRoPE + K-lerp)
+# Transformer block (bidirectional, pre-norm)
 # ---------------------------------------------------------------------------
 
-class FusedBlock(nn.Module):
-    """ULB-style fused attention+gate block for the VAE.
+class TransformerBlock(nn.Module):
+    """Pre-norm transformer block (bidirectional)."""
 
-    Each layer has its own HybridRoPE (fixed + DD-RoPE) and acausal K-lerp,
-    so every attention computation is position-aware and content-phase-aware.
-    Bidirectional (is_causal=False).
-
-    Flow:
-        h_up = swish(up_proj(norm(x)))
-        q, k, v = qkv_proj(h_up)       # d -> inner (1.75x expansion)
-        q, k = qk_norm(q, k)
-        k = acausal_k_lerp(k, x)       # temporal neighbor blending on last 1/4 head_dim
-        dd_angles = rope.compute_dd_angles(x)
-        q = rope(q, dd_angles)          # hybrid: fixed RoPE + DD-RoPE
-        k = rope(k, dd_angles)
-        y = SDPA(q, k, v)               # bidirectional
-        y = o_proj(y)                    # inner -> d
-        y = attn_norm(y) * h_up         # skip-MULTIPLY
-        y = down_proj(swish(y))
-        return x + y                     # residual
-    """
-
-    INNER_RATIO = 1.75
-
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
-        from ulb.rope import HybridRoPE
-        from ulb.lerp import KAcausalLerp
+        self.norm1 = RMSNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm2 = RMSNorm(d_model)
+        hidden = 4 * d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden, d_model, bias=False),
+        )
 
-        # Snap inner_dim to nearest multiple of n_heads*4 (head_dim divisible by 4)
-        snap = n_heads * 4
-        inner_dim = round(d_model * self.INNER_RATIO / snap) * snap
-        assert inner_dim > 0
-
-        self.n_heads = n_heads
-        self.inner_dim = inner_dim
-        self.head_dim = inner_dim // n_heads
-
-        self.norm = RMSNorm(d_model)
-
-        # Gate path (thin, at d_model)
-        self.up_proj = nn.Linear(d_model, d_model, bias=False)
-        self.down_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # QKV: d -> inner (1.75x expansion)
-        self.q_proj = nn.Linear(d_model, inner_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, inner_dim, bias=True)
-        self.v_proj = nn.Linear(d_model, inner_dim, bias=True)
-        self.o_proj = nn.Linear(inner_dim, d_model, bias=False)
-
-        # QK norm (Mamba-3 style, at head_dim)
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
-
-        # Post-attention norm (before skip-multiply, at d_model)
-        self.attn_norm = RMSNorm(d_model)
-
-        # Per-layer HybridRoPE (fixed + DD-RoPE on QK)
-        self.rope = HybridRoPE(d_model, n_heads, self.head_dim)
-
-        # Per-layer acausal K-lerp (last 1/4 of head_dim)
-        quarter_dim = self.head_dim // 4
-        self.k_lerp = KAcausalLerp(d_model, n_heads, quarter_dim, init_bias=-2.0)
-
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, K, D = x.shape
-        H = self.n_heads
-        hd = self.head_dim
-
-        h = self.norm(x)
-
-        # Gate
-        h_up = F.silu(self.up_proj(h))
-
-        # QKV from gated representation
-        q = self.q_proj(h_up).view(B, K, H, hd)
-        k = self.k_proj(h_up).view(B, K, H, hd)
-        v = self.v_proj(h_up).view(B, K, H, hd)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # K temporal mixing (acausal lerp on last 1/4 head_dim)
-        k = self.k_lerp(k, x)
-
-        # Hybrid RoPE (fixed + data-dependent)
-        dd_angles = self.rope.compute_dd_angles(x)
-        q = self.rope(q, dd_angles)
-        k = self.rope(k, dd_angles)
-
-        # SDPA (bidirectional)
-        q = q.transpose(1, 2)  # (B, H, K, hd)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Build attention mask from pad_mask if needed
-        attn_mask = None
-        if pad_mask is not None:
-            attn_mask = pad_mask.unsqueeze(1).unsqueeze(2).expand(B, H, K, K)
-            attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
-
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(B, K, self.inner_dim)
-
-        y = self.o_proj(y)
-
-        # Skip-multiply (not skip-add)
-        y = self.attn_norm(y) * h_up
-
-        # Down projection
-        y = self.down_proj(F.silu(y))
-
-        return x + y
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h, key_padding_mask=mask, need_weights=False)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +183,8 @@ class FusedBlock(nn.Module):
 class Encoder(nn.Module):
     """Encodes a byte chunk (B, K) -> mu (B, D_latent), log_var (B, D_latent).
 
-    Pipeline: embed -> preprocess (passthrough|RoPE|DD-RoPE|lerp) ->
-              fused ULB-style blocks -> mean-pool -> bottleneck.
+    Pipeline: embed -> preprocess (RoPE + DD-RoPE + acausal lerp) ->
+              full bidirectional attention -> mean-pool -> bottleneck.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -277,7 +192,7 @@ class Encoder(nn.Module):
         self.embed = nn.Embedding(VOCAB_SIZE, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
-            FusedBlock(cfg.d_model, cfg.n_heads)
+            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.enc_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
@@ -293,7 +208,7 @@ class Encoder(nn.Module):
         h = self.preprocess(h)
 
         for layer in self.layers:
-            h = layer(h, pad_mask=pad_mask)
+            h = layer(h, mask=pad_mask)
         h = self.norm(h)
 
         # Mean-pool over non-pad positions
@@ -311,7 +226,7 @@ class Decoder(nn.Module):
     """Decodes latent z (B, D_latent) -> byte logits (B, K, VOCAB_SIZE).
 
     Same preprocessing as encoder: z broadcast to K positions gets
-    passthrough|RoPE|DD-RoPE|lerp before fused ULB-style blocks.
+    RoPE + DD-RoPE + acausal lerp before transformer layers.
     """
 
     def __init__(self, cfg: VAEConfig):
@@ -320,7 +235,7 @@ class Decoder(nn.Module):
         self.z_proj = nn.Linear(cfg.d_latent, cfg.d_model)
         self.preprocess = EmbeddingPreprocessor(cfg.d_model)
         self.layers = nn.ModuleList([
-            FusedBlock(cfg.d_model, cfg.n_heads)
+            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.dec_layers)
         ])
         self.norm = RMSNorm(cfg.d_model)
