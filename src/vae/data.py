@@ -17,6 +17,24 @@ import torch
 from .model import BOS, EOS, PAD, BYTE_OFFSET
 
 
+def build_byte_token_map(unique_bytes: np.ndarray | None = None) -> np.ndarray:
+    """Build a byte-value -> token-id lookup table (size 256, dtype int64).
+
+    If unique_bytes is None, uses the standard byte mapping: token = byte + BYTE_OFFSET.
+    If unique_bytes is provided, maps those bytes to dense IDs starting at BYTE_OFFSET.
+    Unmapped bytes get token 0 (PAD) — should never appear if data is clean.
+    """
+    table = np.zeros(256, dtype=np.int64)  # unmapped -> 0 (PAD)
+    if unique_bytes is None:
+        # Standard: byte b -> token b + 3
+        for b in range(256):
+            table[b] = b + BYTE_OFFSET
+    else:
+        for i, b in enumerate(sorted(unique_bytes)):
+            table[b] = i + BYTE_OFFSET
+    return table
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: BPE .bin -> raw byte .bin conversion
 # ---------------------------------------------------------------------------
@@ -307,8 +325,13 @@ class PieceStream:
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-def load_shakespeare_bytes(data_dir: str = "data") -> np.ndarray:
-    """Download tinyshakespeare and return as uint8 numpy array."""
+def load_shakespeare_bytes(data_dir: str = "data") -> tuple[np.ndarray, np.ndarray]:
+    """Download tinyshakespeare and return (uint8 data, byte_map).
+
+    byte_map is a size-256 int64 lookup table mapping byte values to dense
+    token IDs starting at BYTE_OFFSET (3). Shakespeare has 65 unique chars,
+    so token IDs are 3-67, vocab_size=68.
+    """
     data_path = Path(data_dir) / "shakespeare.txt"
     if not data_path.exists():
         print(f"Downloading Shakespeare -> {data_path}")
@@ -316,14 +339,21 @@ def load_shakespeare_bytes(data_dir: str = "data") -> np.ndarray:
         import urllib.request
         urllib.request.urlretrieve(SHAKESPEARE_URL, data_path)
     text = data_path.read_text()
-    return np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+    data = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+    unique_bytes = np.array(sorted(set(data.tolist())), dtype=np.uint8)
+    byte_map = build_byte_token_map(unique_bytes)
+    return data, byte_map
 
 
-def _make_chunks_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
+def _make_chunks_from_bytes(data: np.ndarray, chunk_size: int,
+                            byte_map: np.ndarray | None = None) -> torch.Tensor:
     """Convert raw bytes into chunked training data with BOS/EOS/PAD framing.
 
     Same logic as ByteShardStream._make_chunks: takes pieces of chunk_size*16
     bytes, frames as [BOS, bytes+3, ..., EOS], chunks into chunk_size-width.
+
+    If byte_map is provided (size-256 lookup table), uses it to convert byte
+    values to token IDs. Otherwise uses the default byte + BYTE_OFFSET.
     """
     K = chunk_size
     pb = K * 16  # piece bytes
@@ -339,13 +369,17 @@ def _make_chunks_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
 
     seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
     seqs[:, 0] = BOS
-    seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+    if byte_map is not None:
+        seqs[:, 1 : pb + 1] = byte_map[raw]
+    else:
+        seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
     seqs[:, pb + 1] = EOS
 
     return torch.from_numpy(seqs.reshape(-1, K))
 
 
-def _make_pieces_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
+def _make_pieces_from_bytes(data: np.ndarray, chunk_size: int,
+                            byte_map: np.ndarray | None = None) -> torch.Tensor:
     """Convert raw bytes into pieces (n_pieces, n_chunks_per_piece, chunk_size)."""
     K = chunk_size
     pb = K * 16
@@ -361,7 +395,10 @@ def _make_pieces_from_bytes(data: np.ndarray, chunk_size: int) -> torch.Tensor:
 
     seqs = np.full((n_pieces, padded_len), PAD, dtype=np.int64)
     seqs[:, 0] = BOS
-    seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
+    if byte_map is not None:
+        seqs[:, 1 : pb + 1] = byte_map[raw]
+    else:
+        seqs[:, 1 : pb + 1] = raw.astype(np.int64) + BYTE_OFFSET
     seqs[:, pb + 1] = EOS
 
     return torch.from_numpy(seqs.reshape(n_pieces, n_chunks, K))
@@ -375,7 +412,7 @@ class ShakespeareStream:
 
     def __init__(self, chunk_size: int, batch_size: int, split: str = "train",
                  data_dir: str = "data"):
-        data = load_shakespeare_bytes(data_dir)
+        data, byte_map = load_shakespeare_bytes(data_dir)
         n = len(data)
         split_idx = int(n * 0.9)
 
@@ -384,7 +421,7 @@ class ShakespeareStream:
         else:
             data = data[split_idx:]
 
-        self.chunks = _make_chunks_from_bytes(data, chunk_size)
+        self.chunks = _make_chunks_from_bytes(data, chunk_size, byte_map)
         self.batch_size = batch_size
         self.chunk_size = chunk_size
         self.pos = 0
@@ -426,7 +463,7 @@ class ShakespearePieceStream:
 
     def __init__(self, chunk_size: int, batch_size: int, split: str = "train",
                  data_dir: str = "data"):
-        data = load_shakespeare_bytes(data_dir)
+        data, byte_map = load_shakespeare_bytes(data_dir)
         n = len(data)
         split_idx = int(n * 0.9)
 
@@ -435,7 +472,7 @@ class ShakespearePieceStream:
         else:
             data = data[split_idx:]
 
-        self.pieces = _make_pieces_from_bytes(data, chunk_size)
+        self.pieces = _make_pieces_from_bytes(data, chunk_size, byte_map)
         self.batch_size = batch_size
         self.pos = 0
         self._shuffle()
