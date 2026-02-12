@@ -338,25 +338,25 @@ class MLPParamBank(nn.Module):
         # Output accumulator
         out = torch.zeros(N, self.dim, device=x.device, dtype=x.dtype)
 
-        for k in range(top_k):
-            slot_idx = safe_idx[:, k]       # (N,)
-            slot_w = expert_weights[:, k]   # (N,)
+        for e in range(self.pool_size):
+            # Combined weight across all top_k slots that selected this expert
+            combined_w = torch.zeros(N, 1, device=x.device, dtype=x.dtype)
+            for k in range(top_k):
+                selected = (safe_idx[:, k] == e).unsqueeze(-1)  # (N, 1)
+                combined_w = combined_w + selected * expert_weights[:, k:k+1]
 
-            for e in range(self.pool_size):
-                # Assemble expert weight matrices (shared + private)
-                gate_up_W = self._assemble_weight(
-                    self.gate_up_shared, self.gate_up_bank, e)  # (D, 2*D_i)
-                down_W = self._assemble_weight(
-                    self.down_shared, self.down_bank, e)  # (D_i, D)
+            # Assemble expert weight matrices (shared + private)
+            gate_up_W = self._assemble_weight(
+                self.gate_up_shared, self.gate_up_bank, e)  # (D, 2*D_i)
+            down_W = self._assemble_weight(
+                self.down_shared, self.down_bank, e)  # (D_i, D)
 
-                # Run expert on ALL tokens (matmul is cheap, no weight copies)
-                gate_up = x @ gate_up_W  # (N, 2*D_i)
-                gate, up = gate_up.split(self.inner_dim, dim=-1)
-                h = F.silu(gate) * up  # (N, D_i)
-                e_out = h @ down_W  # (N, D)
+            # Run expert on all tokens, mask to assigned ones
+            gate_up = x @ gate_up_W  # (N, 2*D_i)
+            gate, up = gate_up.split(self.inner_dim, dim=-1)
+            h = F.silu(gate) * up  # (N, D_i)
+            e_out = h @ down_W  # (N, D)
 
-                # Mask: only accumulate for tokens assigned to this expert
-                mask = (slot_idx == e).unsqueeze(-1)  # (N, 1)
-                out = out + mask * slot_w[:, None] * e_out
+            out = out + combined_w * e_out
 
         return out
