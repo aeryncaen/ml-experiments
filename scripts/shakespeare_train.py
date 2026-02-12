@@ -677,9 +677,16 @@ class LLooMLM(nn.Module):
         # Stash for routing info (updated each forward)
         self.last_info: dict = {}
 
-        # Megatron-style init: effective depth = 2 stems + max hops
+        # Megatron-style init: effective depth = 2 stems + expected expert hops.
+        # Use pool_size (not max_hops) as the expected depth per side: a sample
+        # visits at most pool_size distinct experts before routing becomes
+        # redundant, and the exit ramp pushes samples out well before max_hops.
+        # The old formula (2 + seq_max_hops + tok_max_hops = 26) treated the
+        # hop budget ceiling as the actual depth, crushing expert outputs with
+        # out_std = 0.02/sqrt(52) ≈ 0.003, making outbound router logits ~10000x
+        # smaller than the exit ramp.
         cfg = lloom.config
-        n_layers = 2 + cfg.seq_max_hops + cfg.tok_max_hops
+        n_layers = 2 + max(cfg.seq_pool_size, cfg.tok_pool_size)
         from lloom.lloom import lloom_megatron_init_
         lloom_megatron_init_(self, n_layers)
 

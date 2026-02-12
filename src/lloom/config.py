@@ -37,10 +37,12 @@ class LLooMConfig:
     tok_max_hops: int = 32             # generous — MLP hops are cheap
 
     # ---------- routing ----------
-    # exit_bias_init / bridge_bias_init: None = auto = 0.0, giving uniform
-    # 1/(P+2) probability at init for each slot (experts, exit, bridge alike).
-    exit_bias_init: float | None = None   # starting scalar bias for exit slot
-    bridge_bias_init: float | None = None # starting scalar bias for bridge slot
+    # exit_bias_init: None = auto = 0.0.
+    # bridge_bias_init: None = auto = 0.25 — gives bridge a modest head start
+    # so it can compete with the exit ramp at early hops.  Without this,
+    # exit's growing ramp means samples always exit before bridging.
+    exit_bias_init: float | None = None    # starting scalar bias for exit slot
+    bridge_bias_init: float | None = None  # starting scalar bias for bridge slot (auto=0.25)
     exit_ramp_scale: float = 2.0       # exit_bias_init + ramp * (hops_used / max_hops)
     router_noise: float = 1.0          # gaussian noise scale, annealed to 0
 

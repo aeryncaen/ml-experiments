@@ -60,9 +60,14 @@ def lloom_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
     cutoff = cutoff_factor * std
     out_cutoff = cutoff_factor * out_std
 
-    # Names that indicate output projections (residual-contributing)
+    # Names that indicate output projections (residual-contributing).
+    # Only the final projection in each sublayer gets output scaling.
+    # In the attention expert bank, o_proj is an INTERNAL projection
+    # (attn output → inner space, before skip-multiply + down_proj).
+    # Treating both o_proj and down_proj as output projections double-counts
+    # the scaling, compounding to crush expert output magnitude.
     _output_suffixes = ('.o_proj.weight', '.down_proj.weight',
-                        '.o_shared', '.o_bank', '.down_shared', '.down_bank')
+                        '.down_shared', '.down_bank')
     # Names to skip (norm weights, hop embeds, router biases with special init)
     _skip_suffixes = ('.weight',)  # nn.RMSNorm / nn.LayerNorm
     _skip_names = set()
@@ -72,7 +77,8 @@ def lloom_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
         if name.endswith('.norm_shared') or name.endswith('.norm_bank'):
             continue
         if name.endswith('.hop_norm.weight') or name.endswith('.attn_norm.weight') \
-                or name.endswith('.mlp_norm.weight') or name.endswith('.final_norm.weight'):
+                or name.endswith('.mlp_norm.weight') or name.endswith('.final_norm.weight') \
+                or name.endswith('.router_norm.weight'):
             continue
         # Skip hop embeddings (have their own small init)
         if 'hop_embed' in name:

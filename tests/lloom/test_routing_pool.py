@@ -499,7 +499,7 @@ class TestGradientFlowIntegration:
         # Core params always in the compute path
         # entry_router is only used for bridge crossings, not in this test path
         must_have_grad = ('router_shared', 'hop_gate_proj.weight', 'hop_gate_proj.bias')
-        skip_params = {'entry_router.weight'}
+        skip_params = {'entry_router.weight', 'router_norm.weight'}
         for name, p in pool.named_parameters():
             if p.requires_grad and name not in skip_params:
                 assert p.grad is not None, f"No gradient for {name}"

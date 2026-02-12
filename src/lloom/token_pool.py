@@ -129,8 +129,9 @@ class TokenPool(RoutingPool):
             slot_weights_for_bank = torch.ones(B * T, 1, device=x.device, dtype=x.dtype)
             e_out = self.expert_bank(x_flat, slot_idx, slot_weights_for_bank)  # (N, D)
 
-            # Outbound router on expert output
-            e_logits = self.get_router_logits(e_out, slot_idx.squeeze(1))  # (N, n_options)
+            # Outbound router on normalized expert output
+            e_normed = self.router_norm(e_out)  # normalize so logits have predictable scale
+            e_logits = self.get_router_logits(e_normed, slot_idx.squeeze(1))  # (N, n_options)
 
             # Weighted accumulate
             merged_out = merged_out + slot_weight[:, None] * e_out

@@ -133,8 +133,9 @@ class SequencePool(RoutingPool):
             slot_weights_for_bank = torch.ones(B, 1, device=x.device, dtype=x.dtype)
             e_out = self.expert_bank(x_cond, slot_idx, slot_weights_for_bank)  # (B, T, D)
 
-            # Outbound router: mean-pool expert output, run banked router
+            # Outbound router: mean-pool expert output, normalize, run banked router
             e_pooled = e_out.mean(dim=1)  # (B, D)
+            e_pooled = self.router_norm(e_pooled)  # normalize so logits have predictable scale
             e_logits = self.get_router_logits(e_pooled, slot_idx.squeeze(1))  # (B, n_options)
 
             # Weighted accumulate

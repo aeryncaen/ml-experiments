@@ -63,7 +63,7 @@ class RoutingPool(nn.Module, ABC):
         # bridge always dominate top-k since each is a single slot vs P expert
         # slots sharing 1/3 of the mass.
         self.exit_bias_init = exit_bias_init if exit_bias_init is not None else 0.0
-        self.bridge_bias_init = bridge_bias_init if bridge_bias_init is not None else 0.0
+        self.bridge_bias_init = bridge_bias_init if bridge_bias_init is not None else 0.25
         self.exit_ramp_scale = exit_ramp_scale
         self.router_noise_scale = router_noise
         self.router_shared_fraction = router_shared_fraction
@@ -113,6 +113,19 @@ class RoutingPool(nn.Module, ABC):
 
         # --- Hop norm (RMSNorm) ---
         self.hop_norm = nn.RMSNorm(dim)
+
+        # --- Router input norm (RMSNorm) ---
+        # Normalizes expert output before the outbound router so that
+        # router logits have a predictable scale relative to the exit ramp.
+        # Without this, Megatron-init'd output projections produce tiny expert
+        # outputs, making outbound logits orders of magnitude smaller than the
+        # exit bias — causing exit to always dominate.
+        #
+        # eps=1e-8: expert output can have RMS as low as 1e-4 early in
+        # training (Megatron output-projection scaling).  The PyTorch
+        # RMSNorm default eps is large enough to prevent normalization at
+        # that scale — must be kept well below the expected input RMS².
+        self.router_norm = nn.RMSNorm(dim, eps=1e-8)
 
     # ------------------------------------------------------------------
     # Router helpers
