@@ -293,9 +293,10 @@ class LLooM(nn.Module):
         tok_film = None
         tok_first_hop = torch.ones(B, dtype=torch.bool, device=device)
 
-        # Generate FiLM for samples entering token side directly from stem
+        # Stem → token counts as a bridge crossing (goes through FiLM bridge)
         if go_tok.any():
             tok_film = self._generate_film_masked(x, go_tok)
+            n_bridges = torch.where(go_tok, n_bridges + 1, n_bridges)
 
         # Fixed iteration loop for torch.compile compatibility
         # All state mutations use torch.where (static shapes, no aten.nonzero)

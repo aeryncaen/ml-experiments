@@ -39,7 +39,7 @@ class LLooMConfig:
     # ---------- routing ----------
     exit_bias_init: float = 0.0        # starting scalar bias for exit slot
     bridge_bias_init: float = 0.0      # starting scalar bias for bridge slot
-    exit_ramp_scale: float = 3.0       # exit_bias_init + ramp * (hops_used / max_hops)
+    exit_ramp_scale: float = 10.0      # exit_bias_init + ramp * (hops_used / max_hops)
     router_noise: float = 1.0          # gaussian noise scale, annealed to 0
 
     # ---------- weight sharing ----------
