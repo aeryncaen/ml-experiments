@@ -297,9 +297,31 @@ class MLPParamBank(nn.Module):
             self.down_shared_out, self.down_private_out = \
             _make_bank(pool_size, inner_dim, dim, shared_fraction)
 
+    def _assemble_weight(self, shared: nn.Parameter | None,
+                         private: nn.Parameter, expert_id: int
+                         ) -> torch.Tensor:
+        """Assemble full weight matrix for a single expert.
+
+        Returns:
+            (in_dim, out_dim) weight matrix.
+        """
+        priv = private[expert_id]  # (in_dim, priv_out)
+        if shared is not None:
+            return torch.cat([shared, priv], dim=-1)  # (in_dim, out_dim)
+        return priv
+
     def forward(self, x: torch.Tensor, expert_idx: torch.Tensor,
                 expert_weights: torch.Tensor) -> torch.Tensor:
         """Dispatch through banked SwiGLU MLP experts.
+
+        Uses grouped dispatch: loop over pool_size experts, apply each
+        expert's weights to ALL tokens via matmul, then mask to only
+        accumulate for tokens assigned to that expert.  No per-token
+        weight copies — memory is O(N * D_inner) for activations instead
+        of O(N * D * D_inner) for gathered weight tensors.
+
+        torch.compile friendly: fixed loops, no bool indexing, no
+        dynamic shapes.
 
         Args:
             x: (N, D) flattened input tokens.
@@ -313,27 +335,28 @@ class MLPParamBank(nn.Module):
         top_k = expert_idx.shape[1]
         safe_idx = expert_idx.clamp(max=self.pool_size - 1)
 
-        # Gather gate_up weights: (N, K, D, 2*D_inner)
-        gate_up_w = _gather_weights(
-            self.gate_up_shared, self.gate_up_bank, safe_idx,
-            self.gate_up_shared_out, N, top_k, self.dim)
+        # Output accumulator
+        out = torch.zeros(N, self.dim, device=x.device, dtype=x.dtype)
 
-        # Gather down weights: (N, K, D_inner, D)
-        down_w = _gather_weights(
-            self.down_shared, self.down_bank, safe_idx,
-            self.down_shared_out, N, top_k, self.inner_dim)
+        for k in range(top_k):
+            slot_idx = safe_idx[:, k]       # (N,)
+            slot_w = expert_weights[:, k]   # (N,)
 
-        # gate_up_proj: (N, D) @ (N, K, D, 2*D_i) → (N, K, 2*D_i)
-        gate_up = torch.einsum('nd,nkdj->nkj', x, gate_up_w)
+            for e in range(self.pool_size):
+                # Assemble expert weight matrices (shared + private)
+                gate_up_W = self._assemble_weight(
+                    self.gate_up_shared, self.gate_up_bank, e)  # (D, 2*D_i)
+                down_W = self._assemble_weight(
+                    self.down_shared, self.down_bank, e)  # (D_i, D)
 
-        # Split into gate and up
-        gate, up = gate_up.split(self.inner_dim, dim=-1)
+                # Run expert on ALL tokens (matmul is cheap, no weight copies)
+                gate_up = x @ gate_up_W  # (N, 2*D_i)
+                gate, up = gate_up.split(self.inner_dim, dim=-1)
+                h = F.silu(gate) * up  # (N, D_i)
+                e_out = h @ down_W  # (N, D)
 
-        # SwiGLU: SiLU(gate) * up
-        h = F.silu(gate) * up  # (N, K, D_inner)
+                # Mask: only accumulate for tokens assigned to this expert
+                mask = (slot_idx == e).unsqueeze(-1)  # (N, 1)
+                out = out + mask * slot_w[:, None] * e_out
 
-        # down_proj: (N, K, D_inner) @ (N, K, D_inner, D) → (N, K, D)
-        out = torch.einsum('nkj,nkjd->nkd', h, down_w)
-
-        # Weighted sum over top-k: (N, K, D) → (N, D)
-        return (out * expert_weights.unsqueeze(-1)).sum(dim=1)
+        return out
