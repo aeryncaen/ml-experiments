@@ -42,7 +42,8 @@ class TokenPool(RoutingPool):
         bridge_bias_init: Starting bridge bias.
         exit_ramp_scale: Exit bias ramp scale.
         router_noise: Gaussian noise for exploration.
-        shared_fraction: Param sharing fraction.
+        expert_shared_fraction: Fraction of expert bank weights shared.
+        router_shared_fraction: Fraction of router + hop embed params shared.
         hop_gate_dim: Prefix slice for hop gating.
     """
 
@@ -51,13 +52,16 @@ class TokenPool(RoutingPool):
                  film_rank: int = 16,
                  exit_bias_init: float = 0.0, bridge_bias_init: float = 0.0,
                  exit_ramp_scale: float = 3.0, router_noise: float = 1.0,
-                 shared_fraction: float = 0.5, hop_gate_dim: int = 12,
+                 expert_shared_fraction: float = 0.5,
+                 router_shared_fraction: float = 0.5,
+                 hop_gate_dim: int = 12,
                  global_max_hops: int | None = None):
         super().__init__(
             pool_size=pool_size, dim=dim, top_k=top_k, max_hops=max_hops,
             exit_bias_init=exit_bias_init, bridge_bias_init=bridge_bias_init,
             exit_ramp_scale=exit_ramp_scale, router_noise=router_noise,
-            shared_fraction=shared_fraction, hop_gate_dim=hop_gate_dim,
+            router_shared_fraction=router_shared_fraction,
+            hop_gate_dim=hop_gate_dim,
             global_max_hops=global_max_hops,
         )
         self.inner_dim = inner_dim
@@ -66,7 +70,7 @@ class TokenPool(RoutingPool):
         # Expert bank
         self.expert_bank = MLPParamBank(
             pool_size=pool_size, dim=dim, inner_dim=inner_dim,
-            shared_fraction=shared_fraction,
+            shared_fraction=expert_shared_fraction,
         )
 
         # Entry router: standalone token-level router for first hop

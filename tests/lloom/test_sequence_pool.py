@@ -31,7 +31,8 @@ T = 8
 def _make_pool(**kwargs):
     defaults = dict(
         pool_size=POOL, dim=D, inner_dim=D_INNER, n_heads=N_HEADS,
-        top_k=TOP_K, max_hops=MAX_HOPS, shared_fraction=0.5,
+        top_k=TOP_K, max_hops=MAX_HOPS,
+        expert_shared_fraction=0.5, router_shared_fraction=0.5,
         hop_gate_dim=12, exit_bias_init=0.0, bridge_bias_init=0.0,
         exit_ramp_scale=3.0, router_noise=0.0,  # no noise for determinism
     )

@@ -38,7 +38,9 @@ class RoutingPool(nn.Module, ABC):
         bridge_bias_init: Starting scalar bias for bridge slot.
         exit_ramp_scale: Scale for exit bias ramp over hops.
         router_noise: Gaussian noise scale for router exploration.
-        shared_fraction: Fraction of params shared across experts.
+        router_shared_fraction: Fraction of router + hop embed params shared
+            across experts.  (Expert bank sharing is controlled separately
+            by each subclass.)
         hop_gate_dim: Prefix slice of hidden dim used for hop gating.
     """
 
@@ -47,7 +49,7 @@ class RoutingPool(nn.Module, ABC):
                  bridge_bias_init: float = 0.0,
                  exit_ramp_scale: float = 3.0,
                  router_noise: float = 1.0,
-                 shared_fraction: float = 0.5,
+                 router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,
                  global_max_hops: int | None = None):
         super().__init__()
@@ -59,7 +61,7 @@ class RoutingPool(nn.Module, ABC):
         self.bridge_bias_init = bridge_bias_init
         self.exit_ramp_scale = exit_ramp_scale
         self.router_noise_scale = router_noise
-        self.shared_fraction = shared_fraction
+        self.router_shared_fraction = router_shared_fraction
         self.hop_gate_dim = hop_gate_dim
 
         # Hop embedding table is sized to global_max_hops (total across both
@@ -75,11 +77,11 @@ class RoutingPool(nn.Module, ABC):
         # Router: dim → n_options, with shared/private split
         self.router_shared, self.router_bank, \
             self.router_shared_out, self.router_private_out = \
-            _make_bank(pool_size, dim, self.n_options, shared_fraction)
+            _make_bank(pool_size, dim, self.n_options, router_shared_fraction)
 
         # --- Per-expert hop embeddings: (pool_size, global_max_hops, dim) ---
         # Shared/private split on last dim (the embedding dim)
-        hop_shared_dim = round(dim * shared_fraction) if shared_fraction > 0 else 0
+        hop_shared_dim = round(dim * router_shared_fraction) if router_shared_fraction > 0 else 0
         hop_private_dim = dim - hop_shared_dim
 
         self.hop_embed_shared = None

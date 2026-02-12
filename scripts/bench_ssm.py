@@ -182,6 +182,13 @@ class LLooMBenchWrapper(nn.Module):
     LLooM is self-contained (own stems, norms, routing loops) so it cannot
     use _stack() / _stack_moe() / _stack_poe().  This wrapper adapts it to
     the harness interface: (B, L, D) -> (B, L, D).
+
+    Exposes:
+        router_noise_scale: Mutable float — the harness anneals this linearly
+            to 0 over training.  Passed into LLooM.forward() each call.
+        last_mean_hops: Set after each forward — harness reads this for eval
+            stats display.
+        last_info: Full routing info dict from the last forward call.
     """
 
     def __init__(self, **kwargs):
@@ -190,10 +197,15 @@ class LLooMBenchWrapper(nn.Module):
             raise ImportError("LLooM not available")
         self.lloom = LLooM(LLooMConfig(**kwargs))
         self.aux_loss = 0.0
+        self.router_noise_scale = self.lloom.config.router_noise
+        self.last_mean_hops: float | None = None
+        self.last_info: dict | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, info = self.lloom(x)
-        self.aux_loss = 0.0  # no aux loss yet; placeholder for future routing loss
+        out, info = self.lloom(x, noise_scale=self.router_noise_scale)
+        self.aux_loss = 0.0  # placeholder for future routing loss
+        self.last_info = info
+        self.last_mean_hops = info.get('mean_global_hops')
         return out
 
 
@@ -981,6 +993,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         model.eval()
         val_losses = []
         val_hops = []
+        val_routing_stats = []  # list of dicts from model.last_info (LLooM etc.)
         total_correct = 0
         total_valid = 0
         per_task_correct = {t: 0 for t in ALL_TASKS}
@@ -997,6 +1010,9 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
                 _h = getattr(model, 'last_mean_hops', None)
                 if _h is not None:
                     val_hops.append(_h.item() if hasattr(_h, 'item') else _h)
+                _info = getattr(model, 'last_info', None)
+                if _info is not None:
+                    val_routing_stats.append(_info)
                 logits_flat = y.reshape(-1, vocab_size)
                 tgt_flat = tgt.reshape(-1)
                 loss = F.cross_entropy(logits_flat, tgt_flat, ignore_index=-100)
@@ -1031,7 +1047,17 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         else:
             avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
         mean_hops = sum(val_hops) / len(val_hops) if val_hops else None
-        return avg_loss, avg_acc, subtask_accs, mean_hops
+        # Average routing stats across val batches
+        routing_summary = None
+        if val_routing_stats:
+            routing_summary = {}
+            _stat_keys = ('mean_seq_hops', 'mean_tok_hops', 'mean_global_hops', 'mean_bridges',
+                          'stem_go_seq', 'stem_go_tok', 'stem_go_exit')
+            for k in _stat_keys:
+                vals = [d[k] for d in val_routing_stats if k in d]
+                if vals:
+                    routing_summary[k] = sum(vals) / len(vals)
+        return avg_loss, avg_acc, subtask_accs, mean_hops, routing_summary
 
     mem_baseline = 0
     if device == 'cuda':
@@ -1186,7 +1212,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
         train_acc = sum(epoch_accs) / len(epoch_accs)
         
         # Evaluate on validation set
-        val_loss, val_acc, subtask_accs, val_mean_hops = _eval_val()
+        val_loss, val_acc, subtask_accs, val_mean_hops, routing_summary = _eval_val()
         final_epoch = epoch + 1
         
         # Track best
@@ -1196,7 +1222,16 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             best_val_loss = val_loss
             best_subtask_accs = subtask_accs
         
-        _hops_str = f" hops={val_mean_hops:.1f}" if val_mean_hops is not None else ""
+        _hops_str = ""
+        if routing_summary is not None:
+            # Detailed routing stats (LLooM): seq/tok hops + bridges
+            sh = routing_summary.get('mean_seq_hops', 0)
+            th = routing_summary.get('mean_tok_hops', 0)
+            gh = routing_summary.get('mean_global_hops', 0)
+            br = routing_summary.get('mean_bridges', 0)
+            _hops_str = f" hops={gh:.1f}(s{sh:.1f}+t{th:.1f}) br={br:.1f}"
+        elif val_mean_hops is not None:
+            _hops_str = f" hops={val_mean_hops:.1f}"
         if subtask_accs is not None:
             _short = {'delay': 'D', 'selective_copy': 'S', 'induction': 'I', 'parity': 'P', 'mod_arith': 'M'}
             parts = " ".join(f"{_short[t]}={a:.1%}" for t, a in subtask_accs.items())
@@ -1513,19 +1548,26 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             # Token side gets 2x the hop budget (MLP hops are cheap)
             seq_hops = poe_max_hops if poe_max_hops is not None else 2 * pool_size
             tok_hops = seq_hops * 2
-            share_frac = max(poe_block_share_fraction, poe_router_share_fraction,
-                             poe_hop_share_fraction)
-            if share_frac == 0.0:
-                share_frac = 0.5  # LLooM default
+            # Map PoE sharing args to LLooM's 4 independent fractions.
+            # None = use shared_fraction default (0.5).
+            expert_share = poe_block_share_fraction if poe_block_share_fraction > 0 else None
+            router_share = max(poe_router_share_fraction, poe_hop_share_fraction)
+            router_share = router_share if router_share > 0 else None
             lloom_cfg = dict(dim=dim, seq_pool_size=pool_size, tok_pool_size=pool_size,
                              seq_top_k=lloom_top_k, tok_top_k=lloom_top_k,
                              seq_max_hops=seq_hops, tok_max_hops=tok_hops,
-                             max_bridge_crossings=2, shared_fraction=share_frac,
+                             max_bridge_crossings=2,
+                             seq_expert_shared_fraction=expert_share,
+                             tok_expert_shared_fraction=expert_share,
+                             seq_router_shared_fraction=router_share,
+                             tok_router_shared_fraction=router_share,
                              router_noise=router_noise)
             model = LLooMBenchWrapper(**lloom_cfg)
+            _es = expert_share if expert_share is not None else 0.5
+            _rs = router_share if router_share is not None else 0.5
             model._bench_config = (f"LLooM(dim={dim}, pool={pool_size}, top_k={lloom_top_k}, "
                                    f"seq_hops={seq_hops}, tok_hops={tok_hops}, "
-                                   f"share={share_frac}, noise={router_noise})")
+                                   f"expert_share={_es}, router_share={_rs}, noise={router_noise})")
             models['LLooM'] = model
         except ImportError as e:
             print(f"  Warning: LLooM not available ({e})")

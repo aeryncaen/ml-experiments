@@ -37,7 +37,8 @@ class SequencePool(RoutingPool):
         bridge_bias_init: Starting bridge bias.
         exit_ramp_scale: Scale for exit bias ramp.
         router_noise: Gaussian noise scale for exploration.
-        shared_fraction: Fraction of params shared across experts.
+        expert_shared_fraction: Fraction of expert bank weights shared.
+        router_shared_fraction: Fraction of router + hop embed params shared.
         hop_gate_dim: Prefix slice for hop gating.
         is_causal: Whether attention is causal.
     """
@@ -46,13 +47,16 @@ class SequencePool(RoutingPool):
                  n_heads: int, top_k: int = 2, max_hops: int = 16,
                  exit_bias_init: float = 0.0, bridge_bias_init: float = 0.0,
                  exit_ramp_scale: float = 3.0, router_noise: float = 1.0,
-                 shared_fraction: float = 0.5, hop_gate_dim: int = 12,
+                 expert_shared_fraction: float = 0.5,
+                 router_shared_fraction: float = 0.5,
+                 hop_gate_dim: int = 12,
                  is_causal: bool = True, global_max_hops: int | None = None):
         super().__init__(
             pool_size=pool_size, dim=dim, top_k=top_k, max_hops=max_hops,
             exit_bias_init=exit_bias_init, bridge_bias_init=bridge_bias_init,
             exit_ramp_scale=exit_ramp_scale, router_noise=router_noise,
-            shared_fraction=shared_fraction, hop_gate_dim=hop_gate_dim,
+            router_shared_fraction=router_shared_fraction,
+            hop_gate_dim=hop_gate_dim,
             global_max_hops=global_max_hops,
         )
         self.inner_dim = inner_dim
@@ -61,7 +65,7 @@ class SequencePool(RoutingPool):
 
         self.expert_bank = AttentionParamBank(
             pool_size=pool_size, dim=dim, inner_dim=inner_dim,
-            n_heads=n_heads, shared_fraction=shared_fraction,
+            n_heads=n_heads, shared_fraction=expert_shared_fraction,
             is_causal=is_causal,
         )
 

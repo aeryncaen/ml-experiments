@@ -56,7 +56,7 @@ def _make_pool(**kwargs):
     defaults = dict(
         pool_size=POOL, dim=D, top_k=TOP_K, max_hops=MAX_HOPS,
         exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=3.0,
-        router_noise=1.0, shared_fraction=0.5, hop_gate_dim=12,
+        router_noise=1.0, router_shared_fraction=0.5, hop_gate_dim=12,
     )
     defaults.update(kwargs)
     return StubPool(**defaults)
@@ -391,13 +391,13 @@ class TestGetRouterLogits:
             assert pool.router_shared.grad is not None
 
     def test_sharing_params_exist(self):
-        pool = _make_pool(shared_fraction=0.5)
+        pool = _make_pool(router_shared_fraction=0.5)
         assert pool.router_shared is not None
         param_names = {n for n, _ in pool.named_parameters()}
         assert 'router_shared' in param_names
 
     def test_no_sharing(self):
-        pool = _make_pool(shared_fraction=0.0)
+        pool = _make_pool(router_shared_fraction=0.0)
         assert pool.router_shared is None
 
 

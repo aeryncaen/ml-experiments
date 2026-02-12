@@ -41,7 +41,15 @@ class LLooMConfig:
     bridge_bias_init: float = 0.0      # starting scalar bias for bridge slot
     exit_ramp_scale: float = 3.0       # exit_bias_init + ramp * (hops_used / max_hops)
     router_noise: float = 1.0          # gaussian noise scale, annealed to 0
-    shared_fraction: float = 0.5       # 50% param sharing within each side
+
+    # ---------- weight sharing ----------
+    # Convenience default: set shared_fraction to apply to all four categories.
+    # Per-category overrides (None = use shared_fraction):
+    shared_fraction: float = 0.5       # default for any unset per-category fraction
+    seq_expert_shared_fraction: float | None = None  # attention expert bank weights
+    tok_expert_shared_fraction: float | None = None  # MLP expert bank weights
+    seq_router_shared_fraction: float | None = None  # seq-side routers + hop embeds
+    tok_router_shared_fraction: float | None = None  # tok-side routers + hop embeds
 
     # ---------- FiLM conditioning (token side) ----------
     film_rank: int = 16                # low-rank bottleneck for FiLM projection
@@ -76,9 +84,14 @@ class LLooMConfig:
             f"tok_top_k ({self.tok_top_k}) must be <= tok_pool_size ({self.tok_pool_size})")
         assert self.tok_max_hops >= 1, f"tok_max_hops must be >= 1, got {self.tok_max_hops}"
 
-        # Validate shared fraction
+        # Validate shared fractions
         assert 0.0 <= self.shared_fraction <= 1.0, (
             f"shared_fraction must be in [0, 1], got {self.shared_fraction}")
+        for name in ('seq_expert_shared_fraction', 'tok_expert_shared_fraction',
+                     'seq_router_shared_fraction', 'tok_router_shared_fraction'):
+            val = getattr(self, name)
+            if val is not None:
+                assert 0.0 <= val <= 1.0, f"{name} must be in [0, 1], got {val}"
 
         # Validate hop gate dim fits in hidden dim
         assert self.hop_gate_dim <= self.dim, (
@@ -164,6 +177,30 @@ class LLooMConfig:
     def stem_n_options(self) -> int:
         """Stem router output size: seq_pool_size + bridge-to-token + exit."""
         return self.seq_pool_size + 2
+
+    @property
+    def resolved_seq_expert_share(self) -> float:
+        """Resolved sharing fraction for sequence-side expert banks."""
+        v = self.seq_expert_shared_fraction
+        return v if v is not None else self.shared_fraction
+
+    @property
+    def resolved_tok_expert_share(self) -> float:
+        """Resolved sharing fraction for token-side expert banks."""
+        v = self.tok_expert_shared_fraction
+        return v if v is not None else self.shared_fraction
+
+    @property
+    def resolved_seq_router_share(self) -> float:
+        """Resolved sharing fraction for sequence-side routers + hop embeds."""
+        v = self.seq_router_shared_fraction
+        return v if v is not None else self.shared_fraction
+
+    @property
+    def resolved_tok_router_share(self) -> float:
+        """Resolved sharing fraction for token-side routers + hop embeds."""
+        v = self.tok_router_shared_fraction
+        return v if v is not None else self.shared_fraction
 
     @property
     def global_max_hops(self) -> int:
