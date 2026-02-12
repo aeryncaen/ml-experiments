@@ -49,7 +49,7 @@ class LLooMConfig:
     # ---------- weight sharing ----------
     # Convenience default: set shared_fraction to apply to all four categories.
     # Per-category overrides (None = use shared_fraction):
-    shared_fraction: float = 0.5       # default for any unset per-category fraction
+    shared_fraction: float = 0.0       # default for any unset per-category fraction
     seq_expert_shared_fraction: float | None = None  # attention expert bank weights
     tok_expert_shared_fraction: float | None = None  # MLP expert bank weights
     seq_router_shared_fraction: float | None = None  # seq-side routers + hop embeds
