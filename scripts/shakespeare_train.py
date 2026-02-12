@@ -1960,7 +1960,8 @@ def main():
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--early-stop-acc', type=float, default=0.99,
                         help='Stop training when val acc exceeds this (0 to disable)')
-    parser.add_argument('--device', type=str, default='cpu', help='Device')
+    _default_device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    parser.add_argument('--device', type=str, default=_default_device, help='Device')
     parser.add_argument('--save-dir', type=str, default=None, help='Save directory')
     parser.add_argument('--resume', type=str, default=None, metavar='CKPT',
                         help='Resume training from checkpoint (path to .pt file)')
