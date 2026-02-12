@@ -270,6 +270,25 @@ class MulMHABlock(nn.Module):
         return self.block_a(x) * self.block_b(x)
 
 
+class OuterMHABlock(nn.Module):
+    """Two independent MHA blocks combined via outer product.
+
+    Computes a(x) * (b(x) @ proj) — one stream gates the other through
+    a learned linear transform.  proj initialized to identity.
+    """
+
+    def __init__(self, d_model, n_heads=4, mlp_inner=0):
+        super().__init__()
+        self.block_a = MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner)
+        self.block_b = MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner)
+        self.proj = nn.Parameter(torch.eye(d_model))
+
+    def forward(self, x):
+        a = self.block_a(x)
+        b = self.block_b(x)
+        return a * (b @ self.proj)
+
+
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, 
@@ -1569,6 +1588,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # MulMHA: paired MHA blocks, multiply deltas at each depth level
     try_add('MulMHA', lambda: MulMHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
             f"MulMHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
+
+    # OuterMHA: paired MHA blocks, outer product (a * linear(b)) at each depth level
+    try_add('OuterMHA', lambda: OuterMHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
+            f"OuterMHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0),

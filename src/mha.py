@@ -468,6 +468,40 @@ class MulMHALayer(nn.Module):
         return self.layer_a(x) * self.layer_b(x)
 
 
+class OuterMHALayer(nn.Module):
+    """Two independent MHA+SwiGLU sub-layers combined via outer product.
+
+    Computes the outer product of the two D-dim outputs at each position,
+    then projects back to D.  This decomposes to a * (b @ proj), i.e. one
+    stream gates the other through a learned linear transform.
+
+    proj is initialized to identity so at init this equals element-wise
+    multiply (same as MulMHALayer), but the model can learn richer
+    cross-stream interactions.
+
+    Stacker-compatible: takes pre-normed x, returns delta (no residual).
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        max_seq_len: Maximum sequence length for RoPE.
+        ffn_expand: SwiGLU expansion ratio.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
+                 ffn_expand: float = 8/3):
+        super().__init__()
+        self.layer_a = CausalMHALayer(dim, n_heads, max_seq_len, ffn_expand)
+        self.layer_b = CausalMHALayer(dim, n_heads, max_seq_len, ffn_expand)
+        # Projection: (D, D) — initialized to identity so at init = element-wise mul
+        self.proj = nn.Parameter(torch.eye(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.layer_a(x)
+        b = self.layer_b(x)
+        return a * (b @ self.proj)
+
+
 class BidirectionalMHALayer(nn.Module):
     """MHA + SwiGLU layer compatible with ULB stackers. Supports causal or bidirectional.
 
