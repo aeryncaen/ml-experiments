@@ -236,6 +236,23 @@ class DualMHABenchWrapper(nn.Module):
         return self.stack_a(x) - self.stack_b(x)
 
 
+class DiffMHABlock(nn.Module):
+    """Two independent MHA blocks whose outputs are subtracted.
+
+    Single-layer version for bench_ssm stacking. _stack() wraps with
+    pre-norm + residual, so effective update is:
+        x = x + (block_a(norm(x)) - block_b(norm(x)))
+    """
+
+    def __init__(self, d_model, n_heads=4, mlp_inner=0):
+        super().__init__()
+        self.block_a = MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner)
+        self.block_b = MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner)
+
+    def forward(self, x):
+        return self.block_a(x) - self.block_b(x)
+
+
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, 
@@ -1527,6 +1544,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         model = DualMHABenchWrapper(d_model=dim, n_heads=4, n_layers=n_layers, mlp_inner=_dual_mlp)
         model._bench_config = f"DualMHA(d_model={dim}, n_heads=4, n_layers={n_layers}, mlp_inner={_dual_mlp})"
         models['DualMHA'] = model
+
+    # DiffMHA: paired MHA blocks, subtract deltas at each depth level
+    try_add('DiffMHA', lambda: DiffMHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
+            f"DiffMHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0),
