@@ -1508,12 +1508,24 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
     if _wanted('LLooM'):
         try:
-            lloom_cfg = dict(dim=dim, seq_pool_size=4, tok_pool_size=4,
-                             seq_top_k=min(2, 4), tok_top_k=min(2, 4),
-                             seq_max_hops=8, tok_max_hops=16,
-                             max_bridge_crossings=2, shared_fraction=0.5)
+            pool_size = n_experts  # same pool size for both sides
+            lloom_top_k = min(top_k, pool_size)
+            # Token side gets 2x the hop budget (MLP hops are cheap)
+            seq_hops = poe_max_hops if poe_max_hops is not None else 2 * pool_size
+            tok_hops = seq_hops * 2
+            share_frac = max(poe_block_share_fraction, poe_router_share_fraction,
+                             poe_hop_share_fraction)
+            if share_frac == 0.0:
+                share_frac = 0.5  # LLooM default
+            lloom_cfg = dict(dim=dim, seq_pool_size=pool_size, tok_pool_size=pool_size,
+                             seq_top_k=lloom_top_k, tok_top_k=lloom_top_k,
+                             seq_max_hops=seq_hops, tok_max_hops=tok_hops,
+                             max_bridge_crossings=2, shared_fraction=share_frac,
+                             router_noise=router_noise)
             model = LLooMBenchWrapper(**lloom_cfg)
-            model._bench_config = f"LLooM(dim={dim}, seq_pool=4, tok_pool=4)"
+            model._bench_config = (f"LLooM(dim={dim}, pool={pool_size}, top_k={lloom_top_k}, "
+                                   f"seq_hops={seq_hops}, tok_hops={tok_hops}, "
+                                   f"share={share_frac}, noise={router_noise})")
             models['LLooM'] = model
         except ImportError as e:
             print(f"  Warning: LLooM not available ({e})")
