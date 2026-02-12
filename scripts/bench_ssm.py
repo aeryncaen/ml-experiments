@@ -169,6 +169,32 @@ from ds_moe.model import DS1, RMSNorm
 from s6.usb_block import USBBlock, USBConfig
 from ideal.stack import IdealWrapper
 from ulb import ULBBlock, ULBConfig, StackedULB, MoEStackedULB, PoolOfExperts
+try:
+    from lloom import LLooM, LLooMConfig
+    HAS_LLOOM = True
+except ImportError:
+    HAS_LLOOM = False
+
+
+class LLooMBenchWrapper(nn.Module):
+    """Wraps LLooM for the benchmark harness.
+
+    LLooM is self-contained (own stems, norms, routing loops) so it cannot
+    use _stack() / _stack_moe() / _stack_poe().  This wrapper adapts it to
+    the harness interface: (B, L, D) -> (B, L, D).
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        if not HAS_LLOOM:
+            raise ImportError("LLooM not available")
+        self.lloom = LLooM(LLooMConfig(**kwargs))
+        self.aux_loss = 0.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, info = self.lloom(x)
+        self.aux_loss = 0.0  # no aux loss yet; placeholder for future routing loss
+        return out
 
 
 class USBWrapper(nn.Module):
@@ -1478,6 +1504,21 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # Paired-head ablation
     try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable')),
             f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable'))")
+
+    # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
+    if _wanted('LLooM'):
+        try:
+            lloom_cfg = dict(dim=dim, seq_pool_size=4, tok_pool_size=4,
+                             seq_top_k=min(2, 4), tok_top_k=min(2, 4),
+                             seq_max_hops=8, tok_max_hops=16,
+                             max_bridge_crossings=2, shared_fraction=0.5)
+            model = LLooMBenchWrapper(**lloom_cfg)
+            model._bench_config = f"LLooM(dim={dim}, seq_pool=4, tok_pool=4)"
+            models['LLooM'] = model
+        except ImportError as e:
+            print(f"  Warning: LLooM not available ({e})")
+        except Exception as e:
+            print(f"  Warning: LLooM failed to initialize ({e})")
 
     return models
 
