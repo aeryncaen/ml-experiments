@@ -531,18 +531,16 @@ class UniversalTokenBlock(nn.Module):
 class TokenParamBank(nn.Module):
     """Banked token-level experts with batched dispatch — no Python loops.
 
-    Stacks all expert weights into parameter banks and uses gather/scatter
-    for routing. Each expert is act(linear(x)): a (in_dim, out_dim) weight
-    + optional per-channel learnable swish beta.
+    Stacks all expert weights into parameter banks. Each expert is
+    act(linear(x)): a (in_dim, out_dim) weight + learnable swish beta.
 
     Supports asymmetric dims for up-projection (d_model → inner_dim) and
     down-projection (inner_dim → d_model).
 
-    Forward:
-        1. Receive pre-computed routing decisions (topk_idx, topk_weights)
-        2. Gather weights from bank for each token's assigned experts
-        3. Batched matmul + activation
-        4. Weighted sum over top-k, with exit slots → zero contribution
+    Weight sharing: when shared_fraction > 0, out_dim is split into
+    shared + private slices. The shared slice is stored once (in_dim, shared_out),
+    the private slice is per-expert (pool_size, in_dim, private_out).
+    Same for beta. This reduces total params.
 
     Args:
         pool_size: Number of experts in the bank.
@@ -551,10 +549,12 @@ class TokenParamBank(nn.Module):
         top_k: Top-k experts per token.
         n_options: Router output size (pool_size + exit slots).
         swish_mode: 'learnable' or 'silu'.
+        shared_fraction: Fraction of out_dim to share across experts (0.0 = none).
     """
 
     def __init__(self, pool_size: int, in_dim: int, out_dim: int, top_k: int = 2,
-                 n_options: int | None = None, swish_mode: str = 'learnable'):
+                 n_options: int | None = None, swish_mode: str = 'learnable',
+                 shared_fraction: float = 0.0):
         super().__init__()
         self.pool_size = pool_size
         self.in_dim = in_dim
@@ -563,14 +563,63 @@ class TokenParamBank(nn.Module):
         self.n_options = n_options if n_options is not None else pool_size + 1
         self.swish_mode = swish_mode
 
-        # Weight bank: (pool_size, in_dim, out_dim)
-        self.weight_bank = nn.Parameter(torch.randn(pool_size, in_dim, out_dim) * (in_dim ** -0.5))
+        # Weight sharing split
+        self.shared_out = round(out_dim * shared_fraction) if shared_fraction > 0 else 0
+        self.private_out = out_dim - self.shared_out
 
-        # Activation (applied at out_dim)
-        if swish_mode == 'learnable':
-            self.beta_bank = nn.Parameter(torch.ones(pool_size, out_dim))
+        if self.shared_out > 0:
+            self.shared_weight = nn.Parameter(
+                torch.randn(in_dim, self.shared_out) * (in_dim ** -0.5))
         else:
+            self.shared_weight = None
+
+        # Private weight bank: (pool_size, in_dim, private_out)
+        self.weight_bank = nn.Parameter(
+            torch.randn(pool_size, in_dim, self.private_out) * (in_dim ** -0.5))
+
+        # Activation
+        if swish_mode == 'learnable':
+            if self.shared_out > 0:
+                self.shared_beta = nn.Parameter(torch.ones(self.shared_out))
+            else:
+                self.shared_beta = None
+            self.beta_bank = nn.Parameter(torch.ones(pool_size, self.private_out))
+        else:
+            self.shared_beta = None
             self.beta_bank = None
+
+    def _get_weights(self, safe_idx: torch.Tensor, N: int
+                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Gather per-token weights and betas.
+
+        Returns:
+            w: (N, top_k, in_dim, out_dim)
+            beta: (N, top_k, out_dim) or None
+        """
+        # Private: (N*top_k, in_dim, private_out) → (N, top_k, in_dim, private_out)
+        priv_w = self.weight_bank[safe_idx.view(-1)].view(
+            N, self.top_k, self.in_dim, self.private_out)
+
+        if self.shared_weight is not None:
+            # Expand shared to (N, top_k, in_dim, shared_out)
+            shared_w = self.shared_weight.unsqueeze(0).unsqueeze(0).expand(
+                N, self.top_k, -1, -1)
+            w = torch.cat([shared_w, priv_w], dim=-1)  # (N, top_k, in_dim, out_dim)
+        else:
+            w = priv_w
+
+        beta = None
+        if self.beta_bank is not None:
+            priv_beta = self.beta_bank[safe_idx.view(-1)].view(
+                N, self.top_k, self.private_out)
+            if self.shared_beta is not None:
+                shared_beta = self.shared_beta.unsqueeze(0).unsqueeze(0).expand(
+                    N, self.top_k, -1)
+                beta = torch.cat([shared_beta, priv_beta], dim=-1)
+            else:
+                beta = priv_beta
+
+        return w, beta
 
     def forward(self, x_flat: torch.Tensor, topk_idx: torch.Tensor,
                 topk_weights: torch.Tensor, all_exit: torch.Tensor) -> torch.Tensor:
@@ -578,7 +627,7 @@ class TokenParamBank(nn.Module):
 
         Args:
             x_flat: (N, in_dim) flattened input tokens.
-            topk_idx: (N, top_k) expert indices per token (may include exit slots >= pool_size).
+            topk_idx: (N, top_k) expert indices (may include exit slots >= pool_size).
             topk_weights: (N, top_k) normalized weights (exit slots already zeroed).
             all_exit: (N,) bool — tokens where all top-k are exit slots.
 
@@ -586,31 +635,76 @@ class TokenParamBank(nn.Module):
             (N, out_dim) output tokens. All-exit tokens get zeros.
         """
         N = x_flat.shape[0]
+        safe_idx = topk_idx.clamp(max=self.pool_size - 1)
 
-        # Clamp indices to valid range for gathering (exit slots → 0, weight is already 0)
-        safe_idx = topk_idx.clamp(max=self.pool_size - 1)  # (N, top_k)
+        w, beta = self._get_weights(safe_idx, N)
 
-        # Gather weights: (N, top_k, in_dim, out_dim)
-        w = self.weight_bank[safe_idx.view(-1)].view(N, self.top_k, self.in_dim, self.out_dim)
-
-        # Batched matmul: x (N, in_dim) @ w (N, top_k, in_dim, out_dim) → (N, top_k, out_dim)
+        # Batched matmul: (N, in_dim) @ (N, top_k, in_dim, out_dim) → (N, top_k, out_dim)
         expert_out = torch.einsum('ni,nkij->nkj', x_flat, w)
 
         # Activation
-        if self.beta_bank is not None:
-            beta = self.beta_bank[safe_idx.view(-1)].view(N, self.top_k, self.out_dim)
+        if beta is not None:
             expert_out = expert_out * torch.sigmoid(beta * expert_out)
         else:
             expert_out = F.silu(expert_out)
 
-        # Weighted sum over top-k: (N, top_k, out_dim) * (N, top_k, 1) → (N, out_dim)
-        # Exit slots have zero weight, so they contribute nothing.
+        # Weighted sum over top-k
         out = (expert_out * topk_weights.unsqueeze(-1)).sum(dim=1)
-
-        # All-exit tokens: zero output (caller handles residual)
         out = out.masked_fill(all_exit.unsqueeze(-1), 0.0)
-
         return out
+
+
+class RouterParamBank(nn.Module):
+    """Banked routers with batched dispatch and optional weight sharing.
+
+    Each router is a Linear(in_dim, n_options) with no bias and no activation.
+    Stacks all router weights into a bank for batched matmul.
+
+    Weight sharing: when shared_fraction > 0, n_options is split into
+    shared + private slices (same scheme as TokenParamBank).
+
+    Args:
+        pool_size: Number of routers in the bank.
+        in_dim: Input dimension (what the router reads from).
+        n_options: Output size per router (pool_size + exit slots for target pool).
+        shared_fraction: Fraction of n_options to share across routers.
+    """
+
+    def __init__(self, pool_size: int, in_dim: int, n_options: int,
+                 shared_fraction: float = 0.0):
+        super().__init__()
+        self.pool_size = pool_size
+        self.in_dim = in_dim
+        self.n_options = n_options
+
+        self.shared_out = round(n_options * shared_fraction) if shared_fraction > 0 else 0
+        self.private_out = n_options - self.shared_out
+
+        if self.shared_out > 0:
+            self.shared_weight = nn.Parameter(
+                torch.randn(in_dim, self.shared_out) * (in_dim ** -0.5))
+        else:
+            self.shared_weight = None
+
+        # Private weight bank: (pool_size, in_dim, private_out)
+        self.weight_bank = nn.Parameter(
+            torch.randn(pool_size, in_dim, self.private_out) * (in_dim ** -0.5))
+
+    def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        """Route using a specific expert's router.
+
+        Args:
+            x: (N, in_dim) input.
+            expert_idx: Which router to use.
+
+        Returns:
+            (N, n_options) logits.
+        """
+        priv_out = torch.einsum('ni,ij->nj', x, self.weight_bank[expert_idx])
+        if self.shared_weight is not None:
+            shared_out = torch.einsum('ni,ij->nj', x, self.shared_weight)
+            return torch.cat([shared_out, priv_out], dim=-1)
+        return priv_out
 
 
 def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,

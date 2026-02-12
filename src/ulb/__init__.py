@@ -20,7 +20,7 @@ Usage:
 
 from .activations import LearnableSwish
 from .attention import BlendAttention, silu2_attention
-from .block import ULBBlock, ULBConfig, UniversalSequenceBlock, UniversalTokenBlock, TokenParamBank
+from .block import ULBBlock, ULBConfig, UniversalSequenceBlock, UniversalTokenBlock, TokenParamBank, RouterParamBank
 from .lerp import CausalLerp, CausalAdd, KAcausalLerp, KAcausalAdd, KTemporalConv
 from .norm import RMSNorm
 from .rope import HybridRoPE, PairedRoPE, apply_rotary
@@ -33,6 +33,7 @@ __all__ = [
     "UniversalSequenceBlock",
     "UniversalTokenBlock",
     "TokenParamBank",
+    "RouterParamBank",
     # Stacking
     "StackedULB",
     "MoEStackedULB",

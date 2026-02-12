@@ -440,6 +440,10 @@ def _make_tpgl_stacker(args, dim: int, is_causal: bool):
         seq_shared_fraction=args.block_shared_fraction,
         seq_router_shared_fraction=args.router_shared_fraction,
         seq_hop_shared_fraction=args.hop_shared_fraction,
+        pre_shared_fraction=args.pre_shared_fraction,
+        pre_router_shared_fraction=args.pre_router_shared_fraction,
+        post_shared_fraction=args.post_shared_fraction,
+        post_router_shared_fraction=args.post_router_shared_fraction,
     )
 
 
@@ -1360,6 +1364,8 @@ def train(args):
         print(f"  seq_router={args.router_mode}, pre_router={args.pre_router_mode}, post_router={args.post_router_mode}")
         print(f"  seq_shared={args.block_shared_fraction}, seq_router_shared={args.router_shared_fraction}, "
               f"hop_shared={args.hop_shared_fraction}")
+        print(f"  pre_shared={args.pre_shared_fraction}, pre_router_shared={args.pre_router_shared_fraction}")
+        print(f"  post_shared={args.post_shared_fraction}, post_router_shared={args.post_router_shared_fraction}")
 
     if is_llada:
         llada_features = []
@@ -1760,7 +1766,14 @@ def main():
     parser.add_argument('--post-router-mode', type=str, default='single',
                         choices=['squared', 'single', 'half'],
                         help='Post-TokenPool router exit slot density (TPGL)')
-    # Token pool sharing removed — param banks handle weights internally
+    parser.add_argument('--pre-shared-fraction', type=float, default=0.0,
+                        help='Pre-TokenPool (up-proj) weight sharing fraction (TPGL)')
+    parser.add_argument('--pre-router-shared-fraction', type=float, default=0.0,
+                        help='Pre-TokenPool router weight sharing fraction (TPGL)')
+    parser.add_argument('--post-shared-fraction', type=float, default=0.0,
+                        help='Post-TokenPool (down-proj) weight sharing fraction (TPGL)')
+    parser.add_argument('--post-router-shared-fraction', type=float, default=0.0,
+                        help='Post-TokenPool router weight sharing fraction (TPGL)')
 
     # Shared between MoE and PoE
     parser.add_argument('--top-k', type=int, default=2, help='Experts per hop/layer (MoE/PoE/TPGL seq pool)')

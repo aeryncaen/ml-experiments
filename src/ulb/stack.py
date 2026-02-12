@@ -665,9 +665,13 @@ class TriplePoolGraphLearner(nn.Module):
                  swish_mode: str = 'learnable',
                  seq_shared_fraction: float = 0.0,
                  seq_router_shared_fraction: float = 0.0,
-                 seq_hop_shared_fraction: float = 0.0):
+                 seq_hop_shared_fraction: float = 0.0,
+                 pre_shared_fraction: float = 0.0,
+                 pre_router_shared_fraction: float = 0.0,
+                 post_shared_fraction: float = 0.0,
+                 post_router_shared_fraction: float = 0.0):
         super().__init__()
-        from .block import TokenParamBank
+        from .block import TokenParamBank, RouterParamBank
 
         for mode in (seq_router_mode, pre_router_mode, post_router_mode):
             if mode not in self.ROUTER_MODES:
@@ -730,25 +734,27 @@ class TriplePoolGraphLearner(nn.Module):
         # --- Pre-TokenPool param bank: up-projection (d_model → inner_dim) ---
         self.pre_bank = TokenParamBank(
             pool_size=pre_pool_size, in_dim=dim, out_dim=inner_dim, top_k=pre_top_k,
-            n_options=self.pre_n_options, swish_mode=swish_mode)
-        # Pre-token routers operate on d_model input
-        self.pre_routers = nn.ModuleList([
-            nn.Linear(dim, self.pre_n_options, bias=False) for _ in range(seq_pool_size)
-        ])
+            n_options=self.pre_n_options, swish_mode=swish_mode,
+            shared_fraction=pre_shared_fraction)
+        # Pre-token routers: one per seq expert, routes at d_model
+        self.pre_router_bank = RouterParamBank(
+            pool_size=seq_pool_size, in_dim=dim, n_options=self.pre_n_options,
+            shared_fraction=pre_router_shared_fraction)
 
         # --- Post-TokenPool param bank: down-projection (inner_dim → d_model) ---
         self.post_bank = TokenParamBank(
             pool_size=post_pool_size, in_dim=inner_dim, out_dim=dim, top_k=post_top_k,
-            n_options=self.post_n_options, swish_mode=swish_mode)
-        # Post-token routers operate on inner_dim input (attention output)
-        self.post_routers = nn.ModuleList([
-            nn.Linear(inner_dim, self.post_n_options, bias=False) for _ in range(seq_pool_size)
-        ])
+            n_options=self.post_n_options, swish_mode=swish_mode,
+            shared_fraction=post_shared_fraction)
+        # Post-token routers: one per seq expert, routes at inner_dim
+        self.post_router_bank = RouterParamBank(
+            pool_size=seq_pool_size, in_dim=inner_dim, n_options=self.post_n_options,
+            shared_fraction=post_router_shared_fraction)
 
         # --- Final norm (at d_model) ---
         self.final_norm = RMSNorm(dim)
 
-        # --- Weight sharing (sequence pool only — token pools use param banks) ---
+        # --- Weight sharing (sequence pool) ---
         from .shared import share_expert_weights, share_linear_list, share_parameter_list
 
         self._shared_seq_params = (
@@ -813,38 +819,39 @@ class TriplePoolGraphLearner(nn.Module):
         has_exit = is_exit.all(dim=-1)
         return topk_idx, topk_weights, has_exit
 
-    def _route_tokens(self, x: torch.Tensor, router: nn.Module,
-                      bank: 'TokenParamBank') -> torch.Tensor:
-        """Token-level routing through a param bank — fully batched, no loops.
+    def _route_tokens(self, x: torch.Tensor, router_bank: 'RouterParamBank',
+                      seq_expert_idx: int, token_bank: 'TokenParamBank') -> torch.Tensor:
+        """Token-level routing through param banks — fully batched, no loops.
 
         Routes each token independently. Exit slots → zero contribution
         (caller handles residual if needed). No exit ramp.
 
         Args:
             x: (B, T, in_dim) input tokens.
-            router: Linear(in_dim, n_options) for this databank.
-            bank: TokenParamBank (in_dim → out_dim).
+            router_bank: RouterParamBank (one router per seq expert).
+            seq_expert_idx: Which seq expert's router to use.
+            token_bank: TokenParamBank (in_dim → out_dim).
 
         Returns:
             (B, T, out_dim) output.
         """
         B, T, _ = x.shape
         x_flat = x.reshape(B * T, -1)
-        logits = self._perturb_logits(router(x_flat))  # (B*T, n_options)
+        logits = self._perturb_logits(router_bank(x_flat, seq_expert_idx))  # (B*T, n_options)
 
-        topk_vals, topk_idx = logits.topk(bank.top_k, dim=-1)  # (B*T, top_k)
+        topk_vals, topk_idx = logits.topk(token_bank.top_k, dim=-1)  # (B*T, top_k)
         topk_weights = F.softmax(topk_vals, dim=-1)  # (B*T, top_k)
 
         # Zero out exit slot weights, renormalize
-        is_exit = topk_idx >= bank.pool_size  # (B*T, top_k)
+        is_exit = topk_idx >= token_bank.pool_size  # (B*T, top_k)
         topk_weights = topk_weights.masked_fill(is_exit, 0.0)
         weight_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         topk_weights = topk_weights / weight_sum
 
         all_exit = is_exit.all(dim=-1)  # (B*T,)
 
-        out_flat = bank(x_flat, topk_idx, topk_weights, all_exit)  # (B*T, out_dim)
-        return out_flat.view(B, T, bank.out_dim)
+        out_flat = token_bank(x_flat, topk_idx, topk_weights, all_exit)  # (B*T, out_dim)
+        return out_flat.view(B, T, token_bank.out_dim)
 
     # --- Main forward ---
 
@@ -894,14 +901,14 @@ class TriplePoolGraphLearner(nn.Module):
 
             # Pre-TokenPool: up-project (d_model → inner_dim)
             h_up = self._route_tokens(
-                h_expert, self.pre_routers[eid], self.pre_bank)  # (B, T, inner_dim)
+                h_expert, self.pre_router_bank, eid, self.pre_bank)  # (B, T, inner_dim)
 
             # Sequence expert: attention at inner_dim (includes skip-multiply)
             e_out = self.seq_experts[eid](h_up)  # (B, T, inner_dim)
 
             # Post-TokenPool: down-project (inner_dim → d_model)
             e_down = self._route_tokens(
-                e_out, self.post_routers[eid], self.post_bank)  # (B, T, d_model)
+                e_out, self.post_router_bank, eid, self.post_bank)  # (B, T, d_model)
             expert_outs[eid] = e_down
 
             # Outbound router logits (from d_model output)
