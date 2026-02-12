@@ -208,7 +208,7 @@ class LLooMBenchWrapper(nn.Module):
         # LLooM.forward() which stores raw tensors (no .item()) so that the
         # compiled graph has no graph-breaking scalar extractions.
         self.last_info = {
-            k: (v.item() if isinstance(v, torch.Tensor) else v)
+            k: (v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v)
             for k, v in info.items()
         }
         self.last_mean_hops = self.last_info.get('mean_global_hops')
