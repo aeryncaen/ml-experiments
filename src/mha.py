@@ -468,6 +468,95 @@ class MulMHALayer(nn.Module):
         return self.layer_a(x) * self.layer_b(x)
 
 
+class ExpandKVMHALayer(nn.Module):
+    """MHA + SwiGLU where K and V are expanded along the sequence dimension.
+
+    Q stays at T positions.  K and V are projected to kv_expand * T positions:
+    each input token spawns kv_expand key-value slots.  Every query attends
+    to kv_expand times as many positions.
+
+    Stacker-compatible: takes pre-normed x, returns delta (no residual).
+
+    RoPE: each group of kv_expand K positions shares the position index of
+    the original input token (content differentiation, not positional).
+
+    Causal mask: Q at input position i can attend to all K/V positions
+    originating from input positions 0..i, i.e. K indices 0..kv_expand*(i+1)-1.
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        max_seq_len: Maximum sequence length for RoPE.
+        ffn_expand: SwiGLU expansion ratio.
+        kv_expand: Expansion factor for K/V along the sequence dim.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
+                 ffn_expand: float = 8/3, kv_expand: int = 4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.kv_expand = kv_expand
+        assert dim % n_heads == 0
+
+        # Q: normal size.  K, V: kv_expand * dim each.
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, kv_expand * dim, bias=False)
+        self.v_proj = nn.Linear(dim, kv_expand * dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+
+        self.ffn_norm = nn.RMSNorm(dim)
+        self.ffn = SwiGLU(dim, expand=ffn_expand)
+
+        head_dim = dim // n_heads
+        # RoPE freqs only need max_seq_len (Q positions), K reuses via repeat
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        H, Dh, E = self.n_heads, self.head_dim, self.kv_expand
+
+        # Q: (B, H, T, Dh)
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)
+
+        # K: (B, T, E*D) -> (B, T, E, H, Dh) -> (B, H, T*E, Dh)
+        k = self.k_proj(x).view(B, T, E, H, Dh)
+        k = k.permute(0, 3, 1, 2, 4).reshape(B, H, T * E, Dh)
+
+        # V: same reshape as K
+        v = self.v_proj(x).view(B, T, E, H, Dh)
+        v = v.permute(0, 3, 1, 2, 4).reshape(B, H, T * E, Dh)
+
+        # RoPE: Q gets positions [0..T-1].
+        # K gets positions repeated E times: [0,0,..,0, 1,1,..,1, ...].
+        q = _apply_rope(q, self.rope_freqs)
+        # Expand rope freqs for K: repeat each position E times
+        rope_k = self.rope_freqs[:T].unsqueeze(1).expand(-1, E, -1).reshape(T * E, -1)
+        # _apply_rope expects (T, Dh/2) freqs and (B, H, T, Dh) input
+        kc = torch.view_as_complex(k.float().reshape(B, H, T * E, -1, 2))
+        rope_k = rope_k.unsqueeze(0).unsqueeze(0)  # (1, 1, T*E, Dh/2)
+        k = torch.view_as_real(kc * rope_k).flatten(-2).type_as(x)
+
+        # Causal mask: Q pos i attends to K positions from input positions 0..i.
+        # K is laid out as [tok0_e0, tok0_e1, ..., tok0_eE-1, tok1_e0, ...].
+        # So Q[i] can attend to K[0..E*(i+1)-1].
+        # Build (T, T*E) mask.
+        q_idx = torch.arange(T, device=x.device)
+        k_src = torch.arange(T * E, device=x.device).div(E, rounding_mode='floor')
+        causal_mask = k_src.unsqueeze(0) <= q_idx.unsqueeze(1)  # (T, T*E)
+        attn_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T*E)
+        # Convert to float mask for SDPA (False -> -inf)
+        attn_bias = torch.zeros(1, 1, T, T * E, device=x.device, dtype=x.dtype)
+        attn_bias.masked_fill_(~attn_mask, float('-inf'))
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.o_proj(attn_out)
+
+        h = h + self.ffn(self.ffn_norm(h))
+        return h
+
+
 class OuterMHALayer(nn.Module):
     """Two independent MHA+SwiGLU sub-layers combined via outer product.
 

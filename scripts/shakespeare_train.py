@@ -324,6 +324,18 @@ def build_mul_mha(vocab_size: int, args) -> nn.Module:
     return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
 
 
+def build_expandkv_mha(vocab_size: int, args) -> nn.Module:
+    """Build ExpandKV-MHA (K/V expanded 4x along sequence dim)."""
+    from mha import ExpandKVMHALayer
+    from ulb.stack import StackedULB
+    kv_expand = getattr(args, 'kv_expand', 4)
+    make_layer = lambda: ExpandKVMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len,
+        kv_expand=kv_expand)
+    stacker = StackedULB(make_layer, n_layers=args.n_layers, dim=args.dim)
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
 def build_outer_mha(vocab_size: int, args) -> nn.Module:
     """Build an OuterMHA (paired MHA layers, outer product at each depth)."""
     from mha import OuterMHALayer
@@ -795,6 +807,7 @@ ARCH_BUILDERS = {
     'diff-mha': build_diff_mha,
     'mul-mha': build_mul_mha,
     'outer-mha': build_outer_mha,
+    'expandkv-mha': build_expandkv_mha,
     'ulb': build_ulb,
     'mha-moe': build_mha_moe,
     'ulb-moe': build_ulb_moe,

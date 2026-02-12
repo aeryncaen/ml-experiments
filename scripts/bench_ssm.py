@@ -1593,6 +1593,15 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('OuterMHA', lambda: OuterMHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
             f"OuterMHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
 
+    # ExpandKV: K/V expanded 4x along sequence dimension
+    if _wanted('ExpandKV'):
+        try:
+            from mha import ExpandKVMHALayer
+            try_add('ExpandKV', lambda: ExpandKVMHALayer(dim=dim, n_heads=4, kv_expand=4),
+                    f"ExpandKVMHALayer(dim={dim}, n_heads=4, kv_expand=4)")
+        except ImportError:
+            pass
+
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0),
             f"IdealWrapper(d_model={dim}, n_heads=4, ffn_mult=4.0)")
