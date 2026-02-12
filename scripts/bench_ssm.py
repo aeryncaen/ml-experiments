@@ -215,6 +215,27 @@ class LLooMBenchWrapper(nn.Module):
         return out
 
 
+class DualMHABenchWrapper(nn.Module):
+    """Two independent MHA stacks whose outputs are subtracted.
+
+    bench_ssm version: operates on (B, L, D) hidden states (no embed/head).
+    Each half is a full pre-norm residual stack with its own blocks and norms.
+    Output = stack_a(x) - stack_b(x).
+    """
+
+    def __init__(self, d_model, n_heads=4, n_layers=1, mlp_inner=0):
+        super().__init__()
+        self.stack_a = StackedModel(
+            lambda: MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner),
+            n_layers, d_model)
+        self.stack_b = StackedModel(
+            lambda: MHABlock(d_model=d_model, n_heads=n_heads, mlp_inner=mlp_inner),
+            n_layers, d_model)
+
+    def forward(self, x):
+        return self.stack_a(x) - self.stack_b(x)
+
+
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, 
@@ -1499,6 +1520,13 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         mha_mlp = 0
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
             f"MHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
+
+    # DualMHA: two independent MHA stacks, subtract outputs
+    if _wanted('DualMHA'):
+        _dual_mlp = mha_mlp  # reuse same MLP inner dim as MHA
+        model = DualMHABenchWrapper(d_model=dim, n_heads=4, n_layers=n_layers, mlp_inner=_dual_mlp)
+        model._bench_config = f"DualMHA(d_model={dim}, n_heads=4, n_layers={n_layers}, mlp_inner={_dual_mlp})"
+        models['DualMHA'] = model
 
     # Ideal: orthogonal projection attention (no softmax, Cayley-parameterized heads)
     try_add('Ideal', lambda: IdealWrapper(d_model=dim, n_heads=4, ffn_mult=4.0),

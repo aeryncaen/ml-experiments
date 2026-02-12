@@ -184,6 +184,79 @@ class CausalTransformer(nn.Module):
         return self.head(self.final_norm(x))
 
 
+class DualMHA(nn.Module):
+    """Two independent causal transformers whose logits are subtracted.
+
+    Each half has its own embedding, blocks, final norm, and head (weight-tied
+    to its own embedding).  Forward returns logits_a - logits_b.
+
+    The idea: one model learns "what to predict", the other learns "what NOT
+    to predict".  The difference sharpens the distribution.
+
+    Args:
+        vocab_size: Token vocabulary size.
+        dim: Model dimension (same for both halves).
+        n_heads: Number of attention heads.
+        n_layers: Number of transformer blocks per half.
+        max_seq_len: Maximum sequence length for RoPE.
+        ffn_expand: SwiGLU expansion ratio.
+    """
+
+    def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
+                 n_layers: int = 4, max_seq_len: int = 256, ffn_expand: float = 8/3):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        # --- Half A ---
+        self.embed_a = nn.Embedding(vocab_size, dim)
+        self.blocks_a = nn.ModuleList([
+            TransformerBlock(dim, n_heads, ffn_expand) for _ in range(n_layers)
+        ])
+        self.norm_a = nn.RMSNorm(dim)
+        self.head_a = nn.Linear(dim, vocab_size, bias=False)
+        self.head_a.weight = self.embed_a.weight  # weight tying
+
+        # --- Half B ---
+        self.embed_b = nn.Embedding(vocab_size, dim)
+        self.blocks_b = nn.ModuleList([
+            TransformerBlock(dim, n_heads, ffn_expand) for _ in range(n_layers)
+        ])
+        self.norm_b = nn.RMSNorm(dim)
+        self.head_b = nn.Linear(dim, vocab_size, bias=False)
+        self.head_b.weight = self.embed_b.weight  # weight tying
+
+        # Shared RoPE freqs (same positional encoding for both)
+        head_dim = dim // n_heads
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+        # Megatron init each half independently
+        megatron_init_(self, n_layers)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            token_ids: (B, T) token indices.
+
+        Returns:
+            (B, T, vocab_size) logits_a - logits_b.
+        """
+        # Half A
+        xa = self.embed_a(token_ids)
+        for block in self.blocks_a:
+            xa = block(xa, self.rope_freqs)
+        logits_a = self.head_a(self.norm_a(xa))
+
+        # Half B
+        xb = self.embed_b(token_ids)
+        for block in self.blocks_b:
+            xb = block(xb, self.rope_freqs)
+        logits_b = self.head_b(self.norm_b(xb))
+
+        return logits_a - logits_b
+
+
 class BidirectionalTransformerBlock(nn.Module):
     """Pre-norm MHA + SwiGLU block with RoPE. Supports causal or bidirectional attention."""
 

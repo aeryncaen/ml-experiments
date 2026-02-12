@@ -292,6 +292,18 @@ def build_mha(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_dual_mha(vocab_size: int, args) -> nn.Module:
+    """Build a DualMHA (two independent MHA models, logits subtracted)."""
+    from mha import DualMHA
+    return DualMHA(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+    )
+
+
 def build_ulb(vocab_size: int, args) -> nn.Module:
     """Build a CausalULB (ULB blocks, same embed/head as MHA baseline)."""
     from ulb.transformer import CausalULB
@@ -749,6 +761,7 @@ def build_lloom(vocab_size: int, args) -> nn.Module:
 
 ARCH_BUILDERS = {
     'mha': build_mha,
+    'dual-mha': build_dual_mha,
     'ulb': build_ulb,
     'mha-moe': build_mha_moe,
     'ulb-moe': build_ulb_moe,
