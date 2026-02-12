@@ -1631,7 +1631,26 @@ def train(args):
             }, best_ckpt_path)
         best_marker = " *" if is_best else ""
         mask_info = f" mask={cur_mask_prob:.0%}" if is_mlm else ""
-        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{mask_info}{best_marker}")
+
+        # LLooM-specific routing stats on the epoch summary line
+        lloom_info = ""
+        if hasattr(model, 'last_info') and model.last_info:
+            li = model.last_info
+            def _v(k):
+                v = li.get(k, 0.0)
+                return v.item() if isinstance(v, torch.Tensor) else float(v)
+            sh = _v('mean_seq_hops')
+            th = _v('mean_tok_hops')
+            br = _v('mean_bridges')
+            parts = [f"seq_h={sh:.1f}", f"tok_h={th:.1f}", f"br={br:.2f}"]
+            if 'stem_go_seq' in li:
+                gs = _v('stem_go_seq')
+                gt = _v('stem_go_tok')
+                ge = _v('stem_go_exit')
+                parts.append(f"stem(s={gs:.0%}/t={gt:.0%}/x={ge:.0%})")
+            lloom_info = " " + " ".join(parts)
+
+        tqdm.write(f"  [epoch {epoch}] val_loss={val_loss:.4f} vacc={val_acc:.1%}{mask_info}{lloom_info}{best_marker}")
 
         # Early stop on val accuracy
         if args.early_stop_acc > 0 and val_acc >= args.early_stop_acc:
@@ -1656,6 +1675,15 @@ def train(args):
             postfix['hops'] = f"{mean_hops:.1f}"
         if _router_module is not None:
             postfix['rtr'] = f"{_router_module.router_noise_scale:.2f}"
+        # LLooM: show seq/tok hops and bridge count in progress bar too
+        if hasattr(model, 'last_info') and model.last_info:
+            li = model.last_info
+            def _v2(k):
+                v = li.get(k, 0.0)
+                return v.item() if isinstance(v, torch.Tensor) else float(v)
+            postfix['sh'] = f"{_v2('mean_seq_hops'):.1f}"
+            postfix['th'] = f"{_v2('mean_tok_hops'):.1f}"
+            postfix['br'] = f"{_v2('mean_bridges'):.2f}"
         pbar.set_postfix(**postfix)
 
         # Generate a sample after each epoch
