@@ -444,6 +444,30 @@ class DiffMHALayer(nn.Module):
         return self.layer_a(x) - self.layer_b(x)
 
 
+class MulMHALayer(nn.Module):
+    """Two independent MHA+SwiGLU sub-layers whose outputs are multiplied.
+
+    Stacker-compatible: takes pre-normed x, returns delta (no residual).
+    The stacker wraps this with x = x + MulMHALayer(norm(x)), so the
+    effective update is x = x + (layer_a(norm(x)) * layer_b(norm(x))).
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        max_seq_len: Maximum sequence length for RoPE.
+        ffn_expand: SwiGLU expansion ratio.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 4, max_seq_len: int = 256,
+                 ffn_expand: float = 8/3):
+        super().__init__()
+        self.layer_a = CausalMHALayer(dim, n_heads, max_seq_len, ffn_expand)
+        self.layer_b = CausalMHALayer(dim, n_heads, max_seq_len, ffn_expand)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer_a(x) * self.layer_b(x)
+
+
 class BidirectionalMHALayer(nn.Module):
     """MHA + SwiGLU layer compatible with ULB stackers. Supports causal or bidirectional.
 

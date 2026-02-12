@@ -314,6 +314,16 @@ def build_diff_mha(vocab_size: int, args) -> nn.Module:
     return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
 
 
+def build_mul_mha(vocab_size: int, args) -> nn.Module:
+    """Build a MulMHA (paired MHA layers, multiply deltas at each depth)."""
+    from mha import MulMHALayer
+    from ulb.stack import StackedULB
+    make_layer = lambda: MulMHALayer(
+        dim=args.dim, n_heads=args.n_heads, max_seq_len=args.seq_len)
+    stacker = StackedULB(make_layer, n_layers=args.n_layers, dim=args.dim)
+    return StackedLM(stacker, vocab_size, args.dim, args.seq_len)
+
+
 def build_ulb(vocab_size: int, args) -> nn.Module:
     """Build a CausalULB (ULB blocks, same embed/head as MHA baseline)."""
     from ulb.transformer import CausalULB
@@ -773,6 +783,7 @@ ARCH_BUILDERS = {
     'mha': build_mha,
     'dual-mha': build_dual_mha,
     'diff-mha': build_diff_mha,
+    'mul-mha': build_mul_mha,
     'ulb': build_ulb,
     'mha-moe': build_mha_moe,
     'ulb-moe': build_ulb_moe,
