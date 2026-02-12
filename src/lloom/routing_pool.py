@@ -295,10 +295,25 @@ class RoutingPool(nn.Module, ABC):
         flat_idx = expert_idx.reshape(-1).clamp(max=self.pool_size - 1)
 
         # Private: (N, dim_private)
-        priv_embed = self.hop_embed_bank[flat_idx, hop_clamped]
+        # Use torch.index_select to avoid scalar-tensor indexing which causes
+        # inductor graph breaks (_local_scalar_dense) under torch.compile.
+        if isinstance(hop_clamped, torch.Tensor):
+            # hop_embed_bank: (pool_size, max_hops, priv_dim) -> select hop dim
+            bank_at_hop = torch.index_select(
+                self.hop_embed_bank, 1, hop_clamped.view(1)
+            ).squeeze(1)  # (pool_size, priv_dim)
+        else:
+            bank_at_hop = self.hop_embed_bank[:, hop_clamped]  # (pool_size, priv_dim)
+        priv_embed = bank_at_hop[flat_idx]  # (N, priv_dim)
 
         if self.hop_embed_shared is not None:
-            shared_embed = self.hop_embed_shared[hop_clamped].unsqueeze(0).expand_as(priv_embed)
+            if isinstance(hop_clamped, torch.Tensor):
+                shared_at_hop = torch.index_select(
+                    self.hop_embed_shared, 0, hop_clamped.view(1)
+                ).squeeze(0)  # (shared_dim,)
+            else:
+                shared_at_hop = self.hop_embed_shared[hop_clamped]  # (shared_dim,)
+            shared_embed = shared_at_hop.unsqueeze(0).expand_as(priv_embed)
             hop_embed = torch.cat([shared_embed, priv_embed], dim=-1)
         else:
             hop_embed = priv_embed
