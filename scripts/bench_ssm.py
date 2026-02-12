@@ -1235,7 +1235,7 @@ def train_task(model, task_name, dim, max_epochs=100, lr=1e-4, B=32, L=32, devic
             th = routing_summary.get('mean_tok_hops', 0)
             gh = routing_summary.get('mean_global_hops', 0)
             br = routing_summary.get('mean_bridges', 0)
-            _hops_str = f" hops={gh:.1f}(s{sh:.1f}+t{th:.1f}) br={br:.1f}"
+            _hops_str = f" hops={gh:.1f}(s{sh:.1f}+t{th:.1f}) br={br:.2f}"
         elif val_mean_hops is not None:
             _hops_str = f" hops={val_mean_hops:.1f}"
         if subtask_accs is not None:

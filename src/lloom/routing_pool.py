@@ -192,14 +192,22 @@ class RoutingPool(nn.Module, ABC):
 
         Args:
             logits: (..., n_options) router logits.
-            hops_used: Number of hops already consumed on this side (int or scalar tensor).
+            hops_used: Per-sample hop count (B,) tensor, scalar tensor, or int.
 
         Returns:
             (..., n_options) biased logits.
         """
-        exit_bias = self.exit_bias_init + self.exit_ramp_scale * (hops_used / self.max_hops)
         logits = logits.clone()
-        logits[..., self.exit_idx] = logits[..., self.exit_idx] + exit_bias
+        if isinstance(hops_used, torch.Tensor) and hops_used.dim() > 0:
+            # Per-sample hops: (B,) -> (B, 1) for broadcasting against (B, n_options)
+            # or (B*T,) -> (B*T, 1) for token-level logits
+            exit_bias = self.exit_bias_init + self.exit_ramp_scale * (hops_used.float() / self.max_hops)
+            exit_bias = exit_bias.unsqueeze(-1)  # (..., 1)
+            logits[..., self.exit_idx:self.exit_idx+1] = \
+                logits[..., self.exit_idx:self.exit_idx+1] + exit_bias
+        else:
+            exit_bias = self.exit_bias_init + self.exit_ramp_scale * (hops_used / self.max_hops)
+            logits[..., self.exit_idx] = logits[..., self.exit_idx] + exit_bias
         logits[..., self.bridge_idx] = logits[..., self.bridge_idx] + self.bridge_bias_init
         return logits
 

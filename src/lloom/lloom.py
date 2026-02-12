@@ -339,10 +339,10 @@ class LLooM(nn.Module):
         x, seq_logits = self._stem_forward(x, ns)
         info['stem_logits'] = seq_logits.detach()
 
-        # --- Tracking state ---
-        seq_hops_used = torch.tensor(0, device=device)
-        tok_hops_used = torch.tensor(0, device=device)
-        global_hop = torch.tensor(0, device=device)
+        # --- Tracking state (all per-sample) ---
+        seq_hops = torch.zeros(B, dtype=torch.long, device=device)
+        tok_hops = torch.zeros(B, dtype=torch.long, device=device)
+        global_hop = torch.tensor(0, device=device)  # loop counter for hop conditioning
         n_bridges = torch.zeros(B, dtype=torch.long, device=device)
         # Total routing decisions: stem counts as 1, each bridge and expert hop counts as 1
         routing_decisions = torch.ones(B, dtype=torch.long, device=device)  # stem = 1
@@ -380,15 +380,21 @@ class LLooM(nn.Module):
             # ============================================================
             on_seq = side == 1
             if on_seq.any():
-                # Mask bridge if tok side is maxed (bridging there would be pointless)
+                # Per-sample bridge masking: if THIS SAMPLE's tok_hops >= tok_max_hops,
+                # bridging to tok side is pointless — mask bridge logit to -inf.
+                tok_maxed = tok_hops >= cfg.tok_max_hops  # (B,)
                 seq_logits_for_route = current_seq_logits
-                if tok_hops_used >= cfg.tok_max_hops:
+                if tok_maxed.any():
                     seq_logits_for_route = seq_logits_for_route.clone()
-                    seq_logits_for_route[:, self.seq_pool.bridge_idx] = -float('inf')
+                    # Only mask bridge for samples that are tok-maxed
+                    bridge_mask = tok_maxed.unsqueeze(-1)  # (B, 1)
+                    bridge_col = seq_logits_for_route[:, self.seq_pool.bridge_idx:self.seq_pool.bridge_idx+1]
+                    seq_logits_for_route[:, self.seq_pool.bridge_idx:self.seq_pool.bridge_idx+1] = \
+                        torch.where(bridge_mask, torch.full_like(bridge_col, -float('inf')), bridge_col)
 
-                # Route: interpret current logits
+                # Route: interpret current logits (per-sample hops for exit ramp)
                 topk_idx, topk_weights, has_exit, has_bridge, has_continue = \
-                    self.seq_pool.route(seq_logits_for_route, seq_hops_used)
+                    self.seq_pool.route(seq_logits_for_route, seq_hops)
 
                 # Record stem stats on first seq routing decision
                 if not _stem_stats_recorded:
@@ -407,8 +413,8 @@ class LLooM(nn.Module):
                     side = torch.where(bridging, torch.full_like(side, 2), side)
                     n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
                     routing_decisions = torch.where(bridging, routing_decisions + 1, routing_decisions)
-                    # Bridge counts as a seq hop (builds exit pressure)
-                    seq_hops_used = seq_hops_used + 1
+                    # Bridge counts as a seq hop — only for bridging samples
+                    seq_hops = torch.where(bridging, seq_hops + 1, seq_hops)
                     global_hop = global_hop + 1
                     # Produce entry logits for token pool
                     x_flat_for_tok = x.reshape(B * T, D)
@@ -416,7 +422,15 @@ class LLooM(nn.Module):
                     tok_entry_logits = tok_entry_logits.reshape(B, T, self.tok_pool.n_options)
                     if ns > 0 and self.training:
                         tok_entry_logits = tok_entry_logits + torch.randn_like(tok_entry_logits) * ns
-                    current_tok_logits = tok_entry_logits
+                    # Only update tok logits for bridging samples
+                    if current_tok_logits is None:
+                        current_tok_logits = tok_entry_logits
+                    else:
+                        current_tok_logits = torch.where(
+                            bridging[:, None, None],
+                            tok_entry_logits,
+                            current_tok_logits,
+                        )
                     tok_vote_state = None  # reset RCV state for new visit
 
                 # Continue: samples where rank-1 is an expert
@@ -435,13 +449,13 @@ class LLooM(nn.Module):
                         current_seq_logits,
                     )
                     routing_decisions = torch.where(continuing, routing_decisions + 1, routing_decisions)
-                    seq_hops_used = seq_hops_used + 1
+                    # Only increment hops for continuing samples
+                    seq_hops = torch.where(continuing, seq_hops + 1, seq_hops)
                     global_hop = global_hop + 1
 
-                # Budget check: if seq hops exhausted, force remaining seq samples to exit
-                if seq_hops_used >= cfg.seq_max_hops:
-                    still_on_seq = side == 1
-                    side = torch.where(still_on_seq, torch.zeros_like(side), side)
+                # Per-sample budget check: force-exit samples whose seq hops are exhausted
+                seq_over_budget = (seq_hops >= cfg.seq_max_hops) & (side == 1)
+                side = torch.where(seq_over_budget, torch.zeros_like(side), side)
 
             # ============================================================
             # Token side
@@ -456,15 +470,23 @@ class LLooM(nn.Module):
                         current_tok_logits = current_tok_logits + torch.randn_like(current_tok_logits) * ns
                     tok_vote_state = None
 
-                # Mask bridge if seq side is maxed
+                # Per-sample bridge masking: if THIS SAMPLE's seq_hops >= seq_max_hops,
+                # bridging to seq side is pointless — mask bridge logit to -inf.
+                seq_maxed = seq_hops >= cfg.seq_max_hops  # (B,)
                 tok_logits_for_route = current_tok_logits
-                if seq_hops_used >= cfg.seq_max_hops:
+                if seq_maxed.any():
                     tok_logits_for_route = tok_logits_for_route.clone()
-                    tok_logits_for_route[:, :, self.tok_pool.bridge_idx] = -float('inf')
+                    # Expand to (B, 1, 1) for broadcasting against (B, T, n_options)
+                    bridge_mask = seq_maxed[:, None, None]  # (B, 1, 1)
+                    bridge_col = tok_logits_for_route[:, :, self.tok_pool.bridge_idx:self.tok_pool.bridge_idx+1]
+                    tok_logits_for_route[:, :, self.tok_pool.bridge_idx:self.tok_pool.bridge_idx+1] = \
+                        torch.where(bridge_mask, torch.full_like(bridge_col, -float('inf')), bridge_col)
 
                 # Per-token routing: apply biases + top-k per token
+                # tok_hops is (B,) — expand to (B*T,) for token-level apply_biases
+                tok_hops_expanded = tok_hops.repeat_interleave(T)  # (B*T,)
                 BT_logits = tok_logits_for_route.reshape(B * T, self.tok_pool.n_options)
-                BT_logits_biased = self.tok_pool.apply_biases(BT_logits, tok_hops_used)
+                BT_logits_biased = self.tok_pool.apply_biases(BT_logits, tok_hops_expanded)
                 topk_idx_flat, topk_weights_flat, _ = self.tok_pool.select_topk(BT_logits_biased)
 
                 topk_idx = topk_idx_flat.reshape(B, T, cfg.tok_top_k)
@@ -496,8 +518,8 @@ class LLooM(nn.Module):
                     side = torch.where(do_bridge, torch.ones_like(side), side)
                     n_bridges = torch.where(do_bridge, n_bridges + 1, n_bridges)
                     routing_decisions = torch.where(do_bridge, routing_decisions + 1, routing_decisions)
-                    # Bridge counts as a tok hop (builds exit pressure)
-                    tok_hops_used = tok_hops_used + 1
+                    # Bridge counts as a tok hop — only for bridging samples
+                    tok_hops = torch.where(do_bridge, tok_hops + 1, tok_hops)
                     global_hop = global_hop + 1
                     # Produce entry logits for seq pool
                     x_pooled_for_seq = x.mean(dim=1)  # (B, D)
@@ -524,15 +546,15 @@ class LLooM(nn.Module):
                         current_tok_logits,
                     )
                     routing_decisions = torch.where(do_continue, routing_decisions + 1, routing_decisions)
-                    tok_hops_used = tok_hops_used + 1
+                    # Only increment hops for continuing samples
+                    tok_hops = torch.where(do_continue, tok_hops + 1, tok_hops)
                     global_hop = global_hop + 1
 
-                # Budget check
-                if tok_hops_used >= cfg.tok_max_hops:
-                    still_on_tok = side == 2
-                    side = torch.where(still_on_tok, torch.zeros_like(side), side)
+                # Per-sample budget check: force-exit samples whose tok hops are exhausted
+                tok_over_budget = (tok_hops >= cfg.tok_max_hops) & (side == 2)
+                side = torch.where(tok_over_budget, torch.zeros_like(side), side)
 
-            # Bridge crossing limit
+            # Bridge crossing limit (per-sample)
             over_bridge_limit = n_bridges >= cfg.max_bridge_crossings
             still_active = side > 0
             side = torch.where(over_bridge_limit & still_active, torch.zeros_like(side), side)
@@ -543,9 +565,9 @@ class LLooM(nn.Module):
         # --- Final norm ---
         x = self.final_norm(x)
 
-        info['mean_seq_hops'] = seq_hops_used.float()
-        info['mean_tok_hops'] = tok_hops_used.float()
-        info['mean_global_hops'] = global_hop.float()
+        info['mean_seq_hops'] = seq_hops.float().mean()
+        info['mean_tok_hops'] = tok_hops.float().mean()
+        info['mean_global_hops'] = (seq_hops + tok_hops).float().mean()
         info['mean_bridges'] = n_bridges.float().mean()
         info['mean_routing_decisions'] = routing_decisions.float().mean()
 
