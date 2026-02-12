@@ -169,13 +169,16 @@ class LLooM(nn.Module):
         existing: tuple[torch.Tensor, torch.Tensor,
                         torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate FiLM only for masked samples, scatter into batch tensors.
+        """Generate FiLM for masked samples, keep existing for others.
+
+        Uses torch.where (static shapes) instead of boolean indexing to
+        avoid aten.nonzero which breaks torch.compile/inductor.
 
         Args:
             x: (B, T, D) hidden states.
             mask: (B,) bool — which samples need new FiLM vectors.
-            existing: Previous FiLM tuple to update in-place, or None to
-                create fresh zero-initialized tensors.
+            existing: Previous FiLM tuple to blend with, or None to
+                use identity (gamma=1, beta=0) for non-masked samples.
 
         Returns:
             (gamma_up, beta_up, gamma_down, beta_down): each (B, dim_i).
@@ -192,18 +195,15 @@ class LLooM(nn.Module):
             g_down = torch.ones(B, cfg.dim, device=x.device, dtype=x.dtype)
             b_down = torch.zeros(B, cfg.dim, device=x.device, dtype=x.dtype)
 
-        # Generate only for masked samples
-        x_sub = x[mask]  # (N_active, T, D)
-        sg_up, sb_up, sg_down, sb_down = self.tok_pool.generate_film(x_sub)
+        # Generate for full batch (static shapes, compiler-friendly)
+        new_g_up, new_b_up, new_g_down, new_b_down = self.tok_pool.generate_film(x)
 
-        g_up = g_up.clone()
-        b_up = b_up.clone()
-        g_down = g_down.clone()
-        b_down = b_down.clone()
-        g_up[mask] = sg_up
-        b_up[mask] = sb_up
-        g_down[mask] = sg_down
-        b_down[mask] = sb_down
+        # Blend: masked samples get new FiLM, others keep existing
+        m = mask[:, None]  # (B, 1) for broadcasting
+        g_up = torch.where(m, new_g_up, g_up)
+        b_up = torch.where(m, new_b_up, b_up)
+        g_down = torch.where(m, new_g_down, g_down)
+        b_down = torch.where(m, new_b_down, b_down)
 
         return g_up, b_up, g_down, b_down
 
@@ -278,10 +278,10 @@ class LLooM(nn.Module):
         n_bridges = torch.zeros(B, dtype=torch.long, device=device)
 
         # Active state: which side each sample is currently on
-        # 0=done, 1=seq, 2=tok
+        # 0=done, 1=seq, 2=tok  (torch.where instead of bool indexing for compile)
         side = torch.zeros(B, dtype=torch.long, device=device)
-        side[go_seq] = 1
-        side[go_tok] = 2
+        side = torch.where(go_seq, torch.ones_like(side), side)
+        side = torch.where(go_tok, torch.full_like(side, 2), side)
         # go_exit samples stay at 0 (done)
 
         # Per-sample state
@@ -294,9 +294,9 @@ class LLooM(nn.Module):
         # Generate FiLM for samples entering token side directly from stem
         if go_tok.any():
             tok_film = self._generate_film_masked(x, go_tok)
-            tok_first_hop[go_tok] = True
 
         # Fixed iteration loop for torch.compile compatibility
+        # All state mutations use torch.where (static shapes, no aten.nonzero)
         total_max_iters = cfg.seq_max_hops + cfg.tok_max_hops + cfg.max_bridge_crossings
         for _ in range(total_max_iters):
             any_active = side > 0
@@ -306,9 +306,9 @@ class LLooM(nn.Module):
             # --- Sequence side hops ---
             on_seq = side == 1
             if on_seq.any():
-                # Per-side hop for exit ramp/budget, global hop for embeddings
-                seq_hop = int(seq_hops_used[on_seq].max().item())
-                g_hop = int(global_hops_used[on_seq].max().item())
+                # Masked max for hop counts (hops are non-negative, so masking with 0 is safe)
+                seq_hop = int((seq_hops_used * on_seq.long()).max().item())
+                g_hop = int((global_hops_used * on_seq.long()).max().item())
                 x_new, still_active, do_exit, do_bridge, next_expert, _ = \
                     self.seq_pool(
                         x, on_seq, hops_used=seq_hop,
@@ -317,32 +317,33 @@ class LLooM(nn.Module):
                         global_hop=g_hop,
                     )
                 x = x_new
-                seq_hops_used[on_seq] += 1
-                global_hops_used[on_seq] += 1
+                seq_hops_used = torch.where(on_seq, seq_hops_used + 1, seq_hops_used)
+                global_hops_used = torch.where(on_seq, global_hops_used + 1, global_hops_used)
                 current_seq_expert = next_expert
 
                 # Handle exits
                 exiting = do_exit & on_seq
-                side[exiting] = 0
+                side = torch.where(exiting, torch.zeros_like(side), side)
 
                 # Handle bridges to token side
                 bridging = do_bridge & on_seq
                 if bridging.any():
-                    side[bridging] = 2
-                    n_bridges[bridging] += 1
+                    side = torch.where(bridging, torch.full_like(side, 2), side)
+                    n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
                     tok_film = self._generate_film_masked(x, bridging, existing=tok_film)
-                    tok_first_hop[bridging] = True
+                    tok_first_hop = tok_first_hop | bridging
                     tok_vote_state = None  # reset for new token-side visit
 
-                # Samples that continue stay on seq
+                # Samples that didn't exit, bridge, or continue → done
                 continuing = still_active & on_seq
-                side[on_seq & ~exiting & ~bridging & ~continuing] = 0
+                fell_off = on_seq & ~exiting & ~bridging & ~continuing
+                side = torch.where(fell_off, torch.zeros_like(side), side)
 
             # --- Token side hops ---
             on_tok = side == 2
             if on_tok.any():
-                tok_hop = int(tok_hops_used[on_tok].max().item())
-                g_hop = int(global_hops_used[on_tok].max().item())
+                tok_hop = int((tok_hops_used * on_tok.long()).max().item())
+                g_hop = int((global_hops_used * on_tok.long()).max().item())
                 is_first = tok_first_hop.any()
                 x_new, still_active, do_exit, do_bridge, new_tok_expert, \
                     tok_vote_state, _ = self.tok_pool(
@@ -355,23 +356,24 @@ class LLooM(nn.Module):
                         global_hop=g_hop,
                     )
                 x = x_new
-                tok_hops_used[on_tok] += 1
-                global_hops_used[on_tok] += 1
+                tok_hops_used = torch.where(on_tok, tok_hops_used + 1, tok_hops_used)
+                global_hops_used = torch.where(on_tok, global_hops_used + 1, global_hops_used)
                 current_tok_expert = new_tok_expert
-                tok_first_hop[:] = False
+                tok_first_hop = torch.zeros(B, dtype=torch.bool, device=device)
 
                 # Handle exits
                 exiting = do_exit & on_tok
-                side[exiting] = 0
+                side = torch.where(exiting, torch.zeros_like(side), side)
 
                 # Handle bridges to sequence side
                 bridging = do_bridge & on_tok
                 if bridging.any():
-                    side[bridging] = 1
-                    n_bridges[bridging] += 1
+                    side = torch.where(bridging, torch.ones_like(side), side)
+                    n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
 
                 continuing = still_active & on_tok
-                side[on_tok & ~exiting & ~bridging & ~continuing] = 0
+                fell_off = on_tok & ~exiting & ~bridging & ~continuing
+                side = torch.where(fell_off, torch.zeros_like(side), side)
 
         # --- Exit stem ---
         x = self.exit_stem(x)
