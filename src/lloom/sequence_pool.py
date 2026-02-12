@@ -45,8 +45,9 @@ class SequencePool(RoutingPool):
 
     def __init__(self, pool_size: int, dim: int, inner_dim: int,
                  n_heads: int, top_k: int = 2, max_hops: int = 16,
-                 exit_bias_init: float = 0.0, bridge_bias_init: float = 0.0,
-                 exit_ramp_scale: float = 3.0, router_noise: float = 1.0,
+                 exit_bias_init: float | None = None,
+                 bridge_bias_init: float | None = None,
+                 exit_ramp_scale: float = 10.0, router_noise: float = 1.0,
                  expert_shared_fraction: float = 0.5,
                  router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,

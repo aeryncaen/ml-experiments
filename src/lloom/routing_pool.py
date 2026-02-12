@@ -17,6 +17,7 @@ Subclasses (SequencePool, TokenPool) provide:
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 import torch
@@ -45,9 +46,9 @@ class RoutingPool(nn.Module, ABC):
     """
 
     def __init__(self, pool_size: int, dim: int, top_k: int,
-                 max_hops: int, exit_bias_init: float = 0.0,
-                 bridge_bias_init: float = 0.0,
-                 exit_ramp_scale: float = 3.0,
+                 max_hops: int, exit_bias_init: float | None = None,
+                 bridge_bias_init: float | None = None,
+                 exit_ramp_scale: float = 10.0,
                  router_noise: float = 1.0,
                  router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,
@@ -57,8 +58,12 @@ class RoutingPool(nn.Module, ABC):
         self.dim = dim
         self.top_k = top_k
         self.max_hops = max_hops
-        self.exit_bias_init = exit_bias_init
-        self.bridge_bias_init = bridge_bias_init
+
+        # None = auto: log(pool_size) gives equal 1/3 init probability for
+        # (any expert, exit, bridge) since pool_size * exp(0) = exp(log(P))
+        auto_bias = math.log(pool_size) if pool_size > 1 else 0.0
+        self.exit_bias_init = exit_bias_init if exit_bias_init is not None else auto_bias
+        self.bridge_bias_init = bridge_bias_init if bridge_bias_init is not None else auto_bias
         self.exit_ramp_scale = exit_ramp_scale
         self.router_noise_scale = router_noise
         self.router_shared_fraction = router_shared_fraction

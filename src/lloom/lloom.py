@@ -115,9 +115,15 @@ class LLooM(nn.Module):
 
         # --- Stem router: sample-level → seq pool expert / token pool / exit ---
         # Options: seq_pool_size experts + bridge-to-token + exit
+        # Bias init: log(pool_size) for exit/bridge slots so that at init each
+        # category (any expert, exit, bridge) has equal ~1/3 probability.
         self.stem_router = nn.Linear(config.dim, config.stem_n_options, bias=True)
         nn.init.normal_(self.stem_router.weight, std=config.dim ** -0.5)
-        nn.init.zeros_(self.stem_router.bias)
+        with torch.no_grad():
+            self.stem_router.bias.zero_()
+            stem_bias = math.log(config.seq_pool_size) if config.seq_pool_size > 1 else 0.0
+            self.stem_router.bias[config.seq_pool_size] = stem_bias      # bridge-to-token
+            self.stem_router.bias[config.seq_pool_size + 1] = stem_bias  # exit
 
         # --- Sequence pool ---
         self.seq_pool = SequencePool(

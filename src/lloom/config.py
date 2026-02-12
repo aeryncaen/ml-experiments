@@ -37,8 +37,10 @@ class LLooMConfig:
     tok_max_hops: int = 32             # generous — MLP hops are cheap
 
     # ---------- routing ----------
-    exit_bias_init: float = 0.0        # starting scalar bias for exit slot
-    bridge_bias_init: float = 0.0      # starting scalar bias for bridge slot
+    # exit_bias_init / bridge_bias_init: None = auto = log(pool_size), giving
+    # equal 1/3 probability at init for (any expert, exit, bridge) categories.
+    exit_bias_init: float | None = None   # starting scalar bias for exit slot
+    bridge_bias_init: float | None = None # starting scalar bias for bridge slot
     exit_ramp_scale: float = 10.0      # exit_bias_init + ramp * (hops_used / max_hops)
     router_noise: float = 1.0          # gaussian noise scale, annealed to 0
 
