@@ -1305,8 +1305,9 @@ def train(args):
     # Data
     text = load_shakespeare()
     vocab_size = VOCAB_SIZE
+    ngram_label = {1: 'char', 2: 'bigram', 3: 'trigram'}.get(NGRAM, f'{NGRAM}-gram')
     print(f"Shakespeare: {len(text):,} chars, alphabet={ALPHABET_SIZE}, "
-          f"vocab_size={vocab_size} (trigram)")
+          f"vocab_size={vocab_size} ({ngram_label})")
 
     n_train = int(0.9 * len(text))
     train_text, val_text = text[:n_train], text[n_train:]
@@ -1341,7 +1342,7 @@ def train(args):
     print(f"Arch: {args.arch}, Mode: {args.mode}, Params: {n_params:,}")
     print(f"  dim={args.dim}, n_heads={args.n_heads}, n_layers={args.n_layers}, seq_len={args.seq_len}")
     if is_mlm:
-        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-trigram)")
+        print(f"  mask_prob=0.15→{args.mask_prob} over first half (curriculum), gen_len=1 (single next-token)")
     elif is_llada:
         backbone_type = type(model.backbone).__name__
         print(f"  backbone={backbone_type}")
@@ -1638,6 +1639,12 @@ def interactive_generate(args):
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_args = argparse.Namespace(**ckpt['args'])
+
+    # Restore ngram setting from checkpoint
+    global NGRAM, VOCAB_SIZE
+    NGRAM = getattr(saved_args, 'ngram', 2)  # old checkpoints default to bigram
+    VOCAB_SIZE = ALPHABET_SIZE ** NGRAM
+
     vocab_size = ckpt.get('vocab_size', VOCAB_SIZE)
 
     # Use mode/arch from checkpoint, allow CLI overrides for gen params
@@ -1710,6 +1717,8 @@ def main():
                         help='Load checkpoint and run interactive generation (skip training)')
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature (AR)')
     parser.add_argument('--gen-len', type=int, default=256, help='Generation length')
+    parser.add_argument('--ngram', type=int, default=1,
+                        help='N-gram tokenization (1=chars/bytes, 2=bigrams, 3=trigrams)')
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada', 'mlm'],
                         help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (BERT-style)')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
@@ -1817,6 +1826,11 @@ def main():
                         help='torch.compile mode')
 
     args = parser.parse_args()
+
+    # Set n-gram tokenization globals
+    global NGRAM, VOCAB_SIZE
+    NGRAM = args.ngram
+    VOCAB_SIZE = ALPHABET_SIZE ** NGRAM
 
     # Default pool_size to n_layers if not set
     if args.pool_size is None:
