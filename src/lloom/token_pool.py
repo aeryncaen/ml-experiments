@@ -295,22 +295,25 @@ class TokenPool(RoutingPool):
         return x  # raw passthrough
 
     def forward(self, x: torch.Tensor, active_mask: torch.Tensor,
-                hops_used: int,
+                hops_used: int | torch.Tensor,
                 film_params: tuple[torch.Tensor, torch.Tensor,
                                    torch.Tensor, torch.Tensor] | None = None,
                 vote_state: torch.Tensor | None = None,
                 current_expert: torch.Tensor | None = None,
                 is_first_hop: bool = False,
                 noise_scale: float | None = None,
-                global_hop: int | None = None
+                global_hop: int | torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                           torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+                           torch.Tensor, torch.Tensor, torch.Tensor | None,
+                           int | torch.Tensor]:
         """Run one hop of token-side routing.
 
         Args:
             x: (B, T, D) hidden states.
             active_mask: (B,) bool — which samples are active.
             hops_used: Cumulative hops consumed on this side (for exit ramp / budget).
+                Can be int or scalar tensor (scalar tensor avoids recompilation
+                under torch.compile).
             film_params: FiLM conditioning tuple or None.
             vote_state: (B, T) int8 sticky vote state (0=active, 1=exit, 2=bridge).
                 Created if None. Modified in-place.
@@ -319,7 +322,7 @@ class TokenPool(RoutingPool):
             is_first_hop: Whether this is the first hop on this visit.
             noise_scale: Override router noise.
             global_hop: Global hop index across both sides (for hop embeddings).
-                Falls back to hops_used if None.
+                Falls back to hops_used if None. Can be int or scalar tensor.
 
         Returns:
             x: (B, T, D) updated hidden states.

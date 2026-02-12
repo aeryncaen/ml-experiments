@@ -204,8 +204,14 @@ class LLooMBenchWrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, info = self.lloom(x, noise_scale=self.router_noise_scale)
         self.aux_loss = 0.0  # placeholder for future routing loss
-        self.last_info = info
-        self.last_mean_hops = info.get('mean_global_hops')
+        # Materialize tensor values to Python floats — info dict comes from
+        # LLooM.forward() which stores raw tensors (no .item()) so that the
+        # compiled graph has no graph-breaking scalar extractions.
+        self.last_info = {
+            k: (v.item() if isinstance(v, torch.Tensor) else v)
+            for k, v in info.items()
+        }
+        self.last_mean_hops = self.last_info.get('mean_global_hops')
         return out
 
 

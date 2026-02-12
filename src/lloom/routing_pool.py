@@ -160,7 +160,7 @@ class RoutingPool(nn.Module, ABC):
         noise = torch.randn_like(logits) * scale
         return logits + noise
 
-    def apply_biases(self, logits: torch.Tensor, hops_used: int
+    def apply_biases(self, logits: torch.Tensor, hops_used: int | torch.Tensor
                      ) -> torch.Tensor:
         """Apply exit ramp bias and fixed bridge bias.
 
@@ -169,7 +169,7 @@ class RoutingPool(nn.Module, ABC):
 
         Args:
             logits: (..., n_options) router logits.
-            hops_used: Number of hops already consumed on this side.
+            hops_used: Number of hops already consumed on this side (int or scalar tensor).
 
         Returns:
             (..., n_options) biased logits.
@@ -232,13 +232,14 @@ class RoutingPool(nn.Module, ABC):
 
     def apply_hop_conditioning(self, x: torch.Tensor,
                                expert_idx: torch.Tensor,
-                               hop: int) -> torch.Tensor:
+                               hop: int | torch.Tensor) -> torch.Tensor:
         """Apply hop norm + content-gated hop embedding.
 
         Args:
             x: (..., dim) hidden states.
             expert_idx: (...,) expert indices (for per-expert hop embeddings).
-            hop: Current hop index (0-based).
+            hop: Current hop index (0-based). Can be int or scalar tensor
+                (scalar tensor avoids recompilation under torch.compile).
 
         Returns:
             (..., dim) conditioned hidden states.
@@ -247,7 +248,11 @@ class RoutingPool(nn.Module, ABC):
         x = self.hop_norm(x)
 
         # Gather hop embedding for (expert, hop)
-        hop_clamped = min(hop, self.global_max_hops - 1)
+        # Use torch.clamp instead of min() — Python min() with tensor causes graph break
+        if isinstance(hop, torch.Tensor):
+            hop_clamped = torch.clamp(hop, max=self.global_max_hops - 1)
+        else:
+            hop_clamped = min(hop, self.global_max_hops - 1)
         flat_idx = expert_idx.reshape(-1).clamp(max=self.pool_size - 1)
 
         # Private: (N, dim_private)

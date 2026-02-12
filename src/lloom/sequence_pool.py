@@ -116,22 +116,24 @@ class SequencePool(RoutingPool):
         return x
 
     def forward(self, x: torch.Tensor, active_mask: torch.Tensor,
-                hops_used: int, current_expert: torch.Tensor,
+                hops_used: int | torch.Tensor, current_expert: torch.Tensor,
                 noise_scale: float | None = None,
-                global_hop: int | None = None
+                global_hop: int | torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                           torch.Tensor, torch.Tensor, int]:
+                           torch.Tensor, torch.Tensor, int | torch.Tensor]:
         """Run one hop of sequence-side routing.
 
         Args:
             x: (B, T, D) hidden states.
             active_mask: (B,) bool — which samples are still active on this side.
             hops_used: Cumulative hops consumed on this side (for exit ramp / budget).
+                Can be int or scalar tensor (scalar tensor avoids recompilation
+                under torch.compile).
             current_expert: (B,) int — which expert each sample is currently at
                 (used for outbound router and hop embedding selection).
             noise_scale: Override router noise (None = use default).
             global_hop: Global hop index across both sides (for hop embeddings).
-                Falls back to hops_used if None.
+                Falls back to hops_used if None. Can be int or scalar tensor.
 
         Returns:
             x: (B, T, D) updated hidden states (inactive samples unchanged).

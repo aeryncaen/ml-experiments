@@ -268,9 +268,9 @@ class LLooM(nn.Module):
         # --- Stem routing ---
         go_seq, go_tok, go_exit, seq_expert, stem_logits = self._stem_route(x, ns)
         info['stem_logits'] = stem_logits
-        info['stem_go_seq'] = go_seq.float().mean().item()
-        info['stem_go_tok'] = go_tok.float().mean().item()
-        info['stem_go_exit'] = go_exit.float().mean().item()
+        info['stem_go_seq'] = go_seq.float().mean()
+        info['stem_go_tok'] = go_tok.float().mean()
+        info['stem_go_exit'] = go_exit.float().mean()
 
         # --- Main routing loop ---
         # Track cumulative hops: per-side (for exit ramp/budget) and global (for hop embeds)
@@ -309,8 +309,9 @@ class LLooM(nn.Module):
             on_seq = side == 1
             if on_seq.any():
                 # Masked max for hop counts (hops are non-negative, so masking with 0 is safe)
-                seq_hop = int((seq_hops_used * on_seq.long()).max().item())
-                g_hop = int((global_hops_used * on_seq.long()).max().item())
+                # Keep as scalar tensors — Python ints cause recompilation per unique value
+                seq_hop = (seq_hops_used * on_seq.long()).max()
+                g_hop = (global_hops_used * on_seq.long()).max()
                 x_new, still_active, do_exit, do_bridge, next_expert, _ = \
                     self.seq_pool(
                         x, on_seq, hops_used=seq_hop,
@@ -344,8 +345,8 @@ class LLooM(nn.Module):
             # --- Token side hops ---
             on_tok = side == 2
             if on_tok.any():
-                tok_hop = int((tok_hops_used * on_tok.long()).max().item())
-                g_hop = int((global_hops_used * on_tok.long()).max().item())
+                tok_hop = (tok_hops_used * on_tok.long()).max()
+                g_hop = (global_hops_used * on_tok.long()).max()
                 is_first = tok_first_hop.any()
                 x_new, still_active, do_exit, do_bridge, new_tok_expert, \
                     tok_vote_state, _ = self.tok_pool(
@@ -383,9 +384,9 @@ class LLooM(nn.Module):
         # --- Final norm ---
         x = self.final_norm(x)
 
-        info['mean_seq_hops'] = seq_hops_used.float().mean().item()
-        info['mean_tok_hops'] = tok_hops_used.float().mean().item()
-        info['mean_global_hops'] = global_hops_used.float().mean().item()
-        info['mean_bridges'] = n_bridges.float().mean().item()
+        info['mean_seq_hops'] = seq_hops_used.float().mean()
+        info['mean_tok_hops'] = tok_hops_used.float().mean()
+        info['mean_global_hops'] = global_hops_used.float().mean()
+        info['mean_bridges'] = n_bridges.float().mean()
 
         return x, info
