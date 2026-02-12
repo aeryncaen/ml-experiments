@@ -102,6 +102,17 @@ def lloom_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
                 and 'hop_gate_proj' not in name:
             nn.init.zeros_(param)
 
+    # Rescale exit/bridge biases and exit ramp to match the new router logit
+    # scale.  Original router init is dim^{-0.5}; Megatron sets it to `std`.
+    # Without rescaling, the ramp overwhelms the tiny post-Megatron logits.
+    for name, module in model.named_modules():
+        if hasattr(module, 'exit_ramp_scale') and hasattr(module, 'dim'):
+            original_std = module.dim ** -0.5
+            scale = std / original_std
+            module.exit_ramp_scale *= scale
+            module.exit_bias_init *= scale
+            module.bridge_bias_init *= scale
+
 
 # ---------------------------------------------------------------------------
 # Stem block: a full transformer block (attention + SwiGLU MLP)
