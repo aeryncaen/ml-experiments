@@ -325,21 +325,21 @@ class ULBBlock(nn.Module):
 
 
 class UniversalSequenceBlock(nn.Module):
-    """ULBBlock stripped of up/down projections — pure attention compute.
+    """Pure attention compute block for TriplePoolGraphLearner.
 
-    Used as sequence-pool experts in TriplePoolGraphLearner.
-    The databank token pools handle the MLP-like enrichment/refinement,
-    so this block only does QKV→attention→o_proj with skip-multiply.
+    Operates entirely at inner_dim. The token pool banks handle
+    up-projection (d_model → inner_dim) and down-projection
+    (inner_dim → d_model). This block just does QKV → attention →
+    skip-multiply against its input (the up-projected hidden state).
 
     Architecture:
-        q, k, v = q_proj(x), k_proj(x), v_proj(x)   # d→inner (upscale)
+        q, k, v = q_proj(x), k_proj(x), v_proj(x)   # inner→inner
         q = q_norm(q) * q_bias
         k = k_norm(k) * k_bias
         k = k_mix(k, x)
         q, k = rope(q, k, dd_angles)
         y = attend(q, k, v)
-        y = o_proj(y)                                  # inner→d (downscale)
-        y = attn_norm(y) * x                           # skip-multiply against input
+        y = attn_norm(y) * x                          # skip-multiply at inner_dim
         return y
 
     Args:
@@ -352,23 +352,19 @@ class UniversalSequenceBlock(nn.Module):
             config = ULBConfig(**kwargs)
         self.config = config
 
-        d = config.d_model
         inner = config.inner_dim
         n_heads = config.n_heads
         head_dim = config.head_dim
 
         self.aux_loss = 0.0
 
-        # QKV: project from d_model up to inner_dim. KV have bias, Q does not.
-        self.q_proj = nn.Linear(d, inner, bias=False)
-        self.k_proj = nn.Linear(d, inner, bias=True)
-        self.v_proj = nn.Linear(d, inner, bias=True)
+        # QKV: all at inner_dim. KV have bias, Q does not.
+        self.q_proj = nn.Linear(inner, inner, bias=False)
+        self.k_proj = nn.Linear(inner, inner, bias=True)
+        self.v_proj = nn.Linear(inner, inner, bias=True)
 
-        # Output projection: inner_dim back to d_model
-        self.o_proj = nn.Linear(inner, d, bias=False)
-
-        # --- Post-attention norm (before skip-multiply, at d_model) ---
-        self.attn_norm = nn.RMSNorm(d)
+        # --- Post-attention norm (before skip-multiply, at inner_dim) ---
+        self.attn_norm = nn.RMSNorm(inner)
 
         # --- QK norm + post-norm bias (Mamba-3 style BC bias, init ones) ---
         self.q_norm = nn.RMSNorm(head_dim)
@@ -379,18 +375,18 @@ class UniversalSequenceBlock(nn.Module):
         # --- Temporal mixing ---
         quarter_dim = head_dim // 4
 
-        # K mixing
+        # K mixing (all at inner_dim)
         self.k_lerp: CausalLerp | CausalAdd | KAcausalLerp | KAcausalAdd | None = None
         self.k_conv: KTemporalConv | None = None
         k_mix = config.k_mix
         if k_mix == 'lerp':
-            self.k_lerp = CausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+            self.k_lerp = CausalLerp(inner, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'add':
-            self.k_lerp = CausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+            self.k_lerp = CausalAdd(inner, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'acausal_lerp':
-            self.k_lerp = KAcausalLerp(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+            self.k_lerp = KAcausalLerp(inner, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'acausal_add':
-            self.k_lerp = KAcausalAdd(d, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
+            self.k_lerp = KAcausalAdd(inner, n_heads, quarter_dim, init_bias=config.k_lerp_bias)
         elif k_mix == 'conv2':
             self.k_conv = KTemporalConv(n_heads, quarter_dim, kernel_size=2)
         elif k_mix == 'conv3':
@@ -400,8 +396,8 @@ class UniversalSequenceBlock(nn.Module):
         else:
             raise ValueError(f"Unknown k_mix mode: {k_mix}")
 
-        # --- Hybrid RoPE ---
-        self.rope = HybridRoPE(d, n_heads, head_dim, rope_base=config.rope_base)
+        # --- Hybrid RoPE (DD angles from inner_dim input) ---
+        self.rope = HybridRoPE(inner, n_heads, head_dim, rope_base=config.rope_base)
         if config.paired:
             self.paired_rope = PairedRoPE(n_heads, head_dim, rope_base=config.rope_base)
 
@@ -409,7 +405,7 @@ class UniversalSequenceBlock(nn.Module):
         self.blend_attn: BlendAttention | None = None
         if config.attn_mode == 'blend':
             self.blend_attn = BlendAttention(
-                d, n_heads, head_dim, init_bias=config.blend_gate_bias)
+                inner, n_heads, head_dim, init_bias=config.blend_gate_bias)
 
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 blend_gate: torch.Tensor | None = None) -> torch.Tensor:
@@ -469,20 +465,20 @@ class UniversalSequenceBlock(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass. Input and output are at inner_dim.
 
         Args:
-            x: (B, T, D) — pre-normed input.
+            x: (B, T, inner_dim) — up-projected input from pre-token bank.
 
         Returns:
-            (B, T, D) block output.
+            (B, T, inner_dim) — attention output with skip-multiply.
         """
         cfg = self.config
-        b, t, d = x.shape
+        b, t, _ = x.shape
         n_heads = cfg.n_heads
         head_dim = cfg.head_dim
 
-        # --- QKV projections + norm + bias (directly from input) ---
+        # --- QKV projections + norm + bias (inner→inner) ---
         q = self.q_proj(x).view(b, t, n_heads, head_dim)
         k = self.k_proj(x).view(b, t, n_heads, head_dim)
         v = self.v_proj(x).view(b, t, n_heads, head_dim)
@@ -495,9 +491,6 @@ class UniversalSequenceBlock(nn.Module):
         # --- Attention ---
         y = self.attend(q, k, v, dd_angles, blend_gate)
         y = y.contiguous().view(b, t, cfg.inner_dim)
-
-        # --- Output projection (inner_dim → d_model) ---
-        y = self.o_proj(y)
 
         # --- Skip-multiply against input (NOT skip-add) ---
         y = self.attn_norm(y) * x
@@ -533,6 +526,91 @@ class UniversalTokenBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.linear(x))
+
+
+class TokenParamBank(nn.Module):
+    """Banked token-level experts with batched dispatch — no Python loops.
+
+    Stacks all expert weights into parameter banks and uses gather/scatter
+    for routing. Each expert is act(linear(x)): a (in_dim, out_dim) weight
+    + optional per-channel learnable swish beta.
+
+    Supports asymmetric dims for up-projection (d_model → inner_dim) and
+    down-projection (inner_dim → d_model).
+
+    Forward:
+        1. Receive pre-computed routing decisions (topk_idx, topk_weights)
+        2. Gather weights from bank for each token's assigned experts
+        3. Batched matmul + activation
+        4. Weighted sum over top-k, with exit slots → zero contribution
+
+    Args:
+        pool_size: Number of experts in the bank.
+        in_dim: Input dimension.
+        out_dim: Output dimension.
+        top_k: Top-k experts per token.
+        n_options: Router output size (pool_size + exit slots).
+        swish_mode: 'learnable' or 'silu'.
+    """
+
+    def __init__(self, pool_size: int, in_dim: int, out_dim: int, top_k: int = 2,
+                 n_options: int | None = None, swish_mode: str = 'learnable'):
+        super().__init__()
+        self.pool_size = pool_size
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.top_k = top_k
+        self.n_options = n_options if n_options is not None else pool_size + 1
+        self.swish_mode = swish_mode
+
+        # Weight bank: (pool_size, in_dim, out_dim)
+        self.weight_bank = nn.Parameter(torch.randn(pool_size, in_dim, out_dim) * (in_dim ** -0.5))
+
+        # Activation (applied at out_dim)
+        if swish_mode == 'learnable':
+            self.beta_bank = nn.Parameter(torch.ones(pool_size, out_dim))
+        else:
+            self.beta_bank = None
+
+    def forward(self, x_flat: torch.Tensor, topk_idx: torch.Tensor,
+                topk_weights: torch.Tensor, all_exit: torch.Tensor) -> torch.Tensor:
+        """Batched expert dispatch.
+
+        Args:
+            x_flat: (N, in_dim) flattened input tokens.
+            topk_idx: (N, top_k) expert indices per token (may include exit slots >= pool_size).
+            topk_weights: (N, top_k) normalized weights (exit slots already zeroed).
+            all_exit: (N,) bool — tokens where all top-k are exit slots.
+
+        Returns:
+            (N, out_dim) output tokens. All-exit tokens get zeros.
+        """
+        N = x_flat.shape[0]
+
+        # Clamp indices to valid range for gathering (exit slots → 0, weight is already 0)
+        safe_idx = topk_idx.clamp(max=self.pool_size - 1)  # (N, top_k)
+
+        # Gather weights: (N, top_k, in_dim, out_dim)
+        w = self.weight_bank[safe_idx.view(-1)].view(N, self.top_k, self.in_dim, self.out_dim)
+
+        # Batched matmul: x (N, in_dim) @ w (N, top_k, in_dim, out_dim) → (N, top_k, out_dim)
+        expert_out = torch.einsum('ni,nkij->nkj', x_flat, w)
+
+        # Activation
+        if self.beta_bank is not None:
+            beta = self.beta_bank[safe_idx.view(-1)].view(N, self.top_k, self.out_dim)
+            expert_out = expert_out * torch.sigmoid(beta * expert_out)
+        else:
+            expert_out = F.silu(expert_out)
+
+        # Weighted sum over top-k: (N, top_k, out_dim) * (N, top_k, 1) → (N, out_dim)
+        # Exit slots have zero weight, so they contribute nothing.
+        out = (expert_out * topk_weights.unsqueeze(-1)).sum(dim=1)
+
+        # All-exit tokens: zero output (caller handles residual)
+        out = out.masked_fill(all_exit.unsqueeze(-1), 0.0)
+
+        return out
 
 
 def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,

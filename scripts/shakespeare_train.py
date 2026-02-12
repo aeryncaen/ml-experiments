@@ -410,7 +410,7 @@ def build_ulb_poe(vocab_size: int, args) -> nn.Module:
 
 def _make_tpgl_stacker(args, dim: int, is_causal: bool):
     """Build a TriplePoolGraphLearner stacker from CLI args."""
-    from ulb.block import ULBConfig, UniversalSequenceBlock, UniversalTokenBlock
+    from ulb.block import ULBConfig, UniversalSequenceBlock
     from ulb.stack import TriplePoolGraphLearner
     config = ULBConfig(
         d_model=dim,
@@ -423,12 +423,11 @@ def _make_tpgl_stacker(args, dim: int, is_causal: bool):
     )
     return TriplePoolGraphLearner(
         make_seq_block=lambda: UniversalSequenceBlock(config),
-        make_pre_block=lambda: UniversalTokenBlock(dim, swish_mode=args.swish_mode),
-        make_post_block=lambda: UniversalTokenBlock(dim, swish_mode=args.swish_mode),
         seq_pool_size=args.pool_size,
         pre_pool_size=args.pre_pool_size,
         post_pool_size=args.post_pool_size,
         dim=dim,
+        inner_dim=config.inner_dim,
         seq_top_k=args.top_k,
         pre_top_k=args.pre_top_k,
         post_top_k=args.post_top_k,
@@ -437,13 +436,10 @@ def _make_tpgl_stacker(args, dim: int, is_causal: bool):
         pre_router_mode=args.pre_router_mode,
         post_router_mode=args.post_router_mode,
         router_noise=args.router_noise,
+        swish_mode=args.swish_mode,
         seq_shared_fraction=args.block_shared_fraction,
         seq_router_shared_fraction=args.router_shared_fraction,
         seq_hop_shared_fraction=args.hop_shared_fraction,
-        pre_shared_fraction=args.pre_shared_fraction,
-        pre_router_shared_fraction=args.pre_router_shared_fraction,
-        post_shared_fraction=args.post_shared_fraction,
-        post_router_shared_fraction=args.post_router_shared_fraction,
     )
 
 
@@ -1364,8 +1360,6 @@ def train(args):
         print(f"  seq_router={args.router_mode}, pre_router={args.pre_router_mode}, post_router={args.post_router_mode}")
         print(f"  seq_shared={args.block_shared_fraction}, seq_router_shared={args.router_shared_fraction}, "
               f"hop_shared={args.hop_shared_fraction}")
-        print(f"  pre_shared={args.pre_shared_fraction}, pre_router_shared={args.pre_router_shared_fraction}")
-        print(f"  post_shared={args.post_shared_fraction}, post_router_shared={args.post_router_shared_fraction}")
 
     if is_llada:
         llada_features = []
@@ -1466,7 +1460,9 @@ def train(args):
             frac = min((epoch - 1) / ramp_end, 1.0)
             cur_mask_prob = 0.15 + frac * (args.mask_prob - 0.15)
 
-        for step in range(args.steps_per_epoch):
+        step_pbar = tqdm(range(args.steps_per_epoch), desc=f"  Epoch {epoch}",
+                         unit="step", leave=False)
+        for step in step_pbar:
             batch = train_ds.sample_batch(args.batch_size, device)
 
             if is_mlm:
@@ -1486,6 +1482,11 @@ def train(args):
             scheduler.step()
             epoch_loss += loss
             epoch_acc += acc
+
+            # Update inner progress bar with running averages
+            steps_done = step + 1
+            step_pbar.set_postfix(loss=f"{epoch_loss/steps_done:.4f}",
+                                  acc=f"{epoch_acc/steps_done:.1%}")
 
         avg_loss = epoch_loss / args.steps_per_epoch
         avg_acc = epoch_acc / args.steps_per_epoch
@@ -1759,14 +1760,7 @@ def main():
     parser.add_argument('--post-router-mode', type=str, default='single',
                         choices=['squared', 'single', 'half'],
                         help='Post-TokenPool router exit slot density (TPGL)')
-    parser.add_argument('--pre-shared-fraction', type=float, default=0.0,
-                        help='Pre-TokenPool block weight sharing fraction (TPGL)')
-    parser.add_argument('--pre-router-shared-fraction', type=float, default=0.0,
-                        help='Pre-TokenPool router weight sharing fraction (TPGL)')
-    parser.add_argument('--post-shared-fraction', type=float, default=0.0,
-                        help='Post-TokenPool block weight sharing fraction (TPGL)')
-    parser.add_argument('--post-router-shared-fraction', type=float, default=0.0,
-                        help='Post-TokenPool router weight sharing fraction (TPGL)')
+    # Token pool sharing removed — param banks handle weights internally
 
     # Shared between MoE and PoE
     parser.add_argument('--top-k', type=int, default=2, help='Experts per hop/layer (MoE/PoE/TPGL seq pool)')

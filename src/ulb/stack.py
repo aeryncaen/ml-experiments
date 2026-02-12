@@ -606,32 +606,31 @@ class TriplePoolGraphLearner(nn.Module):
     """Three-pool architecture: SequencePool + pre-TokenPool + post-TokenPool.
 
     Separates sequence-level compute (attention) from token-level data recall
-    (databank MLPs). The SequencePool contains UniversalSequenceBlock experts
-    that are sample-routed. The TokenPools contain UniversalTokenBlock experts
-    that are token-routed.
+    (databank param banks). The SequencePool contains UniversalSequenceBlock
+    experts that are sample-routed. The TokenPools are TokenParamBank instances
+    with stacked weights and batched dispatch — no Python loops over experts.
 
     Per-hop flow:
         1. Sample-route to sequence experts (same as PoolOfExperts)
         2. For each active sequence expert:
            a. Pre-norm the input
-           b. Token-route to pre-TokenPool (enrich), with exit option
+           b. Token-route through pre-TokenPool param bank (enrich)
            c. Run UniversalSequenceBlock (attention)
-           d. Token-route to post-TokenPool (refine), with exit option
+           d. Token-route through post-TokenPool param bank (refine)
         3. Weighted-merge expert outputs, residual add
         4. Merge outbound router logits, pick next hop or exit
 
-    Token routing mirrors sample routing: top-k over pool_size + exit slots,
-    softmax merge, exit slots get zero weight and renormalize. When all top-k
-    are exit, the token passes through unchanged.
+    Token routing: top-k over pool_size + exit slots, softmax merge, exit
+    slots get zero weight and renormalize. When all top-k are exit, the token
+    passes through unchanged. Dispatch is fully batched via param bank gather.
 
     Args:
         make_seq_block: Callable creating an UniversalSequenceBlock (no args).
-        make_pre_block: Callable creating a pre-TokenPool UniversalTokenBlock.
-        make_post_block: Callable creating a post-TokenPool UniversalTokenBlock.
         seq_pool_size: Number of sequence experts.
-        pre_pool_size: Number of pre-TokenPool databank units.
-        post_pool_size: Number of post-TokenPool databank units.
-        dim: Model dimension.
+        pre_pool_size: Number of pre-TokenPool (up-projection) databank units.
+        post_pool_size: Number of post-TokenPool (down-projection) databank units.
+        dim: Model dimension (d_model, residual stream width).
+        inner_dim: Inner dimension for attention (pre-bank output, seq expert operating dim).
         seq_top_k: Top-k for sequence routing (default 2).
         pre_top_k: Top-k for pre-TokenPool token routing (default 2).
         post_top_k: Top-k for post-TokenPool token routing (default 2).
@@ -640,25 +639,21 @@ class TriplePoolGraphLearner(nn.Module):
         pre_router_mode: Exit slot density for pre-token router.
         post_router_mode: Exit slot density for post-token router.
         router_noise: Gaussian noise scale for all routers during training.
+        swish_mode: Activation for token banks ('learnable' or 'silu').
         seq_shared_fraction: Block weight sharing for sequence pool.
         seq_router_shared_fraction: Router weight sharing for sequence pool.
         seq_hop_shared_fraction: Hop embed/gate sharing for sequence pool.
-        pre_shared_fraction: Block weight sharing for pre-TokenPool.
-        pre_router_shared_fraction: Router weight sharing for pre-TokenPool.
-        post_shared_fraction: Block weight sharing for post-TokenPool.
-        post_router_shared_fraction: Router weight sharing for post-TokenPool.
     """
 
     ROUTER_MODES = ('squared', 'single', 'half')
 
     def __init__(self,
                  make_seq_block: Callable[[], nn.Module],
-                 make_pre_block: Callable[[], nn.Module],
-                 make_post_block: Callable[[], nn.Module],
                  seq_pool_size: int,
                  pre_pool_size: int,
                  post_pool_size: int,
                  dim: int,
+                 inner_dim: int,
                  seq_top_k: int = 2,
                  pre_top_k: int = 2,
                  post_top_k: int = 2,
@@ -667,14 +662,13 @@ class TriplePoolGraphLearner(nn.Module):
                  pre_router_mode: str = 'single',
                  post_router_mode: str = 'single',
                  router_noise: float = 1.0,
+                 swish_mode: str = 'learnable',
                  seq_shared_fraction: float = 0.0,
                  seq_router_shared_fraction: float = 0.0,
-                 seq_hop_shared_fraction: float = 0.0,
-                 pre_shared_fraction: float = 0.0,
-                 pre_router_shared_fraction: float = 0.0,
-                 post_shared_fraction: float = 0.0,
-                 post_router_shared_fraction: float = 0.0):
+                 seq_hop_shared_fraction: float = 0.0):
         super().__init__()
+        from .block import TokenParamBank
+
         for mode in (seq_router_mode, pre_router_mode, post_router_mode):
             if mode not in self.ROUTER_MODES:
                 raise ValueError(f"router_mode must be one of {self.ROUTER_MODES}, got {mode!r}")
@@ -707,23 +701,22 @@ class TriplePoolGraphLearner(nn.Module):
         self.pre_router_mode = pre_router_mode
         self.post_router_mode = post_router_mode
 
-        # --- Stem: non-routed entry layer ---
-        self.stem_norm = RMSNorm(dim)
-        self.stem_layer = make_seq_block()
+        self.inner_dim = inner_dim
 
         # --- Stem router: kicks off the first hop (sequence-level) ---
         self.stem_router = nn.Linear(dim, self.seq_n_options, bias=False)
 
-        # --- Sequence pool (sample-routed) ---
+        # --- Sequence pool (sample-routed, operates at inner_dim) ---
         self.seq_experts = nn.ModuleList([make_seq_block() for _ in range(seq_pool_size)])
+        # Outbound routers operate on post-bank output (d_model)
         self.seq_routers = nn.ModuleList([
             nn.Linear(dim, self.seq_n_options, bias=False) for _ in range(seq_pool_size)
         ])
 
-        # Per-hop pre-norm (shared across hops)
+        # Per-hop pre-norm (at d_model, before up-projection)
         self.hop_norm = RMSNorm(dim)
 
-        # Per-expert hop conditioning
+        # Per-expert hop conditioning (at d_model, before up-projection)
         hop_gate_dim = min(dim, 12)
         self.hop_gate_dim = hop_gate_dim
         from .shared import ParamHolder
@@ -734,29 +727,30 @@ class TriplePoolGraphLearner(nn.Module):
             nn.Linear(hop_gate_dim, 1, bias=False) for _ in range(seq_pool_size)
         ])
 
-        # --- Pre-TokenPool (token-routed) ---
-        self.pre_experts = nn.ModuleList([make_pre_block() for _ in range(pre_pool_size)])
-        # Per-sequence-expert pre-token router
+        # --- Pre-TokenPool param bank: up-projection (d_model → inner_dim) ---
+        self.pre_bank = TokenParamBank(
+            pool_size=pre_pool_size, in_dim=dim, out_dim=inner_dim, top_k=pre_top_k,
+            n_options=self.pre_n_options, swish_mode=swish_mode)
+        # Pre-token routers operate on d_model input
         self.pre_routers = nn.ModuleList([
             nn.Linear(dim, self.pre_n_options, bias=False) for _ in range(seq_pool_size)
         ])
 
-        # --- Post-TokenPool (token-routed) ---
-        self.post_experts = nn.ModuleList([make_post_block() for _ in range(post_pool_size)])
-        # Per-sequence-expert post-token router
+        # --- Post-TokenPool param bank: down-projection (inner_dim → d_model) ---
+        self.post_bank = TokenParamBank(
+            pool_size=post_pool_size, in_dim=inner_dim, out_dim=dim, top_k=post_top_k,
+            n_options=self.post_n_options, swish_mode=swish_mode)
+        # Post-token routers operate on inner_dim input (attention output)
         self.post_routers = nn.ModuleList([
-            nn.Linear(dim, self.post_n_options, bias=False) for _ in range(seq_pool_size)
+            nn.Linear(inner_dim, self.post_n_options, bias=False) for _ in range(seq_pool_size)
         ])
 
-        # --- Exit: non-routed output layer ---
-        self.exit_norm = RMSNorm(dim)
-        self.exit_layer = make_seq_block()
+        # --- Final norm (at d_model) ---
         self.final_norm = RMSNorm(dim)
 
-        # --- Weight sharing ---
+        # --- Weight sharing (sequence pool only — token pools use param banks) ---
         from .shared import share_expert_weights, share_linear_list, share_parameter_list
 
-        # Sequence pool sharing
         self._shared_seq_params = (
             share_expert_weights(self.seq_experts, seq_shared_fraction)
             if seq_shared_fraction > 0.0 else nn.ParameterDict()
@@ -772,26 +766,6 @@ class TriplePoolGraphLearner(nn.Module):
         self._shared_hop_gate_params = (
             share_linear_list(self.hop_gates, seq_hop_shared_fraction, prefix='hop_gate')
             if seq_hop_shared_fraction > 0.0 else nn.ParameterDict()
-        )
-
-        # Pre-TokenPool sharing
-        self._shared_pre_params = (
-            share_expert_weights(self.pre_experts, pre_shared_fraction)
-            if pre_shared_fraction > 0.0 else nn.ParameterDict()
-        )
-        self._shared_pre_router_params = (
-            share_linear_list(self.pre_routers, pre_router_shared_fraction, prefix='pre_router')
-            if pre_router_shared_fraction > 0.0 else nn.ParameterDict()
-        )
-
-        # Post-TokenPool sharing
-        self._shared_post_params = (
-            share_expert_weights(self.post_experts, post_shared_fraction)
-            if post_shared_fraction > 0.0 else nn.ParameterDict()
-        )
-        self._shared_post_router_params = (
-            share_linear_list(self.post_routers, post_router_shared_fraction, prefix='post_router')
-            if post_router_shared_fraction > 0.0 else nn.ParameterDict()
         )
 
         self.aux_loss = 0.0
@@ -840,71 +814,43 @@ class TriplePoolGraphLearner(nn.Module):
         return topk_idx, topk_weights, has_exit
 
     def _route_tokens(self, x: torch.Tensor, router: nn.Module,
-                      experts: nn.ModuleList, pool_size: int, top_k: int
-                      ) -> torch.Tensor:
-        """Token-level routing through a databank pool.
+                      bank: 'TokenParamBank') -> torch.Tensor:
+        """Token-level routing through a param bank — fully batched, no loops.
 
-        Routes each token independently. Exit slots → token passes through
-        unchanged (identity). No exit ramp — databanks have no pressure to exit.
+        Routes each token independently. Exit slots → zero contribution
+        (caller handles residual if needed). No exit ramp.
 
         Args:
-            x: (B, T, D) input tokens.
-            router: Linear(D, n_options) for this databank.
-            experts: ModuleList of databank units.
-            pool_size: Number of real experts in this pool.
-            top_k: Top-k selection per token.
+            x: (B, T, in_dim) input tokens.
+            router: Linear(in_dim, n_options) for this databank.
+            bank: TokenParamBank (in_dim → out_dim).
 
         Returns:
-            (B, T, D) output — enriched/refined tokens.
+            (B, T, out_dim) output.
         """
-        B, T, D = x.shape
-        # Flatten to (B*T, D) for per-token routing
-        x_flat = x.view(B * T, D)
+        B, T, _ = x.shape
+        x_flat = x.reshape(B * T, -1)
         logits = self._perturb_logits(router(x_flat))  # (B*T, n_options)
 
-        topk_vals, topk_idx = logits.topk(top_k, dim=-1)  # (B*T, top_k)
+        topk_vals, topk_idx = logits.topk(bank.top_k, dim=-1)  # (B*T, top_k)
         topk_weights = F.softmax(topk_vals, dim=-1)  # (B*T, top_k)
 
         # Zero out exit slot weights, renormalize
-        is_exit = topk_idx >= pool_size  # (B*T, top_k)
+        is_exit = topk_idx >= bank.pool_size  # (B*T, top_k)
         topk_weights = topk_weights.masked_fill(is_exit, 0.0)
         weight_sum = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         topk_weights = topk_weights / weight_sum
 
-        # All-exit tokens pass through unchanged
         all_exit = is_exit.all(dim=-1)  # (B*T,)
 
-        # Find active experts
-        active_eids = topk_idx.unique()
-        active_eids = active_eids[active_eids < pool_size]
-
-        # Run active experts on full token set, weighted merge
-        out_flat = torch.zeros_like(x_flat)  # (B*T, D)
-
-        expert_outs = {}
-        for eid in active_eids.tolist():
-            expert_outs[eid] = experts[eid](x_flat)  # (B*T, D)
-
-        for k_idx in range(top_k):
-            w = topk_weights[:, k_idx]  # (B*T,)
-            eids = topk_idx[:, k_idx]  # (B*T,)
-            for eid in active_eids.tolist():
-                mask = eids == eid
-                if not mask.any():
-                    continue
-                out_flat = out_flat + (mask[:, None].float() * w[:, None]) * expert_outs[eid]
-
-        # All-exit tokens: use original input (identity)
-        out_flat = torch.where(all_exit[:, None], x_flat, out_flat)
-
-        return out_flat.view(B, T, D)
+        out_flat = bank(x_flat, topk_idx, topk_weights, all_exit)  # (B*T, out_dim)
+        return out_flat.view(B, T, bank.out_dim)
 
     # --- Main forward ---
 
     def stem(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run stem layer and produce initial sequence router logits."""
-        x = x + self.stem_layer(self.stem_norm(x))
-        stem_pool = x.mean(dim=1)  # (B, D)
+        """Produce initial sequence router logits from d_model input."""
+        stem_pool = x.mean(dim=1)  # (B, d_model)
         logits = self._perturb_logits(self.stem_router(stem_pool))
         return x, logits
 
@@ -913,19 +859,25 @@ class TriplePoolGraphLearner(nn.Module):
                     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         """Run selected sequence experts with pre/post token routing.
 
+        Flow per expert:
+            hop_norm(x) at d_model → hop conditioning at d_model
+            → pre-bank up-proj (d_model → inner_dim)
+            → seq expert (inner_dim → inner_dim, with skip-multiply)
+            → post-bank down-proj (inner_dim → d_model)
+
         Args:
-            x: (B, T, D) current hidden state.
+            x: (B, T, d_model) current hidden state.
             topk_idx: (B, seq_top_k) selected expert/exit indices.
             topk_weights: (B, seq_top_k) softmax weights.
             hop: Current hop index.
 
         Returns:
-            out: (B, T, D) weighted-merged expert output.
+            out: (B, T, d_model) weighted-merged expert output (delta for residual).
             next_logits: (B, seq_n_options) merged outbound logits.
             hop_aux: Accumulated aux loss.
         """
         B = x.shape[0]
-        h = self.hop_norm(x)
+        h = self.hop_norm(x)  # (B, T, d_model)
 
         active_eids = topk_idx.unique()
         active_eids = active_eids[active_eids < self.seq_pool_size]
@@ -935,34 +887,31 @@ class TriplePoolGraphLearner(nn.Module):
         expert_logits = {}
 
         for eid in active_eids.tolist():
-            # Hop conditioning
+            # Hop conditioning (at d_model)
             gate = torch.sigmoid(self.hop_gates[eid](h[..., :self.hop_gate_dim]))
             hop_cond = gate * self.hop_embeds[eid][hop]
-            h_expert = h + hop_cond
+            h_expert = h + hop_cond  # (B, T, d_model)
 
-            # Pre-TokenPool: enrich input tokens
-            h_expert = self._route_tokens(
-                h_expert, self.pre_routers[eid], self.pre_experts,
-                self.pre_pool_size, self.pre_top_k)
+            # Pre-TokenPool: up-project (d_model → inner_dim)
+            h_up = self._route_tokens(
+                h_expert, self.pre_routers[eid], self.pre_bank)  # (B, T, inner_dim)
 
-            # Sequence expert: attention compute
-            e_out = self.seq_experts[eid](h_expert)
-            expert_outs[eid] = e_out
+            # Sequence expert: attention at inner_dim (includes skip-multiply)
+            e_out = self.seq_experts[eid](h_up)  # (B, T, inner_dim)
 
-            # Post-TokenPool: refine output tokens
-            e_out_refined = self._route_tokens(
-                e_out, self.post_routers[eid], self.post_experts,
-                self.post_pool_size, self.post_top_k)
-            expert_outs[eid] = e_out_refined
+            # Post-TokenPool: down-project (inner_dim → d_model)
+            e_down = self._route_tokens(
+                e_out, self.post_routers[eid], self.post_bank)  # (B, T, d_model)
+            expert_outs[eid] = e_down
 
-            # Outbound router logits (from refined output)
-            e_pool = e_out_refined.mean(dim=1)
+            # Outbound router logits (from d_model output)
+            e_pool = e_down.mean(dim=1)  # (B, d_model)
             expert_logits[eid] = self.seq_routers[eid](e_pool)
 
             block_aux = getattr(self.seq_experts[eid], 'aux_loss', 0.0)
             hop_aux = hop_aux + block_aux
 
-        # Weighted merge
+        # Weighted merge (at d_model)
         out = torch.zeros_like(x)
         next_logits = torch.zeros(B, self.seq_n_options, device=x.device, dtype=x.dtype)
 
@@ -980,8 +929,7 @@ class TriplePoolGraphLearner(nn.Module):
         return out, next_logits, hop_aux
 
     def finalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Run exit layer and final norm."""
-        x = x + self.exit_layer(self.exit_norm(x))
+        """Final norm at d_model."""
         return self.final_norm(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
