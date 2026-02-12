@@ -1554,23 +1554,24 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             # Token side gets 2x the hop budget (MLP hops are cheap)
             seq_hops = poe_max_hops if poe_max_hops is not None else 2 * pool_size
             tok_hops = seq_hops * 2
-            # Map PoE sharing args to LLooM's 4 independent fractions.
-            # None = use shared_fraction default (0.5).
-            expert_share = poe_block_share_fraction if poe_block_share_fraction > 0 else None
+            # Map PoE sharing args to LLooM config.
+            # PoE has 3 sharing fractions; LLooM has a single shared_fraction
+            # default plus 4 optional per-category overrides. We set the
+            # global default from block share, and per-category router share
+            # from the max of router + hop share.
+            expert_share = poe_block_share_fraction
             router_share = max(poe_router_share_fraction, poe_hop_share_fraction)
-            router_share = router_share if router_share > 0 else None
             lloom_cfg = dict(dim=dim, seq_pool_size=pool_size, tok_pool_size=pool_size,
                              seq_top_k=lloom_top_k, tok_top_k=lloom_top_k,
                              seq_max_hops=seq_hops, tok_max_hops=tok_hops,
                              max_bridge_crossings=2,
-                             seq_expert_shared_fraction=expert_share,
-                             tok_expert_shared_fraction=expert_share,
+                             shared_fraction=expert_share,
                              seq_router_shared_fraction=router_share,
                              tok_router_shared_fraction=router_share,
                              router_noise=router_noise)
             model = LLooMBenchWrapper(**lloom_cfg)
-            _es = expert_share if expert_share is not None else 0.5
-            _rs = router_share if router_share is not None else 0.5
+            _es = expert_share
+            _rs = router_share
             model._bench_config = (f"LLooM(dim={dim}, pool={pool_size}, top_k={lloom_top_k}, "
                                    f"seq_hops={seq_hops}, tok_hops={tok_hops}, "
                                    f"expert_share={_es}, router_share={_rs}, noise={router_noise})")
