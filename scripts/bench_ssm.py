@@ -1568,7 +1568,8 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
                              shared_fraction=expert_share,
                              seq_router_shared_fraction=router_share,
                              tok_router_shared_fraction=router_share,
-                             router_noise=router_noise)
+                             router_noise=router_noise,
+                             exit_ramp_scale=args.exit_ramp_scale)
             model = LLooMBenchWrapper(**lloom_cfg)
             _es = expert_share
             _rs = router_share
@@ -1629,6 +1630,8 @@ if __name__ == '__main__':
                         help='Fraction of hop embed/gate dims shared across experts (0.0=independent)')
     parser.add_argument('--router-noise', type=float, default=1.0,
                         help='Starting router noise scale (linearly annealed to 0 over training)')
+    parser.add_argument('--exit-ramp-scale', type=float, default=2.0,
+                        help='Exit bias ramp scale for LLooM/PoE (exit_bias = exit_ramp_scale * hops_used/max_hops)')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
