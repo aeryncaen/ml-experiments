@@ -652,6 +652,91 @@ def build_llada_ulb_poe(vocab_size: int, args) -> nn.Module:
                       subs_parameterization=args.subs)
 
 
+# --- LLooM builder (AR) ---
+
+class LLooMLM(nn.Module):
+    """Language model wrapper for LLooM.
+
+    LLooM.forward() returns (output, info) but the AR training loop expects
+    model(token_ids) -> logits.  This wrapper handles embed/head and stashes
+    the info dict for routing stats display.
+    """
+
+    def __init__(self, lloom: nn.Module, vocab_size: int, dim: int, max_seq_len: int):
+        super().__init__()
+        self.lloom = lloom
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        # Stash for routing info (updated each forward)
+        self.last_info: dict = {}
+
+    @property
+    def router_noise_scale(self) -> float:
+        return self.lloom.router_noise_scale
+
+    @router_noise_scale.setter
+    def router_noise_scale(self, val: float) -> None:
+        self.lloom.router_noise_scale = val
+
+    @property
+    def last_mean_hops(self) -> float:
+        info = self.last_info
+        seq = info.get('mean_seq_hops', 0.0)
+        tok = info.get('mean_tok_hops', 0.0)
+        if isinstance(seq, torch.Tensor):
+            seq = seq.item()
+        if isinstance(tok, torch.Tensor):
+            tok = tok.item()
+        return seq + tok
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        x = self.token_embed(token_ids)
+        x, info = self.lloom(x)
+        self.last_info = {k: v.detach() if isinstance(v, torch.Tensor) else v
+                          for k, v in info.items()}
+        return self.head(x)
+
+
+def build_lloom(vocab_size: int, args) -> nn.Module:
+    """Build LLooM for AR Shakespeare training."""
+    from lloom.config import LLooMConfig
+    from lloom.lloom import LLooM
+
+    cfg = LLooMConfig(
+        dim=args.dim,
+        max_seq_len=args.seq_len,
+        stem_n_heads=args.n_heads,
+        stem_mlp_expansion=args.inner_ratio,
+        seq_pool_size=args.lloom_seq_pool_size,
+        seq_top_k=args.lloom_seq_top_k,
+        seq_n_heads=args.n_heads,
+        seq_expansion=args.inner_ratio,
+        seq_max_hops=args.lloom_seq_max_hops,
+        tok_pool_size=args.lloom_tok_pool_size,
+        tok_top_k=args.lloom_tok_top_k,
+        tok_expansion=args.inner_ratio,
+        tok_max_hops=args.lloom_tok_max_hops,
+        exit_bias_init=None,  # auto = log(pool_size)
+        bridge_bias_init=None,
+        exit_ramp_scale=args.lloom_exit_ramp_scale,
+        router_noise=args.router_noise,
+        shared_fraction=args.lloom_shared_fraction,
+        hop_gate_dim=args.lloom_hop_gate_dim,
+        max_bridge_crossings=args.lloom_max_bridges,
+        is_causal=not args.no_causal,
+        dropout=0.0,
+    )
+    lloom = LLooM(cfg)
+    return LLooMLM(lloom, vocab_size, args.dim, args.seq_len)
+
+
 ARCH_BUILDERS = {
     'mha': build_mha,
     'ulb': build_ulb,
@@ -661,6 +746,7 @@ ARCH_BUILDERS = {
     'ulb-poe': build_ulb_poe,
     'ulb-tpgl': build_ulb_tpgl,
     'ulb-diffusion-poe': build_ulb_diffusion_poe,
+    'lloom': build_lloom,
 }
 
 LLADA_BUILDERS = {
@@ -1367,6 +1453,11 @@ def train(args):
               f"hop_shared={args.hop_shared_fraction}")
         print(f"  pre_shared={args.pre_shared_fraction}, pre_router_shared={args.pre_router_shared_fraction}")
         print(f"  post_shared={args.post_shared_fraction}, post_router_shared={args.post_router_shared_fraction}")
+    if args.arch == 'lloom':
+        print(f"  seq_pool={args.lloom_seq_pool_size} (top_k={args.lloom_seq_top_k}, max_hops={args.lloom_seq_max_hops})")
+        print(f"  tok_pool={args.lloom_tok_pool_size} (top_k={args.lloom_tok_top_k}, max_hops={args.lloom_tok_max_hops})")
+        print(f"  exit_ramp={args.lloom_exit_ramp_scale}, shared={args.lloom_shared_fraction}, "
+              f"bridges={args.lloom_max_bridges}, router_noise={args.router_noise}")
 
     if is_llada:
         llada_features = []
@@ -1722,7 +1813,7 @@ def main():
     parser.add_argument('--mode', type=str, default='ar', choices=['ar', 'diffusion', 'llada', 'mlm'],
                         help='Training mode: autoregressive, masked diffusion (PoE), llada, or mlm (BERT-style)')
     parser.add_argument('--arch', type=str, default='mha', choices=list(ARCH_BUILDERS.keys()),
-                        help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-tpgl, ulb-diffusion-poe')
+                        help='Model architecture: mha, ulb, mha-moe, ulb-moe, mha-poe, ulb-poe, ulb-tpgl, ulb-diffusion-poe, lloom')
 
     # Model
     parser.add_argument('--dim', type=int, default=128, help='Model dimension')
@@ -1761,6 +1852,28 @@ def main():
                         help='Hop embed/gate weight sharing fraction (PoE)')
     parser.add_argument('--swish-mode', type=str, default='learnable', choices=['learnable', 'silu'],
                         help='Activation mode for ULB/databank (learnable Swish or SiLU)')
+
+    # LLooM-specific
+    parser.add_argument('--lloom-seq-pool-size', type=int, default=4,
+                        help='Sequence-side expert pool size (LLooM)')
+    parser.add_argument('--lloom-tok-pool-size', type=int, default=4,
+                        help='Token-side expert pool size (LLooM)')
+    parser.add_argument('--lloom-seq-top-k', type=int, default=2,
+                        help='Sequence-side top-k (LLooM)')
+    parser.add_argument('--lloom-tok-top-k', type=int, default=2,
+                        help='Token-side top-k (LLooM)')
+    parser.add_argument('--lloom-seq-max-hops', type=int, default=8,
+                        help='Sequence-side max hops (LLooM)')
+    parser.add_argument('--lloom-tok-max-hops', type=int, default=16,
+                        help='Token-side max hops (LLooM)')
+    parser.add_argument('--lloom-exit-ramp-scale', type=float, default=2.0,
+                        help='Exit bias ramp scale (LLooM)')
+    parser.add_argument('--lloom-shared-fraction', type=float, default=0.5,
+                        help='Weight sharing fraction (LLooM)')
+    parser.add_argument('--lloom-hop-gate-dim', type=int, default=12,
+                        help='Hop gate prefix dim (LLooM)')
+    parser.add_argument('--lloom-max-bridges', type=int, default=2,
+                        help='Max bridge crossings per sample (LLooM)')
 
     # TPGL-specific (TriplePoolGraphLearner)
     parser.add_argument('--pre-pool-size', type=int, default=None,
