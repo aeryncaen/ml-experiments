@@ -363,9 +363,15 @@ class LLooM(nn.Module):
             # ============================================================
             on_seq = side == 1
             if on_seq.any():
+                # Mask bridge if tok side is maxed (bridging there would be pointless)
+                seq_logits_for_route = current_seq_logits
+                if tok_hops_used >= cfg.tok_max_hops:
+                    seq_logits_for_route = seq_logits_for_route.clone()
+                    seq_logits_for_route[:, self.seq_pool.bridge_idx] = -float('inf')
+
                 # Route: interpret current logits
                 topk_idx, topk_weights, has_exit, has_bridge, has_continue = \
-                    self.seq_pool.route(current_seq_logits, seq_hops_used)
+                    self.seq_pool.route(seq_logits_for_route, seq_hops_used)
 
                 # Record stem stats on first seq routing decision
                 if not _stem_stats_recorded:
@@ -384,9 +390,10 @@ class LLooM(nn.Module):
                     side = torch.where(bridging, torch.full_like(side, 2), side)
                     n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
                     routing_decisions = torch.where(bridging, routing_decisions + 1, routing_decisions)
+                    # Bridge counts as a seq hop (builds exit pressure)
+                    seq_hops_used = seq_hops_used + 1
+                    global_hop = global_hop + 1
                     # Produce entry logits for token pool
-                    x_pooled_for_tok = x.mean(dim=1)  # (B, D) -- sample-level for entry router
-                    # But tok pool entry router is token-level, so we use per-token
                     x_flat_for_tok = x.reshape(B * T, D)
                     tok_entry_logits = self.tok_pool.entry_router(x_flat_for_tok)  # (B*T, tok_n_options)
                     tok_entry_logits = tok_entry_logits.reshape(B, T, self.tok_pool.n_options)
@@ -432,8 +439,14 @@ class LLooM(nn.Module):
                         current_tok_logits = current_tok_logits + torch.randn_like(current_tok_logits) * ns
                     tok_vote_state = None
 
+                # Mask bridge if seq side is maxed
+                tok_logits_for_route = current_tok_logits
+                if seq_hops_used >= cfg.seq_max_hops:
+                    tok_logits_for_route = tok_logits_for_route.clone()
+                    tok_logits_for_route[:, :, self.tok_pool.bridge_idx] = -float('inf')
+
                 # Per-token routing: apply biases + top-k per token
-                BT_logits = current_tok_logits.reshape(B * T, self.tok_pool.n_options)
+                BT_logits = tok_logits_for_route.reshape(B * T, self.tok_pool.n_options)
                 BT_logits_biased = self.tok_pool.apply_biases(BT_logits, tok_hops_used)
                 topk_idx_flat, topk_weights_flat, _ = self.tok_pool.select_topk(BT_logits_biased)
 
@@ -466,6 +479,9 @@ class LLooM(nn.Module):
                     side = torch.where(do_bridge, torch.ones_like(side), side)
                     n_bridges = torch.where(do_bridge, n_bridges + 1, n_bridges)
                     routing_decisions = torch.where(do_bridge, routing_decisions + 1, routing_decisions)
+                    # Bridge counts as a tok hop (builds exit pressure)
+                    tok_hops_used = tok_hops_used + 1
+                    global_hop = global_hop + 1
                     # Produce entry logits for seq pool
                     x_pooled_for_seq = x.mean(dim=1)  # (B, D)
                     seq_entry_logits = self.seq_pool.entry_router(x_pooled_for_seq)  # (B, seq_n_options)
