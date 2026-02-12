@@ -33,6 +33,77 @@ from .token_pool import TokenPool
 
 
 # ---------------------------------------------------------------------------
+# Megatron-style init for LLooM
+# ---------------------------------------------------------------------------
+
+def lloom_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
+                         cutoff_factor: float = 2.0):
+    """Megatron-style weight init for LLooM-based models.
+
+    Follows the same convention as ulb_megatron_init_:
+    - Input projections: trunc_normal(std)
+    - Output projections (o_proj, down_proj, o_shared, o_bank, down_shared,
+      down_bank): trunc_normal(std / sqrt(2 * n_layers))
+    - Embeddings: trunc_normal(std)
+    - Norm weights: left at their init (1.0)
+    - Biases: zero (except stem_router bias which is set separately)
+    - Banked params (3-D tensors in expert banks): same rule, applied to the
+      raw parameter tensor regardless of shape.
+
+    Args:
+        model: The top-level model (e.g. LLooMLM) containing LLooM + embed/head.
+        n_layers: Effective depth for output scaling (stems + expected hops).
+        std: Base init std for input projections and embeddings.
+        cutoff_factor: Truncation range = cutoff_factor * std.
+    """
+    out_std = std / math.sqrt(2.0 * n_layers)
+    cutoff = cutoff_factor * std
+    out_cutoff = cutoff_factor * out_std
+
+    # Names that indicate output projections (residual-contributing)
+    _output_suffixes = ('.o_proj.weight', '.down_proj.weight',
+                        '.o_shared', '.o_bank', '.down_shared', '.down_bank')
+    # Names to skip (norm weights, hop embeds, router biases with special init)
+    _skip_suffixes = ('.weight',)  # nn.RMSNorm / nn.LayerNorm
+    _skip_names = set()
+
+    for name, param in model.named_parameters():
+        # Skip norm weights (1-D, from RMSNorm — but also expert norm banks)
+        if name.endswith('.norm_shared') or name.endswith('.norm_bank'):
+            continue
+        if name.endswith('.hop_norm.weight') or name.endswith('.attn_norm.weight') \
+                or name.endswith('.mlp_norm.weight') or name.endswith('.final_norm.weight'):
+            continue
+        # Skip hop embeddings (have their own small init)
+        if 'hop_embed' in name:
+            continue
+        # Skip stem_router bias (set separately for exit/bridge)
+        if name == 'stem_router.bias' or name.endswith('.stem_router.bias'):
+            continue
+        # Skip hop_gate_proj bias
+        if 'hop_gate_proj' in name:
+            continue
+
+        is_output = any(name.endswith(s) for s in _output_suffixes)
+
+        if is_output:
+            nn.init.trunc_normal_(param, std=out_std,
+                                  a=-out_cutoff, b=out_cutoff)
+        else:
+            nn.init.trunc_normal_(param, std=std,
+                                  a=-cutoff, b=cutoff)
+
+        # Zero biases that we didn't skip
+        # (nn.Linear biases are separate params ending in .bias)
+
+    # Zero all biases except the ones we skipped
+    for name, param in model.named_parameters():
+        if name.endswith('.bias') and 'stem_router' not in name \
+                and 'hop_gate_proj' not in name:
+            nn.init.zeros_(param)
+
+
+# ---------------------------------------------------------------------------
 # Stem block: a full transformer block (attention + SwiGLU MLP)
 # ---------------------------------------------------------------------------
 

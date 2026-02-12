@@ -677,6 +677,12 @@ class LLooMLM(nn.Module):
         # Stash for routing info (updated each forward)
         self.last_info: dict = {}
 
+        # Megatron-style init: effective depth = 2 stems + max hops
+        cfg = lloom.config
+        n_layers = 2 + cfg.seq_max_hops + cfg.tok_max_hops
+        from lloom.lloom import lloom_megatron_init_
+        lloom_megatron_init_(self, n_layers)
+
     @property
     def router_noise_scale(self) -> float:
         return self.lloom.router_noise_scale
