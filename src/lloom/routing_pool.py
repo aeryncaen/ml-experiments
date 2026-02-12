@@ -57,11 +57,13 @@ class RoutingPool(nn.Module, ABC):
         self.top_k = top_k
         self.max_hops = max_hops
 
-        # None = auto: log(pool_size) gives equal 1/3 init probability for
-        # (any expert, exit, bridge) since pool_size * exp(0) = exp(log(P))
-        auto_bias = math.log(pool_size) if pool_size > 1 else 0.0
-        self.exit_bias_init = exit_bias_init if exit_bias_init is not None else auto_bias
-        self.bridge_bias_init = bridge_bias_init if bridge_bias_init is not None else auto_bias
+        # None = auto: zero bias so all pool_size + 2 options start at uniform
+        # probability 1/(P+2).  The old log(pool_size) gave equal *category*
+        # probability (1/3 each for experts/exit/bridge) but made exit and
+        # bridge always dominate top-k since each is a single slot vs P expert
+        # slots sharing 1/3 of the mass.
+        self.exit_bias_init = exit_bias_init if exit_bias_init is not None else 0.0
+        self.bridge_bias_init = bridge_bias_init if bridge_bias_init is not None else 0.0
         self.exit_ramp_scale = exit_ramp_scale
         self.router_noise_scale = router_noise
         self.router_shared_fraction = router_shared_fraction

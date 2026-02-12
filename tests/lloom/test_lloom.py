@@ -255,19 +255,10 @@ class TestInfoDict:
 
 class TestInitBehavior:
     def test_stem_router_bias_init(self):
-        """Expert slots zero, exit/bridge slots log(pool_size) for 1/3 category prob."""
-        import math
+        """All bias slots zero — pool's apply_biases() is the single bias source."""
         model = _make_model()
-        cfg = model.config
         bias = model.stem_router.bias.data
-        expected_bias = math.log(cfg.seq_pool_size)
-        # Expert slots: zero
-        torch.testing.assert_close(
-            bias[:cfg.seq_pool_size],
-            torch.zeros(cfg.seq_pool_size))
-        # Exit and bridge slots: log(pool_size)
-        assert abs(bias[cfg.seq_exit_idx].item() - expected_bias) < 1e-5
-        assert abs(bias[cfg.seq_bridge_idx].item() - expected_bias) < 1e-5
+        torch.testing.assert_close(bias, torch.zeros_like(bias))
 
     def test_final_norm_init(self):
         model = _make_model()
