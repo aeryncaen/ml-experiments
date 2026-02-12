@@ -174,7 +174,7 @@ class LLooMConfig:
 
     @property
     def stem_n_options(self) -> int:
-        """Stem router output size: seq_pool_size + bridge-to-token + exit."""
+        """Stem router output size: seq_pool_size + exit + bridge (same as seq pool)."""
         return self.seq_pool_size + 2
 
     @property

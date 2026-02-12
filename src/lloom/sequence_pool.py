@@ -1,9 +1,9 @@
-"""SequencePool — sample-level routing through banked attention experts.
+"""SequencePool --- sample-level routing through banked attention experts.
 
 Implements the sequence side of LLooM: entire samples route through a pool
-of attention experts with top-k selection. Decision aggregation uses the
-all-top-k agreement rule: ALL top-k must be exit for sample to exit,
-ALL must be bridge for sample to bridge, otherwise continue.
+of attention experts with top-k selection.  Post-dispatch routing: experts
+run first, then their outbound routers produce logits from expert output,
+which are weighted-merged to form the next hop's incoming logits.
 """
 
 from __future__ import annotations
@@ -18,13 +18,13 @@ from .routing_pool import RoutingPool
 class SequencePool(RoutingPool):
     """Pool of attention experts with sample-level routing.
 
-    Per-hop flow:
+    Per execute_hop():
         1. Hop norm + content-gated hop embedding
         2. Banked attention dispatch for top-k experts
-        3. Weighted merge across top-k + residual add
-        4. Outbound router logits
-        5. Apply exit bias (ramping) and bridge bias (fixed)
-        6. Top-k selection + classify: all exit → exit, all bridge → bridge
+        3. Each expert's outbound router produces logits from expert output
+        4. Weighted merge of both expert outputs and outbound logits
+        Returns (out, next_logits) for the caller to residual-add and feed
+        into the next route() call.
 
     Args:
         pool_size: Number of attention experts.
@@ -70,136 +70,87 @@ class SequencePool(RoutingPool):
             is_causal=is_causal,
         )
 
-    def dispatch(self, x: torch.Tensor, expert_idx: torch.Tensor,
-                 expert_weights: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Banked attention dispatch.
+    def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                    topk_weights: torch.Tensor,
+                    hop: int | torch.Tensor = 0
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run selected experts and produce weighted-merged output + next logits.
+
+        Flow (following PoE):
+            1. hop_norm(x) + gated hop embedding -> h
+            2. h dispatched through AttentionParamBank (banked gather + einsum)
+               Each top-k slot produces an output.  The bank merges them
+               weighted by topk_weights internally.
+            3. Outbound router: mean-pool the merged output, compute logits
+               per selected expert, weighted-merge logits.
+
+        Because AttentionParamBank already does the weighted merge across
+        top-k, we can't get per-expert outputs from it.  Instead we compute
+        the merged output, and approximate outbound logits by running the
+        router for the *dominant* expert (rank-1) on the merged output.
+        This is a pragmatic choice -- banked dispatch means we don't have
+        individual expert outputs to feed separate routers.
+
+        Actually, to do it properly we loop over top-k slots (fixed small
+        loop: 2-3), run the expert bank for each slot individually, get
+        the output, run the outbound router, and merge.
 
         Args:
-            x: (B, T, D) hidden states.
-            expert_idx: (B, top_k) expert indices.
-            expert_weights: (B, top_k) routing weights.
+            x: (B, T, D) current hidden state.
+            topk_idx: (B, top_k) selected expert/exit indices.
+            topk_weights: (B, top_k) normalized expert weights.
+            hop: Global hop index for hop conditioning.
 
         Returns:
-            (B, T, D) expert outputs.
+            out: (B, T, D) weighted-merged expert output (delta for residual).
+            next_logits: (B, n_options) merged outbound router logits (perturbed).
         """
-        return self.expert_bank(x, expert_idx, expert_weights)
+        B, T, D = x.shape
+        top_k = topk_idx.shape[1]
+        safe_idx = topk_idx.clamp(max=self.pool_size - 1)
 
-    def aggregate_decisions(self, topk_idx: torch.Tensor,
-                            is_expert: torch.Tensor,
-                            is_exit: torch.Tensor,
-                            is_bridge: torch.Tensor,
-                            **kwargs
-                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """All-top-k agreement rule for sample-level decisions.
+        # --- Hop conditioning ---
+        # Use rank-1 expert for hop embedding (all top-k get same conditioning)
+        rank1_expert = safe_idx[:, 0]  # (B,)
+        x_cond = self.apply_hop_conditioning(
+            x.reshape(B * T, D),
+            rank1_expert.repeat_interleave(T),
+            hop=hop,
+        ).reshape(B, T, D)
 
-        ALL top-k must be exit → sample exits.
-        ALL top-k must be bridge → sample bridges.
-        Otherwise → sample continues.
+        # --- Per-slot expert dispatch + outbound router ---
+        # Loop over top-k slots (fixed small: 2-3 iterations)
+        # For each slot, dispatch single-expert, get output, run outbound router
+        merged_out = torch.zeros_like(x)  # (B, T, D)
+        merged_logits = torch.zeros(B, self.n_options, device=x.device, dtype=x.dtype)
 
-        Args:
-            topk_idx: (B, top_k) selected indices.
-            is_expert/is_exit/is_bridge: (B, top_k) boolean masks.
+        for k in range(top_k):
+            slot_idx = safe_idx[:, k:k+1]  # (B, 1)
+            slot_weight = topk_weights[:, k]  # (B,)
 
-        Returns:
-            (do_continue, do_exit, do_bridge): each (B,) bool.
-        """
-        all_exit = is_exit.all(dim=-1)       # (B,)
-        all_bridge = is_bridge.all(dim=-1)   # (B,)
-        do_continue = ~all_exit & ~all_bridge
-        return do_continue, all_exit, all_bridge
+            # Dispatch this single expert slot
+            # expert_bank expects (B, top_k, ...) so we pass top_k=1
+            slot_weights_for_bank = torch.ones(B, 1, device=x.device, dtype=x.dtype)
+            e_out = self.expert_bank(x_cond, slot_idx, slot_weights_for_bank)  # (B, T, D)
+
+            # Outbound router: mean-pool expert output, run banked router
+            e_pooled = e_out.mean(dim=1)  # (B, D)
+            e_logits = self.get_router_logits(e_pooled, slot_idx.squeeze(1))  # (B, n_options)
+
+            # Weighted accumulate
+            w = slot_weight  # (B,)
+            merged_out = merged_out + w[:, None, None] * e_out
+            merged_logits = merged_logits + w[:, None] * e_logits
+
+        # Perturb merged logits
+        merged_logits = self.perturb_logits(merged_logits)
+
+        return merged_out, merged_logits
 
     def prepare_bridge_out(self, x: torch.Tensor) -> torch.Tensor:
-        """Identity — raw hidden state passes to token side."""
+        """Identity --- raw hidden state passes to token side."""
         return x
 
     def accept_bridge_in(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Identity — receive raw hidden state from token side."""
+        """Identity --- receive raw hidden state from token side."""
         return x
-
-    def forward(self, x: torch.Tensor, active_mask: torch.Tensor,
-                hops_used: int | torch.Tensor, current_expert: torch.Tensor,
-                noise_scale: float | None = None,
-                global_hop: int | torch.Tensor | None = None
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                           torch.Tensor, torch.Tensor, int | torch.Tensor]:
-        """Run one hop of sequence-side routing.
-
-        Args:
-            x: (B, T, D) hidden states.
-            active_mask: (B,) bool — which samples are still active on this side.
-            hops_used: Cumulative hops consumed on this side (for exit ramp / budget).
-                Can be int or scalar tensor (scalar tensor avoids recompilation
-                under torch.compile).
-            current_expert: (B,) int — which expert each sample is currently at
-                (used for outbound router and hop embedding selection).
-            noise_scale: Override router noise (None = use default).
-            global_hop: Global hop index across both sides (for hop embeddings).
-                Falls back to hops_used if None. Can be int or scalar tensor.
-
-        Returns:
-            x: (B, T, D) updated hidden states (inactive samples unchanged).
-            active_mask: (B,) updated active mask.
-            do_exit: (B,) bool — samples that chose to exit.
-            do_bridge: (B,) bool — samples that chose to bridge.
-            next_expert: (B,) int — expert assignment for next hop (top-1 of experts).
-            hops_used: Updated hop count.
-        """
-        B, T, D = x.shape
-        gh = global_hop if global_hop is not None else hops_used
-
-        if hops_used >= self.max_hops:
-            # Budget exhausted — force exit
-            return (x, torch.zeros(B, dtype=torch.bool, device=x.device),
-                    active_mask.clone(), torch.zeros(B, dtype=torch.bool, device=x.device),
-                    current_expert, hops_used)
-
-        # --- Hop conditioning (for active samples) ---
-        # Uses global hop for embedding index (computational lifetime)
-        x_cond = self.apply_hop_conditioning(
-            x.view(B * T, D),
-            current_expert.repeat_interleave(T),
-            hop=gh,
-        ).view(B, T, D)
-
-        # Blend: active samples get conditioned, inactive keep original
-        x_work = torch.where(active_mask[:, None, None], x_cond, x)
-
-        # --- Router logits from current expert ---
-        # Pool over tokens for sample-level routing: mean pool
-        x_pooled = x_work.mean(dim=1)  # (B, D)
-        logits = self.get_router_logits(x_pooled, current_expert)
-        logits = self.perturb_logits(logits, noise_scale)
-        logits = self.apply_biases(logits, hops_used)
-
-        # --- Top-k selection ---
-        topk_idx, topk_weights, _ = self.select_topk(logits)
-        is_expert, is_exit, is_bridge = self.classify_topk(topk_idx)
-
-        # --- Dispatch through experts ---
-        expert_out = self.dispatch(x_work, topk_idx, topk_weights)
-
-        # Residual add (only for active samples)
-        x_new = x + torch.where(active_mask[:, None, None], expert_out, torch.zeros_like(expert_out))
-
-        # --- Aggregate decisions ---
-        do_continue, do_exit, do_bridge = self.aggregate_decisions(
-            topk_idx, is_expert, is_exit, is_bridge)
-
-        # Apply only to currently active samples
-        do_exit = do_exit & active_mask
-        do_bridge = do_bridge & active_mask
-        do_continue = do_continue & active_mask
-
-        # Update active mask
-        new_active = active_mask & do_continue
-
-        # Next expert = top-1 expert slot (first expert in top-k)
-        # For samples that exit/bridge, doesn't matter
-        first_expert_mask = is_expert[:, 0]
-        next_expert = torch.where(
-            first_expert_mask,
-            topk_idx[:, 0],
-            current_expert,  # keep current if top-1 wasn't an expert
-        )
-
-        return x_new, new_active, do_exit, do_bridge, next_expert, hops_used + 1

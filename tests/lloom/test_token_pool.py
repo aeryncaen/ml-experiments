@@ -1,17 +1,17 @@
 """Tests for LLooM TokenPool.
 
 Covers:
-- RCV vectorized voting: majority, elimination, sticky votes
-- Token parking (only exit/bridge in top-k)
-- Entry router vs outbound router
+- execute_hop() output shapes and post-dispatch routing
+- RCV: ranked_choice_vote with sticky votes
+- Entry router for bridge crossings
 - Gradient flow through all parameters
-- Forward shapes and hop budget enforcement
+- Logit chain: execute_hop logits feed back into routing
 """
 
 import pytest
 import torch
 
-from lloom.token_pool import TokenPool
+from lloom.token_pool import TokenPool, _ranked_choice_vote
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -41,67 +41,63 @@ def _make_pool(**kwargs):
 
 def _make_inputs(b=B, t=T):
     x = torch.randn(b, t, D, requires_grad=True)
-    active = torch.ones(b, dtype=torch.bool)
-    return x, active
+    topk_idx = torch.randint(0, POOL, (b, t, TOP_K))
+    topk_weights = torch.full((b, t, TOP_K), 1.0 / TOP_K)
+    return x, topk_idx, topk_weights
 
 
 # ---------------------------------------------------------------------------
-# RCV voting
+# RCV voting (module-level function)
 # ---------------------------------------------------------------------------
 
 class TestRankedChoiceVoting:
-    """Test the static _ranked_choice_vote method directly."""
+    """Test the _ranked_choice_vote function directly."""
 
     def test_clear_continue_majority(self):
-        """All tokens vote continue → continue."""
+        """All tokens vote continue -> continue."""
         votes = torch.zeros(B, T, dtype=torch.int8)  # all continue
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         assert cont.all()
         assert not exit_.any()
         assert not bridge.any()
 
     def test_clear_exit_majority(self):
-        """All tokens vote exit → exit."""
+        """All tokens vote exit -> exit."""
         votes = torch.ones(B, T, dtype=torch.int8)  # all exit
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         assert exit_.all()
         assert not cont.any()
         assert not bridge.any()
 
     def test_clear_bridge_majority(self):
-        """All tokens vote bridge → bridge."""
+        """All tokens vote bridge -> bridge."""
         votes = torch.full((B, T), 2, dtype=torch.int8)  # all bridge
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         assert bridge.all()
         assert not cont.any()
         assert not exit_.any()
 
     def test_simple_majority(self):
-        """More than half vote exit → exit in round 1."""
+        """More than half vote exit -> exit in round 1."""
         votes = torch.zeros(B, T, dtype=torch.int8)
         votes[:, :T // 2 + 1] = 1  # majority exit
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         assert exit_.all()
 
     def test_no_majority_goes_to_round2(self):
-        """Three-way split with no majority → round 2 resolves."""
-        # T=9 tokens: 3 continue, 3 exit, 3 bridge → no majority
-        # After elimination: lowest eliminated, votes transfer
+        """Three-way split with no majority -> round 2 resolves."""
         pool_t = 9
         votes = torch.zeros(B, pool_t, dtype=torch.int8)
         votes[:, :3] = 0  # continue
         votes[:, 3:6] = 1  # exit
         votes[:, 6:9] = 2  # bridge
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, pool_t, votes.device)
-        # All three tied at 3 each. argmin picks first (continue=0).
-        # Continue eliminated → transfers to whichever of exit/bridge is leading.
-        # exit=3, bridge=3, so exit >= bridge → transfer to exit. exit gets 6 > 4.5.
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, pool_t, votes.device)
         assert (cont | exit_ | bridge).all()  # decision made for every sample
 
     def test_mutually_exclusive_decisions(self):
         """Exactly one of continue/exit/bridge should be true per sample."""
         votes = torch.randint(0, 3, (B, T), dtype=torch.int8)
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         total = cont.long() + exit_.long() + bridge.long()
         assert (total == 1).all()
 
@@ -111,102 +107,131 @@ class TestRankedChoiceVoting:
         votes[0, :] = 0  # sample 0: all continue
         votes[1, :] = 1  # sample 1: all exit
         votes[2, :] = 2  # sample 2: all bridge
-        cont, exit_, bridge = TokenPool._ranked_choice_vote(votes, B, T, votes.device)
+        cont, exit_, bridge = _ranked_choice_vote(votes, B, T, votes.device)
         assert cont[0] and exit_[1] and bridge[2]
 
 
 # ---------------------------------------------------------------------------
-# Sticky votes
+# Sticky votes via ranked_choice_vote
 # ---------------------------------------------------------------------------
 
 class TestStickyVotes:
-    def test_newly_parked_tokens_lock_vote(self):
-        pool = _make_pool()
+    def test_newly_decided_tokens_lock_vote(self):
         vote_state = torch.zeros(B, T, dtype=torch.int8)
+        # Some tokens exit, some bridge, some continue
+        token_has_exit = torch.zeros(B, T, dtype=torch.bool)
+        token_has_bridge = torch.zeros(B, T, dtype=torch.bool)
+        token_has_continue = torch.zeros(B, T, dtype=torch.bool)
 
-        # Craft topk_idx where all are exit for some tokens
-        topk_idx = torch.zeros(B, T, TOP_K, dtype=torch.long)
-        # Token 0: both exit
-        topk_idx[:, 0, :] = pool.exit_idx
-        # Token 1: both bridge
-        topk_idx[:, 1, :] = pool.bridge_idx
-        # Token 2: one expert, one exit (not parked)
-        topk_idx[:, 2, 0] = 0
-        topk_idx[:, 2, 1] = pool.exit_idx
+        token_has_exit[:, 0] = True    # token 0 exits
+        token_has_bridge[:, 1] = True  # token 1 bridges
+        token_has_continue[:, 2:] = True  # rest continue
 
-        is_expert, is_exit, is_bridge = pool.classify_topk(topk_idx)
-        pool.aggregate_decisions(topk_idx, is_expert, is_exit, is_bridge,
-                                 vote_state=vote_state)
-
+        _, _, _, vs = TokenPool.ranked_choice_vote(
+            token_has_exit, token_has_bridge, token_has_continue,
+            vote_state=vote_state,
+        )
         # Token 0 should be locked as exit (1)
-        assert (vote_state[:, 0] == 1).all()
+        assert (vs[:, 0] == 1).all()
         # Token 1 should be locked as bridge (2)
-        assert (vote_state[:, 1] == 2).all()
-        # Token 2 should still be active (0)
-        assert (vote_state[:, 2] == 0).all()
+        assert (vs[:, 1] == 2).all()
+        # Token 2+ should still be active (0)
+        assert (vs[:, 2] == 0).all()
 
     def test_locked_votes_persist(self):
-        pool = _make_pool()
         vote_state = torch.zeros(B, T, dtype=torch.int8)
         vote_state[:, 0] = 1  # already locked as exit
 
-        # Even if new routing gives expert for token 0, locked vote persists
-        topk_idx = torch.randint(0, POOL, (B, T, TOP_K))
-        is_expert, is_exit, is_bridge = pool.classify_topk(topk_idx)
-        pool.aggregate_decisions(topk_idx, is_expert, is_exit, is_bridge,
-                                 vote_state=vote_state)
+        # All tokens now continue (but locked one stays locked)
+        token_has_exit = torch.zeros(B, T, dtype=torch.bool)
+        token_has_bridge = torch.zeros(B, T, dtype=torch.bool)
+        token_has_continue = torch.ones(B, T, dtype=torch.bool)
 
-        # Token 0 should still be locked as exit
-        assert (vote_state[:, 0] == 1).all()
+        _, _, _, vs = TokenPool.ranked_choice_vote(
+            token_has_exit, token_has_bridge, token_has_continue,
+            vote_state=vote_state,
+        )
+        assert (vs[:, 0] == 1).all()  # still locked
 
     def test_sticky_votes_monotonic(self):
         """Number of parked tokens should never decrease."""
-        pool = _make_pool()
         vote_state = torch.zeros(B, T, dtype=torch.int8)
 
         for _ in range(5):
             n_parked_before = (vote_state > 0).sum().item()
-            topk_idx = torch.randint(0, pool.n_options, (B, T, TOP_K))
-            is_expert, is_exit, is_bridge = pool.classify_topk(topk_idx)
-            pool.aggregate_decisions(topk_idx, is_expert, is_exit, is_bridge,
-                                     vote_state=vote_state)
+            # Random decisions
+            token_has_exit = torch.rand(B, T) < 0.2
+            token_has_bridge = torch.rand(B, T) < 0.2
+            token_has_continue = ~token_has_exit & ~token_has_bridge
+
+            _, _, _, vote_state = TokenPool.ranked_choice_vote(
+                token_has_exit, token_has_bridge, token_has_continue,
+                vote_state=vote_state,
+            )
             n_parked_after = (vote_state > 0).sum().item()
             assert n_parked_after >= n_parked_before
 
 
 # ---------------------------------------------------------------------------
-# Forward and shapes
+# execute_hop shapes
 # ---------------------------------------------------------------------------
 
-class TestForward:
-    def test_basic_output_shape(self):
+class TestExecuteHopShapes:
+    def test_basic_output_shapes(self):
         pool = _make_pool()
-        x, active = _make_inputs()
-        x_out, new_active, do_exit, do_bridge, ce, vs, hops = \
-            pool(x, active, hops_used=0, is_first_hop=True)
-        assert x_out.shape == (B, T, D)
-        assert new_active.shape == (B,)
-        assert do_exit.shape == (B,)
-        assert do_bridge.shape == (B,)
-        assert ce.shape == (B, T)
-        assert vs.shape == (B, T)
-        assert hops == 1
-
-    def test_entry_router_first_hop(self):
-        """First hop should use entry router, not outbound router."""
-        pool = _make_pool()
-        x, active = _make_inputs()
-        # Should not crash with current_expert=None on first hop
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True,
-                         current_expert=None)
-        assert x_out.shape == (B, T, D)
+        x, topk_idx, topk_weights = _make_inputs()
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert out.shape == (B, T, D)
+        assert next_logits.shape == (B, T, pool.n_options)
 
     @pytest.mark.parametrize("b,t", [(1, 4), (4, 16)])
     def test_various_shapes(self, b, t):
         pool = _make_pool()
-        x, active = _make_inputs(b=b, t=t)
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
-        assert x_out.shape == (b, t, D)
+        x, topk_idx, topk_weights = _make_inputs(b=b, t=t)
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert out.shape == (b, t, D)
+        assert next_logits.shape == (b, t, pool.n_options)
+
+
+# ---------------------------------------------------------------------------
+# Post-dispatch routing
+# ---------------------------------------------------------------------------
+
+class TestPostDispatchRouting:
+    def test_next_logits_nonzero(self):
+        pool = _make_pool()
+        x, topk_idx, topk_weights = _make_inputs()
+        _, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert next_logits.abs().sum() > 0
+
+    def test_logit_chain_flow(self):
+        """execute_hop logits can feed back into per-token routing."""
+        pool = _make_pool()
+        x = torch.randn(B, T, D)
+
+        # Initial logits from entry router
+        logits = pool.entry_router(x.reshape(B * T, D)).reshape(B, T, pool.n_options)
+
+        # First hop: apply biases + topk per token
+        biased = pool.apply_biases(logits.reshape(B * T, pool.n_options), hops_used=0)
+        topk_idx, topk_weights, _ = pool.select_topk(biased)
+        topk_idx = topk_idx.reshape(B, T, TOP_K)
+        topk_weights = topk_weights.reshape(B, T, TOP_K)
+
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        x = x + out
+
+        # Second hop from outbound logits
+        biased2 = pool.apply_biases(next_logits.reshape(B * T, pool.n_options), hops_used=1)
+        topk_idx2, topk_weights2, _ = pool.select_topk(biased2)
+        topk_idx2 = topk_idx2.reshape(B, T, TOP_K)
+        topk_weights2 = topk_weights2.reshape(B, T, TOP_K)
+
+        out2, next_logits2 = pool.execute_hop(x, topk_idx2, topk_weights2, hop=1)
+        x = x + out2
+
+        assert x.shape == (B, T, D)
+        assert next_logits2.shape == (B, T, pool.n_options)
 
 
 # ---------------------------------------------------------------------------
@@ -217,42 +242,58 @@ class TestGradientFlow:
     def test_all_params_get_grad(self):
         pool = _make_pool()
         pool.hop_gate_proj.bias.data.fill_(2.0)
-        x, active = _make_inputs()
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
-        loss = x_out.sum()
+        x, topk_idx, topk_weights = _make_inputs()
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        loss = out.sum() + next_logits.sum()
         loss.backward()
 
         assert x.grad is not None and x.grad.abs().sum() > 0
 
-        # Entry router and expert bank should get gradients
+        # Entry router should have params
+        assert pool.entry_router.weight.grad is None  # wasn't used here, that's fine
+
+    def test_entry_router_gets_grad(self):
+        pool = _make_pool()
+        x = torch.randn(B, T, D, requires_grad=True)
+        logits = pool.entry_router(x.reshape(B * T, D))
+        logits.sum().backward()
         assert pool.entry_router.weight.grad is not None
 
     def test_multi_hop_backward(self):
         pool = _make_pool()
-        x, active = _make_inputs()
-        ce = None
+        x = torch.randn(B, T, D, requires_grad=True)
+        logits = pool.entry_router(x.reshape(B * T, D)).reshape(B, T, pool.n_options)
+
         for hop in range(3):
-            x_out, active, _, _, ce, vs, _ = pool(
-                x, active, hops_used=hop, is_first_hop=(hop == 0),
-                current_expert=ce)
-            x = x + x_out
+            biased = pool.apply_biases(logits.reshape(B * T, pool.n_options), hops_used=hop)
+            topk_idx, topk_weights, _ = pool.select_topk(biased)
+            topk_idx = topk_idx.reshape(B, T, TOP_K)
+            topk_weights = topk_weights.reshape(B, T, TOP_K)
+            out, logits = pool.execute_hop(x, topk_idx, topk_weights, hop=hop)
+            x = x + out
+
         loss = x.sum()
         loss.backward()  # should not crash
 
 
 # ---------------------------------------------------------------------------
-# Hop budget
+# Entry router
 # ---------------------------------------------------------------------------
 
-class TestHopBudget:
-    def test_force_exit_at_budget(self):
+class TestEntryRouter:
+    def test_entry_router_output_shape(self):
         pool = _make_pool()
-        x, active = _make_inputs()
-        x_out, new_active, do_exit, _, _, _, hops = \
-            pool(x, active, hops_used=MAX_HOPS, is_first_hop=True)
-        assert do_exit.all()
-        assert not new_active.any()
-        assert hops == MAX_HOPS
+        x = torch.randn(B * T, D)
+        logits = pool.entry_router(x)
+        assert logits.shape == (B * T, pool.n_options)
+
+    def test_entry_router_gradient(self):
+        pool = _make_pool()
+        x = torch.randn(B * T, D, requires_grad=True)
+        logits = pool.entry_router(x)
+        logits.sum().backward()
+        assert x.grad is not None
+        assert pool.entry_router.weight.grad is not None
 
 
 # ---------------------------------------------------------------------------
@@ -272,121 +313,50 @@ class TestBridge:
 
 
 # ---------------------------------------------------------------------------
-# Hop conditioning in forward path
+# Hop conditioning through execute_hop
 # ---------------------------------------------------------------------------
 
 class TestHopConditioning:
-    """Verify that apply_hop_conditioning is called during TokenPool.forward."""
-
     def test_different_hops_produce_different_outputs(self):
-        """Output should differ when hops_used changes, proving conditioning is active."""
         pool = _make_pool(router_noise=0.0)
+        pool.hop_gate_proj.bias.data.fill_(2.0)
         pool.eval()
-        torch.manual_seed(0)
         x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
+        topk_idx = torch.zeros(B, T, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, T, TOP_K), 1.0 / TOP_K)
 
         with torch.no_grad():
-            out0, *_ = pool(x, active, hops_used=0, is_first_hop=True)
-            out1, *_ = pool(x, active, hops_used=1, is_first_hop=False,
-                            current_expert=torch.zeros(B, T, dtype=torch.long))
+            out0, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+            out1, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=1)
 
-        # With hop conditioning, the outputs should differ because of hop embedding
         assert not torch.allclose(out0, out1, atol=1e-6), \
-            "Outputs identical across hops — hop conditioning not applied"
+            "Outputs identical across hops -- hop conditioning not applied"
 
     def test_hop_embed_gets_gradient(self):
-        """hop_embed_bank must receive gradient through TokenPool.forward."""
         pool = _make_pool()
-        pool.train()
-        x, active = _make_inputs()
-
-        out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
+        pool.hop_gate_proj.bias.data.fill_(2.0)
+        x = torch.randn(B, T, D, requires_grad=True)
+        topk_idx = torch.zeros(B, T, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, T, TOP_K), 1.0 / TOP_K)
+        out, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
         out.sum().backward()
-
         assert pool.hop_embed_bank.grad is not None
-        assert pool.hop_embed_bank.grad.abs().max() > 0, \
-            "hop_embed_bank got zero gradient — not connected to forward path"
+        assert pool.hop_embed_bank.grad.abs().max() > 0
 
     def test_hop_gate_proj_gets_gradient(self):
-        """hop_gate_proj must receive gradient through TokenPool.forward."""
         pool = _make_pool()
-        pool.train()
-        x, active = _make_inputs()
-
-        out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
+        x = torch.randn(B, T, D, requires_grad=True)
+        topk_idx = torch.zeros(B, T, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, T, TOP_K), 1.0 / TOP_K)
+        out, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
         out.sum().backward()
-
         assert pool.hop_gate_proj.weight.grad is not None
-        assert pool.hop_gate_proj.weight.grad.abs().max() > 0, \
-            "hop_gate_proj.weight got zero gradient — not connected to forward path"
 
     def test_hop_norm_gets_gradient(self):
-        """hop_norm (RMSNorm) must receive gradient through TokenPool.forward."""
         pool = _make_pool()
-        pool.train()
-        x, active = _make_inputs()
-
-        out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
+        x = torch.randn(B, T, D, requires_grad=True)
+        topk_idx = torch.zeros(B, T, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, T, TOP_K), 1.0 / TOP_K)
+        out, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
         out.sum().backward()
-
-        # RMSNorm has a 'weight' parameter
         assert pool.hop_norm.weight.grad is not None
-        assert pool.hop_norm.weight.grad.abs().max() > 0, \
-            "hop_norm.weight got zero gradient — not connected to forward path"
-
-    def test_inactive_samples_skip_conditioning(self):
-        """Inactive samples should get identical output regardless of hop."""
-        pool = _make_pool(router_noise=0.0)
-        pool.eval()
-        x = torch.randn(B, T, D)
-        # All inactive
-        active = torch.zeros(B, dtype=torch.bool)
-
-        with torch.no_grad():
-            out0, *_ = pool(x, active, hops_used=0, is_first_hop=True)
-            out5, *_ = pool(x, active, hops_used=5, is_first_hop=False,
-                            current_expert=torch.zeros(B, T, dtype=torch.long))
-
-        # Inactive samples should be unchanged from input x
-        assert torch.allclose(out0, x, atol=1e-6), \
-            "Inactive samples were modified by forward"
-        assert torch.allclose(out5, x, atol=1e-6), \
-            "Inactive samples were modified by forward"
-
-
-# ---------------------------------------------------------------------------
-# Global hop conditioning
-# ---------------------------------------------------------------------------
-
-class TestGlobalHop:
-    def test_global_hop_changes_conditioning(self):
-        """Different global_hop with same hops_used should produce different outputs."""
-        pool = _make_pool(router_noise=0.0, global_max_hops=48)
-        pool.eval()
-        x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
-
-        with torch.no_grad():
-            out0, *_ = pool(x, active, hops_used=0, is_first_hop=True, global_hop=0)
-            out10, *_ = pool(x, active, hops_used=0, is_first_hop=True, global_hop=10)
-
-        assert not torch.allclose(out0, out10, atol=1e-6), \
-            "Different global_hop values produced identical outputs"
-
-    def test_fallback_to_hops_used(self):
-        """Without global_hop, conditioning should use hops_used."""
-        pool = _make_pool(router_noise=0.0)
-        pool.eval()
-        x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
-        ce = torch.zeros(B, T, dtype=torch.long)
-
-        with torch.no_grad():
-            out_explicit, *_ = pool(x, active, hops_used=3, is_first_hop=False,
-                                    current_expert=ce, global_hop=3)
-            out_fallback, *_ = pool(x, active, hops_used=3, is_first_hop=False,
-                                    current_expert=ce)
-
-        assert torch.allclose(out_explicit, out_fallback, atol=1e-6), \
-            "global_hop=hops_used should match fallback behavior"

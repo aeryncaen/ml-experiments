@@ -5,8 +5,10 @@ Uses a minimal concrete subclass (StubPool) to test the base class methods:
 - apply_biases: exit ramp increases with hops, bridge bias fixed
 - select_topk: weight zeroing for exit/bridge, renormalization
 - classify_topk: correct expert/exit/bridge masks
+- route(): rank-1 exit/bridge rule
 - apply_hop_conditioning: content-gated hop embedding application
 - get_router_logits: banked router dispatch with sharing
+- entry_router: standalone router for bridge crossings
 - Gradient flow through all base class parameters
 """
 
@@ -24,14 +26,9 @@ from lloom.routing_pool import RoutingPool
 class StubPool(RoutingPool):
     """Minimal subclass that passes through for dispatch."""
 
-    def dispatch(self, x, expert_idx, expert_weights, **kwargs):
-        return x  # identity
-
-    def aggregate_decisions(self, topk_idx, is_expert, is_exit, is_bridge, **kwargs):
-        B = topk_idx.shape[0]
-        return (torch.ones(B, dtype=torch.bool),
-                torch.zeros(B, dtype=torch.bool),
-                torch.zeros(B, dtype=torch.bool))
+    def execute_hop(self, x, topk_idx, topk_weights, hop=0):
+        B = x.shape[0]
+        return x * 0, torch.zeros(B, self.n_options, device=x.device)
 
     def prepare_bridge_out(self, x):
         return x
@@ -278,6 +275,74 @@ class TestClassifyTopk:
 
 
 # ---------------------------------------------------------------------------
+# route() --- rank-1 exit/bridge rule
+# ---------------------------------------------------------------------------
+
+class TestRoute:
+    def test_output_shapes(self):
+        pool = _make_pool(router_noise=0.0)
+        logits = torch.randn(B, pool.n_options)
+        topk_idx, topk_weights, has_exit, has_bridge, has_continue = \
+            pool.route(logits, hops_used=0)
+        assert topk_idx.shape == (B, TOP_K)
+        assert topk_weights.shape == (B, TOP_K)
+        assert has_exit.shape == (B,)
+        assert has_bridge.shape == (B,)
+        assert has_continue.shape == (B,)
+
+    def test_exit_rank1_triggers_exit(self):
+        """When exit is rank-1 (highest logit), has_exit should be True."""
+        pool = _make_pool(exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=0.0)
+        logits = torch.zeros(B, pool.n_options)
+        logits[:, pool.exit_idx] = 100.0  # exit dominates
+        logits[:, 0] = 50.0  # some expert second
+        _, _, has_exit, has_bridge, has_continue = pool.route(logits, hops_used=0)
+        assert has_exit.all()
+        assert not has_bridge.any()
+        assert not has_continue.any()
+
+    def test_bridge_rank1_triggers_bridge(self):
+        """When bridge is rank-1, has_bridge should be True."""
+        pool = _make_pool(exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=0.0)
+        logits = torch.zeros(B, pool.n_options)
+        logits[:, pool.bridge_idx] = 100.0
+        logits[:, 0] = 50.0
+        _, _, has_exit, has_bridge, has_continue = pool.route(logits, hops_used=0)
+        assert has_bridge.all()
+        assert not has_exit.any()
+        assert not has_continue.any()
+
+    def test_expert_rank1_continues(self):
+        """When an expert is rank-1, has_continue should be True."""
+        pool = _make_pool(exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=0.0)
+        logits = torch.zeros(B, pool.n_options)
+        logits[:, 0] = 100.0  # expert 0 dominates
+        logits[:, 1] = 50.0
+        _, _, has_exit, has_bridge, has_continue = pool.route(logits, hops_used=0)
+        assert has_continue.all()
+        assert not has_exit.any()
+        assert not has_bridge.any()
+
+    def test_exit_rank2_does_not_trigger(self):
+        """Exit in rank-2 (not rank-1) should NOT trigger exit."""
+        pool = _make_pool(exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=0.0)
+        logits = torch.zeros(B, pool.n_options)
+        logits[:, 0] = 100.0  # expert rank-1
+        logits[:, pool.exit_idx] = 50.0  # exit rank-2
+        _, _, has_exit, _, has_continue = pool.route(logits, hops_used=0)
+        assert has_continue.all()
+        assert not has_exit.any()
+
+    def test_mutually_exclusive(self):
+        """Exactly one of exit/bridge/continue should be true per sample."""
+        pool = _make_pool()
+        logits = torch.randn(B, pool.n_options)
+        _, _, has_exit, has_bridge, has_continue = pool.route(logits, hops_used=0)
+        total = has_exit.long() + has_bridge.long() + has_continue.long()
+        assert (total == 1).all()
+
+
+# ---------------------------------------------------------------------------
 # apply_hop_conditioning
 # ---------------------------------------------------------------------------
 
@@ -293,10 +358,6 @@ class TestApplyHopConditioning:
         pool = _make_pool()
         x = torch.randn(B, T, D)
         eidx = torch.randint(0, POOL, (B,))
-        # For 3d input with 1d expert_idx, we need matching shapes
-        # In practice, sequence side passes (B, T, D) with (B,) expert_idx
-        # The hop embed is (B, D), broadcast over T
-        # Let's test with (B*T, D) and (B*T,) to match the flat case
         x_flat = x.view(B * T, D)
         eidx_flat = eidx.repeat_interleave(T)
         out = pool.apply_hop_conditioning(x_flat, eidx_flat, hop=0)
@@ -306,10 +367,6 @@ class TestApplyHopConditioning:
         pool = _make_pool()
         x = torch.randn(B, D)
         eidx = torch.randint(0, POOL, (B,))
-        out0 = pool.apply_hop_conditioning(x, eidx, hop=0)
-        out1 = pool.apply_hop_conditioning(x, eidx, hop=1)
-        # Different hop embeddings should produce different results
-        # (gate may be near zero at init, so let's set it nonzero)
         pool.hop_gate_proj.bias.data.fill_(2.0)  # open the gate
         out0 = pool.apply_hop_conditioning(x, eidx, hop=0)
         out1 = pool.apply_hop_conditioning(x, eidx, hop=1)
@@ -328,10 +385,7 @@ class TestApplyHopConditioning:
         pool = _make_pool()
         x = torch.randn(B, D)
         eidx = torch.randint(0, POOL, (B,))
-        # Gate projection is zero-initialized, so sigmoid(0) = 0.5
-        # Hop embed should be added at ~50% strength
         out = pool.apply_hop_conditioning(x, eidx, hop=0)
-        # Output should differ from just hop_norm(x) but not by a huge amount
         normed = pool.hop_norm(x)
         diff = (out - normed).abs().mean()
         assert diff > 0  # should be nonzero (hop embed != 0)
@@ -402,16 +456,32 @@ class TestGetRouterLogits:
 
 
 # ---------------------------------------------------------------------------
+# entry_router
+# ---------------------------------------------------------------------------
+
+class TestEntryRouter:
+    def test_output_shape(self):
+        pool = _make_pool()
+        x = torch.randn(B, D)
+        logits = pool.entry_router(x)
+        assert logits.shape == (B, pool.n_options)
+
+    def test_gradient_flow(self):
+        pool = _make_pool()
+        x = torch.randn(B, D, requires_grad=True)
+        logits = pool.entry_router(x)
+        logits.sum().backward()
+        assert x.grad is not None
+        assert pool.entry_router.weight.grad is not None
+
+
+# ---------------------------------------------------------------------------
 # Integration: gradient flow through full base class
 # ---------------------------------------------------------------------------
 
 class TestGradientFlowIntegration:
     def test_all_base_params_get_grad(self):
-        """Test gradient flow through router + hop conditioning together.
-
-        Uses logits.sum() as loss (not softmax) to avoid vanishing gradients
-        from saturated softmax masking the actual gradient connectivity.
-        """
+        """Test gradient flow through router + hop conditioning together."""
         pool = _make_pool()
         pool.hop_gate_proj.bias.data.fill_(2.0)
         pool.train()
@@ -419,19 +489,19 @@ class TestGradientFlowIntegration:
         x = torch.randn(B, D, requires_grad=True)
         eidx = torch.arange(POOL)[:B] % POOL
 
-        # Hop conditioning → router logits
+        # Hop conditioning -> router logits
         x_cond = pool.apply_hop_conditioning(x, eidx, hop=0)
         logits = pool.get_router_logits(x_cond, eidx)
 
-        # Use logits.sum() directly — tests gradient connectivity without
-        # softmax saturation. The select_topk grad flow is tested separately.
         loss = logits.sum()
         loss.backward()
 
         # Core params always in the compute path
+        # entry_router is only used for bridge crossings, not in this test path
         must_have_grad = ('router_shared', 'hop_gate_proj.weight', 'hop_gate_proj.bias')
+        skip_params = {'entry_router.weight'}
         for name, p in pool.named_parameters():
-            if p.requires_grad:
+            if p.requires_grad and name not in skip_params:
                 assert p.grad is not None, f"No gradient for {name}"
                 if name in must_have_grad:
                     assert p.grad.abs().sum() > 0, f"Zero gradient for {name}"

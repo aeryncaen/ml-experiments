@@ -1,18 +1,17 @@
-"""RoutingPool — shared routing mechanics for LLooM's dual-paradigm pools.
+"""RoutingPool --- shared routing mechanics for LLooM's dual-paradigm pools.
 
 Base class providing:
-- Banked outbound routers (with 50% sharing)
+- Banked outbound routers (with sharing)
 - Content-gated hop embeddings
 - Hop norm (RMSNorm)
 - Router noise injection (annealed)
 - Exit/bridge bias application (exit ramp + fixed bridge bias)
 - Top-k selection with exit/bridge weight zeroing and renormalization
-- Classification of top-k picks into expert/exit/bridge
+- route(): logit interpretation with rank-1 exit/bridge rule
+- Entry router (for bridge crossings)
 
 Subclasses (SequencePool, TokenPool) provide:
-- dispatch() — expert forward pass
-- aggregate_decisions() — sample-level continue/exit/bridge decision
-- prepare_bridge_out() / accept_bridge_in() — bridge formatting
+- execute_hop() --- dispatch experts, outbound routers on output, weighted merge
 """
 
 from __future__ import annotations
@@ -40,8 +39,7 @@ class RoutingPool(nn.Module, ABC):
         exit_ramp_scale: Scale for exit bias ramp over hops.
         router_noise: Gaussian noise scale for router exploration.
         router_shared_fraction: Fraction of router + hop embed params shared
-            across experts.  (Expert bank sharing is controlled separately
-            by each subclass.)
+            across experts.
         hop_gate_dim: Prefix slice of hidden dim used for hop gating.
     """
 
@@ -79,10 +77,15 @@ class RoutingPool(nn.Module, ABC):
         self.bridge_idx = pool_size + 1
 
         # --- Banked outbound routers (one per expert) ---
-        # Router: dim → n_options, with shared/private split
+        # Router: dim -> n_options, with shared/private split
         self.router_shared, self.router_bank, \
             self.router_shared_out, self.router_private_out = \
             _make_bank(pool_size, dim, self.n_options, router_shared_fraction)
+
+        # --- Entry router: for samples arriving via bridge ---
+        # Standalone Linear, produces logits in this pool's space
+        self.entry_router = nn.Linear(dim, self.n_options, bias=False)
+        nn.init.normal_(self.entry_router.weight, std=dim ** -0.5)
 
         # --- Per-expert hop embeddings: (pool_size, global_max_hops, dim) ---
         # Shared/private split on last dim (the embedding dim)
@@ -135,12 +138,12 @@ class RoutingPool(nn.Module, ABC):
         orig_shape = x.shape[:-1]
         x_flat = x.reshape(N, self.dim)
 
-        # Matmul: (N, dim) @ (N, dim, private_out) → (N, private_out)
+        # Matmul: (N, dim) @ (N, dim, private_out) -> (N, private_out)
         priv_logits = torch.bmm(
             x_flat.unsqueeze(1), priv_w).squeeze(1)  # (N, private_out)
 
         if self.router_shared is not None:
-            # (N, dim) @ (dim, shared_out) → (N, shared_out)
+            # (N, dim) @ (dim, shared_out) -> (N, shared_out)
             shared_logits = x_flat @ self.router_shared
             logits = torch.cat([shared_logits, priv_logits], dim=-1)
         else:
@@ -231,6 +234,37 @@ class RoutingPool(nn.Module, ABC):
         is_bridge = topk_idx == self.bridge_idx
         return is_expert, is_exit, is_bridge
 
+    def route(self, logits: torch.Tensor, hops_used: int | torch.Tensor
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Interpret incoming logits into routing decisions.
+
+        Applies biases, top-k selection, and the rank-1 exit/bridge rule:
+        exit or bridge triggers only if it is the rank-1 pick (index 0
+        in the top-k). Otherwise it is zeroed out and expert weights
+        renormalize.
+
+        Args:
+            logits: (B, n_options) incoming router logits.
+            hops_used: Number of hops already consumed on this side.
+
+        Returns:
+            topk_idx: (B, top_k) selected indices.
+            topk_weights: (B, top_k) normalized expert weights (exit/bridge zeroed).
+            has_exit: (B,) bool -- rank-1 is exit.
+            has_bridge: (B,) bool -- rank-1 is bridge.
+            has_continue: (B,) bool -- rank-1 is an expert.
+        """
+        logits = self.apply_biases(logits, hops_used)
+        topk_idx, topk_weights, _ = self.select_topk(logits)
+
+        # Rank-1 exit/bridge rule: only the top-1 pick matters for action
+        rank1 = topk_idx[..., 0]  # (B,)
+        has_exit = rank1 == self.exit_idx
+        has_bridge = rank1 == self.bridge_idx
+        has_continue = rank1 < self.pool_size
+
+        return topk_idx, topk_weights, has_exit, has_bridge, has_continue
+
     # ------------------------------------------------------------------
     # Hop conditioning
     # ------------------------------------------------------------------
@@ -253,7 +287,7 @@ class RoutingPool(nn.Module, ABC):
         x = self.hop_norm(x)
 
         # Gather hop embedding for (expert, hop)
-        # Use torch.clamp instead of min() — Python min() with tensor causes graph break
+        # Use torch.clamp instead of min() -- Python min() with tensor causes graph break
         if isinstance(hop, torch.Tensor):
             hop_clamped = torch.clamp(hop, max=self.global_max_hops - 1)
         else:
@@ -282,33 +316,27 @@ class RoutingPool(nn.Module, ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def dispatch(self, x: torch.Tensor, expert_idx: torch.Tensor,
-                 expert_weights: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Run expert forward pass.
+    def execute_hop(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                    topk_weights: torch.Tensor,
+                    hop: int | torch.Tensor = 0
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run selected experts and produce weighted-merged output + next logits.
+
+        Following PoE's pattern:
+        1. Hop conditioning (hop norm + gated hop embed)
+        2. Dispatch through selected experts
+        3. Each expert's outbound router processes expert output -> logits
+        4. Weighted merge of both expert outputs and outbound logits
 
         Args:
-            x: Hidden states.
-            expert_idx: Selected expert indices.
-            expert_weights: Routing weights.
+            x: (B, T, D) current hidden state.
+            topk_idx: (B, top_k) selected expert/exit indices.
+            topk_weights: (B, top_k) softmax weights (exit/bridge zeroed).
+            hop: Global hop index for hop conditioning.
 
         Returns:
-            Expert outputs (same shape as x).
-        """
-        ...
-
-    @abstractmethod
-    def aggregate_decisions(self, topk_idx: torch.Tensor,
-                            is_expert: torch.Tensor,
-                            is_exit: torch.Tensor,
-                            is_bridge: torch.Tensor,
-                            **kwargs
-                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Determine sample-level action: continue, exit, or bridge.
-
-        Returns:
-            do_continue: (B,) bool — sample continues routing on this side.
-            do_exit: (B,) bool — sample exits the pools.
-            do_bridge: (B,) bool — sample bridges to the other side.
+            out: (B, T, D) weighted-merged expert output (delta for residual).
+            next_logits: (B, n_options) perturbed merged outbound router logits.
         """
         ...
 

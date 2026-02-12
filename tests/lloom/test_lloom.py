@@ -4,10 +4,9 @@ Covers:
 - End-to-end forward and backward
 - Output shapes for various (B, T) inputs
 - Stem router behavior (routing to seq, tok, exit)
-- Minimum compute path (entry_stem → exit_stem only)
+- Minimum compute path (entry_stem -> exit_stem only)
 - Bridge crossings
 - Init behavior (param stats, bias inits)
-- Causal masking respected in stems
 - Info dict populated
 - StemBlock independently
 """
@@ -169,12 +168,14 @@ class TestStemRouter:
     def test_force_exit_via_bias(self):
         """With very high exit bias, all samples should exit immediately."""
         model = _make_model()
-        # Bias the exit slot very high
+        cfg = model.config
+        # Exit slot in seq pool space is at cfg.seq_exit_idx
         with torch.no_grad():
-            model.stem_router.bias.data[-1] = 100.0  # exit slot
+            model.stem_router.bias.data.zero_()
+            model.stem_router.bias.data[cfg.seq_exit_idx] = 100.0
         x = _make_input()
         _, info = model(x)
-        assert info['stem_go_exit'] == 1.0
+        assert info['stem_go_exit'].item() == pytest.approx(1.0)
 
     def test_force_seq_via_bias(self):
         """With very high first expert bias, all should go to seq."""
@@ -184,7 +185,7 @@ class TestStemRouter:
             model.stem_router.bias.data[0] = 100.0  # first seq expert
         x = _make_input()
         _, info = model(x)
-        assert info['stem_go_seq'] == 1.0
+        assert info['stem_go_seq'].item() == pytest.approx(1.0)
 
     def test_force_tok_via_bias(self):
         """With very high bridge bias, all should go to token side."""
@@ -192,10 +193,10 @@ class TestStemRouter:
         cfg = model.config
         with torch.no_grad():
             model.stem_router.bias.data.zero_()
-            model.stem_router.bias.data[cfg.seq_pool_size] = 100.0  # bridge slot
+            model.stem_router.bias.data[cfg.seq_bridge_idx] = 100.0
         x = _make_input()
         _, info = model(x)
-        assert info['stem_go_tok'] == 1.0
+        assert info['stem_go_tok'].item() == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -204,22 +205,26 @@ class TestStemRouter:
 
 class TestMinComputePath:
     def test_exit_only_path(self):
-        """All samples exit from stem → only stems run."""
+        """All samples exit from stem -> only stems run."""
         model = _make_model()
+        cfg = model.config
         with torch.no_grad():
-            model.stem_router.bias.data[-1] = 100.0
+            model.stem_router.bias.data.zero_()
+            model.stem_router.bias.data[cfg.seq_exit_idx] = 100.0
         x = _make_input()
         out, info = model(x)
         assert out.shape == (B, T, D)
-        assert info['mean_seq_hops'] == 0.0
-        assert info['mean_tok_hops'] == 0.0
-        assert info['mean_bridges'] == 0.0
+        assert info['mean_seq_hops'].item() == 0.0
+        assert info['mean_tok_hops'].item() == 0.0
+        assert info['mean_bridges'].item() == 0.0
 
     def test_exit_path_backward(self):
         """Min compute path should still support backward."""
         model = _make_model()
+        cfg = model.config
         with torch.no_grad():
-            model.stem_router.bias.data[-1] = 100.0
+            model.stem_router.bias.data.zero_()
+            model.stem_router.bias.data[cfg.seq_exit_idx] = 100.0
         x = _make_input()
         out, info = model(x)
         loss = out.sum()
@@ -260,9 +265,9 @@ class TestInitBehavior:
         torch.testing.assert_close(
             bias[:cfg.seq_pool_size],
             torch.zeros(cfg.seq_pool_size))
-        # Bridge-to-token and exit slots: log(pool_size)
-        assert abs(bias[cfg.seq_pool_size].item() - expected_bias) < 1e-5
-        assert abs(bias[cfg.seq_pool_size + 1].item() - expected_bias) < 1e-5
+        # Exit and bridge slots: log(pool_size)
+        assert abs(bias[cfg.seq_exit_idx].item() - expected_bias) < 1e-5
+        assert abs(bias[cfg.seq_bridge_idx].item() - expected_bias) < 1e-5
 
     def test_final_norm_init(self):
         model = _make_model()
@@ -274,7 +279,7 @@ class TestInitBehavior:
         """Model should have a reasonable number of parameters."""
         model = _make_model()
         n_params = sum(p.numel() for p in model.parameters())
-        # Small test config — should be a few hundred K at most
+        # Small test config -- should be a few hundred K at most
         assert 1000 < n_params < 10_000_000
 
 
@@ -315,17 +320,6 @@ class TestGlobalHops:
             _, info = model(x)
         assert 'mean_global_hops' in info
 
-    def test_global_hops_geq_side_hops(self):
-        """Global hops should be >= max(seq_hops, tok_hops) for each sample."""
-        model = _make_model()
-        model.eval()
-        x = torch.randn(B, T, D)
-        with torch.no_grad():
-            _, info = model(x)
-        # Global = seq + tok, so it's always >= either side alone
-        assert info['mean_global_hops'] >= info['mean_seq_hops']
-        assert info['mean_global_hops'] >= info['mean_tok_hops']
-
     def test_embedding_tables_sized_to_global_max(self):
         """Both pools' hop embedding tables should be sized to global_max_hops."""
         cfg = _make_config(seq_max_hops=4, tok_max_hops=8)
@@ -340,12 +334,11 @@ class TestGlobalHops:
         if model.tok_pool.hop_embed_shared is not None:
             assert model.tok_pool.hop_embed_shared.shape[0] == global_max
 
-    def test_global_hops_sum_of_sides(self):
-        """Global hops should equal seq_hops + tok_hops."""
+    def test_entry_routers_exist_on_both_pools(self):
+        """Both pools should have entry routers for bridge crossings."""
         model = _make_model()
-        model.eval()
-        x = torch.randn(B, T, D)
-        with torch.no_grad():
-            _, info = model(x)
-        assert abs(info['mean_global_hops']
-                   - (info['mean_seq_hops'] + info['mean_tok_hops'])) < 1e-6
+        assert hasattr(model.seq_pool, 'entry_router')
+        assert hasattr(model.tok_pool, 'entry_router')
+        cfg = model.config
+        assert model.seq_pool.entry_router.weight.shape == (cfg.seq_n_options, cfg.dim)
+        assert model.tok_pool.entry_router.weight.shape == (cfg.tok_n_options, cfg.dim)

@@ -1,12 +1,11 @@
 """Tests for LLooM SequencePool.
 
 Covers:
-- Output shapes from forward()
-- Gradient flow through all parameters
-- All-top-k exit/bridge/continue decision logic
-- Hop budget enforcement (force exit when exhausted)
+- execute_hop() output shapes
+- Post-dispatch routing: outbound logits produced from expert output
+- Gradient flow through all parameters (expert bank + routers + hop conditioning)
+- Entry router for bridge crossings
 - Bridge passthrough (identity)
-- Active mask handling (inactive samples unchanged)
 """
 
 import pytest
@@ -42,34 +41,90 @@ def _make_pool(**kwargs):
 
 def _make_inputs(b=B, t=T):
     x = torch.randn(b, t, D, requires_grad=True)
-    active = torch.ones(b, dtype=torch.bool)
-    current_expert = torch.randint(0, POOL, (b,))
-    return x, active, current_expert
+    # Create topk_idx with valid expert indices
+    topk_idx = torch.randint(0, POOL, (b, TOP_K))
+    topk_weights = torch.full((b, TOP_K), 1.0 / TOP_K)
+    return x, topk_idx, topk_weights
 
 
 # ---------------------------------------------------------------------------
-# Forward shape tests
+# execute_hop shape tests
 # ---------------------------------------------------------------------------
 
-class TestForwardShapes:
-    def test_basic_output_shape(self):
+class TestExecuteHopShapes:
+    def test_basic_output_shapes(self):
         pool = _make_pool()
-        x, active, ce = _make_inputs()
-        x_out, new_active, do_exit, do_bridge, next_expert, hops = \
-            pool(x, active, hops_used=0, current_expert=ce)
-        assert x_out.shape == (B, T, D)
-        assert new_active.shape == (B,)
-        assert do_exit.shape == (B,)
-        assert do_bridge.shape == (B,)
-        assert next_expert.shape == (B,)
-        assert hops == 1
+        x, topk_idx, topk_weights = _make_inputs()
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert out.shape == (B, T, D)
+        assert next_logits.shape == (B, pool.n_options)
 
     @pytest.mark.parametrize("b,t", [(1, 4), (4, 16), (2, 1)])
     def test_various_shapes(self, b, t):
         pool = _make_pool()
-        x, active, ce = _make_inputs(b=b, t=t)
-        x_out, *_ = pool(x, active, hops_used=0, current_expert=ce)
-        assert x_out.shape == (b, t, D)
+        x, topk_idx, topk_weights = _make_inputs(b=b, t=t)
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert out.shape == (b, t, D)
+        assert next_logits.shape == (b, pool.n_options)
+
+    def test_exit_in_topk_still_works(self):
+        """Exit/bridge indices in topk should not crash (they get clamped)."""
+        pool = _make_pool()
+        x = torch.randn(B, T, D)
+        topk_idx = torch.tensor([[0, pool.exit_idx]] * B)
+        topk_weights = torch.tensor([[1.0, 0.0]] * B)  # exit weight zeroed
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert out.shape == (B, T, D)
+
+
+# ---------------------------------------------------------------------------
+# Post-dispatch routing
+# ---------------------------------------------------------------------------
+
+class TestPostDispatchRouting:
+    def test_next_logits_nonzero(self):
+        """Outbound logits should be non-trivial (not all zeros)."""
+        pool = _make_pool()
+        x, topk_idx, topk_weights = _make_inputs()
+        _, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        assert next_logits.abs().sum() > 0
+
+    def test_next_logits_differ_across_hops(self):
+        """Different hops should produce different outbound logits (hop conditioning)."""
+        pool = _make_pool()
+        pool.hop_gate_proj.bias.data.fill_(2.0)  # open gate
+        pool.eval()
+        x = torch.randn(B, T, D)
+        topk_idx = torch.zeros(B, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, TOP_K), 1.0 / TOP_K)
+
+        with torch.no_grad():
+            _, logits0 = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+            _, logits1 = pool.execute_hop(x, topk_idx, topk_weights, hop=1)
+
+        assert not torch.allclose(logits0, logits1, atol=1e-5), \
+            "Same outbound logits across hops -- hop conditioning not working"
+
+    def test_logit_chain_flow(self):
+        """execute_hop output logits can feed back into route()."""
+        pool = _make_pool()
+        x = torch.randn(B, T, D)
+        # Initial logits from entry router
+        logits = pool.entry_router(x.mean(dim=1))
+
+        # First hop
+        topk_idx, topk_weights, has_exit, has_bridge, has_continue = \
+            pool.route(logits, hops_used=0)
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        x = x + out
+
+        # Second hop using outbound logits
+        topk_idx2, topk_weights2, _, _, _ = pool.route(next_logits, hops_used=1)
+        out2, next_logits2 = pool.execute_hop(x, topk_idx2, topk_weights2, hop=1)
+        x = x + out2
+
+        assert x.shape == (B, T, D)
+        assert next_logits2.shape == (B, pool.n_options)
 
 
 # ---------------------------------------------------------------------------
@@ -80,129 +135,70 @@ class TestGradientFlow:
     def test_all_params_get_grad(self):
         pool = _make_pool()
         pool.hop_gate_proj.bias.data.fill_(2.0)
-        x, active, ce = _make_inputs()
-        x_out, *_ = pool(x, active, hops_used=0, current_expert=ce)
-        loss = x_out.sum()
+        x, topk_idx, topk_weights = _make_inputs()
+        out, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        loss = out.sum() + next_logits.sum()
         loss.backward()
 
         assert x.grad is not None and x.grad.abs().sum() > 0
 
-        # Expert bank params should all get gradient
+        # Expert bank params should get gradient
         for name, p in pool.expert_bank.named_parameters():
             assert p.grad is not None, f"No gradient for expert_bank.{name}"
 
-    def test_backward_does_not_crash(self):
-        """Multi-hop backward should not crash."""
+    def test_outbound_router_gets_grad(self):
+        """Router bank should get gradient through execute_hop."""
         pool = _make_pool()
-        x, active, ce = _make_inputs()
+        x = torch.randn(B, T, D, requires_grad=True)
+        topk_idx = torch.zeros(B, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, TOP_K), 1.0 / TOP_K)
+        _, next_logits = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        next_logits.sum().backward()
+        assert pool.router_bank.grad is not None
+        assert pool.router_bank.grad.abs().sum() > 0
+
+    def test_multi_hop_backward(self):
+        """Multi-hop logit chain backward should not crash."""
+        pool = _make_pool()
+        x = torch.randn(B, T, D, requires_grad=True)
+        logits = pool.entry_router(x.mean(dim=1))
+
         for hop in range(3):
-            x_out, active, _, _, ce, _ = pool(x, active, hops_used=hop, current_expert=ce)
-            x = x + x_out  # accumulate for gradient flow
+            topk_idx, topk_weights, _, _, _ = pool.route(logits, hops_used=hop)
+            out, logits = pool.execute_hop(x, topk_idx, topk_weights, hop=hop)
+            x = x + out
+
         loss = x.sum()
         loss.backward()  # should not crash
 
 
 # ---------------------------------------------------------------------------
-# Decision aggregation: all-top-k agreement
+# Entry router
 # ---------------------------------------------------------------------------
 
-class TestAggregateDecisions:
-    def test_all_exit(self):
+class TestEntryRouter:
+    def test_entry_router_produces_valid_logits(self):
         pool = _make_pool()
-        # All top-k are exit
-        idx = torch.full((B, TOP_K), pool.exit_idx, dtype=torch.long)
-        is_expert, is_exit, is_bridge = pool.classify_topk(idx)
-        cont, exit_, bridge = pool.aggregate_decisions(idx, is_expert, is_exit, is_bridge)
-        assert exit_.all()
-        assert not cont.any()
-        assert not bridge.any()
+        x = torch.randn(B, D)
+        logits = pool.entry_router(x)
+        assert logits.shape == (B, pool.n_options)
 
-    def test_all_bridge(self):
+    def test_entry_router_gradient(self):
         pool = _make_pool()
-        idx = torch.full((B, TOP_K), pool.bridge_idx, dtype=torch.long)
-        is_expert, is_exit, is_bridge = pool.classify_topk(idx)
-        cont, exit_, bridge = pool.aggregate_decisions(idx, is_expert, is_exit, is_bridge)
-        assert bridge.all()
-        assert not cont.any()
-        assert not exit_.any()
+        x = torch.randn(B, D, requires_grad=True)
+        logits = pool.entry_router(x)
+        logits.sum().backward()
+        assert x.grad is not None
+        assert pool.entry_router.weight.grad is not None
 
-    def test_mixed_continues(self):
+    def test_entry_logits_feed_into_route(self):
+        """Entry router logits should work with route()."""
         pool = _make_pool()
-        # One expert, one exit → should continue (not all-exit)
-        idx = torch.tensor([[0, pool.exit_idx]] * B)
-        is_expert, is_exit, is_bridge = pool.classify_topk(idx)
-        cont, exit_, bridge = pool.aggregate_decisions(idx, is_expert, is_exit, is_bridge)
-        assert cont.all()
-        assert not exit_.any()
-        assert not bridge.any()
-
-    def test_all_expert_continues(self):
-        pool = _make_pool()
-        idx = torch.randint(0, POOL, (B, TOP_K))
-        is_expert, is_exit, is_bridge = pool.classify_topk(idx)
-        cont, exit_, bridge = pool.aggregate_decisions(idx, is_expert, is_exit, is_bridge)
-        assert cont.all()
-
-
-# ---------------------------------------------------------------------------
-# Hop budget
-# ---------------------------------------------------------------------------
-
-class TestHopBudget:
-    def test_force_exit_at_budget(self):
-        pool = _make_pool()
-        x, active, ce = _make_inputs()
-        x_out, new_active, do_exit, do_bridge, _, hops = \
-            pool(x, active, hops_used=MAX_HOPS, current_expert=ce)
-        # Budget exhausted: all active should exit
-        assert do_exit.all()
-        assert not new_active.any()
-        assert hops == MAX_HOPS  # hop count not incremented
-
-    def test_force_exit_beyond_budget(self):
-        pool = _make_pool()
-        x, active, ce = _make_inputs()
-        x_out, new_active, do_exit, _, _, hops = \
-            pool(x, active, hops_used=MAX_HOPS + 5, current_expert=ce)
-        assert do_exit.all()
-
-    def test_normal_hop_increments(self):
-        pool = _make_pool()
-        x, active, ce = _make_inputs()
-        _, _, _, _, _, hops = pool(x, active, hops_used=3, current_expert=ce)
-        assert hops == 4
-
-
-# ---------------------------------------------------------------------------
-# Active mask handling
-# ---------------------------------------------------------------------------
-
-class TestActiveMask:
-    def test_inactive_samples_unchanged(self):
-        pool = _make_pool()
-        x_orig = torch.randn(B, T, D)
-        x = x_orig.clone().requires_grad_(True)
-        active = torch.zeros(B, dtype=torch.bool)  # all inactive
-        ce = torch.randint(0, POOL, (B,))
-        x_out, new_active, do_exit, do_bridge, _, _ = \
-            pool(x, active, hops_used=0, current_expert=ce)
-        # x_out should equal x for all samples (no active dispatch)
-        # Inactive: expert_out is zeroed, so x_new = x + 0 = x
-        # But hop conditioning and routing still run — the key is the
-        # active_mask gates the residual add.
-        assert not new_active.any()  # still all inactive
-        assert not do_exit.any()
-        assert not do_bridge.any()
-
-    def test_partial_active(self):
-        pool = _make_pool()
-        x, _, ce = _make_inputs()
-        active = torch.tensor([True, False, True])
-        x_out, new_active, do_exit, do_bridge, _, _ = \
-            pool(x, active, hops_used=0, current_expert=ce)
-        # Sample 1 (inactive) should not exit or bridge
-        assert not do_exit[1]
-        assert not do_bridge[1]
+        x = torch.randn(B, D)
+        logits = pool.entry_router(x)
+        topk_idx, topk_weights, has_exit, has_bridge, has_continue = \
+            pool.route(logits, hops_used=0)
+        assert topk_idx.shape == (B, TOP_K)
 
 
 # ---------------------------------------------------------------------------
@@ -222,50 +218,55 @@ class TestBridge:
 
 
 # ---------------------------------------------------------------------------
+# Hop conditioning through execute_hop
+# ---------------------------------------------------------------------------
+
+class TestHopConditioning:
+    def test_different_hops_produce_different_outputs(self):
+        """Output should differ when hop changes."""
+        pool = _make_pool(router_noise=0.0)
+        pool.hop_gate_proj.bias.data.fill_(2.0)
+        pool.eval()
+        x = torch.randn(B, T, D)
+        topk_idx = torch.zeros(B, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, TOP_K), 1.0 / TOP_K)
+
+        with torch.no_grad():
+            out0, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+            out10, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=10)
+
+        assert not torch.allclose(out0, out10, atol=1e-6), \
+            "Different hops produced identical outputs"
+
+    def test_hop_embed_gets_gradient(self):
+        pool = _make_pool()
+        pool.hop_gate_proj.bias.data.fill_(2.0)
+        x = torch.randn(B, T, D, requires_grad=True)
+        topk_idx = torch.zeros(B, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, TOP_K), 1.0 / TOP_K)
+        out, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+        out.sum().backward()
+        assert pool.hop_embed_bank.grad is not None
+        assert pool.hop_embed_bank.grad.abs().max() > 0
+
+
+# ---------------------------------------------------------------------------
 # Global hop conditioning
 # ---------------------------------------------------------------------------
 
 class TestGlobalHop:
     def test_global_hop_changes_conditioning(self):
-        """Different global_hop with same hops_used should produce different outputs."""
+        """Different global hop values should produce different outputs."""
         pool = _make_pool(router_noise=0.0, global_max_hops=48)
+        pool.hop_gate_proj.bias.data.fill_(2.0)
         pool.eval()
         x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
-        ce = torch.zeros(B, dtype=torch.long)
+        topk_idx = torch.zeros(B, TOP_K, dtype=torch.long)
+        topk_weights = torch.full((B, TOP_K), 1.0 / TOP_K)
 
         with torch.no_grad():
-            out0, *_ = pool(x, active, hops_used=0, current_expert=ce, global_hop=0)
-            out10, *_ = pool(x, active, hops_used=0, current_expert=ce, global_hop=10)
+            out0, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=0)
+            out10, _ = pool.execute_hop(x, topk_idx, topk_weights, hop=10)
 
         assert not torch.allclose(out0, out10, atol=1e-6), \
             "Different global_hop values produced identical outputs"
-
-    def test_hops_used_still_controls_exit_ramp(self):
-        """Exit ramp should use hops_used (local), not global_hop."""
-        pool = _make_pool(router_noise=0.0, exit_ramp_scale=3.0, global_max_hops=48)
-        pool.eval()
-        x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
-        ce = torch.zeros(B, dtype=torch.long)
-
-        # At hops_used=MAX_HOPS, should force exit regardless of global_hop
-        out, new_active, do_exit, _, _, _ = \
-            pool(x, active, hops_used=MAX_HOPS, current_expert=ce, global_hop=0)
-        assert do_exit.all()
-        assert not new_active.any()
-
-    def test_fallback_to_hops_used_when_global_not_set(self):
-        """Without global_hop, conditioning should use hops_used."""
-        pool = _make_pool(router_noise=0.0)
-        pool.eval()
-        x = torch.randn(B, T, D)
-        active = torch.ones(B, dtype=torch.bool)
-        ce = torch.zeros(B, dtype=torch.long)
-
-        with torch.no_grad():
-            out_explicit, *_ = pool(x, active, hops_used=3, current_expert=ce, global_hop=3)
-            out_fallback, *_ = pool(x, active, hops_used=3, current_expert=ce)
-
-        assert torch.allclose(out_explicit, out_fallback, atol=1e-6), \
-            "global_hop=hops_used should match fallback behavior"
