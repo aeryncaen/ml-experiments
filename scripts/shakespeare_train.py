@@ -694,13 +694,10 @@ class LLooMLM(nn.Module):
     @property
     def last_mean_hops(self) -> float:
         info = self.last_info
-        seq = info.get('mean_seq_hops', 0.0)
-        tok = info.get('mean_tok_hops', 0.0)
-        if isinstance(seq, torch.Tensor):
-            seq = seq.item()
-        if isinstance(tok, torch.Tensor):
-            tok = tok.item()
-        return seq + tok
+        rd = info.get('mean_routing_decisions', 0.0)
+        if isinstance(rd, torch.Tensor):
+            rd = rd.item()
+        return rd
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         x = self.token_embed(token_ids)

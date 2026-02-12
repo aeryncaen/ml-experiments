@@ -330,6 +330,8 @@ class LLooM(nn.Module):
         tok_hops_used = torch.tensor(0, device=device)
         global_hop = torch.tensor(0, device=device)
         n_bridges = torch.zeros(B, dtype=torch.long, device=device)
+        # Total routing decisions: stem counts as 1, each bridge and expert hop counts as 1
+        routing_decisions = torch.ones(B, dtype=torch.long, device=device)  # stem = 1
 
         # Per-sample state: 0=done, 1=seq, 2=tok
         side = torch.ones(B, dtype=torch.long, device=device)  # all start on seq side
@@ -384,6 +386,7 @@ class LLooM(nn.Module):
                 if bridging.any():
                     side = torch.where(bridging, torch.full_like(side, 2), side)
                     n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
+                    routing_decisions = torch.where(bridging, routing_decisions + 1, routing_decisions)
                     # Produce entry logits for token pool
                     x_pooled_for_tok = x.mean(dim=1)  # (B, D) -- sample-level for entry router
                     # But tok pool entry router is token-level, so we use per-token
@@ -410,6 +413,7 @@ class LLooM(nn.Module):
                         next_logits,
                         current_seq_logits,
                     )
+                    routing_decisions = torch.where(continuing, routing_decisions + 1, routing_decisions)
                     seq_hops_used = seq_hops_used + 1
                     global_hop = global_hop + 1
 
@@ -464,6 +468,7 @@ class LLooM(nn.Module):
                 if do_bridge.any():
                     side = torch.where(do_bridge, torch.ones_like(side), side)
                     n_bridges = torch.where(do_bridge, n_bridges + 1, n_bridges)
+                    routing_decisions = torch.where(do_bridge, routing_decisions + 1, routing_decisions)
                     # Produce entry logits for seq pool
                     x_pooled_for_seq = x.mean(dim=1)  # (B, D)
                     seq_entry_logits = self.seq_pool.entry_router(x_pooled_for_seq)  # (B, seq_n_options)
@@ -488,6 +493,7 @@ class LLooM(nn.Module):
                         next_logits,
                         current_tok_logits,
                     )
+                    routing_decisions = torch.where(do_continue, routing_decisions + 1, routing_decisions)
                     tok_hops_used = tok_hops_used + 1
                     global_hop = global_hop + 1
 
@@ -511,5 +517,6 @@ class LLooM(nn.Module):
         info['mean_tok_hops'] = tok_hops_used.float()
         info['mean_global_hops'] = global_hop.float()
         info['mean_bridges'] = n_bridges.float().mean()
+        info['mean_routing_decisions'] = routing_decisions.float().mean()
 
         return x, info
