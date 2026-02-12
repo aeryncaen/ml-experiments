@@ -4,7 +4,7 @@ Top-level model combining:
 - Entry/exit stems (full transformer blocks)
 - Stem router (sample-level → sequence pool, token pool, or exit)
 - Sequence pool (attention experts, sample-routed)
-- Token pool (SwiGLU MLP experts, token-routed + FiLM + RCV)
+- Token pool (SwiGLU MLP experts, token-routed + RCV)
 - Bridge (raw passthrough between sides)
 
 Forward flow:
@@ -151,7 +151,6 @@ class LLooM(nn.Module):
             inner_dim=config.tok_inner_dim,
             top_k=config.tok_top_k,
             max_hops=config.tok_max_hops,
-            film_rank=config.film_rank,
             exit_bias_init=config.exit_bias_init,
             bridge_bias_init=config.bridge_bias_init,
             exit_ramp_scale=config.exit_ramp_scale,
@@ -160,7 +159,7 @@ class LLooM(nn.Module):
             router_shared_fraction=config.resolved_tok_router_share,
             hop_gate_dim=config.hop_gate_dim,
             global_max_hops=config.global_max_hops,
-        )
+       )
 
         # --- Exit stem ---
         self.exit_stem = StemBlock(
@@ -171,49 +170,6 @@ class LLooM(nn.Module):
 
         # --- Final norm ---
         self.final_norm = nn.RMSNorm(config.dim)
-
-    def _generate_film_masked(
-        self, x: torch.Tensor, mask: torch.Tensor,
-        existing: tuple[torch.Tensor, torch.Tensor,
-                        torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate FiLM for masked samples, keep existing for others.
-
-        Uses torch.where (static shapes) instead of boolean indexing to
-        avoid aten.nonzero which breaks torch.compile/inductor.
-
-        Args:
-            x: (B, T, D) hidden states.
-            mask: (B,) bool — which samples need new FiLM vectors.
-            existing: Previous FiLM tuple to blend with, or None to
-                use identity (gamma=1, beta=0) for non-masked samples.
-
-        Returns:
-            (gamma_up, beta_up, gamma_down, beta_down): each (B, dim_i).
-        """
-        B = x.shape[0]
-        cfg = self.config
-
-        if existing is not None:
-            g_up, b_up, g_down, b_down = existing
-        else:
-            # Identity init: gamma=1, beta=0
-            g_up = torch.ones(B, cfg.tok_inner_dim, device=x.device, dtype=x.dtype)
-            b_up = torch.zeros(B, cfg.tok_inner_dim, device=x.device, dtype=x.dtype)
-            g_down = torch.ones(B, cfg.dim, device=x.device, dtype=x.dtype)
-            b_down = torch.zeros(B, cfg.dim, device=x.device, dtype=x.dtype)
-
-        # Generate for full batch (static shapes, compiler-friendly)
-        new_g_up, new_b_up, new_g_down, new_b_down = self.tok_pool.generate_film(x)
-
-        # Blend: masked samples get new FiLM, others keep existing
-        m = mask[:, None]  # (B, 1) for broadcasting
-        g_up = torch.where(m, new_g_up, g_up)
-        b_up = torch.where(m, new_b_up, b_up)
-        g_down = torch.where(m, new_g_down, g_down)
-        b_down = torch.where(m, new_b_down, b_down)
-
-        return g_up, b_up, g_down, b_down
 
     def _stem_route(self, x: torch.Tensor, noise_scale: float | None = None
                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
@@ -296,13 +252,10 @@ class LLooM(nn.Module):
         current_seq_expert = seq_expert
         current_tok_expert = None  # (B, T) — set on first token-side entry
         tok_vote_state = None
-        tok_film = None
         tok_first_hop = torch.ones(B, dtype=torch.bool, device=device)
 
-        # Stem → token counts as a bridge crossing (goes through FiLM bridge)
-        if go_tok.any():
-            tok_film = self._generate_film_masked(x, go_tok)
-            n_bridges = torch.where(go_tok, n_bridges + 1, n_bridges)
+        # Stem → token counts as a bridge crossing
+        n_bridges = torch.where(go_tok, n_bridges + 1, n_bridges)
 
         # Fixed iteration loop for torch.compile compatibility
         # All state mutations use torch.where (static shapes, no aten.nonzero)
@@ -340,7 +293,6 @@ class LLooM(nn.Module):
                 if bridging.any():
                     side = torch.where(bridging, torch.full_like(side, 2), side)
                     n_bridges = torch.where(bridging, n_bridges + 1, n_bridges)
-                    tok_film = self._generate_film_masked(x, bridging, existing=tok_film)
                     tok_first_hop = tok_first_hop | bridging
                     tok_vote_state = None  # reset for new token-side visit
 
@@ -358,7 +310,6 @@ class LLooM(nn.Module):
                 x_new, still_active, do_exit, do_bridge, new_tok_expert, \
                     tok_vote_state, _ = self.tok_pool(
                         x, on_tok, hops_used=tok_hop,
-                        film_params=tok_film,
                         vote_state=tok_vote_state,
                         current_expert=current_tok_expert,
                         is_first_hop=is_first,

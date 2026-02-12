@@ -48,7 +48,7 @@ class RoutingPool(nn.Module, ABC):
     def __init__(self, pool_size: int, dim: int, top_k: int,
                  max_hops: int, exit_bias_init: float | None = None,
                  bridge_bias_init: float | None = None,
-                 exit_ramp_scale: float = 10.0,
+                 exit_ramp_scale: float = 2.0,
                  router_noise: float = 1.0,
                  router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,

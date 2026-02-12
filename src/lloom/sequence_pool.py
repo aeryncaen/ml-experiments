@@ -47,7 +47,7 @@ class SequencePool(RoutingPool):
                  n_heads: int, top_k: int = 2, max_hops: int = 16,
                  exit_bias_init: float | None = None,
                  bridge_bias_init: float | None = None,
-                 exit_ramp_scale: float = 10.0, router_noise: float = 1.0,
+                 exit_ramp_scale: float = 2.0, router_noise: float = 1.0,
                  expert_shared_fraction: float = 0.5,
                  router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,

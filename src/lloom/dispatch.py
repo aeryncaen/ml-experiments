@@ -1,7 +1,7 @@
 """Banked expert dispatch for LLooM.
 
 AttentionParamBank — sequence-side attention experts (up → QKV → SDPA → norm → skip-mul → down).
-MLPParamBank — token-side SwiGLU MLP experts (gate_up → FiLM → SiLU*gate → down → FiLM).
+MLPParamBank — token-side SwiGLU MLP experts (gate_up → SiLU*gate → down).
 
 Both support 50% parameter sharing (shared + private weight slices) and use
 gather + einsum for dispatch — no Python loops over pool_size.
@@ -267,10 +267,8 @@ class MLPParamBank(nn.Module):
 
     Expert architecture (per top-k slot):
         gate, up = split(gate_up_proj(x))
-        up = γ_up * up + β_up               # FiLM on query
         h = SiLU(gate) * up                  # SwiGLU
         out = down_proj(h)
-        out = γ_down * out + β_down          # FiLM on answer
 
     All weight matrices are banked. Dispatch is fully vectorized via einsum.
 
@@ -300,20 +298,13 @@ class MLPParamBank(nn.Module):
             _make_bank(pool_size, inner_dim, dim, shared_fraction)
 
     def forward(self, x: torch.Tensor, expert_idx: torch.Tensor,
-                expert_weights: torch.Tensor,
-                film_params: tuple[torch.Tensor, torch.Tensor,
-                                   torch.Tensor, torch.Tensor] | None = None
-                ) -> torch.Tensor:
+                expert_weights: torch.Tensor) -> torch.Tensor:
         """Dispatch through banked SwiGLU MLP experts.
 
         Args:
             x: (N, D) flattened input tokens.
             expert_idx: (N, top_k) expert indices (clamped to valid range).
             expert_weights: (N, top_k) routing weights (exit/bridge zeroed).
-            film_params: Optional (γ_up, β_up, γ_down, β_down).
-                γ_up, β_up: (N, D_inner) — modulate up-proj output.
-                γ_down, β_down: (N, D) — modulate down-proj output.
-                If None, FiLM is identity (γ=1, β=0).
 
         Returns:
             (N, D) output tokens.
@@ -338,22 +329,11 @@ class MLPParamBank(nn.Module):
         # Split into gate and up
         gate, up = gate_up.split(self.inner_dim, dim=-1)
 
-        # FiLM on up (query conditioning)
-        if film_params is not None:
-            gamma_up, beta_up, _, _ = film_params
-            # (N, D_inner) → (N, 1, D_inner) for broadcast over top_k
-            up = gamma_up.unsqueeze(1) * up + beta_up.unsqueeze(1)
-
         # SwiGLU: SiLU(gate) * up
         h = F.silu(gate) * up  # (N, K, D_inner)
 
         # down_proj: (N, K, D_inner) @ (N, K, D_inner, D) → (N, K, D)
         out = torch.einsum('nkj,nkjd->nkd', h, down_w)
-
-        # FiLM on output (answer conditioning)
-        if film_params is not None:
-            _, _, gamma_down, beta_down = film_params
-            out = gamma_down.unsqueeze(1) * out + beta_down.unsqueeze(1)
 
         # Weighted sum over top-k: (N, K, D) → (N, D)
         return (out * expert_weights.unsqueeze(-1)).sum(dim=1)

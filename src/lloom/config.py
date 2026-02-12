@@ -41,7 +41,7 @@ class LLooMConfig:
     # equal 1/3 probability at init for (any expert, exit, bridge) categories.
     exit_bias_init: float | None = None   # starting scalar bias for exit slot
     bridge_bias_init: float | None = None # starting scalar bias for bridge slot
-    exit_ramp_scale: float = 10.0      # exit_bias_init + ramp * (hops_used / max_hops)
+    exit_ramp_scale: float = 2.0       # exit_bias_init + ramp * (hops_used / max_hops)
     router_noise: float = 1.0          # gaussian noise scale, annealed to 0
 
     # ---------- weight sharing ----------
@@ -52,9 +52,6 @@ class LLooMConfig:
     tok_expert_shared_fraction: float | None = None  # MLP expert bank weights
     seq_router_shared_fraction: float | None = None  # seq-side routers + hop embeds
     tok_router_shared_fraction: float | None = None  # tok-side routers + hop embeds
-
-    # ---------- FiLM conditioning (token side) ----------
-    film_rank: int = 16                # low-rank bottleneck for FiLM projection
 
     # ---------- hop conditioning ----------
     hop_gate_dim: int = 12             # prefix slice of hidden dim for gating
@@ -209,7 +206,4 @@ class LLooMConfig:
         """Maximum total hops across both sides (for hop embedding table size)."""
         return self.seq_max_hops + self.tok_max_hops
 
-    @property
-    def film_output_dim(self) -> int:
-        """FiLM projection output: gamma_up[D_i], beta_up[D_i], gamma_down[D], beta_down[D]."""
-        return 2 * self.tok_inner_dim + 2 * self.dim
+

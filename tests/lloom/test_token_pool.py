@@ -2,10 +2,9 @@
 
 Covers:
 - RCV vectorized voting: majority, elimination, sticky votes
-- FiLM generation and identity at init
 - Token parking (only exit/bridge in top-k)
 - Entry router vs outbound router
-- Gradient flow through all parameters including FiLM
+- Gradient flow through all parameters
 - Forward shapes and hop budget enforcement
 """
 
@@ -23,7 +22,6 @@ D = 32
 D_INNER = 48
 TOP_K = 2
 MAX_HOPS = 16
-FILM_RANK = 8
 B = 3
 T = 8
 
@@ -31,7 +29,7 @@ T = 8
 def _make_pool(**kwargs):
     defaults = dict(
         pool_size=POOL, dim=D, inner_dim=D_INNER, top_k=TOP_K,
-        max_hops=MAX_HOPS, film_rank=FILM_RANK,
+        max_hops=MAX_HOPS,
         expert_shared_fraction=0.5, router_shared_fraction=0.5,
         hop_gate_dim=12,
         exit_bias_init=0.0, bridge_bias_init=0.0,
@@ -177,54 +175,6 @@ class TestStickyVotes:
 
 
 # ---------------------------------------------------------------------------
-# FiLM generation
-# ---------------------------------------------------------------------------
-
-class TestFiLM:
-    def test_film_output_shapes(self):
-        pool = _make_pool()
-        x = torch.randn(B, T, D)
-        g_up, b_up, g_down, b_down = pool.generate_film(x)
-        assert g_up.shape == (B, D_INNER)
-        assert b_up.shape == (B, D_INNER)
-        assert g_down.shape == (B, D)  # down-proj output is D, not D_inner
-        assert b_down.shape == (B, D)
-
-    def test_film_identity_at_init(self):
-        """FiLM should be near-identity at initialization (gamma~1, beta~0)."""
-        pool = _make_pool()
-        x = torch.randn(B, T, D)
-        g_up, b_up, g_down, b_down = pool.generate_film(x)
-        # film_up.weight is zero-init, so output = bias + small noise from SiLU
-        # bias is set to gamma=1, beta=0
-        # With zero weight, film_up output = bias regardless of input
-        torch.testing.assert_close(g_up, torch.ones_like(g_up), atol=0.1, rtol=0.1)
-        torch.testing.assert_close(b_up, torch.zeros_like(b_up), atol=0.1, rtol=0.1)
-        torch.testing.assert_close(g_down, torch.ones_like(g_down), atol=0.1, rtol=0.1)
-        torch.testing.assert_close(b_down, torch.zeros_like(b_down), atol=0.1, rtol=0.1)
-
-    def test_film_gradient_flow(self):
-        pool = _make_pool()
-        x = torch.randn(B, T, D, requires_grad=True)
-        film = pool.generate_film(x)
-        loss = sum(f.sum() for f in film)
-        loss.backward()
-        assert x.grad is not None
-        assert pool.film_down.weight.grad is not None
-        assert pool.film_up.weight.grad is not None
-
-    def test_film_different_inputs_different_output(self):
-        pool = _make_pool()
-        # Need nonzero film_up weights to see input differences
-        pool.film_up.weight.data.normal_(std=0.1)
-        x1 = torch.randn(B, T, D)
-        x2 = torch.randn(B, T, D)
-        film1 = pool.generate_film(x1)
-        film2 = pool.generate_film(x2)
-        assert not torch.allclose(film1[0], film2[0], atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
 # Forward and shapes
 # ---------------------------------------------------------------------------
 
@@ -251,14 +201,6 @@ class TestForward:
                          current_expert=None)
         assert x_out.shape == (B, T, D)
 
-    def test_with_film(self):
-        pool = _make_pool()
-        x, active = _make_inputs()
-        film = pool.generate_film(x.detach())
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True,
-                         film_params=film)
-        assert x_out.shape == (B, T, D)
-
     @pytest.mark.parametrize("b,t", [(1, 4), (4, 16)])
     def test_various_shapes(self, b, t):
         pool = _make_pool()
@@ -276,9 +218,7 @@ class TestGradientFlow:
         pool = _make_pool()
         pool.hop_gate_proj.bias.data.fill_(2.0)
         x, active = _make_inputs()
-        film = pool.generate_film(x.detach())
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True,
-                         film_params=film)
+        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True)
         loss = x_out.sum()
         loss.backward()
 
@@ -286,20 +226,6 @@ class TestGradientFlow:
 
         # Entry router and expert bank should get gradients
         assert pool.entry_router.weight.grad is not None
-
-    def test_grad_with_film(self):
-        """Gradients flow through FiLM params back to the FiLM generator."""
-        pool = _make_pool()
-        pool.film_up.weight.data.normal_(std=0.1)
-        x = torch.randn(B, T, D, requires_grad=True)
-        active = torch.ones(B, dtype=torch.bool)
-        film = pool.generate_film(x)
-        x_out, *_ = pool(x, active, hops_used=0, is_first_hop=True,
-                         film_params=film)
-        loss = x_out.sum()
-        loss.backward()
-        # film_down should get gradient through the FiLM → expert path
-        assert pool.film_down.weight.grad is not None
 
     def test_multi_hop_backward(self):
         pool = _make_pool()

@@ -4,7 +4,6 @@ Covers:
 - Output shapes for various (B, T, D) / (N, D) configurations
 - Gradient flow through all parameters
 - Weight sharing correctness (shared slice is same object across gathers)
-- FiLM modulation changes MLP output
 - Top-k weighted merge behavior
 - Index clamping safety (out-of-range expert ids)
 """
@@ -341,66 +340,6 @@ class TestMLPParamBank:
         for name, p in bank.named_parameters():
             assert p.grad is not None, f"No gradient for {name}"
             assert p.grad.abs().sum() > 0, f"Zero gradient for {name}"
-
-    def test_gradient_flow_with_film(self):
-        """Gradients flow through FiLM parameters."""
-        bank = _make_mlp_bank()
-        x = torch.randn(N, D, requires_grad=True)
-        idx = _rand_expert_idx(N)
-        w = _rand_weights(N)
-
-        gamma_up = torch.randn(N, D_INNER, requires_grad=True)
-        beta_up = torch.randn(N, D_INNER, requires_grad=True)
-        gamma_down = torch.randn(N, D, requires_grad=True)
-        beta_down = torch.randn(N, D, requires_grad=True)
-        film = (gamma_up, beta_up, gamma_down, beta_down)
-
-        out = bank(x, idx, w, film_params=film)
-        loss = out.sum()
-        loss.backward()
-
-        assert gamma_up.grad is not None and gamma_up.grad.abs().sum() > 0
-        assert beta_up.grad is not None and beta_up.grad.abs().sum() > 0
-        assert gamma_down.grad is not None and gamma_down.grad.abs().sum() > 0
-        assert beta_down.grad is not None and beta_down.grad.abs().sum() > 0
-
-    def test_film_changes_output(self):
-        """FiLM modulation should change the output vs no FiLM."""
-        bank = _make_mlp_bank()
-        x = torch.randn(N, D)
-        idx = _rand_expert_idx(N)
-        w = _rand_weights(N)
-
-        out_no_film = bank(x, idx, w, film_params=None)
-
-        gamma_up = torch.ones(N, D_INNER) * 2.0
-        beta_up = torch.ones(N, D_INNER) * 0.5
-        gamma_down = torch.ones(N, D) * 1.5
-        beta_down = torch.ones(N, D) * 0.3
-        film = (gamma_up, beta_up, gamma_down, beta_down)
-
-        out_with_film = bank(x, idx, w, film_params=film)
-
-        assert not torch.allclose(out_no_film, out_with_film, atol=1e-5)
-
-    def test_film_identity(self):
-        """FiLM with gamma=1, beta=0 should match no-FiLM output."""
-        bank = _make_mlp_bank()
-        x = torch.randn(N, D)
-        idx = _rand_expert_idx(N)
-        w = _rand_weights(N)
-
-        out_no_film = bank(x, idx, w, film_params=None)
-
-        gamma_up = torch.ones(N, D_INNER)
-        beta_up = torch.zeros(N, D_INNER)
-        gamma_down = torch.ones(N, D)
-        beta_down = torch.zeros(N, D)
-        film = (gamma_up, beta_up, gamma_down, beta_down)
-
-        out_identity_film = bank(x, idx, w, film_params=film)
-
-        torch.testing.assert_close(out_no_film, out_identity_film, atol=1e-5, rtol=1e-5)
 
     def test_sharing_params_exist(self):
         bank = _make_mlp_bank(shared_fraction=0.5)

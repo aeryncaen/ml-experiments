@@ -38,7 +38,7 @@ def _make_config(**kwargs):
         tok_max_hops=8,
         exit_bias_init=0.0, bridge_bias_init=0.0, exit_ramp_scale=3.0,
         router_noise=0.0,  # deterministic
-        shared_fraction=0.5, film_rank=8, hop_gate_dim=12,
+        shared_fraction=0.5, hop_gate_dim=12,
         max_bridge_crossings=2,
         is_causal=True, dropout=0.0,
     )

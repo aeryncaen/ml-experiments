@@ -4,9 +4,6 @@ Implements the token side of LLooM: individual tokens route through a pool
 of MLP experts with top-k selection. Decision aggregation uses Ranked Choice
 Voting with sticky votes: tokens that vote exit/bridge lock permanently,
 and elimination rounds resolve ties.
-
-FiLM conditioning is generated at every entry to the token side and remains
-static throughout the token-side loop.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .dispatch import MLPParamBank, _make_bank
+from .dispatch import MLPParamBank
 from .routing_pool import RoutingPool
 
 
@@ -37,7 +34,6 @@ class TokenPool(RoutingPool):
         inner_dim: Expert inner dimension.
         top_k: Experts selected per routing decision.
         max_hops: Maximum hops (cumulative).
-        film_rank: Low-rank bottleneck for FiLM projection.
         exit_bias_init: Starting exit bias.
         bridge_bias_init: Starting bridge bias.
         exit_ramp_scale: Exit bias ramp scale.
@@ -49,10 +45,9 @@ class TokenPool(RoutingPool):
 
     def __init__(self, pool_size: int, dim: int, inner_dim: int,
                  top_k: int = 2, max_hops: int = 32,
-                 film_rank: int = 16,
                  exit_bias_init: float | None = None,
                  bridge_bias_init: float | None = None,
-                 exit_ramp_scale: float = 10.0, router_noise: float = 1.0,
+                 exit_ramp_scale: float = 2.0, router_noise: float = 1.0,
                  expert_shared_fraction: float = 0.5,
                  router_shared_fraction: float = 0.5,
                  hop_gate_dim: int = 12,
@@ -66,7 +61,6 @@ class TokenPool(RoutingPool):
             global_max_hops=global_max_hops,
         )
         self.inner_dim = inner_dim
-        self.film_rank = film_rank
 
         # Expert bank
         self.expert_bank = MLPParamBank(
@@ -79,60 +73,19 @@ class TokenPool(RoutingPool):
         self.entry_router = nn.Linear(dim, self.n_options, bias=False)
         nn.init.normal_(self.entry_router.weight, std=dim ** -0.5)
 
-        # FiLM generator: low-rank projection from mean-pooled sample state
-        # Output: (gamma_up[D_inner], beta_up[D_inner], gamma_down[D], beta_down[D])
-        # gamma_up/beta_up modulate the up-proj output (D_inner)
-        # gamma_down/beta_down modulate the down-proj output (D)
-        film_output = 2 * inner_dim + 2 * dim
-        self.film_output_split = (inner_dim, inner_dim, dim, dim)
-        self.film_down = nn.Linear(dim, film_rank, bias=False)
-        self.film_up = nn.Linear(film_rank, film_output, bias=True)
-        nn.init.normal_(self.film_down.weight, std=dim ** -0.5)
-        nn.init.zeros_(self.film_up.weight)
-        # Init bias so gamma=1, beta=0 (identity FiLM at init)
-        with torch.no_grad():
-            bias = torch.zeros(film_output)
-            # gamma_up init to 1
-            bias[:inner_dim] = 1.0
-            # beta_up init to 0 (already zero)
-            # gamma_down init to 1
-            bias[2 * inner_dim:2 * inner_dim + dim] = 1.0
-            # beta_down init to 0 (already zero)
-            self.film_up.bias.copy_(bias)
-
-    def generate_film(self, x: torch.Tensor
-                      ) -> tuple[torch.Tensor, torch.Tensor,
-                                 torch.Tensor, torch.Tensor]:
-        """Generate FiLM conditioning from sample state.
-
-        Args:
-            x: (B, T, D) hidden states.
-
-        Returns:
-            (gamma_up, beta_up, gamma_down, beta_down):
-                each (B, inner_dim), broadcast over T by the expert bank.
-        """
-        sample_repr = x.mean(dim=1)  # (B, D)
-        film_raw = self.film_up(F.silu(self.film_down(sample_repr)))  # (B, film_output)
-        gamma_up, beta_up, gamma_down, beta_down = \
-            film_raw.split(self.film_output_split, dim=-1)
-        return gamma_up, beta_up, gamma_down, beta_down
-
     def dispatch(self, x: torch.Tensor, expert_idx: torch.Tensor,
                  expert_weights: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Banked SwiGLU dispatch with FiLM.
+        """Banked SwiGLU dispatch.
 
         Args:
             x: (N, D) flattened tokens.
             expert_idx: (N, top_k) expert indices.
             expert_weights: (N, top_k) routing weights.
-            **kwargs: film_params — tuple of (gamma_up, beta_up, gamma_down, beta_down).
 
         Returns:
             (N, D) expert outputs.
         """
-        film_params = kwargs.get('film_params', None)
-        return self.expert_bank(x, expert_idx, expert_weights, film_params=film_params)
+        return self.expert_bank(x, expert_idx, expert_weights)
 
     def aggregate_decisions(self, topk_idx: torch.Tensor,
                             is_expert: torch.Tensor,
@@ -292,13 +245,11 @@ class TokenPool(RoutingPool):
         return x  # already (B, T, D) when called from forward
 
     def accept_bridge_in(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Receive hidden states from sequence side. FiLM is generated externally."""
+        """Receive hidden states from sequence side."""
         return x  # raw passthrough
 
     def forward(self, x: torch.Tensor, active_mask: torch.Tensor,
                 hops_used: int | torch.Tensor,
-                film_params: tuple[torch.Tensor, torch.Tensor,
-                                   torch.Tensor, torch.Tensor] | None = None,
                 vote_state: torch.Tensor | None = None,
                 current_expert: torch.Tensor | None = None,
                 is_first_hop: bool = False,
@@ -315,7 +266,6 @@ class TokenPool(RoutingPool):
             hops_used: Cumulative hops consumed on this side (for exit ramp / budget).
                 Can be int or scalar tensor (scalar tensor avoids recompilation
                 under torch.compile).
-            film_params: FiLM conditioning tuple or None.
             vote_state: (B, T) int8 sticky vote state (0=active, 1=exit, 2=bridge).
                 Created if None. Modified in-place.
             current_expert: (B, T) int — per-token expert assignment.
@@ -392,22 +342,8 @@ class TokenPool(RoutingPool):
         # --- Dispatch tokens that have any expert in top-k ---
         has_any_expert = is_expert_bt.any(dim=-1)  # (B, T)
 
-        # Expand film_params to (B*T, inner_dim) if provided
-        film_flat = None
-        if film_params is not None:
-            g_up, b_up, g_down, b_down = film_params
-            # (B, inner_dim) → (B*T, inner_dim) via repeat_interleave
-            film_flat = (
-                g_up.repeat_interleave(T, dim=0),
-                b_up.repeat_interleave(T, dim=0),
-                g_down.repeat_interleave(T, dim=0),
-                b_down.repeat_interleave(T, dim=0),
-            )
-
         # Dispatch all tokens (parked tokens will have zero weights from select_topk)
-        expert_out = self.dispatch(
-            x_flat, topk_idx_flat, topk_weights_flat,
-            film_params=film_flat)
+        expert_out = self.dispatch(x_flat, topk_idx_flat, topk_weights_flat)
         expert_out = expert_out.view(B, T, D)
 
         # --- Next-hop expert tracking ---
