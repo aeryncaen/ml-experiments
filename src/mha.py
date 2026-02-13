@@ -305,6 +305,8 @@ class FeatureAttnBlock(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
                                n_heads=feat_n_heads)
+        # Content-dependent gate on feature-attention delta
+        self.feat_gate_proj = nn.Linear(dim, dim, bias=False)
 
     def _seq_attn(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -322,16 +324,15 @@ class FeatureAttnBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(attn_out)
 
-    def _feat_attn(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ffn(self.feat_norm(x))
-
     def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         if self.feat_first:
-            x = x + self._feat_attn(x)
+            feat_delta = self.ffn(self.feat_norm(x))
+            x = x + feat_delta * self.feat_gate_proj(x)
             x = x + self._seq_attn(x, rope_freqs)
         else:
             x = x + self._seq_attn(x, rope_freqs)
-            x = x + self._feat_attn(x)
+            feat_delta = self.ffn(self.feat_norm(x))
+            x = x + feat_delta * self.feat_gate_proj(x)
         return x
 
 
