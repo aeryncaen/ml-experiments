@@ -1698,6 +1698,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable')),
             f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable'))")
 
+    # ULB + feature-attention (projected gate + feat-attn sublayer)
+    try_add('ULBFeatAttn', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True)),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', use_feat_attn=True))")
+
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
     if _wanted('LLooM'):
         try:

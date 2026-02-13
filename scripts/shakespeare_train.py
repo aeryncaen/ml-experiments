@@ -378,6 +378,26 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_ulb_feat(vocab_size: int, args) -> nn.Module:
+    """Build a CausalULB with feature-attention (projected gate + feat-attn sublayer)."""
+    from ulb.transformer import CausalULB
+    return CausalULB(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+        embed_lerp=args.embed_lerp,
+        use_feat_attn=True,
+        feat_expansion=getattr(args, 'feat_expansion', 4.0),
+        feat_group_dim=getattr(args, 'feat_group_dim', 16),
+        feat_n_heads=getattr(args, 'feat_n_heads', 1),
+    )
+
+
 # --- MoE builders ---
 
 def build_mha_moe(vocab_size: int, args) -> nn.Module:
@@ -826,6 +846,7 @@ ARCH_BUILDERS = {
     'outer-mha': build_outer_mha,
     'expandkv-mha': build_expandkv_mha,
     'ulb': build_ulb,
+    'ulb-feat': build_ulb_feat,
     'mha-moe': build_mha_moe,
     'ulb-moe': build_ulb_moe,
     'mha-poe': build_mha_poe,

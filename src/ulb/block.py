@@ -80,6 +80,12 @@ class ULBConfig:
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
 
+    # Feature-attention (replaces raw skip-multiply with projected gate + feature attn)
+    use_feat_attn: bool = False
+    feat_expansion: float = 4.0
+    feat_group_dim: int = 16
+    feat_n_heads: int = 1
+
     def __post_init__(self):
         if self.paired:
             assert self.n_heads % 2 == 0, (
@@ -186,6 +192,21 @@ class ULBBlock(nn.Module):
         if config.attn_mode == 'blend':
             self.blend_attn = BlendAttention(
                 d, n_heads, head_dim, init_bias=config.blend_gate_bias)
+
+        # --- Feature-attention (optional) ---
+        self.use_feat_attn = config.use_feat_attn
+        if config.use_feat_attn:
+            from mha import FeatureAttn
+            # Projected gate replaces raw h_up in skip-multiply
+            self.gate_proj = nn.Linear(d, d, bias=False)
+            # Feature attention sublayer
+            self.feat_attn = FeatureAttn(
+                d, feat_expansion=config.feat_expansion,
+                group_dim=config.feat_group_dim, n_heads=config.feat_n_heads)
+            # Pre-norm for feature attention
+            self.feat_norm = nn.RMSNorm(d)
+            # Content-dependent gate on feature-attention delta
+            self.feat_gate_proj = nn.Linear(d, d, bias=False)
 
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 blend_gate: torch.Tensor | None = None) -> torch.Tensor:
@@ -315,8 +336,18 @@ class ULBBlock(nn.Module):
         # --- Output projection (inner_dim → d_model) ---
         y = self.o_proj(y)
 
-        # --- Skip-multiply (NOT skip-add) ---
-        y = self.attn_norm(y) * h_up
+        # --- Skip-multiply ---
+        if self.use_feat_attn:
+            # Projected gate (not raw content gating itself)
+            gate = self.gate_proj(h_up)
+            y = self.attn_norm(y) * gate
+
+            # Feature-attention with pre-norm residual + content-dependent gate
+            feat_delta = self.feat_attn(self.feat_norm(y))
+            feat_gate = self.feat_gate_proj(y)
+            y = y + feat_delta * feat_gate
+        else:
+            y = self.attn_norm(y) * h_up
 
         # --- Down projection ---
         y = self.down_proj(self.down_act(y))
