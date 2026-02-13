@@ -301,8 +301,7 @@ def build_feat_attn(vocab_size: int, args) -> nn.Module:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
-        feat_expansion=getattr(args, 'feat_expansion', 4.0),
-        feat_group_dim=getattr(args, 'feat_group_dim', 16),
+        feat_expansion=getattr(args, 'feat_expansion', 4),
         feat_n_heads=getattr(args, 'feat_n_heads', 1),
         feat_first=getattr(args, 'feat_first', False),
     )
@@ -392,8 +391,7 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         use_feat_attn=True,
-        feat_expansion=getattr(args, 'feat_expansion', 4.0),
-        feat_group_dim=getattr(args, 'feat_group_dim', 16),
+        feat_expansion=getattr(args, 'feat_expansion', 4),
         feat_n_heads=getattr(args, 'feat_n_heads', 1),
     )
 
@@ -1988,13 +1986,11 @@ def main():
     parser.add_argument('--swish-mode', type=str, default='learnable', choices=['learnable', 'silu'],
                         help='Activation mode for ULB/databank (learnable Swish or SiLU)')
 
-    # Feature-attention (feat-attn arch)
-    parser.add_argument('--feat-expansion', type=float, default=4.0,
-                        help='Feature expansion factor for feature-attention (feat-attn arch)')
-    parser.add_argument('--feat-group-dim', type=int, default=16,
-                        help='Feature group size for feature-attention (feat-attn arch)')
+    # Feature-attention (feat-attn / ulb-feat arch)
+    parser.add_argument('--feat-expansion', type=int, default=4,
+                        help='Feature rank expansion (number of D-dim groups)')
     parser.add_argument('--feat-n-heads', type=int, default=1,
-                        help='Heads within feature-attention (feat-attn arch)')
+                        help='Heads within feature-attention')
     parser.add_argument('--feat-first', action='store_true', default=False,
                         help='Run feature-attention before sequence-attention (feat-attn arch)')
 

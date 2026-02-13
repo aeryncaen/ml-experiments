@@ -297,8 +297,8 @@ class FeatAttnBlock(nn.Module):
     and projects back down.  This is dynamic content-dependent feature mixing.
     """
 
-    def __init__(self, d_model, n_heads=4, feat_expansion=4.0,
-                 feat_group_dim=16, feat_n_heads=1, feat_first=False):
+    def __init__(self, d_model, n_heads=4, feat_expansion=4,
+                 feat_n_heads=1, feat_first=False):
         super().__init__()
         self.feat_first = feat_first
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
@@ -307,7 +307,7 @@ class FeatAttnBlock(nn.Module):
         self.feat_norm = RMSNorm(d_model)
         from mha import FeatureAttn
         self.feat_attn = FeatureAttn(d_model, feat_expansion=feat_expansion,
-                                     group_dim=feat_group_dim, n_heads=feat_n_heads)
+                                     n_heads=feat_n_heads)
 
     def forward(self, x):
         B, T, D = x.shape

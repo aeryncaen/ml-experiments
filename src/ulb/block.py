@@ -82,8 +82,7 @@ class ULBConfig:
 
     # Feature-attention (replaces raw skip-multiply with projected gate + feature attn)
     use_feat_attn: bool = False
-    feat_expansion: float = 4.0
-    feat_group_dim: int = 16
+    feat_expansion: int = 4    # number of D-dim feature groups (rank)
     feat_n_heads: int = 1
 
     def __post_init__(self):
@@ -202,7 +201,7 @@ class ULBBlock(nn.Module):
             # Feature attention sublayer
             self.feat_attn = FeatureAttn(
                 d, feat_expansion=config.feat_expansion,
-                group_dim=config.feat_group_dim, n_heads=config.feat_n_heads)
+                n_heads=config.feat_n_heads)
             # Pre-norm for feature attention
             self.feat_norm = nn.RMSNorm(d)
             # Content-dependent gate on feature-attention delta

@@ -44,8 +44,7 @@ class CausalULB(nn.Module):
                  is_causal: bool = True,
                  embed_lerp: bool = False,
                  use_feat_attn: bool = False,
-                 feat_expansion: float = 4.0,
-                 feat_group_dim: int = 16,
+                 feat_expansion: int = 4,
                  feat_n_heads: int = 1):
         super().__init__()
         from .block import ULBBlock, ULBConfig
@@ -69,7 +68,6 @@ class CausalULB(nn.Module):
             is_causal=is_causal,
             use_feat_attn=use_feat_attn,
             feat_expansion=feat_expansion,
-            feat_group_dim=feat_group_dim,
             feat_n_heads=feat_n_heads,
         )
         self.blocks = nn.ModuleList([ULBBlock(config) for _ in range(n_layers)])
