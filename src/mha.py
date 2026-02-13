@@ -153,9 +153,9 @@ class FeatureAttn(nn.Module):
         y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.group_dim)
         y = self.o_proj(y)                                    # (N, G, gd)
 
-        # Flatten back, skip-multiply, project down
+        # Flatten back, skip-add, project down
         y = y.reshape(N, self.feat_dim)                        # (N, feat_dim)
-        y = self.feat_norm(y) * h_up                           # skip-multiply
+        y = self.feat_norm(y) + h_up                           # skip-add
         out = self.w_down(y)                                   # (N, D)
 
         return out.view(*orig_shape, self.dim)
