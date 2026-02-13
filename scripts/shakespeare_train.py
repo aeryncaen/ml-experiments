@@ -292,6 +292,22 @@ def build_mha(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_feat_attn(vocab_size: int, args) -> nn.Module:
+    """Build a FeatureAttnTransformer (sequence-attn + feature-attn, no MLP)."""
+    from mha import FeatureAttnTransformer
+    return FeatureAttnTransformer(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+        feat_expansion=getattr(args, 'feat_expansion', 4.0),
+        feat_group_dim=getattr(args, 'feat_group_dim', 16),
+        feat_n_heads=getattr(args, 'feat_n_heads', 1),
+        feat_first=getattr(args, 'feat_first', False),
+    )
+
+
 def build_dual_mha(vocab_size: int, args) -> nn.Module:
     """Build a DualMHA (two independent MHA models, logits subtracted)."""
     from mha import DualMHA
@@ -803,6 +819,7 @@ def build_lloom(vocab_size: int, args) -> nn.Module:
 
 ARCH_BUILDERS = {
     'mha': build_mha,
+    'feat-attn': build_feat_attn,
     'dual-mha': build_dual_mha,
     'diff-mha': build_diff_mha,
     'mul-mha': build_mul_mha,
@@ -1949,6 +1966,16 @@ def main():
                         help='Hop embed/gate weight sharing fraction (PoE)')
     parser.add_argument('--swish-mode', type=str, default='learnable', choices=['learnable', 'silu'],
                         help='Activation mode for ULB/databank (learnable Swish or SiLU)')
+
+    # Feature-attention (feat-attn arch)
+    parser.add_argument('--feat-expansion', type=float, default=4.0,
+                        help='Feature expansion factor for feature-attention (feat-attn arch)')
+    parser.add_argument('--feat-group-dim', type=int, default=16,
+                        help='Feature group size for feature-attention (feat-attn arch)')
+    parser.add_argument('--feat-n-heads', type=int, default=1,
+                        help='Heads within feature-attention (feat-attn arch)')
+    parser.add_argument('--feat-first', action='store_true', default=False,
+                        help='Run feature-attention before sequence-attention (feat-attn arch)')
 
     # LLooM-specific
     parser.add_argument('--lloom-seq-pool-size', type=int, default=4,

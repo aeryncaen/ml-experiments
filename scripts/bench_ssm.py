@@ -289,6 +289,48 @@ class OuterMHABlock(nn.Module):
         return a * (b @ self.proj)
 
 
+class FeatAttnBlock(nn.Module):
+    """Causal MHA + feature-attention (no SwiGLU MLP).
+
+    Feature-attention replaces the MLP sublayer: expands each token into
+    feature groups, runs non-causal self-attention over them, skip-multiplies,
+    and projects back down.  This is dynamic content-dependent feature mixing.
+    """
+
+    def __init__(self, d_model, n_heads=4, feat_expansion=4.0,
+                 feat_group_dim=16, feat_n_heads=1, feat_first=False):
+        super().__init__()
+        self.feat_first = feat_first
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
+                              groups=d_model, bias=True)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.feat_norm = RMSNorm(d_model)
+        from mha import FeatureAttn
+        self.feat_attn = FeatureAttn(d_model, feat_expansion=feat_expansion,
+                                     group_dim=feat_group_dim, n_heads=feat_n_heads)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        # Causal conv
+        h = F.pad(x.transpose(1, 2), (2, 0))
+        h = self.conv(h).transpose(1, 2)
+
+        if self.feat_first:
+            # Feature attention first
+            h = h + self.feat_attn(self.feat_norm(h))
+            # Then sequence attention
+            mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+            attn_out, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
+            h = attn_out
+        else:
+            # Sequence attention first
+            mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+            h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
+            # Then feature attention
+            h = h + self.feat_attn(self.feat_norm(h))
+        return h
+
+
 class USBWrapper(nn.Module):
     """Wraps USB to accept (B, L, H) and return (B, L, H)."""
     def __init__(self, d_model, headdim=64, expansion_factor=2, layer_idx=0, 
@@ -1573,6 +1615,14 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         mha_mlp = 0
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
             f"MHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
+
+    # FeatAttn: MHA + feature-attention (no MLP)
+    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4.0, feat_group_dim=16)")
+
+    # FeatAttnFirst: feature-attention before sequence-attention
+    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True)")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):

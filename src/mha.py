@@ -71,6 +71,96 @@ class SwiGLU(nn.Module):
         return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
+class FeatureAttn(nn.Module):
+    """Feature-attention: replaces SwiGLU with attention over feature groups.
+
+    Expands each token from D to D_feat via SiLU-gated up-projection, reshapes
+    into feature groups, runs self-attention over those groups (non-causal),
+    then projects back down to D via skip-multiply.
+
+    This is what MLPs try to do (feature mixing) but with dynamic,
+    content-dependent attention instead of fixed learned weights.
+
+    Args:
+        dim: Model dimension.
+        feat_expansion: Expansion factor (D -> D * feat_expansion).
+        group_dim: Size of each feature group (the "token" for feature-attn).
+        n_heads: Number of attention heads within feature-attention.
+    """
+
+    def __init__(self, dim: int, feat_expansion: float = 4.0,
+                 group_dim: int = 16, n_heads: int = 1):
+        super().__init__()
+        feat_dim = int(dim * feat_expansion)
+        # Snap feat_dim to be divisible by group_dim
+        feat_dim = max(group_dim, (feat_dim // group_dim) * group_dim)
+
+        self.dim = dim
+        self.feat_dim = feat_dim
+        self.group_dim = group_dim
+        self.n_groups = feat_dim // group_dim
+        self.n_heads = n_heads
+        self.head_dim = group_dim // n_heads
+
+        assert group_dim % n_heads == 0, (
+            f"group_dim ({group_dim}) must be divisible by n_heads ({n_heads})")
+
+        # up_proj: D -> feat_dim (gated expansion)
+        self.w_up = nn.Linear(dim, feat_dim, bias=False)
+
+        # Feature-attention QKV: group_dim -> 3 * group_dim (applied per group)
+        self.qkv_proj = nn.Linear(group_dim, 3 * group_dim, bias=False)
+
+        # Output projection: group_dim -> group_dim (mixes across heads)
+        self.o_proj = nn.Linear(group_dim, group_dim, bias=False)
+
+        # Norm before skip-multiply
+        self.feat_norm = nn.RMSNorm(feat_dim)
+
+        # down_proj: feat_dim -> D
+        self.w_down = nn.Linear(feat_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (..., D) input.
+        Returns:
+            (..., D) output.
+        """
+        orig_shape = x.shape[:-1]
+        N = x.reshape(-1, self.dim).shape[0]
+        x_flat = x.reshape(N, self.dim)
+
+        # Gated expansion
+        h_up = F.silu(self.w_up(x_flat))                     # (N, feat_dim)
+
+        # Reshape into feature groups
+        h = h_up.view(N, self.n_groups, self.group_dim)       # (N, G, gd)
+
+        # Feature-attention QKV
+        qkv = self.qkv_proj(h)                                # (N, G, 3*gd)
+        q, k, v = qkv.split(self.group_dim, dim=-1)           # each (N, G, gd)
+
+        # Reshape for multi-head: (N, n_heads, G, head_dim)
+        q = q.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Attend over feature groups (non-causal)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)  # (N, H, G, hd)
+
+        # Concat heads and output projection
+        y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.group_dim)
+        y = self.o_proj(y)                                    # (N, G, gd)
+
+        # Flatten back, skip-multiply, project down
+        y = y.reshape(N, self.feat_dim)                        # (N, feat_dim)
+        y = self.feat_norm(y) * h_up                           # skip-multiply
+        out = self.w_down(y)                                   # (N, D)
+
+        return out.view(*orig_shape, self.dim)
+
+
 def _precompute_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> torch.Tensor:
     """Precompute RoPE complex frequencies."""
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
@@ -176,6 +266,126 @@ class CausalTransformer(nn.Module):
         Returns:
             (B, T, vocab_size) logits.
         """
+        x = self.token_embed(token_ids)
+
+        for block in self.blocks:
+            x = block(x, self.rope_freqs)
+
+        return self.head(self.final_norm(x))
+
+
+class FeatureAttnBlock(nn.Module):
+    """Pre-norm sequence-attention + pre-norm feature-attention block with RoPE.
+
+    Drop-in replacement for TransformerBlock: replaces SwiGLU FFN with
+    FeatureAttn (attention over feature groups within each token).
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of sequence-attention heads.
+        feat_expansion: Feature expansion factor.
+        feat_group_dim: Feature group size.
+        feat_n_heads: Heads within feature-attention.
+        feat_first: If True, feature-attention runs before sequence-attention.
+            Default False (sequence-attention first, like standard transformers).
+    """
+
+    def __init__(self, dim: int, n_heads: int, feat_expansion: float = 4.0,
+                 feat_group_dim: int = 16, feat_n_heads: int = 1,
+                 feat_first: bool = False):
+        super().__init__()
+        self.feat_first = feat_first
+
+        self.attn_norm = nn.RMSNorm(dim)
+        self.feat_norm = nn.RMSNorm(dim)
+
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert dim % n_heads == 0
+
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
+                               group_dim=feat_group_dim, n_heads=feat_n_heads)
+
+    def _seq_attn(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        h = self.attn_norm(x)
+        qkv = self.qkv_proj(h).view(B, T, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q = _apply_rope(q, rope_freqs)
+        k = _apply_rope(k, rope_freqs)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        return self.o_proj(attn_out)
+
+    def _feat_attn(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ffn(self.feat_norm(x))
+
+    def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
+        if self.feat_first:
+            x = x + self._feat_attn(x)
+            x = x + self._seq_attn(x, rope_freqs)
+        else:
+            x = x + self._seq_attn(x, rope_freqs)
+            x = x + self._feat_attn(x)
+        return x
+
+
+class FeatureAttnTransformer(nn.Module):
+    """Causal LM with feature-attention replacing SwiGLU.
+
+    Identical to CausalTransformer except each block uses FeatureAttnBlock
+    (sequence-attention + feature-attention) instead of TransformerBlock
+    (sequence-attention + SwiGLU).
+
+    Args:
+        vocab_size: Token vocabulary size.
+        dim: Model dimension.
+        n_heads: Number of sequence-attention heads.
+        n_layers: Number of transformer blocks.
+        max_seq_len: Maximum sequence length for RoPE precomputation.
+        feat_expansion: Feature expansion factor (D -> D * expansion).
+        feat_group_dim: Feature group size for feature-attention.
+        feat_n_heads: Heads within feature-attention.
+        feat_first: If True, feature-attention runs before sequence-attention.
+    """
+
+    def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
+                 n_layers: int = 4, max_seq_len: int = 256,
+                 feat_expansion: float = 4.0, feat_group_dim: int = 16,
+                 feat_n_heads: int = 1, feat_first: bool = False):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+
+        self.blocks = nn.ModuleList([
+            FeatureAttnBlock(dim, n_heads, feat_expansion, feat_group_dim,
+                             feat_n_heads, feat_first)
+            for _ in range(n_layers)
+        ])
+        self.final_norm = nn.RMSNorm(dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        # Precompute RoPE frequencies
+        head_dim = dim // n_heads
+        self.register_buffer('rope_freqs', _precompute_freqs(head_dim, max_seq_len))
+
+        # Megatron init
+        megatron_init_(self, n_layers)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         x = self.token_embed(token_ids)
 
         for block in self.blocks:
