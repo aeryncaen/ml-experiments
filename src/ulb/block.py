@@ -338,12 +338,12 @@ class ULBBlock(nn.Module):
         # --- Skip-multiply ---
         if self.use_feat_attn:
             # Projected gate (not raw content gating itself)
-            gate = self.gate_proj(h_up)
+            gate = torch.sigmoid(self.gate_proj(h_up))
             y = self.attn_norm(y) * gate
 
-            # Feature-attention with pre-norm residual + content-dependent gate
+            # Feature-attention with pre-norm residual + sigmoid gate
             feat_delta = self.feat_attn(self.feat_norm(y))
-            feat_gate = self.feat_gate_proj(y)
+            feat_gate = torch.sigmoid(self.feat_gate_proj(y))
             y = y + feat_delta * feat_gate
         else:
             y = self.attn_norm(y) * h_up

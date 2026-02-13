@@ -153,8 +153,8 @@ class FeatureAttn(nn.Module):
 
         # Flatten back, projected gate, project down
         y = y.reshape(N, self.feat_dim)                         # (N, X*D)
-        gate = self.gate_proj(h_up)                             # (N, X*D)
-        y = self.feat_norm(y) * gate                            # gated by learned projection
+        gate = torch.sigmoid(self.gate_proj(h_up))                # (N, X*D)
+        y = self.feat_norm(y) * gate                            # sigmoid-gated
         out = self.w_down(y)                                    # (N, D)
 
         return out.view(*orig_shape, self.dim)
@@ -327,12 +327,12 @@ class FeatureAttnBlock(nn.Module):
     def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         if self.feat_first:
             feat_delta = self.ffn(self.feat_norm(x))
-            x = x + feat_delta * self.feat_gate_proj(x)
+            x = x + feat_delta * torch.sigmoid(self.feat_gate_proj(x))
             x = x + self._seq_attn(x, rope_freqs)
         else:
             x = x + self._seq_attn(x, rope_freqs)
             feat_delta = self.ffn(self.feat_norm(x))
-            x = x + feat_delta * self.feat_gate_proj(x)
+            x = x + feat_delta * torch.sigmoid(self.feat_gate_proj(x))
         return x
 
 
