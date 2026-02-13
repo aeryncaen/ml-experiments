@@ -1617,12 +1617,17 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             f"MHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
 
     # FeatAttn: MHA + feature-attention (no MLP)
-    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4.0, feat_group_dim=16)")
+    if target_params:
+        feat_exp = _find_knob(lambda k: lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_expansion=k),
+                              n_layers, dim, target_params)
+    else:
+        feat_exp = 4
+    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_expansion=feat_exp),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion={feat_exp})")
 
     # FeatAttnFirst: feature-attention before sequence-attention
-    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True)")
+    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_expansion=feat_exp, feat_first=True),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion={feat_exp}, feat_first=True)")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):
