@@ -114,7 +114,10 @@ class FeatureAttn(nn.Module):
         # Output projection: group_dim -> group_dim (mixes across heads)
         self.o_proj = nn.Linear(group_dim, group_dim, bias=False)
 
-        # Norm before skip-multiply
+        # Gate projection: content-dependent gate (not raw content gating itself)
+        self.gate_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+
+        # Norm before gated combine
         self.feat_norm = nn.RMSNorm(feat_dim)
 
         # down_proj: feat_dim -> D
@@ -153,9 +156,10 @@ class FeatureAttn(nn.Module):
         y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.group_dim)
         y = self.o_proj(y)                                    # (N, G, gd)
 
-        # Flatten back, skip-add, project down
+        # Flatten back, projected gate, project down
         y = y.reshape(N, self.feat_dim)                        # (N, feat_dim)
-        y = self.feat_norm(y) + h_up                           # skip-add
+        gate = self.gate_proj(h_up)                            # (N, feat_dim)
+        y = self.feat_norm(y) * gate                           # gated by learned projection
         out = self.w_down(y)                                   # (N, D)
 
         return out.view(*orig_shape, self.dim)
