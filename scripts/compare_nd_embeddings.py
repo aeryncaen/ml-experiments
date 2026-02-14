@@ -450,104 +450,81 @@ def main():
 
     # --- Plot ---
     print("Plotting...")
-    fig = plt.figure(figsize=(18, 12))
-    gs = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.3)
+    rank_labels = list(shapes.keys())  # ['1D', '2D', '3D', '4D']
+    n_ranks = len(rank_labels)
 
-    # (0,0): Training loss
-    ax = fig.add_subplot(gs[0, 0])
-    for label in shapes:
-        ax.plot(results[label]['train_losses'], color=colors[label], alpha=0.8,
-                label=f"{label} ({results[label]['n_params']:,}p)")
-    ax.set_xlabel('epoch')
-    ax.set_ylabel('loss')
-    ax.set_title('Training Loss')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    # Layout: 3 rows
+    #   Row 0: loss curve, val acc curve, final acc bar chart (shared across all)
+    #   Row 1: one grad SVD subplot per rank (4 columns)
+    #   Row 2: one weight SVD subplot per rank (4 columns)
+    fig = plt.figure(figsize=(20, 16))
+    gs = gridspec.GridSpec(3, n_ranks, hspace=0.4, wspace=0.3,
+                           height_ratios=[1, 1, 1])
 
-    # (0,1): Val accuracy
-    ax = fig.add_subplot(gs[0, 1])
-    for label in shapes:
-        ax.plot(results[label]['val_accs'], color=colors[label], alpha=0.8, label=label)
-    ax.set_xlabel('epoch')
-    ax.set_ylabel('accuracy')
-    ax.set_title('Validation Accuracy')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    # Row 0, col 0-1: Training loss + Val accuracy (span 2 cols each)
+    ax_loss = fig.add_subplot(gs[0, :n_ranks // 2])
+    for label in rank_labels:
+        ax_loss.plot(results[label]['train_losses'], color=colors[label], alpha=0.8,
+                     label=f"{label}", linewidth=2)
+    ax_loss.set_xlabel('epoch')
+    ax_loss.set_ylabel('loss')
+    ax_loss.set_title('Training Loss')
+    ax_loss.legend(fontsize=10)
+    ax_loss.grid(True, alpha=0.3)
 
-    # (0,2): Final val accuracy bar chart
-    ax = fig.add_subplot(gs[0, 2])
-    labels = list(shapes.keys())
-    final_accs = [results[l]['val_accs'][-1] for l in labels]
-    bars = ax.bar(labels, final_accs, color=[colors[l] for l in labels], alpha=0.8)
-    for bar, acc in zip(bars, final_accs):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f'{acc:.3f}', ha='center', va='bottom', fontsize=10)
-    ax.set_ylabel('final val accuracy')
-    ax.set_title('Final Accuracy')
-    ax.set_ylim(0, 1.1)
-    ax.grid(True, alpha=0.3, axis='y')
+    ax_acc = fig.add_subplot(gs[0, n_ranks // 2:])
+    for label in rank_labels:
+        ax_acc.plot(results[label]['val_accs'], color=colors[label], alpha=0.8,
+                    label=label, linewidth=2)
+    ax_acc.set_xlabel('epoch')
+    ax_acc.set_ylabel('accuracy')
+    ax_acc.set_title('Validation Accuracy')
+    ax_acc.legend(fontsize=10)
+    ax_acc.grid(True, alpha=0.3)
 
-    # (1,0): Gradient SVD spectra at mid-training
-    ax = fig.add_subplot(gs[1, 0])
-    for label in shapes:
+    # Row 1: Gradient SVD — one subplot per rank
+    mid_epochs = {}
+    for label in rank_labels:
+        snaps = results[label]['snapshot_epochs']
+        mid_epochs[label] = snaps[len(snaps) // 2]
+
+    for i, label in enumerate(rank_labels):
+        ax = fig.add_subplot(gs[1, i])
         snap = results[label]['grad_snapshots']
-        mid_epoch = results[label]['snapshot_epochs'][len(results[label]['snapshot_epochs']) // 2]
-        if mid_epoch in snap:
-            for name, g in snap[mid_epoch].items():
+        ep = mid_epochs[label]
+        if ep in snap:
+            for name, g in snap[ep].items():
                 S = svd_spectrum(g)
-                short_name = name.split('.')[-1]
-                style = '-' if 'seq' in name or 'wq' == short_name else '--'
-                ax.semilogy(S.numpy(), color=colors[label], linestyle=style,
-                           alpha=0.7, label=f'{label} {short_name}')
-    ax.set_xlabel('singular value index')
-    ax.set_ylabel('normalized SV')
-    ax.set_title(f'Gradient SVD Spectra (mid-training)')
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
+                short = name.split('.')[-1]
+                ax.semilogy(S.numpy(), linewidth=1.5, alpha=0.8, label=short)
+        ax.set_title(f'{label} Grad SVD (ep {ep})', fontsize=10)
+        ax.set_xlabel('SV index')
+        if i == 0:
+            ax.set_ylabel('normalized SV')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
 
-    # (1,1): Weight SVD spectra at end of training
-    ax = fig.add_subplot(gs[1, 1])
-    for label in shapes:
+    # Row 2: Weight SVD — one subplot per rank
+    for i, label in enumerate(rank_labels):
+        ax = fig.add_subplot(gs[2, i])
         snap = results[label]['weight_snapshots']
-        final_epoch = results[label]['snapshot_epochs'][-1]
-        if final_epoch in snap:
-            for name, w in snap[final_epoch].items():
+        final_ep = results[label]['snapshot_epochs'][-1]
+        if final_ep in snap:
+            for name, w in snap[final_ep].items():
                 S = svd_spectrum(w)
-                short_name = name.split('.')[-1]
-                style = '-' if 'seq' in name or 'wq' == short_name else '--'
-                ax.semilogy(S.numpy(), color=colors[label], linestyle=style,
-                           alpha=0.7, label=f'{label} {short_name}')
-    ax.set_xlabel('singular value index')
-    ax.set_ylabel('normalized SV')
-    ax.set_title('Weight SVD Spectra (trained)')
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
+                short = name.split('.')[-1]
+                eff = (S > 0.1).sum().item()
+                ax.semilogy(S.numpy(), linewidth=1.5, alpha=0.8,
+                           label=f'{short} (rank {eff})')
+        ax.set_title(f'{label} Weight SVD (trained)', fontsize=10)
+        ax.set_xlabel('SV index')
+        if i == 0:
+            ax.set_ylabel('normalized SV')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
 
-    # (1,2): Effective rank comparison (# SVs above 10% of max)
-    ax = fig.add_subplot(gs[1, 2])
-    for label in shapes:
-        snap = results[label]['weight_snapshots']
-        final_epoch = results[label]['snapshot_epochs'][-1]
-        eff_ranks = []
-        param_names = []
-        if final_epoch in snap:
-            for name, w in snap[final_epoch].items():
-                S = svd_spectrum(w)
-                eff_rank = (S > 0.1).sum().item()
-                total = len(S)
-                eff_ranks.append(eff_rank / total)
-                param_names.append(name.split('.')[-1])
-        if eff_ranks:
-            x_pos = np.arange(len(eff_ranks))
-            ax.bar(x_pos, eff_ranks, color=colors[label], alpha=0.7, label=label)
-    ax.set_ylabel('effective rank fraction (SV > 10%)')
-    ax.set_title('Weight Effective Rank')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis='y')
-
-    # Suptitle
-    shape_strs = [f"{l}: {' x '.join(map(str, shapes[l]))}" for l in shapes]
-    fig.suptitle(f'1D vs 2D vs 3D vs 4D Embeddings on mod_arith (D={D})\n'
+    shape_strs = [f"{l}: {'x'.join(map(str, shapes[l]))}" for l in rank_labels]
+    fig.suptitle(f'1D vs 2D vs 3D vs 4D Projection Structure on mod_arith (D={D})\n'
                  f'{" | ".join(shape_strs)}',
                  fontsize=13, fontweight='bold')
 
