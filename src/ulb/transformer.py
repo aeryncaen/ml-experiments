@@ -152,22 +152,17 @@ class CausalULB2D(nn.Module):
         self._init_weights(n_layers)
 
     def _init_weights(self, n_layers: int, std: float = 0.02):
-        """Megatron-style init for 2D tensor params.
+        """Uniform init for all 2D tensor params.
 
-        Uses sqrt(n_layers) not sqrt(2*n_layers) because ULB2D has one
-        residual addition per block (up->attn->feat->down), unlike
-        transformers which have two (attn + MLP).
+        No Megatron-style output reduction — sigmoid gates on every
+        delta handle residual stream scaling adaptively.
         """
-        out_std = std / math.sqrt(n_layers)
         cutoff = 3.0 * std
-        out_cutoff = 3.0 * out_std
 
         for name, param in self.named_parameters():
             if param.dim() == 4:
                 # 4D tensor projections
-                if any(name.endswith(s) for s in ('.w_o', '.w_down', '.feat_w_o')):
-                    nn.init.trunc_normal_(param, std=out_std, a=-out_cutoff, b=out_cutoff)
-                elif any(name.endswith(s) for s in
+                if any(name.endswith(s) for s in
                          ('.w_attn_gate', '.w_feat_gate', '.w_k_gate', '.w_dd',
                           '.w_blend')):
                     pass  # keep zero-init
