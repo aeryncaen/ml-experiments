@@ -375,6 +375,11 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
 
         pbar.set_postfix(train_loss=f'{train_losses[-1]:.4f}', val_acc=f'{val_acc:.3f}')
 
+        # Early stop if solved
+        if val_acc > 0.99:
+            print(f'  [{label}] Early stop at epoch {epoch} — val_acc={val_acc:.3f}', flush=True)
+            break
+
     return {
         'train_losses': train_losses,
         'val_accs': val_accs,
