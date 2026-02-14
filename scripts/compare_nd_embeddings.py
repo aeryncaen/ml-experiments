@@ -366,6 +366,18 @@ def main():
     colors = {'1D': 'C0', '2D': 'C1', '3D': 'C2', '4D': 'C3'}
     results = {}
 
+    def print_leaderboard():
+        if not results:
+            return
+        print(f"\n{'='*70}")
+        print(f"{'Model':<8} {'Shape':>20} {'Params':>12} {'Final Loss':>12} {'Val Acc':>10}")
+        print(f"{'-'*70}")
+        for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
+            r = results[label]
+            shape_str = 'x'.join(map(str, r['shape']))
+            print(f"{label:<8} {shape_str:>20} {r['n_params']:>12,} {r['train_losses'][-1]:>12.4f} {r['val_accs'][-1]:>10.3f}")
+        print(f"{'='*70}\n", flush=True)
+
     for label, shape in shapes.items():
         torch.manual_seed(42)
         print(f"\n[{label}] Building model ({' x '.join(map(str, shape))})...", flush=True)
@@ -377,15 +389,10 @@ def main():
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
+        print_leaderboard()
 
-    # --- Summary ---
-    print(f"\n{'='*60}")
-    print(f"{'Model':<8} {'Params':>12} {'Final Loss':>12} {'Final Val Acc':>14}")
-    print(f"{'-'*60}")
-    for label in shapes:
-        r = results[label]
-        print(f"{label:<8} {r['n_params']:>12,} {r['train_losses'][-1]:>12.4f} {r['val_accs'][-1]:>14.3f}")
-    print(f"{'='*60}\n")
+    print("FINAL RESULTS:")
+    print_leaderboard()
 
     # --- Plot ---
     print("Plotting...")
