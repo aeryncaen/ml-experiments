@@ -289,6 +289,49 @@ class OuterMHABlock(nn.Module):
         return a * (b @ self.proj)
 
 
+class StupidAttnBlock(nn.Module):
+    """Pairwise element-wise multiplication as "attention".
+
+    For each position i, compute the element-wise product with every
+    other position j (causal: j <= i), average those products, then
+    gate back into position i by multiplying against the original.
+
+    No QKV projections, no softmax, no learned attention weights.
+    Just: "multiply pairs, gate the result back in."
+    """
+
+    def __init__(self, d_model, causal=True):
+        super().__init__()
+        self.causal = causal
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
+                              groups=d_model, bias=True)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        # Causal conv
+        h = F.pad(x.transpose(1, 2), (2, 0))
+        h = self.conv(h).transpose(1, 2)  # (B, T, D)
+
+        # Pairwise element-wise products: h[i] * h[j] for all causal j <= i
+        # h_i is (B, T, 1, D), h_j is (B, 1, T, D)
+        # products is (B, T, T, D) — products[b, i, j] = h[b,i] * h[b,j]
+        products = h.unsqueeze(2) * h.unsqueeze(1)  # (B, T, T, D)
+
+        if self.causal:
+            # Mask out future: keep j <= i
+            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=x.dtype))
+            # (T, T) -> (1, T, T, 1) for broadcasting
+            products = products * mask.unsqueeze(0).unsqueeze(-1)
+            # Average over causal positions (divide by number of valid j per i)
+            counts = mask.sum(dim=-1).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
+            pooled = products.sum(dim=2) / counts  # (B, T, D)
+        else:
+            pooled = products.mean(dim=2)  # (B, T, D)
+
+        # Gate back into original position
+        return h * pooled
+
+    
 class FeatAttnBlock(nn.Module):
     """Causal MHA + feature-attention (no SwiGLU MLP).
 
@@ -1615,6 +1658,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
         mha_mlp = 0
     try_add('MHA', lambda: MHABlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp),
             f"MHABlock(d_model={dim}, n_heads=4, mlp_inner={mha_mlp})")
+
+    # StupidAttn: pairwise element-wise multiply, gate back in
+    try_add('StupidAttn', lambda: StupidAttnBlock(d_model=dim),
+            f"StupidAttnBlock(d_model={dim})")
 
     # FeatAttn: MHA + feature-attention (no MLP)
     try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
