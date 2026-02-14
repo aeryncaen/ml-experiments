@@ -278,6 +278,8 @@ class Model(nn.Module):
         ])
         self.final_norm = RMSNorm(D)
         self.head = nn.Linear(D, vocab_size, bias=False)
+        # Tie embed and head weights (matching Zoology)
+        self.head.weight = self.embed.weight
 
     def forward(self, x):
         h = self.embed(x)
