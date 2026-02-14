@@ -34,7 +34,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-VOCAB_SIZE = 64
+VOCAB_SIZE = 8192
 MOD_BASE = 5
 
 
@@ -42,6 +42,58 @@ def gen_mod_arith(B, L, device='cpu'):
     x = torch.randint(0, MOD_BASE, (B, L), device=device)
     target = x.cumsum(dim=1) % MOD_BASE
     return x, target
+
+
+def gen_mqar(num_examples, seq_len, vocab_size=8192, num_kv_pairs=4, power_a=0.01, seed=42):
+    """Generate multi-query associative recall data (from Zoology).
+
+    Sequence contains key-value pairs, then queries. Model must recall the
+    value associated with each queried key.
+
+    Returns (inputs, labels) tensors. Labels are -100 except at query positions.
+    """
+    rng = np.random.default_rng(seed)
+    context_size = num_kv_pairs * 2
+
+    key_vocab = np.arange(1, vocab_size // 2)
+    val_vocab = np.arange(vocab_size // 2, vocab_size)
+
+    keys = np.stack([rng.choice(key_vocab, num_kv_pairs, replace=False)
+                     for _ in range(num_examples)])
+    values = np.stack([rng.choice(val_vocab, num_kv_pairs, replace=False)
+                       for _ in range(num_examples)])
+
+    # Build context: key val key val ...
+    kvs = np.zeros((num_examples, context_size), dtype=np.int64)
+    kvs[:, 0::2] = keys
+    kvs[:, 1::2] = values
+
+    # Power-law gaps for query placement
+    space = (seq_len - context_size) // 2
+    p = power_a * np.arange(1, space + 1) ** (power_a - 1)
+    p = p / p.sum()
+
+    log_p = np.log(p)
+    gumbel = rng.gumbel(size=(num_examples, space))
+    gap_idx = np.argpartition(-(log_p + gumbel), num_kv_pairs, axis=1)[:, :num_kv_pairs]
+
+    # Build query section
+    queries = np.zeros((num_examples, seq_len - context_size + 1), dtype=np.int64)
+    np.put_along_axis(queries, gap_idx * 2, values=keys, axis=1)
+
+    examples = np.concatenate([kvs, queries], axis=1)
+
+    labels = np.full((num_examples, seq_len + 1), -100, dtype=np.int64)
+    np.put_along_axis(labels, gap_idx * 2 + context_size + 1, values=values, axis=1)
+
+    inputs = torch.tensor(examples[:, :-1])
+    labels = torch.tensor(labels[:, 1:])
+
+    # Fill non-query/non-kv positions with random tokens
+    mask = inputs == 0
+    inputs[mask] = torch.randint(vocab_size, size=inputs.shape)[mask]
+
+    return inputs, labels
 
 
 class RMSNorm(nn.Module):
@@ -215,17 +267,17 @@ class BlockND(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, D, shape, n_layers=1, n_heads=4, ffn_expand=2):
+    def __init__(self, D, shape, vocab_size=VOCAB_SIZE, n_layers=1, n_heads=4, ffn_expand=2):
         super().__init__()
         self.D = D
         self.shape = shape
-        self.embed = nn.Embedding(VOCAB_SIZE, D)
+        self.embed = nn.Embedding(vocab_size, D)
         self.blocks = nn.ModuleList([
             BlockND(D, shape, n_heads=n_heads, ffn_expand=ffn_expand)
             for _ in range(n_layers)
         ])
         self.final_norm = RMSNorm(D)
-        self.head = nn.Linear(D, VOCAB_SIZE, bias=False)
+        self.head = nn.Linear(D, vocab_size, bias=False)
 
     def forward(self, x):
         h = self.embed(x)
@@ -234,7 +286,8 @@ class Model(nn.Module):
         return self.head(self.final_norm(h))
 
 
-def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
+def train(model, n_epochs, task='mqar', B=64, L=64, lr=3e-4, device='cpu', label='',
+          vocab_size=8192, num_kv_pairs=4):
     model = model.to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
 
@@ -247,7 +300,15 @@ def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
     snapshot_epochs = sorted(set([0, n_epochs // 4, n_epochs // 2,
                                    3 * n_epochs // 4, n_epochs - 1]))
 
-    val_x, val_t = gen_mod_arith(512, L, device=device)
+    # Pre-generate val data
+    if task == 'mqar':
+        val_x, val_t = gen_mqar(512, L, vocab_size=vocab_size,
+                                num_kv_pairs=num_kv_pairs, seed=9999)
+        val_x, val_t = val_x.to(device), val_t.to(device)
+        ignore_index = -100
+    else:
+        val_x, val_t = gen_mod_arith(512, L, device=device)
+        ignore_index = -100  # not used for mod_arith but keep consistent
 
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
@@ -255,10 +316,18 @@ def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
         epoch_loss = 0
         n_batches = 20
 
-        for _ in range(n_batches):
-            x, t = gen_mod_arith(B, L, device=device)
+        for batch_i in range(n_batches):
+            if task == 'mqar':
+                x, t = gen_mqar(B, L, vocab_size=vocab_size,
+                                num_kv_pairs=num_kv_pairs,
+                                seed=epoch * n_batches + batch_i)
+                x, t = x.to(device), t.to(device)
+            else:
+                x, t = gen_mod_arith(B, L, device=device)
+
             logits = model(x)
-            loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), t.reshape(-1))
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
+                                   ignore_index=-100)
             opt.zero_grad()
             loss.backward()
 
@@ -268,7 +337,7 @@ def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
                     grad_snapshots[epoch] = {}
                     weight_snapshots[epoch] = {}
                 for name, p in model.named_parameters():
-                    if p.grad is not None and ('wq' in name or 'seq_wq' in name or 'feat_wq' in name):
+                    if p.grad is not None and ('wq' in name or 'seq_wq' in name):
                         if name not in grad_snapshots[epoch]:
                             grad_snapshots[epoch][name] = p.grad.detach().cpu().clone()
                             weight_snapshots[epoch][name] = p.detach().cpu().clone()
@@ -278,11 +347,18 @@ def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
 
         train_losses.append(epoch_loss / n_batches)
 
+        # Eval
         model.eval()
         with torch.no_grad():
             logits = model(val_x)
-            preds = logits.argmax(-1)
-            val_acc = (preds == val_t).float().mean().item()
+            if task == 'mqar':
+                # Accuracy only on query positions (where label != -100)
+                mask = val_t != -100
+                preds = logits.argmax(-1)
+                val_acc = (preds[mask] == val_t[mask]).float().mean().item()
+            else:
+                preds = logits.argmax(-1)
+                val_acc = (preds == val_t).float().mean().item()
             val_accs.append(val_acc)
 
         pbar.set_postfix(train_loss=f'{train_losses[-1]:.4f}', val_acc=f'{val_acc:.3f}')
@@ -313,7 +389,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dim', type=int, default=4096,
                         help='Model dim (must be factorable into 2/3/4-way)')
+    parser.add_argument('--task', type=str, default='mqar', choices=['mqar', 'mod_arith'],
+                        help='Task: mqar (associative recall) or mod_arith')
     parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--seq-len', type=int, default=64, help='Sequence length')
+    parser.add_argument('--num-kv-pairs', type=int, default=4,
+                        help='Number of key-value pairs (mqar only)')
     parser.add_argument('--n-layers', type=int, default=2)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--save', type=str, default=None)
@@ -331,6 +412,8 @@ def main():
     print(f"Using device: {args.device}")
 
     D = args.dim
+    vocab_size = VOCAB_SIZE if args.task == 'mqar' else MOD_BASE
+    task_name = 'MQAR (associative recall)' if args.task == 'mqar' else 'Modular Arithmetic'
 
     # Compute factorizations
     shapes = {}
@@ -339,6 +422,7 @@ def main():
     shapes['3D'] = factorize_dim(D, 3)
     shapes['4D'] = factorize_dim(D, 4)
 
+    print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}")
     print(f"d_model = {D}")
     for label, shape in shapes.items():
         print(f"  {label}: {' x '.join(map(str, shape))} = {math.prod(shape)}")
@@ -361,11 +445,13 @@ def main():
     for label, shape in shapes.items():
         torch.manual_seed(42)
         print(f"\n[{label}] Building model ({' x '.join(map(str, shape))})...", flush=True)
-        model = Model(D, shape, n_layers=args.n_layers, ffn_expand=2)
+        model = Model(D, shape, vocab_size=vocab_size, n_layers=args.n_layers, ffn_expand=2)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
-        results[label] = train(model, args.epochs, lr=args.lr, device=args.device, label=label)
+        results[label] = train(model, args.epochs, task=args.task, L=args.seq_len,
+                               lr=args.lr, device=args.device, label=label,
+                               vocab_size=vocab_size, num_kv_pairs=args.num_kv_pairs)
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
@@ -504,7 +590,7 @@ def main():
         ax.grid(True, alpha=0.3)
 
     shape_strs = [f"{l}: {'x'.join(map(str, shapes[l]))}" for l in rank_labels]
-    fig.suptitle(f'1D vs 2D vs 3D vs 4D Projection Structure on mod_arith (D={D})\n'
+    fig.suptitle(f'1D vs 2D vs 3D vs 4D Projection Structure on {task_name} (D={D})\n'
                  f'{" | ".join(shape_strs)}',
                  fontsize=13, fontweight='bold')
 
