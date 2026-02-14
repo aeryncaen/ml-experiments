@@ -476,13 +476,11 @@ class ULB2DBlock(nn.Module):
         self.q_post_bias = nn.Parameter(torch.ones(C_w))
         self.k_post_bias = nn.Parameter(torch.ones(C_w))
 
-        # --- K temporal lerp (last quarter of C_w) ---
-        quarter = C_w // 4
-        self.quarter = quarter
-        self.w_k_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, quarter))
-        self.k_gate_bias = nn.Parameter(torch.full((C_h, quarter), config.k_lerp_bias))
+        # --- Sequence temporal lerp (all dims of x) ---
+        self.w_seq_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
+        self.seq_gate_bias = nn.Parameter(torch.full((C_h, C_w), config.k_lerp_bias))
 
-        # --- Hybrid RoPE (at C_w) ---
+        # --- Hybrid RoPE (applied to x before QKV) ---
         self.fixed_pairs = C_w // 4
         self.dd_pairs = C_w // 4
         inv_freq = 1.0 / (config.rope_base ** (
@@ -532,26 +530,15 @@ class ULB2DBlock(nn.Module):
         D = cfg.d_model
         b, t = x.shape[:2]
 
-        # --- QKV (all at C_w) ---
-        q = self._proj2d(x, self.w_q)                           # (B, T, C_h, C_w)
-        k = self._proj2d(x, self.w_k, self.k_bias_param)
-        v = self._proj2d(x, self.w_v, self.v_bias_param)
-
-        # QK norm + post-norm bias (per-head RMSNorm over C_w)
-        q = self.q_norm(q) * self.q_post_bias
-        k = self.k_norm(k) * self.k_post_bias
-
-        # --- K temporal lerp (last quarter of C_w) ---
+        # --- Sequence temporal lerp (all dims, on x before QKV) ---
         if t >= 2:
-            qd = self.quarter
             gate = torch.sigmoid(
-                self._proj2d(x, self.w_k_gate, self.k_gate_bias))
-            k_static = k[..., :-qd]
-            k_cur = k[..., -qd:]
-            k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
-            k = torch.cat([k_static, (1 - gate) * k_cur + gate * k_prev], dim=-1)
+                self._proj2d(x, self.w_seq_gate, self.seq_gate_bias))  # (B, T, C_h, C_w)
+            x_prev = F.pad(x[:, :-1], (0, 0, 0, 0, 1, 0))
+            x = (1 - gate) * x + gate * x_prev
 
-        # --- Hybrid RoPE (data-dependent + fixed) ---
+        # --- Hybrid RoPE (applied to x before QKV) ---
+        from .rope import apply_rotary
         dd_deltas = self._proj2d(x, self.w_dd, self.dd_bias)
         dd_angles = dd_deltas.cumsum(dim=1)
 
@@ -562,17 +549,21 @@ class ULB2DBlock(nn.Module):
         cos_f = freqs.cos()[None, :, None, :]
         sin_f = freqs.sin()[None, :, None, :]
 
-        def apply_hybrid_rope(qk: torch.Tensor) -> torch.Tensor:
-            from .rope import apply_rotary
-            qk_fixed = torch.cat([qk[..., :fp], qk[..., fp:2*fp]], dim=-1)
-            qk_dd = torch.cat([qk[..., 2*fp:2*fp+dp], qk[..., 2*fp+dp:]], dim=-1)
-            qk_fixed = apply_rotary(qk_fixed, cos_f, sin_f)
-            qk_dd = apply_rotary(qk_dd, dd_angles.cos(), dd_angles.sin())
-            return torch.cat([qk_fixed[..., :fp], qk_fixed[..., fp:],
-                              qk_dd[..., :dp], qk_dd[..., dp:]], dim=-1)
+        x_fixed = torch.cat([x[..., :fp], x[..., fp:2*fp]], dim=-1)
+        x_dd = torch.cat([x[..., 2*fp:2*fp+dp], x[..., 2*fp+dp:]], dim=-1)
+        x_fixed = apply_rotary(x_fixed, cos_f, sin_f)
+        x_dd = apply_rotary(x_dd, dd_angles.cos(), dd_angles.sin())
+        x = torch.cat([x_fixed[..., :fp], x_fixed[..., fp:],
+                        x_dd[..., :dp], x_dd[..., dp:]], dim=-1)
 
-        q = apply_hybrid_rope(q)
-        k = apply_hybrid_rope(k)
+        # --- QKV (all at C_w, from position-encoded x) ---
+        q = self._proj2d(x, self.w_q)                           # (B, T, C_h, C_w)
+        k = self._proj2d(x, self.w_k, self.k_bias_param)
+        v = self._proj2d(x, self.w_v, self.v_bias_param)
+
+        # QK norm + post-norm bias (per-head RMSNorm over C_w)
+        q = self.q_norm(q) * self.q_post_bias
+        k = self.k_norm(k) * self.k_post_bias
 
         # --- Seq-attention (C_h heads, C_w head_dim) ---
         q_s = q.permute(0, 2, 1, 3)
