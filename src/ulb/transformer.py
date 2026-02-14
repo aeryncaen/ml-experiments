@@ -151,27 +151,15 @@ class CausalULB2D(nn.Module):
         self._init_weights(n_layers)
 
     def _init_weights(self, n_layers: int, std: float = 0.02):
-        """Init for all 2D tensor params.
-
-        Output projections (w_o, feat_w_down) use Megatron-style
-        1/sqrt(n_layers) scaling to keep residual stream stable.
-        """
+        """Init for all 2D tensor params."""
         cutoff = 3.0 * std
-        megatron_scale = 1.0 / (max(1, n_layers / 2) ** 0.5)
 
         for name, param in self.named_parameters():
             if param.dim() == 4:
-                # 4D tensor projections
                 if any(name.endswith(s) for s in
                          ('.w_attn_gate', '.w_k_gate', '.w_dd',
                           '.w_blend')):
                     pass  # keep zero-init
-                elif any(name.endswith(s) for s in
-                         ('.w_o', '.feat_w_down')):
-                    # Megatron init: scale down residual-contributing projections
-                    nn.init.trunc_normal_(param, std=std * megatron_scale,
-                                         a=-cutoff * megatron_scale,
-                                         b=cutoff * megatron_scale)
                 else:
                     nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
             elif param.dim() == 2 and 'embed' in name:
