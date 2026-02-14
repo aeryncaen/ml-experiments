@@ -124,149 +124,112 @@ def factorize_dim(D, rank):
 # ---------------------------------------------------------------------------
 
 class BlockND(nn.Module):
-    """Causal self-attention + feat-attn MLP using N-dimensional tensor projections.
+    """Causal self-attention + SwiGLU MLP using N-dimensional tensor projections.
 
-    For rank=1, uses standard nn.Linear.
-    For rank>=2, uses einsum with (shape, shape) tensor weights.
+    All ranks use the same architecture: QKV seq-attn + SwiGLU MLP.
+    Only the projection structure changes:
+      1D: nn.Linear (flat matrix multiply)
+      ND: einsum with rank-2N tensor weights
     """
 
     def __init__(self, D, shape, n_heads=4, ffn_expand=2):
-        """
-        Args:
-            D: total model dim (product of shape).
-            shape: tuple of ints for the ND factorization.
-            n_heads: number of seq-attn heads (for 1D, or derived from shape[0] for ND).
-            ffn_expand: feat-attn MLP expansion factor.
-        """
         super().__init__()
         self.D = D
         self.shape = shape
         self.rank = len(shape)
+        self.n_heads = n_heads if self.rank == 1 else shape[0]
+        self.head_dim = D // self.n_heads
+
+        init_scale = D ** -0.5
+        mlp_inner = int(D * ffn_expand)
+        self.mlp_inner = mlp_inner
 
         if self.rank == 1:
-            # Standard 1D transformer block
-            self.n_heads = n_heads
-            self.head_dim = D // n_heads
+            # Flat linear projections
             self.wq = nn.Linear(D, D, bias=False)
             self.wk = nn.Linear(D, D, bias=False)
             self.wv = nn.Linear(D, D, bias=False)
             self.wo = nn.Linear(D, D, bias=False)
-            self.norm1 = RMSNorm(D)
-
-            # SwiGLU MLP (to match feat-attn param count approximately)
-            mlp_inner = int(D * ffn_expand)
-            self.norm2 = RMSNorm(D)
             self.gate_proj = nn.Linear(D, mlp_inner, bias=False)
             self.up_proj = nn.Linear(D, mlp_inner, bias=False)
             self.down_proj = nn.Linear(mlp_inner, D, bias=False)
         else:
-            # ND tensor block
-            # For seq-attn: shape[0] features as heads, rest as descriptor
-            self.n_features = shape[0]
-            desc_shape = shape[1:]
-            self.desc_dim = math.prod(desc_shape)
-
-            init_scale = D ** -0.5
-
-            # Build einsum string for this rank
-            # Input indices: ...cde (for rank=3 with c,d,e)
-            # Weight indices: cdefgh (in_indices + out_indices)
-            # Output indices: ...fgh
+            # ND tensor projections via einsum
             n = self.rank
             in_chars = ''.join(chr(ord('c') + i) for i in range(n))
             out_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
             self.einsum_str = f'...{in_chars},{in_chars}{out_chars}->...{out_chars}'
 
-            w_shape = tuple(shape) + tuple(shape)  # (shape..., shape...)
-
+            w_shape = tuple(shape) + tuple(shape)
             self.seq_wq = nn.Parameter(torch.randn(*w_shape) * init_scale)
             self.seq_wk = nn.Parameter(torch.randn(*w_shape) * init_scale)
             self.seq_wv = nn.Parameter(torch.randn(*w_shape) * init_scale)
             self.seq_wo = nn.Parameter(torch.randn(*w_shape) * init_scale)
-            self.norm1 = RMSNorm(D)
 
-            # Feat-attn MLP: expand descriptor, silu2 over features, compress back
-            # Expand the last dim of shape by ffn_expand
-            exp_last = max(4, int(shape[-1] * ffn_expand / 4) * 4)
-            self.exp_shape = shape[:-1] + (exp_last,)
-            self.exp_dim = math.prod(self.exp_shape)
+            # SwiGLU MLP with ND tensor projections
+            # up/gate: (shape...) -> mlp_inner, down: mlp_inner -> (shape...)
+            # Factor mlp_inner into same-rank shape
+            mlp_shape = factorize_dim(mlp_inner, self.rank)
+            self.mlp_shape = mlp_shape
 
-            # Projection shapes: (shape..., exp_shape...) and (exp_shape..., shape...)
-            feat_w_in_shape = tuple(shape) + tuple(self.exp_shape)
-            feat_w_out_shape = tuple(self.exp_shape) + tuple(shape)
-            feat_in_chars = in_chars
-            feat_out_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
-            self.feat_einsum_in = f'...{feat_in_chars},{feat_in_chars}{feat_out_chars}->...{feat_out_chars}'
-            # For down proj, input is exp_shape, output is shape
-            feat_down_in = feat_out_chars
-            feat_down_out = in_chars
-            self.feat_einsum_out = f'...{feat_down_in},{feat_down_in}{feat_down_out}->...{feat_down_out}'
+            mlp_up_shape = tuple(shape) + tuple(mlp_shape)
+            mlp_down_shape = tuple(mlp_shape) + tuple(shape)
+            mlp_up_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
+            self.mlp_einsum_up = f'...{in_chars},{in_chars}{mlp_up_chars}->...{mlp_up_chars}'
+            self.mlp_einsum_down = f'...{mlp_up_chars},{mlp_up_chars}{in_chars}->...{in_chars}'
 
-            init_scale_ffn = self.exp_dim ** -0.5
-            self.feat_wq = nn.Parameter(torch.randn(*feat_w_in_shape) * init_scale)
-            self.feat_wk = nn.Parameter(torch.randn(*feat_w_in_shape) * init_scale)
-            self.feat_wv = nn.Parameter(torch.randn(*feat_w_in_shape) * init_scale)
-            self.feat_wd = nn.Parameter(torch.randn(*feat_w_out_shape) * init_scale_ffn)
-            self.norm2 = RMSNorm(D)
+            mlp_init = math.prod(mlp_shape) ** -0.5
+            self.mlp_gate = nn.Parameter(torch.randn(*mlp_up_shape) * init_scale)
+            self.mlp_up = nn.Parameter(torch.randn(*mlp_up_shape) * init_scale)
+            self.mlp_down = nn.Parameter(torch.randn(*mlp_down_shape) * mlp_init)
+
+        self.norm1 = RMSNorm(D)
+        self.norm2 = RMSNorm(D)
+
+    def _proj_nd(self, x, w, einsum_str=None):
+        return torch.einsum(einsum_str or self.einsum_str, x, w)
 
     def forward(self, x):
         B, T, D = x.shape
+        NH, HD = self.n_heads, self.head_dim
 
         if self.rank == 1:
-            # Standard 1D
+            # --- Seq-attn with flat linear ---
             h = self.norm1(x)
-            q = self.wq(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-            k = self.wk(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-            v = self.wv(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+            q = self.wq(h).view(B, T, NH, HD).transpose(1, 2)
+            k = self.wk(h).view(B, T, NH, HD).transpose(1, 2)
+            v = self.wv(h).view(B, T, NH, HD).transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(B, T, D)
-            y = self.wo(y)
-            x = x + y
-            # SwiGLU MLP
+            x = x + self.wo(y)
+            # --- SwiGLU MLP with flat linear ---
             r = self.norm2(x)
             x = x + self.down_proj(F.silu(self.gate_proj(r)) * self.up_proj(r))
             return x
 
-        # ND path
+        # --- ND path: same architecture, tensor projections ---
         shape = self.shape
-        NF = self.n_features
 
-        # --- Seq-attn ---
+        # Seq-attn
         h = self.norm1(x).view(B, T, *shape)
-        Q = torch.einsum(self.einsum_str, h, self.seq_wq)
-        K = torch.einsum(self.einsum_str, h, self.seq_wk)
-        V = torch.einsum(self.einsum_str, h, self.seq_wv)
-        # Flatten all dims after features into descriptor: (B, T, NF, desc_dim)
-        Q = Q.view(B, T, NF, -1)
-        K = K.view(B, T, NF, -1)
-        V = V.view(B, T, NF, -1)
-        # Seq-attn: (B, NF, T, desc_dim)
-        Q = Q.permute(0, 2, 1, 3)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
+        Q = self._proj_nd(h, self.seq_wq)
+        K = self._proj_nd(h, self.seq_wk)
+        V = self._proj_nd(h, self.seq_wv)
+        Q = Q.view(B, T, NH, -1).permute(0, 2, 1, 3)
+        K = K.view(B, T, NH, -1).permute(0, 2, 1, 3)
+        V = V.view(B, T, NH, -1).permute(0, 2, 1, 3)
         y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         y = y.permute(0, 2, 1, 3).contiguous().view(B, T, *shape)
-        y = torch.einsum(self.einsum_str, y, self.seq_wo)
+        y = self._proj_nd(y, self.seq_wo)
         x = x + y.reshape(B, T, D)
 
-        # --- Feat-attn MLP: silu² over features ---
-        h = self.norm2(x).view(B, T, *shape)
-        fQ = torch.einsum(self.feat_einsum_in, h, self.feat_wq)
-        fK = torch.einsum(self.feat_einsum_in, h, self.feat_wk)
-        fV = torch.einsum(self.feat_einsum_in, h, self.feat_wv)
-        # Flatten to (B*T, 1, NF, exp_desc_dim) for silu2 attention over features
-        exp_dd = self.exp_dim // NF
-        fQ = fQ.view(B * T, 1, NF, exp_dd)
-        fK = fK.view(B * T, 1, NF, exp_dd)
-        fV = fV.view(B * T, 1, NF, exp_dd)
-        # silu² attention
-        scale = 1.0 / math.sqrt(exp_dd)
-        logits = (fQ @ fK.transpose(-2, -1)) * scale
-        weights = F.silu(logits) ** 2
-        feat_out = weights @ fV
-        feat_out = feat_out.view(B, T, *self.exp_shape)
-        feat_out = torch.einsum(self.feat_einsum_out, feat_out, self.feat_wd)
-        x = x + feat_out.reshape(B, T, D)
+        # SwiGLU MLP
+        r = self.norm2(x).view(B, T, *shape)
+        gate = self._proj_nd(r, self.mlp_gate, self.mlp_einsum_up)
+        up = self._proj_nd(r, self.mlp_up, self.mlp_einsum_up)
+        h = F.silu(gate) * up
+        down = self._proj_nd(h, self.mlp_down, self.mlp_einsum_down)
+        x = x + down.reshape(B, T, D)
 
         return x
 
