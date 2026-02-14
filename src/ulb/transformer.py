@@ -157,7 +157,7 @@ class CausalULB2D(nn.Module):
         1/sqrt(n_layers) scaling to keep residual stream stable.
         """
         cutoff = 3.0 * std
-        megatron_scale = 1.0 / (n_layers ** 0.5)
+        megatron_scale = 1.0 / (max(1, n_layers / 2) ** 0.5)
 
         for name, param in self.named_parameters():
             if param.dim() == 4:
