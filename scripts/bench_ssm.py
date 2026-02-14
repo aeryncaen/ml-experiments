@@ -357,25 +357,15 @@ class FeatAttnBlock(nn.Module):
                  up_factor=1):
         super().__init__()
         self.feat_first = feat_first
-        self.feat_half = d_model // 2
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                               groups=d_model, bias=True)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.feat_norm = RMSNorm(d_model)
         from mha import FeatureAttn
-        # Feature-attention only on half the dims
-        self.feat_attn = FeatureAttn(self.feat_half, feat_expansion=feat_expansion,
+        self.feat_attn = FeatureAttn(d_model, feat_expansion=feat_expansion,
                                      n_heads=feat_n_heads,
                                      transpose_groups=transpose_groups,
                                      up_factor=up_factor)
-
-    def _feat_step(self, h):
-        h_normed = self.feat_norm(h)
-        h_feat = h_normed[..., :self.feat_half]
-        feat_delta = self.feat_attn(h_feat)
-        h_out = h.clone()
-        h_out[..., :self.feat_half] = h[..., :self.feat_half] + feat_delta
-        return h_out
 
     def forward(self, x):
         B, T, D = x.shape
@@ -384,14 +374,18 @@ class FeatAttnBlock(nn.Module):
         h = self.conv(h).transpose(1, 2)
 
         if self.feat_first:
-            h = self._feat_step(h)
+            # Feature attention first
+            h = h + self.feat_attn(self.feat_norm(h))
+            # Then sequence attention
             mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
             attn_out, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
             h = attn_out
         else:
+            # Sequence attention first
             mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
             h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
-            h = self._feat_step(h)
+            # Then feature attention
+            h = h + self.feat_attn(self.feat_norm(h))
         return h
 
 

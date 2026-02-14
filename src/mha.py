@@ -341,8 +341,6 @@ class FeatureAttnBlock(nn.Module):
                  transpose_groups: bool = False, up_factor: int = 1):
         super().__init__()
         self.feat_first = feat_first
-        self.dim = dim
-        self.feat_half = dim // 2
 
         self.attn_norm = nn.RMSNorm(dim)
         self.feat_norm = nn.RMSNorm(dim)
@@ -353,13 +351,12 @@ class FeatureAttnBlock(nn.Module):
 
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
-        # Feature-attention only on half the dims
-        self.ffn = FeatureAttn(self.feat_half, feat_expansion=feat_expansion,
+        self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
                                n_heads=feat_n_heads,
                                transpose_groups=transpose_groups,
                                up_factor=up_factor)
-        # Content-dependent gate on feature-attention delta (half dims)
-        self.feat_gate_proj = nn.Linear(self.feat_half, self.feat_half, bias=False)
+        # Content-dependent gate on feature-attention delta
+        self.feat_gate_proj = nn.Linear(dim, dim, bias=False)
 
     def _seq_attn(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -377,23 +374,15 @@ class FeatureAttnBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(attn_out)
 
-    def _feat_attn(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.feat_norm(x)
-        # Split: first half goes through feature-attention, second half passes through
-        h_feat, h_pass = h[..., :self.feat_half], h[..., self.feat_half:]
-        x_feat = x[..., :self.feat_half]
-        feat_delta = self.ffn(h_feat)
-        gate = torch.sigmoid(self.feat_gate_proj(x_feat))
-        x_feat = x_feat + feat_delta * gate
-        return torch.cat([x_feat, x[..., self.feat_half:]], dim=-1)
-
     def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
         if self.feat_first:
-            x = self._feat_attn(x)
+            feat_delta = self.ffn(self.feat_norm(x))
+            x = x + feat_delta * torch.sigmoid(self.feat_gate_proj(x))
             x = x + self._seq_attn(x, rope_freqs)
         else:
             x = x + self._seq_attn(x, rope_freqs)
-            x = self._feat_attn(x)
+            feat_delta = self.ffn(self.feat_norm(x))
+            x = x + feat_delta * torch.sigmoid(self.feat_gate_proj(x))
         return x
 
 
