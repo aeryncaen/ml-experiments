@@ -290,14 +290,14 @@ class OuterMHABlock(nn.Module):
 
 
 class StupidAttnBlock(nn.Module):
-    """Pairwise element-wise multiplication as "attention".
+    """Element-wise QKV attention — D-dimensional gating per pair.
 
-    For each position i, compute the element-wise product with every
-    other position j (causal: j <= i), average those products, then
-    gate back into position i by multiplying against the original.
+    For each pair (i, j), Q[i] * K[j] gives a D-dimensional gate
+    for V[j], which accumulates into position i. Every feature
+    independently decides how much to pull from each other position.
 
-    No QKV projections, no softmax, no learned attention weights.
-    Just: "multiply pairs, gate the result back in."
+    Standard attention: scalar gate per pair (Q @ K^T -> one number).
+    This: element-wise gate per pair (Q * K -> D numbers).
     """
 
     def __init__(self, d_model, causal=True):
@@ -305,6 +305,9 @@ class StupidAttnBlock(nn.Module):
         self.causal = causal
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                               groups=d_model, bias=True)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -312,24 +315,25 @@ class StupidAttnBlock(nn.Module):
         h = F.pad(x.transpose(1, 2), (2, 0))
         h = self.conv(h).transpose(1, 2)  # (B, T, D)
 
-        # Pairwise element-wise products: h[i] * h[j] for all causal j <= i
-        # h_i is (B, T, 1, D), h_j is (B, 1, T, D)
-        # products is (B, T, T, D) — products[b, i, j] = h[b,i] * h[b,j]
-        products = h.unsqueeze(2) * h.unsqueeze(1)  # (B, T, T, D)
+        q = self.q_proj(h)  # (B, T, D)
+        k = self.k_proj(h)  # (B, T, D)
+        v = self.v_proj(h)  # (B, T, D)
+
+        # Element-wise gate: Q[i] * K[j] for all pairs -> (B, T, T, D)
+        gate = q.unsqueeze(2) * k.unsqueeze(1)  # (B, T_i, T_j, D)
+
+        # Gate V[j] and accumulate into position i
+        gated_v = gate * v.unsqueeze(1)  # (B, T_i, T_j, D)
 
         if self.causal:
-            # Mask out future: keep j <= i
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=x.dtype))
-            # (T, T) -> (1, T, T, 1) for broadcasting
-            products = products * mask.unsqueeze(0).unsqueeze(-1)
-            # Average over causal positions (divide by number of valid j per i)
+            gated_v = gated_v * mask.unsqueeze(0).unsqueeze(-1)
             counts = mask.sum(dim=-1).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
-            pooled = products.sum(dim=2) / counts  # (B, T, D)
+            out = gated_v.sum(dim=2) / counts  # (B, T, D)
         else:
-            pooled = products.mean(dim=2)  # (B, T, D)
+            out = gated_v.mean(dim=2)  # (B, T, D)
 
-        # Gate back into original position
-        return h * pooled
+        return out
 
     
 class FeatAttnBlock(nn.Module):
