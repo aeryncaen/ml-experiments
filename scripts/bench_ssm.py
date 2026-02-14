@@ -1534,7 +1534,7 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     if match_params:
         try:
             target_params = _count_stacked_params(
-                lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')),
+                lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True)),
                 n_layers, dim
             )
             print(f"  Auto-sizing to match ULBBlendP: {target_params:,} params")
