@@ -405,7 +405,6 @@ class ULB2DConfig:
     c_w: int = 48
     ffn_expand: float = 8 / 3   # SwiGLU FFN expansion ratio (matches transformer default)
     is_causal: bool = True
-    rope_base: float = 10000.0
     use_blend: bool = True
     blend_gate_bias: float = -1.1
     k_lerp_bias: float = -2.0
@@ -480,12 +479,8 @@ class ULB2DBlock(nn.Module):
         self.w_seq_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
         self.seq_gate_bias = nn.Parameter(torch.full((C_h, C_w), config.k_lerp_bias))
 
-        # --- Hybrid RoPE (applied to x before QKV) ---
-        self.fixed_pairs = C_w // 4
-        self.dd_pairs = C_w // 4
-        inv_freq = 1.0 / (config.rope_base ** (
-            torch.arange(0, self.fixed_pairs * 2, 2).float() / C_w))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        # --- Data-dependent RoPE (applied to x before QKV) ---
+        self.dd_pairs = C_w // 2  # half of dims get rotated
         self.w_dd = nn.Parameter(torch.zeros(C_h, C_w, C_h, self.dd_pairs))
         self.dd_bias = nn.Parameter(torch.zeros(C_h, self.dd_pairs))
 
@@ -535,24 +530,15 @@ class ULB2DBlock(nn.Module):
             x_prev = F.pad(x[:, :-1], (0, 0, 0, 0, 1, 0))
             x = (1 - gate) * x + gate * x_prev
 
-        # --- Hybrid RoPE (applied to x before QKV) ---
+        # --- Data-dependent RoPE (applied to x before QKV) ---
         from .rope import apply_rotary
-        dd_deltas = self._proj2d(x, self.w_dd, self.dd_bias)
+        dp = self.dd_pairs
+        dd_deltas = self._proj2d(x, self.w_dd, self.dd_bias)    # (B, T, C_h, dp)
         dd_angles = dd_deltas.cumsum(dim=1)
 
-        fp = self.fixed_pairs
-        dp = self.dd_pairs
-        pos = torch.arange(t, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(pos, self.inv_freq)
-        cos_f = freqs.cos()[None, :, None, :]
-        sin_f = freqs.sin()[None, :, None, :]
-
-        x_fixed = torch.cat([x[..., :fp], x[..., fp:2*fp]], dim=-1)
-        x_dd = torch.cat([x[..., 2*fp:2*fp+dp], x[..., 2*fp+dp:]], dim=-1)
-        x_fixed = apply_rotary(x_fixed, cos_f, sin_f)
-        x_dd = apply_rotary(x_dd, dd_angles.cos(), dd_angles.sin())
-        x = torch.cat([x_fixed[..., :fp], x_fixed[..., fp:],
-                        x_dd[..., :dp], x_dd[..., dp:]], dim=-1)
+        x_rot = torch.cat([x[..., :dp], x[..., dp:]], dim=-1)
+        x_rot = apply_rotary(x_rot, dd_angles.cos(), dd_angles.sin())
+        x = torch.cat([x_rot[..., :dp], x_rot[..., dp:]], dim=-1)
 
         # --- QKV (all at C_w, from position-encoded x) ---
         q = self._proj2d(x, self.w_q)                           # (B, T, C_h, C_w)
