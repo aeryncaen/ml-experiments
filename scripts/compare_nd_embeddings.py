@@ -56,67 +56,47 @@ class RMSNorm(nn.Module):
 # Factorization helpers
 # ---------------------------------------------------------------------------
 
-def factorize_dim(D, rank):
-    """Find a factorization of D into `rank` factors, as balanced as possible.
+def _balanced_factor(n, parts):
+    """Factor n into `parts` balanced factors."""
+    if parts == 1:
+        return (n,)
+    target = int(round(n ** (1.0 / parts)))
+    best = 2
+    for f in range(2, int(n ** 0.5) + 1):
+        if n % f == 0 and abs(f - target) <= abs(best - target):
+            best = f
+    return (best,) + _balanced_factor(n // best, parts - 1)
 
-    Returns tuple of ints whose product == D.
-    For rank=1, returns (D,).
-    For rank=2, finds closest pair (a, b) with a <= b, a*b == D.
-    For rank=3, finds (a, b, c) with a*b*c == D.
-    For rank=4, finds (a, b, c, d) with a*b*c*d == D.
+
+def factorize_dim(D, rank):
+    """Factor D into `rank` dimensions using 1:3 ratio structure.
+
+    Mirrors the ULB architecture convention: first dimension is the number
+    of features (small), remaining dimensions form the descriptor (large).
+    Target ratio is 1:3 (n_features : desc_dim) for rank 2.
+    For rank > 2, the descriptor is further factored into balanced parts.
+
+    Examples for D=4096:
+        1D: (4096,)
+        2D: (32, 128)       — 32 features x 128 descriptor
+        3D: (32, 8, 16)     — 32 features x (8x16) descriptor
+        4D: (32, 4, 4, 8)   — 32 features x (4x4x8) descriptor
     """
     if rank == 1:
         return (D,)
+    # First dim: target 1:3 ratio -> n_features ≈ sqrt(D/3)
+    target_nf = int((D / 3) ** 0.5)
+    best = 1
+    for s in range(2, int(D ** 0.5) + 1):
+        if D % s == 0:
+            if abs(s - target_nf) <= abs(best - target_nf):
+                best = s
+    nf = best
+    desc = D // nf
     if rank == 2:
-        best = (1, D)
-        for a in range(2, int(D**0.5) + 1):
-            if D % a == 0:
-                best = (a, D // a)
-        return best
-    if rank == 3:
-        best = None
-        best_spread = float('inf')
-        for a in range(2, int(D**(1/3)) + 2):
-            if D % a != 0:
-                continue
-            rem = D // a
-            for b in range(a, int(rem**0.5) + 1):
-                if rem % b == 0:
-                    c = rem // b
-                    spread = max(a, b, c) - min(a, b, c)
-                    if best is None or spread < best_spread:
-                        best = (a, b, c)
-                        best_spread = spread
-        if best is None:
-            # Fallback: use 2D factorization + split
-            a, bc = factorize_dim(D, 2)
-            b, c = factorize_dim(bc, 2)
-            best = (a, b, c)
-        return best
-    if rank == 4:
-        best = None
-        best_spread = float('inf')
-        for a in range(2, int(D**(1/4)) + 2):
-            if D % a != 0:
-                continue
-            rem = D // a
-            for b in range(a, int(rem**(1/3)) + 2):
-                if rem % b != 0:
-                    continue
-                rem2 = rem // b
-                for c in range(b, int(rem2**0.5) + 1):
-                    if rem2 % c == 0:
-                        d = rem2 // c
-                        spread = max(a, b, c, d) - min(a, b, c, d)
-                        if best is None or spread < best_spread:
-                            best = (a, b, c, d)
-                            best_spread = spread
-        if best is None:
-            ab, cd = factorize_dim(D, 2)
-            a, b = factorize_dim(ab, 2)
-            c, d = factorize_dim(cd, 2)
-            best = (a, b, c, d)
-        return best
+        return (nf, desc)
+    # For rank > 2, factor descriptor into (rank-1) balanced parts
+    return (nf,) + _balanced_factor(desc, rank - 1)
 
 
 # ---------------------------------------------------------------------------
