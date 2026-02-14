@@ -152,8 +152,13 @@ class CausalULB2D(nn.Module):
         self._init_weights(n_layers)
 
     def _init_weights(self, n_layers: int, std: float = 0.02):
-        """Megatron-style init for 2D tensor params."""
-        out_std = std / math.sqrt(2.0 * n_layers)
+        """Megatron-style init for 2D tensor params.
+
+        Uses sqrt(n_layers) not sqrt(2*n_layers) because ULB2D has one
+        residual addition per block (up->attn->feat->down), unlike
+        transformers which have two (attn + MLP).
+        """
+        out_std = std / math.sqrt(n_layers)
         cutoff = 3.0 * std
         out_cutoff = 3.0 * out_std
 

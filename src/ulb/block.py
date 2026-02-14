@@ -453,7 +453,6 @@ class ULB2DBlock(nn.Module):
         self.w_up = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
         self.w_down = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
         self.up_act = LearnableSwish(D)
-        self.down_act = LearnableSwish(D)
 
         # --- 2D QKV + output projections ---
         self.w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
@@ -499,7 +498,7 @@ class ULB2DBlock(nn.Module):
         # --- Post-attention norm + sigmoid gate ---
         self.attn_norm = nn.RMSNorm(D)
         self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-        self.attn_gate_bias = nn.Parameter(torch.zeros(C_h, C_w))
+        self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
         # --- Feat-attn sublayer (optional) ---
         self.use_feat_attn = config.use_feat_attn
@@ -511,7 +510,7 @@ class ULB2DBlock(nn.Module):
             self.feat_norm = nn.RMSNorm(D)
             self.feat_out_norm = nn.RMSNorm(D)
             self.w_feat_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-            self.feat_gate_bias = nn.Parameter(torch.zeros(C_h, C_w))
+            self.feat_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
         self.aux_loss = 0.0
 
@@ -630,9 +629,8 @@ class ULB2DBlock(nn.Module):
                 self._proj2d(h, self.w_feat_gate, self.feat_gate_bias))
             h = h + feat_delta * feat_gate
 
-        # --- Down projection ---
+        # --- Down projection (no activation — output goes into residual) ---
         y = self._proj2d(h, self.w_down)
-        y = self.down_act(y.reshape(b, t, D)).view(b, t, C_h, C_w)
 
         return y
 
