@@ -496,9 +496,7 @@ class ULB2DBlock(nn.Module):
             self.blend_bias = nn.Parameter(torch.full((C_h, 1), config.blend_gate_bias))
             self.silu2_norm = nn.RMSNorm(C_w)
 
-        # --- Post-attention sigmoid gate ---
-        self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-        self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
+        # (attn gate removed — plain residual)
 
         # --- Feat-attn MLP: silu² attention over features replaces both
         #     feat-attn and SwiGLU. Expand to F_w, attend, compress back. ---
@@ -585,11 +583,9 @@ class ULB2DBlock(nn.Module):
 
         y = y.permute(0, 2, 1, 3).contiguous()                  # (B, T, C_h, C_w)
 
-        # --- Output projection + gated residual ---
+        # --- Output projection + residual ---
         y = self._proj2d(y, self.w_o)
-        attn_gate = torch.sigmoid(
-            self._proj2d(x, self.w_attn_gate, self.attn_gate_bias))
-        h = x + y * attn_gate
+        h = x + y
 
         # --- Feat-attn MLP: silu² attention over C_h features at expanded F_w ---
         feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)

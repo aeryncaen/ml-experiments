@@ -157,8 +157,7 @@ class CausalULB2D(nn.Module):
         for name, param in self.named_parameters():
             if param.dim() == 4:
                 if any(name.endswith(s) for s in
-                         ('.w_attn_gate', '.w_seq_gate', '.w_dd',
-                          '.w_blend')):
+                         ('.w_seq_gate', '.w_dd', '.w_blend')):
                     pass  # keep zero-init
                 else:
                     nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
