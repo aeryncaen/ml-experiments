@@ -79,13 +79,13 @@ def build_transformer():
     return GPT()
 
 
-def train_steps(model, n_steps, lr=3e-4):
+def train_steps(model, n_steps, lr=3e-4, device="cpu"):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     B, T = 4, 128
     for step in range(n_steps):
         optimizer.zero_grad()
-        idx = torch.randint(0, 50304, (B, T))
-        targets = torch.randint(0, 50304, (B, T))
+        idx = torch.randint(0, 50304, (B, T), device=device)
+        targets = torch.randint(0, 50304, (B, T), device=device)
         logits = model(idx)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         loss.backward()
@@ -96,12 +96,12 @@ def train_steps(model, n_steps, lr=3e-4):
     return loss.item()
 
 
-def collect_grads(model):
+def collect_grads(model, device="cpu"):
     """Run one forward/backward on random data and return grad stats."""
     B, T = 4, 128
     model.zero_grad()
-    idx = torch.randint(0, 50304, (B, T))
-    targets = torch.randint(0, 50304, (B, T))
+    idx = torch.randint(0, 50304, (B, T), device=device)
+    targets = torch.randint(0, 50304, (B, T), device=device)
     logits = model(idx)
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
     loss.backward()
@@ -110,32 +110,34 @@ def collect_grads(model):
 
 def compare():
     torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
 
     from ulb.transformer import CausalULB2D
 
     print("Building models...")
-    tf = build_transformer()
-    ulb = CausalULB2D(vocab_size=50304, c_h=16, c_w=48, n_layers=12, max_seq_len=2048)
+    tf = build_transformer().to(device)
+    ulb = CausalULB2D(vocab_size=50304, c_h=16, c_w=48, n_layers=12, max_seq_len=2048).to(device)
 
     print(f"TF params:  {sum(p.numel() for p in tf.parameters()):,}")
     print(f"ULB params: {sum(p.numel() for p in ulb.parameters()):,}")
 
     # Train both for 300 steps
     print("\nTraining Transformer for 300 steps (lr=3e-4)...")
-    train_steps(tf, 300, lr=3e-4)
+    train_steps(tf, 300, lr=3e-4, device=device)
 
     print("\nTraining ULB-2D for 300 steps (lr=3e-4)...")
-    train_steps(ulb, 300, lr=3e-4)
+    train_steps(ulb, 300, lr=3e-4, device=device)
 
     # Now collect grads at step 300
     print("\n" + "=" * 80)
     print("GRADIENT COMPARISON AT STEP 300")
     print("=" * 80)
 
-    loss_tf = collect_grads(tf)
+    loss_tf = collect_grads(tf, device)
     tf_total = torch.nn.utils.clip_grad_norm_(tf.parameters(), float('inf'))
 
-    loss_ulb = collect_grads(ulb)
+    loss_ulb = collect_grads(ulb, device)
     ulb_total = torch.nn.utils.clip_grad_norm_(ulb.parameters(), float('inf'))
 
     print(f"\n  TF loss:  {loss_tf:.4f}   ULB loss: {loss_ulb:.4f}")
