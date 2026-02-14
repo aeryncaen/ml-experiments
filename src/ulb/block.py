@@ -471,7 +471,7 @@ class ULB2DBlock(nn.Module):
         # --- 2D Up/Down projections (expand / compress) ---
         self.w_up = nn.Parameter(torch.randn(C_h, C_w, C_h, E_w) * init_scale_in)
         self.w_down = nn.Parameter(torch.randn(C_h, E_w, C_h, C_w) * init_scale)
-        self.up_act = LearnableSwish(I)
+        self.up_act = nn.SiLU()
 
         # --- 2D QKV + output projections (all at expanded width) ---
         self.w_q = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
@@ -519,7 +519,7 @@ class ULB2DBlock(nn.Module):
         self.attn_gate_bias = nn.Parameter(torch.ones(C_h, E_w))
 
         # --- Mid activation (between seq-attn and feat-attn) ---
-        self.mid_act = LearnableSwish(I)
+        self.mid_act = nn.SiLU()
 
         # --- Feat-attn sublayer (optional, at expanded width) ---
         self.use_feat_attn = config.use_feat_attn
