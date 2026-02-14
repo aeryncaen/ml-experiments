@@ -317,6 +317,31 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     val_x, val_t = val_x.to(device), val_t.to(device)
     n_batches = num_train_examples // B
 
+    # Register starting loss before any training
+    model.eval()
+    with torch.no_grad():
+        x0 = train_x[:B].to(device)
+        t0 = train_t[:B].to(device)
+        logits0 = model(x0)
+        loss0 = F.cross_entropy(logits0.reshape(-1, vocab_size), t0.reshape(-1),
+                                ignore_index=-100).item()
+    train_losses.append(loss0)
+    # Starting val acc
+    with torch.no_grad():
+        all_preds = []
+        val_bs = min(512, len(val_x))
+        for vi in range(0, len(val_x), val_bs):
+            vlogits = model(val_x[vi:vi+val_bs])
+            all_preds.append(vlogits.argmax(-1))
+        preds = torch.cat(all_preds, dim=0)
+        if task == 'mqar':
+            mask = val_t != -100
+            val_acc0 = (preds[mask] == val_t[mask]).float().mean().item()
+        else:
+            val_acc0 = (preds == val_t).float().mean().item()
+    val_accs.append(val_acc0)
+    print(f'  [{label}] start: loss={loss0:.4f}, val_acc={val_acc0:.3f}', flush=True)
+
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
         model.train()
