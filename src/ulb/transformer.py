@@ -163,21 +163,21 @@ class CausalULB1D(nn.Module):
 class CausalULB2D(nn.Module):
     """Causal language model using true 2D ULB blocks.
 
-    Tokens are embedded as flat (B, T, D) where D = c_h * c_w, reshaped to
-    (B, T, C_h, C_w) for processing through ULB2DBlocks, then flattened back
-    for the LM head.
+    Tokens are embedded as flat (B, T, D) where D = n_features * desc_dim,
+    reshaped to (B, T, n_features, desc_dim) for processing through
+    ULB2DBlocks, then flattened back for the LM head.
 
     Args:
         vocab_size: Token vocabulary size.
-        c_h: Channel height (number of seq-attn heads).
-        c_w: Channel width (head_dim). Must be divisible by 4 (RoPE).
+        n_features: Number of features per token (also seq-attn heads).
+        desc_dim: Descriptor dimension per feature. Must be divisible by 4 (RoPE).
         n_layers: Number of ULB2D blocks.
         max_seq_len: Maximum sequence length.
         use_blend: Use blend attention (default True).
         is_causal: Causal masking for seq-attn (default True).
     """
 
-    def __init__(self, vocab_size: int, c_h: int = 8, c_w: int = 8,
+    def __init__(self, vocab_size: int, n_features: int = 8, desc_dim: int = 8,
                  n_layers: int = 4, max_seq_len: int = 256,
                  use_blend: bool = True,
                  is_causal: bool = True, ffn_expand: float = 8/3):
@@ -186,15 +186,15 @@ class CausalULB2D(nn.Module):
         from .norm import RMSNorm
 
         config = ULB2DConfig(
-            c_h=c_h, c_w=c_w, ffn_expand=ffn_expand,
+            n_features=n_features, desc_dim=desc_dim, ffn_expand=ffn_expand,
             is_causal=is_causal, use_blend=use_blend,
         )
         dim = config.d_model
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
-        self.c_h = c_h
-        self.c_w = c_w
+        self.n_features = n_features
+        self.desc_dim = desc_dim
 
         self.n_layers = n_layers
         self.token_embed = nn.Embedding(vocab_size, dim)
@@ -231,12 +231,12 @@ class CausalULB2D(nn.Module):
             (B, T, vocab_size) logits.
         """
         B, T = token_ids.shape
-        C_h, C_w = self.c_h, self.c_w
+        NF, DD = self.n_features, self.desc_dim
 
         x = self.token_embed(token_ids)  # (B, T, D)
 
         for norm, block in zip(self.norms, self.blocks):
-            x_normed = norm(x).view(B, T, C_h, C_w)
+            x_normed = norm(x).view(B, T, NF, DD)
             x = x + block(x_normed).reshape(B, T, -1)
 
         return self.head(self.final_norm(x))
@@ -371,12 +371,12 @@ class LLaDAModel(nn.Module):
             # TransformerBlock-based (Causal or Bidirectional)
             for block in bb.blocks:
                 x = block(x, bb.rope_freqs)
-        elif hasattr(bb, 'c_h'):
-            # ULB2D-based — blocks expect (B, T, C_h, C_w)
+        elif hasattr(bb, 'n_features'):
+            # ULB2D-based — blocks expect (B, T, n_features, desc_dim)
             B, T, D = x.shape
-            C_h, C_w = bb.c_h, bb.c_w
+            NF, DD = bb.n_features, bb.desc_dim
             for norm, block in zip(bb.norms, bb.blocks):
-                x_normed = norm(x).view(B, T, C_h, C_w)
+                x_normed = norm(x).view(B, T, NF, DD)
                 x = x + block(x_normed).reshape(B, T, D)
         elif hasattr(bb, 'norms'):
             # ULB-based

@@ -386,12 +386,19 @@ class ULBBlock(nn.Module):
 
 @dataclass
 class ULB1DConfig:
-    """Configuration for ULB1DBlock.
+    """Configuration for ULB1DBlock — 1D linear version of ULB2DBlock.
+
+    Flat d_model is conceptually (n_features * desc_dim) where:
+        n_features = n_heads  (number of features / seq-attn heads)
+        desc_dim   = d_model // n_heads  (descriptor length per feature)
+
+    Uses nn.Linear instead of 2D tensor projections, for ablating
+    whether the advantage comes from the architecture vs the 2D structure.
 
     Args:
-        d_model:     Model dimension.
-        n_heads:     Number of attention heads.
-        ffn_expand:  Feature-attention MLP expansion ratio (default 8/3).
+        d_model:     Model dimension (= n_features * desc_dim).
+        n_heads:     Number of features (also seq-attn heads).
+        ffn_expand:  Feat-attn MLP expansion ratio (default 8/3).
         is_causal:   Whether seq-attention is causal.
         use_blend:   Use blend attention (softmax + silu2 lerp).
         blend_gate_bias: Initial blend gate bias.
@@ -406,24 +413,25 @@ class ULB1DConfig:
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
             f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
-        self._head_dim = self.d_model // self.n_heads
-        assert self._head_dim % 2 == 0, (
-            f"head_dim ({self._head_dim}) must be even for RoPE")
+        self._desc_dim = self.d_model // self.n_heads
+        assert self._desc_dim % 2 == 0, (
+            f"desc_dim ({self._desc_dim}) must be even for RoPE")
         # FFN hidden dim for feat-attn MLP — snap to multiple of n_heads
         self._ffn_dim = round(self.d_model * self.ffn_expand / self.n_heads) * self.n_heads
 
     @property
-    def head_dim(self) -> int:
-        return self._head_dim
+    def n_features(self) -> int:
+        """Number of features (= n_heads, used for seq-attn and feat-attn)."""
+        return self.n_heads
+
+    @property
+    def desc_dim(self) -> int:
+        """Descriptor dimension per feature."""
+        return self._desc_dim
 
     @property
     def ffn_dim(self) -> int:
         return self._ffn_dim
-
-    @property
-    def feat_n_heads(self) -> int:
-        """Number of 'feature heads' for feat-attn = n_heads (C_h equivalent)."""
-        return self.n_heads
 
 
 class ULB1DBlock(nn.Module):
@@ -431,10 +439,10 @@ class ULB1DBlock(nn.Module):
 
     Architecture:
         q, k, v = linear(x)                     # QKV at d_model
-        q, k = qk_norm + rope                   # standard RoPE
-        y = seq_attn(q, k, v)                   # n_heads heads, causal
+        q, k = qk_norm + rope                   # standard RoPE on descriptors
+        y = seq_attn(q, k, v)                   # n_features heads, desc_dim per head
         h = x + linear(y)                        # plain residual
-        # Feat-attn MLP (silu² over n_heads features, expanded head_dim):
+        # Feat-attn MLP (silu² over n_features, expanded descriptors):
         fQ, fK, fV = linear(norm(h))            # expand to ffn_dim
         feat = silu2_attn(fQ, fK, fV)           # silu² over features
         h = h + linear(feat)                     # compress back
@@ -448,9 +456,9 @@ class ULB1DBlock(nn.Module):
             config = ULB1DConfig(**kwargs)
         self.config = config
         D = config.d_model
-        H = config.n_heads
-        hd = config.head_dim
-        F = config.ffn_dim
+        NF = config.n_features      # number of features (= n_heads)
+        DD = config.desc_dim         # descriptor dim per feature
+        FD = config.ffn_dim          # expanded feat-attn MLP dim
 
         # --- QKV + output ---
         self.q_proj = nn.Linear(D, D, bias=False)
@@ -458,31 +466,31 @@ class ULB1DBlock(nn.Module):
         self.v_proj = nn.Linear(D, D, bias=True)
         self.o_proj = nn.Linear(D, D, bias=False)
 
-        # --- QK norm + post-norm bias ---
-        self.q_norm = nn.RMSNorm(hd)
-        self.k_norm = nn.RMSNorm(hd)
-        self.q_post_bias = nn.Parameter(torch.ones(hd))
-        self.k_post_bias = nn.Parameter(torch.ones(hd))
+        # --- QK norm + post-norm bias (per-feature descriptor norm) ---
+        self.q_norm = nn.RMSNorm(DD)
+        self.k_norm = nn.RMSNorm(DD)
+        self.q_post_bias = nn.Parameter(torch.ones(DD))
+        self.k_post_bias = nn.Parameter(torch.ones(DD))
 
-        # --- Standard RoPE ---
+        # --- Standard RoPE (over descriptor dim) ---
         inv_freq = 1.0 / (10000.0 ** (
-            torch.arange(0, hd, 2).float() / hd))
+            torch.arange(0, DD, 2).float() / DD))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         # --- Blend attention (optional) ---
         self.use_blend = config.use_blend
         if config.use_blend:
-            self.blend_gate_proj = nn.Linear(D, H, bias=True)
+            self.blend_gate_proj = nn.Linear(D, NF, bias=True)
             nn.init.zeros_(self.blend_gate_proj.weight)
             nn.init.constant_(self.blend_gate_proj.bias, config.blend_gate_bias)
-            self.silu2_norm = nn.RMSNorm(hd)
+            self.silu2_norm = nn.RMSNorm(DD)
 
         # --- Feat-attn MLP: silu² attention over features ---
         self.feat_norm = nn.RMSNorm(D)
-        self.feat_q_proj = nn.Linear(D, F, bias=False)
-        self.feat_k_proj = nn.Linear(D, F, bias=False)
-        self.feat_v_proj = nn.Linear(D, F, bias=False)
-        self.feat_down_proj = nn.Linear(F, D, bias=False)
+        self.feat_q_proj = nn.Linear(D, FD, bias=False)
+        self.feat_k_proj = nn.Linear(D, FD, bias=False)
+        self.feat_v_proj = nn.Linear(D, FD, bias=False)
+        self.feat_down_proj = nn.Linear(FD, D, bias=False)
 
         self.aux_loss = 0.0
 
@@ -490,38 +498,38 @@ class ULB1DBlock(nn.Module):
         """Forward pass. x: (B, T, D), returns (B, T, D)."""
         cfg = self.config
         D = cfg.d_model
-        H = cfg.n_heads
-        hd = cfg.head_dim
-        F_dim = cfg.ffn_dim
+        NF = cfg.n_features         # number of features
+        DD = cfg.desc_dim            # descriptor dim per feature
+        FD = cfg.ffn_dim             # expanded feat-attn dim
         b, t = x.shape[:2]
 
-        # --- QKV ---
-        q = self.q_proj(x).view(b, t, H, hd)
-        k = self.k_proj(x).view(b, t, H, hd)
-        v = self.v_proj(x).view(b, t, H, hd)
+        # --- QKV: project then reshape to (B, T, n_features, desc_dim) ---
+        q = self.q_proj(x).view(b, t, NF, DD)
+        k = self.k_proj(x).view(b, t, NF, DD)
+        v = self.v_proj(x).view(b, t, NF, DD)
 
         # QK norm + post-norm bias
         q = self.q_norm(q) * self.q_post_bias
         k = self.k_norm(k) * self.k_post_bias
 
-        # --- Standard RoPE on Q and K ---
+        # --- Standard RoPE on Q and K (over descriptor dim) ---
         from .rope import apply_rotary
         pos = torch.arange(t, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(pos, self.inv_freq)          # (T, hd//2)
-        cos_f = freqs.cos()[None, :, None, :]             # (1, T, 1, hd//2)
+        freqs = torch.outer(pos, self.inv_freq)          # (T, DD//2)
+        cos_f = freqs.cos()[None, :, None, :]             # (1, T, 1, DD//2)
         sin_f = freqs.sin()[None, :, None, :]
         q = apply_rotary(q, cos_f, sin_f)
         k = apply_rotary(k, cos_f, sin_f)
 
-        # --- Seq-attention ---
-        q_s = q.permute(0, 2, 1, 3)                      # (B, H, T, hd)
+        # --- Seq-attention (n_features heads, desc_dim per head) ---
+        q_s = q.permute(0, 2, 1, 3)                      # (B, NF, T, DD)
         k_s = k.permute(0, 2, 1, 3)
         v_s = v.permute(0, 2, 1, 3)
 
         if self.use_blend:
             blend_gate = torch.sigmoid(
-                self.blend_gate_proj(x))                  # (B, T, H)
-            blend_gate = blend_gate.permute(0, 2, 1).unsqueeze(-1)  # (B, H, T, 1)
+                self.blend_gate_proj(x))                  # (B, T, NF)
+            blend_gate = blend_gate.permute(0, 2, 1).unsqueeze(-1)  # (B, NF, T, 1)
             y_soft = F.scaled_dot_product_attention(
                 q_s, k_s, v_s, is_causal=cfg.is_causal)
             y_silu2 = self.silu2_norm(
@@ -536,17 +544,17 @@ class ULB1DBlock(nn.Module):
         # --- Output projection + residual ---
         h = x + self.o_proj(y)
 
-        # --- Feat-attn MLP: silu² attention over H features ---
+        # --- Feat-attn MLP: silu² attention over features ---
         feat_in = self.feat_norm(h)
-        fQ = self.feat_q_proj(feat_in).view(b, t, H, -1)   # (B, T, H, F_dim//H)
-        fK = self.feat_k_proj(feat_in).view(b, t, H, -1)
-        fV = self.feat_v_proj(feat_in).view(b, t, H, -1)
-        # silu² attention: H features attend to each other, F_dim//H is head_dim
-        fQ = fQ.reshape(b * t, 1, H, -1)
-        fK = fK.reshape(b * t, 1, H, -1)
-        fV = fV.reshape(b * t, 1, H, -1)
+        fQ = self.feat_q_proj(feat_in).view(b, t, NF, -1)   # (B, T, NF, FD//NF)
+        fK = self.feat_k_proj(feat_in).view(b, t, NF, -1)
+        fV = self.feat_v_proj(feat_in).view(b, t, NF, -1)
+        # silu² attention: features attend to each other, FD//NF is descriptor dim
+        fQ = fQ.reshape(b * t, 1, NF, -1)
+        fK = fK.reshape(b * t, 1, NF, -1)
+        fV = fV.reshape(b * t, 1, NF, -1)
         feat_out = silu2_attention(fQ, fK, fV, is_causal=False)
-        feat_out = feat_out.view(b, t, F_dim)
+        feat_out = feat_out.view(b, t, FD)
         h = h + self.feat_down_proj(feat_out)
 
         return h
@@ -556,67 +564,66 @@ class ULB1DBlock(nn.Module):
 class ULB2DConfig:
     """Configuration for ULB2DBlock — true end-to-end 2D token processing.
 
-    Tokens live as (B, T, C_h, C_w) in the residual stream. Inside the block,
-    w_up expands to (C_h, E_w) where E_w = round(C_w * expand / 4) * 4. All
-    internal ops (seq-attn, feat-attn, gates, RoPE, k-lerp) work at the
-    expanded width. w_down compresses back to (C_h, C_w).
+    Each token is a 2D matrix of (n_features, desc_dim) — i.e. N features
+    each with a descriptor of length desc_dim. Tokens live as
+    (B, T, n_features, desc_dim) in the residual stream.
+
+    All projections are 2D tensor params (n_features, desc_dim, n_features, desc_dim)
+    applied via einsum. The feat-attn MLP expands descriptors to ffn_desc_dim,
+    applies silu² attention over features, then compresses back.
 
     Args:
-        c_h:     Channel height (number of seq-attn heads).
-        c_w:     Channel width (residual stream feature dim per head).
-                 Must be divisible by 4 (RoPE). Target 1:3 ratio (c_h:c_w).
-        ffn_expand: SwiGLU FFN expansion ratio (default 8/3). F_w = C_w * ffn_expand,
-                 snapped to multiple of 4.
-        is_causal: Whether seq-attention is causal.
-        rope_base: Base for fixed RoPE inverse frequencies.
-        use_blend: Use blend attention (softmax + silu2 lerp) instead of pure softmax.
+        n_features:  Number of features per token (also the number of seq-attn heads).
+        desc_dim:    Descriptor dimension per feature.
+                     Must be divisible by 4 (RoPE). Target 1:3 ratio (n_features:desc_dim).
+        ffn_expand:  Feat-attn MLP expansion ratio (default 8/3).
+                     ffn_desc_dim = desc_dim * ffn_expand, snapped to multiple of 4.
+        is_causal:   Whether seq-attention is causal.
+        use_blend:   Use blend attention (softmax + silu2 lerp) instead of pure softmax.
         blend_gate_bias: Initial blend gate bias.
-        k_lerp_bias: Initial K temporal mixing gate bias.
     """
-    c_h: int = 16
-    c_w: int = 48
-    ffn_expand: float = 8 / 3   # SwiGLU FFN expansion ratio (matches transformer default)
+    n_features: int = 16
+    desc_dim: int = 48
+    ffn_expand: float = 8 / 3   # feat-attn MLP expansion ratio (matches transformer default)
     is_causal: bool = True
     use_blend: bool = True
     blend_gate_bias: float = -1.1
 
     def __post_init__(self):
-        assert self.c_w % 4 == 0, (
-            f"c_w ({self.c_w}) must be divisible by 4 for RoPE")
-        # FFN hidden width: snap to multiple of 4
-        self._f_w = round(self.c_w * self.ffn_expand / 4) * 4
-        assert self._f_w > 0, (
-            f"f_w resolved to 0 (c_w={self.c_w}, ffn_expand={self.ffn_expand})")
+        assert self.desc_dim % 4 == 0, (
+            f"desc_dim ({self.desc_dim}) must be divisible by 4 for RoPE")
+        # FFN descriptor width: snap to multiple of 4
+        self._ffn_desc_dim = round(self.desc_dim * self.ffn_expand / 4) * 4
+        assert self._ffn_desc_dim > 0, (
+            f"ffn_desc_dim resolved to 0 (desc_dim={self.desc_dim}, ffn_expand={self.ffn_expand})")
 
     @property
     def d_model(self) -> int:
-        return self.c_h * self.c_w
+        return self.n_features * self.desc_dim
 
     @property
-    def f_w(self) -> int:
-        """FFN hidden width per head."""
-        return self._f_w
+    def ffn_desc_dim(self) -> int:
+        """Expanded descriptor dim inside feat-attn MLP."""
+        return self._ffn_desc_dim
 
 
 class ULB2DBlock(nn.Module):
     """True end-to-end 2D Universal Learning Block.
 
-    All tokens are (B, T, C_h, C_w). All projections are (C_h, C_w, C_h, C_w)
-    tensor params applied via einsum. No nn.Linear anywhere.
+    Tokens are 2D: (B, T, n_features, desc_dim). All projections are
+    (NF, DD, NF, DD) tensor params applied via einsum. No nn.Linear anywhere.
 
     Architecture:
-        q, k, v = proj2d(x, wq/wk/wv)           # 2D QKV at residual width
-        k = k_lerp(k, x)                         # temporal mixing on last C_w//4
-        q, k = hybrid_rope(q, k, dd_angles(x))   # fixed + data-dependent RoPE
-        y = seq_attn(q, k, v)                    # C_h heads, C_w head_dim, causal
-        y = proj2d(y, w_o)                       # 2D output projection
-        h = x + y * sigmoid(proj2d(x, w_gate))   # gated attn residual
-        # Feat-attn MLP (replaces both feat-attn and SwiGLU):
-        fQ,fK,fV = proj2d(norm(h), wfq/wfk/wfv) # expand C_w -> F_w
-        feat = silu2_attn(fQ, fK, fV)            # silu² over C_h features, F_w heads
-        h = h + proj2d(feat, w_down)             # compress F_w -> C_w
+        q, k, v = proj2d(x, wq/wk/wv)           # 2D QKV at residual desc_dim
+        q, k = qk_norm + rope                    # standard RoPE on descriptors
+        y = seq_attn(q, k, v)                    # n_features heads, desc_dim head_dim
+        h = x + proj2d(y, w_o)                   # plain residual
+        # Feat-attn MLP (silu² attention over features):
+        fQ,fK,fV = proj2d(norm(h), wfq/wfk/wfv) # expand desc_dim -> ffn_desc_dim
+        feat = silu2_attn(fQ, fK, fV)            # silu² over n_features, ffn_desc_dim descriptors
+        h = h + proj2d(feat, w_down)             # compress ffn_desc_dim -> desc_dim
 
-    Caller does: x = x + block(norm(x))  where x is (B, T, C_h, C_w).
+    Caller does: x = x + block(norm(x))  where x is (B, T, n_features, desc_dim).
     """
 
     def __init__(self, config: ULB2DConfig | None = None, **kwargs):
@@ -624,75 +631,75 @@ class ULB2DBlock(nn.Module):
         if config is None:
             config = ULB2DConfig(**kwargs)
         self.config = config
-        C_h = config.c_h
-        C_w = config.c_w     # residual width = head dim
-        F_w = config.f_w     # FFN hidden width
-        D = config.d_model    # C_h * C_w
-        init_scale = (C_h * C_w) ** -0.5
+        NF = config.n_features
+        DD = config.desc_dim
+        FD = config.ffn_desc_dim
+        D = config.d_model        # NF * DD
+        init_scale = (NF * DD) ** -0.5
 
-        # --- 2D QKV + output projections (all at residual width C_w) ---
-        self.w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_o = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
+        # --- 2D QKV + output projections (all at residual desc_dim) ---
+        self.w_q = nn.Parameter(torch.randn(NF, DD, NF, DD) * init_scale)
+        self.w_k = nn.Parameter(torch.randn(NF, DD, NF, DD) * init_scale)
+        self.w_v = nn.Parameter(torch.randn(NF, DD, NF, DD) * init_scale)
+        self.w_o = nn.Parameter(torch.randn(NF, DD, NF, DD) * init_scale)
 
         # KV bias
-        self.k_bias_param = nn.Parameter(torch.zeros(C_h, C_w))
-        self.v_bias_param = nn.Parameter(torch.zeros(C_h, C_w))
+        self.k_bias_param = nn.Parameter(torch.zeros(NF, DD))
+        self.v_bias_param = nn.Parameter(torch.zeros(NF, DD))
 
-        # --- QK norm + post-norm bias ---
-        self.q_norm = nn.RMSNorm(C_w)
-        self.k_norm = nn.RMSNorm(C_w)
-        self.q_post_bias = nn.Parameter(torch.ones(C_w))
-        self.k_post_bias = nn.Parameter(torch.ones(C_w))
+        # --- QK norm + post-norm bias (per-feature descriptor norm) ---
+        self.q_norm = nn.RMSNorm(DD)
+        self.k_norm = nn.RMSNorm(DD)
+        self.q_post_bias = nn.Parameter(torch.ones(DD))
+        self.k_post_bias = nn.Parameter(torch.ones(DD))
 
-        # --- Standard RoPE ---
-        self.rope_pairs = C_w // 2
+        # --- Standard RoPE (over descriptor dim) ---
+        self.rope_pairs = DD // 2
         inv_freq = 1.0 / (10000.0 ** (
-            torch.arange(0, C_w, 2).float() / C_w))
+            torch.arange(0, DD, 2).float() / DD))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         # --- Blend attention (optional) ---
         self.use_blend = config.use_blend
         if config.use_blend:
-            self.w_blend = nn.Parameter(torch.zeros(C_h, C_w, C_h, 1))
-            self.blend_bias = nn.Parameter(torch.full((C_h, 1), config.blend_gate_bias))
-            self.silu2_norm = nn.RMSNorm(C_w)
+            self.w_blend = nn.Parameter(torch.zeros(NF, DD, NF, 1))
+            self.blend_bias = nn.Parameter(torch.full((NF, 1), config.blend_gate_bias))
+            self.silu2_norm = nn.RMSNorm(DD)
 
         # (attn gate removed — plain residual)
 
-        # --- Feat-attn MLP: silu² attention over features replaces both
-        #     feat-attn and SwiGLU. Expand to F_w, attend, compress back. ---
-        init_scale_ffn = (C_h * F_w) ** -0.5
+        # --- Feat-attn MLP: silu² attention over features.
+        #     Expand descriptors to ffn_desc_dim, attend, compress back. ---
+        init_scale_ffn = (NF * FD) ** -0.5
         self.feat_norm = nn.RMSNorm(D)
-        self.feat_w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
-        self.feat_w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
-        self.feat_w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
-        self.feat_w_down = nn.Parameter(torch.randn(C_h, F_w, C_h, C_w) * init_scale_ffn)
+        self.feat_w_q = nn.Parameter(torch.randn(NF, DD, NF, FD) * init_scale)
+        self.feat_w_k = nn.Parameter(torch.randn(NF, DD, NF, FD) * init_scale)
+        self.feat_w_v = nn.Parameter(torch.randn(NF, DD, NF, FD) * init_scale)
+        self.feat_w_down = nn.Parameter(torch.randn(NF, FD, NF, DD) * init_scale_ffn)
 
         self.aux_loss = 0.0
 
     def _proj2d(self, x: torch.Tensor, w: torch.Tensor,
                 bias: torch.Tensor | None = None) -> torch.Tensor:
-        """2D projection: x (..., C_h, C_w) @ w (C_h, C_w, out_h, out_w) -> (..., out_h, out_w)"""
+        """2D projection: x (..., NF, DD) @ w (NF, DD, out_f, out_d) -> (..., out_f, out_d)"""
         y = torch.einsum('...cd,cdef->...ef', x, w)
         if bias is not None:
             y = y + bias
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass. x: (B, T, C_h, C_w), returns (B, T, C_h, C_w).
+        """Forward pass. x: (B, T, n_features, desc_dim), returns same shape.
 
-        Architecture: seq-attn → feat-attn MLP (silu² over features), all at residual width.
+        Architecture: seq-attn -> feat-attn MLP (silu² over features).
         """
         cfg = self.config
-        C_h, C_w = cfg.c_h, cfg.c_w
-        F_w = cfg.f_w
+        NF, DD = cfg.n_features, cfg.desc_dim
+        FD = cfg.ffn_desc_dim
         D = cfg.d_model
         b, t = x.shape[:2]
 
         # --- QKV ---
-        q = self._proj2d(x, self.w_q)                           # (B, T, C_h, C_w)
+        q = self._proj2d(x, self.w_q)                           # (B, T, NF, DD)
         k = self._proj2d(x, self.w_k, self.k_bias_param)
         v = self._proj2d(x, self.w_v, self.v_bias_param)
 
@@ -700,17 +707,17 @@ class ULB2DBlock(nn.Module):
         q = self.q_norm(q) * self.q_post_bias
         k = self.k_norm(k) * self.k_post_bias
 
-        # --- Standard RoPE on Q and K ---
+        # --- Standard RoPE on Q and K (over descriptor dim) ---
         from .rope import apply_rotary
         pos = torch.arange(t, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(pos, self.inv_freq)                  # (T, C_w//2)
-        cos_f = freqs.cos()[None, :, None, :]                    # (1, T, 1, C_w//2)
+        freqs = torch.outer(pos, self.inv_freq)                  # (T, DD//2)
+        cos_f = freqs.cos()[None, :, None, :]                    # (1, T, 1, DD//2)
         sin_f = freqs.sin()[None, :, None, :]
         q = apply_rotary(q, cos_f, sin_f)
         k = apply_rotary(k, cos_f, sin_f)
 
-        # --- Seq-attention (C_h heads, C_w head_dim) ---
-        q_s = q.permute(0, 2, 1, 3)
+        # --- Seq-attention (n_features heads, desc_dim per head) ---
+        q_s = q.permute(0, 2, 1, 3)                             # (B, NF, T, DD)
         k_s = k.permute(0, 2, 1, 3)
         v_s = v.permute(0, 2, 1, 3)
 
@@ -727,25 +734,25 @@ class ULB2DBlock(nn.Module):
             y = F.scaled_dot_product_attention(
                 q_s, k_s, v_s, is_causal=cfg.is_causal)
 
-        y = y.permute(0, 2, 1, 3).contiguous()                  # (B, T, C_h, C_w)
+        y = y.permute(0, 2, 1, 3).contiguous()                  # (B, T, NF, DD)
 
         # --- Output projection + residual ---
         y = self._proj2d(y, self.w_o)
         h = x + y
 
-        # --- Feat-attn MLP: silu² attention over C_h features at expanded F_w ---
-        feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)
-        fQ = self._proj2d(feat_in, self.feat_w_q)               # (B, T, C_h, F_w)
+        # --- Feat-attn MLP: silu² attention over features at expanded ffn_desc_dim ---
+        feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, NF, DD)
+        fQ = self._proj2d(feat_in, self.feat_w_q)               # (B, T, NF, FD)
         fK = self._proj2d(feat_in, self.feat_w_k)
         fV = self._proj2d(feat_in, self.feat_w_v)
-        # silu² attention: C_h features attend to each other, F_w is head_dim
-        # Layout for silu2_attention: (B, H, T, D) = (B*T, 1, C_h, F_w)
-        fQ = fQ.reshape(b * t, 1, C_h, F_w)
-        fK = fK.reshape(b * t, 1, C_h, F_w)
-        fV = fV.reshape(b * t, 1, C_h, F_w)
-        feat_out = silu2_attention(fQ, fK, fV, is_causal=False)  # (B*T, 1, C_h, F_w)
-        feat_out = feat_out.view(b, t, C_h, F_w)
-        h = h + self._proj2d(feat_out, self.feat_w_down)        # (B, T, C_h, C_w)
+        # silu² attention: features attend to each other, FD is descriptor dim
+        # Layout for silu2_attention: (B, H, T, D) = (B*T, 1, NF, FD)
+        fQ = fQ.reshape(b * t, 1, NF, FD)
+        fK = fK.reshape(b * t, 1, NF, FD)
+        fV = fV.reshape(b * t, 1, NF, FD)
+        feat_out = silu2_attention(fQ, fK, fV, is_causal=False)  # (B*T, 1, NF, FD)
+        feat_out = feat_out.view(b, t, NF, FD)
+        h = h + self._proj2d(feat_out, self.feat_w_down)        # (B, T, NF, DD)
 
         return h
 

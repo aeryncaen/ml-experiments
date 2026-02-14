@@ -2035,32 +2035,32 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('ULBBlendPFA', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', feat_attn=True, feat_c_h=_sqrt_dim_ulb, feat_c_w=_sqrt_dim_ulb)),
             f"ULBBlock(ULBConfig(d_model={dim}, feat_attn=True, feat_c_h={_sqrt_dim_ulb}, feat_c_w={_sqrt_dim_ulb}))")
 
-    # True end-to-end 2D ULB — all projections are (C,C,C,C) tensors, tokens as (B,T,C,C) throughout
+    # True end-to-end 2D ULB — all projections are (NF,DD,NF,DD) tensors, tokens as (B,T,NF,DD) throughout
     # Wrap to accept/return flat (B,T,D) for bench_ssm compatibility
-    # Target 1:3 ratio (c_h:c_w)
+    # Target 1:3 ratio (n_features:desc_dim)
     from ulb.block import ULB2DBlock, ULB2DConfig
-    _target_h = int((dim / 3) ** 0.5)
-    _best_h = 1
+    _target_nf = int((dim / 3) ** 0.5)
+    _best_nf = 1
     for _s in range(1, int(dim ** 0.5) + 1):
         if dim % _s == 0 and (dim // _s) % 4 == 0:
-            if abs(_s - _target_h) <= abs(_best_h - _target_h):
-                _best_h = _s
-    _2d_c_h, _2d_c_w = _best_h, dim // _best_h
+            if abs(_s - _target_nf) <= abs(_best_nf - _target_nf):
+                _best_nf = _s
+    _2d_nf, _2d_dd = _best_nf, dim // _best_nf
     class _ULB2DFlat(nn.Module):
         def __init__(self, cfg):
             super().__init__()
             self.block = ULB2DBlock(cfg)
-            self.c_h, self.c_w = cfg.c_h, cfg.c_w
+            self.n_features, self.desc_dim = cfg.n_features, cfg.desc_dim
             self.aux_loss = 0.0
         def forward(self, x):
             B, T, D = x.shape
-            y = self.block(x.view(B, T, self.c_h, self.c_w))
+            y = self.block(x.view(B, T, self.n_features, self.desc_dim))
             self.aux_loss = self.block.aux_loss
             return y.reshape(B, T, D)
-    try_add('ULBBlendP2D', lambda: _ULB2DFlat(ULB2DConfig(c_h=_2d_c_h, c_w=_2d_c_w)),
-            f"ULB2DBlock(ULB2DConfig(c_h={_2d_c_h}, c_w={_2d_c_w}))")
-    try_add('ULBBlendP2D-noFA', lambda: _ULB2DFlat(ULB2DConfig(c_h=_2d_c_h, c_w=_2d_c_w, use_feat_attn=False)),
-            f"ULB2DBlock(ULB2DConfig(c_h={_2d_c_h}, c_w={_2d_c_w}, use_feat_attn=False))")
+    try_add('ULBBlendP2D', lambda: _ULB2DFlat(ULB2DConfig(n_features=_2d_nf, desc_dim=_2d_dd)),
+            f"ULB2DBlock(ULB2DConfig(n_features={_2d_nf}, desc_dim={_2d_dd}))")
+    try_add('ULBBlendP2D-noFA', lambda: _ULB2DFlat(ULB2DConfig(n_features=_2d_nf, desc_dim=_2d_dd)),
+            f"ULB2DBlock(ULB2DConfig(n_features={_2d_nf}, desc_dim={_2d_dd}))")
 
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
     if _wanted('LLooM'):

@@ -55,8 +55,8 @@ class HParams:
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
     # 2D factorization (ulb_2d): 0 = auto-factor from d_model
-    c_h: int = _env_int("C_H", 0)
-    c_w: int = _env_int("C_W", 0)
+    n_features: int = _env_int("N_FEATURES", 0)
+    desc_dim: int = _env_int("DESC_DIM", 0)
 
     # Fused gate knobs (0 = use d_model, no expansion)
     fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
@@ -76,7 +76,7 @@ class HParams:
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
-    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.25)  # fraction of steps for decay phase
+    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.33)  # fraction of steps for decay phase
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -991,21 +991,21 @@ class GPTULB2D(nn.Module):
     def __init__(self):
         super().__init__()
         from ulb.transformer import CausalULB2D
-        c_h, c_w = HP.c_h, HP.c_w
-        if c_h == 0 or c_w == 0:
-            # Auto-factor from d_model, targeting 1:3 ratio (c_h:c_w)
+        nf, dd = HP.n_features, HP.desc_dim
+        if nf == 0 or dd == 0:
+            # Auto-factor from d_model, targeting 1:3 ratio (n_features:desc_dim)
             dim = HP.d_model
-            target_h = int((dim / 3) ** 0.5)
+            target_nf = int((dim / 3) ** 0.5)
             best = 1
             for s in range(1, int(dim ** 0.5) + 1):
                 if dim % s == 0 and (dim // s) % 4 == 0:
-                    if abs(s - target_h) <= abs(best - target_h):
+                    if abs(s - target_nf) <= abs(best - target_nf):
                         best = s
-            c_h, c_w = best, dim // best
+            nf, dd = best, dim // best
         self.inner = CausalULB2D(
             vocab_size=HP.vocab_size,
-            c_h=c_h,
-            c_w=c_w,
+            n_features=nf,
+            desc_dim=dd,
             n_layers=HP.n_layer,
             max_seq_len=HP.seq_len,
         )
@@ -1087,7 +1087,7 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
-    _extra = f" c_h={HP.c_h} c_w={HP.c_w}" if HP.c_h > 0 and HP.c_w > 0 else ""
+    _extra = f" n_features={HP.n_features} desc_dim={HP.desc_dim}" if HP.n_features > 0 and HP.desc_dim > 0 else ""
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"

@@ -391,45 +391,43 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         feat_attn=True,
-        feat_c_h=args.c_h,
-        feat_c_w=args.c_w,
+        feat_c_h=args.n_features,
+        feat_c_w=args.desc_dim,
     )
 
 
-def _resolve_c_h_c_w(args):
-    """Derive c_h, c_w from args. If not specified, auto-factor from --dim.
+def _resolve_features_desc(args):
+    """Derive n_features, desc_dim from args. If not specified, auto-factor from --dim.
 
-    Targets a 1:3 ratio (c_h:c_w) — fewer heads, more features.
-    c_w must be divisible by 4 for RoPE.
+    Targets a 1:3 ratio (n_features:desc_dim) — fewer features, longer descriptors.
+    desc_dim must be divisible by 4 for RoPE.
     """
-    c_h, c_w = args.c_h, args.c_w
-    if c_h is None and c_w is None:
+    nf, dd = args.n_features, args.desc_dim
+    if nf is None and dd is None:
         dim = args.dim
-        # Target c_h ≈ dim^(1/2) / sqrt(3), c_w ≈ dim^(1/2) * sqrt(3)
-        # i.e. c_h ≈ (dim/3)^0.5, c_w ≈ (dim*3)^0.5
-        target_h = int((dim / 3) ** 0.5)
-        # Find closest factor of dim to target_h where dim//factor is divisible by 4
+        # Target n_features ≈ (dim/3)^0.5
+        target_nf = int((dim / 3) ** 0.5)
         best = 1
         for s in range(1, int(dim ** 0.5) + 1):
             if dim % s == 0 and (dim // s) % 4 == 0:
-                if abs(s - target_h) <= abs(best - target_h):
+                if abs(s - target_nf) <= abs(best - target_nf):
                     best = s
-        c_h, c_w = best, dim // best
-    elif c_h is not None and c_w is None:
-        c_w = args.dim // c_h
-    elif c_w is not None and c_h is None:
-        c_h = args.dim // c_w
-    return c_h, c_w
+        nf, dd = best, dim // best
+    elif nf is not None and dd is None:
+        dd = args.dim // nf
+    elif dd is not None and nf is None:
+        nf = args.dim // dd
+    return nf, dd
 
 
 def build_ulb_2d(vocab_size: int, args) -> nn.Module:
     """Build a CausalULB2D — true end-to-end 2D token processing."""
     from ulb.transformer import CausalULB2D
-    c_h, c_w = _resolve_c_h_c_w(args)
+    nf, dd = _resolve_features_desc(args)
     return CausalULB2D(
         vocab_size=vocab_size,
-        c_h=c_h,
-        c_w=c_w,
+        n_features=nf,
+        desc_dim=dd,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
         is_causal=not args.no_causal,
@@ -680,22 +678,22 @@ def build_llada_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         feat_attn=True,
-        feat_c_h=args.c_h,
-        feat_c_w=args.c_w,
+        feat_c_h=args.n_features,
+        feat_c_w=args.desc_dim,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
-                      time_conditioning=args.time_cond,
-                      subs_parameterization=args.subs)
+                       time_conditioning=args.time_cond,
+                       subs_parameterization=args.subs)
 
 
 def build_llada_ulb_2d(vocab_size: int, args) -> nn.Module:
     """Build LLaDA with CausalULB2D backbone (true end-to-end 2D)."""
     from ulb.transformer import CausalULB2D, LLaDAModel
-    c_h, c_w = _resolve_c_h_c_w(args)
+    nf, dd = _resolve_features_desc(args)
     backbone = CausalULB2D(
         vocab_size=vocab_size,
-        c_h=c_h,
-        c_w=c_w,
+        n_features=nf,
+        desc_dim=dd,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len + args.gen_len,
         is_causal=not args.no_causal,
@@ -2077,10 +2075,10 @@ def main():
                         help='Run feature-attention before sequence-attention (feat-attn arch)')
 
     # 2D factorization (ulb-2d, ulb-feat)
-    parser.add_argument('--c-h', type=int, default=None,
-                        help='Channel height for 2D factorization (default: auto from dim)')
-    parser.add_argument('--c-w', type=int, default=None,
-                        help='Channel width for 2D factorization (default: dim // c_h)')
+    parser.add_argument('--n-features', type=int, default=None,
+                        help='Number of features for 2D factorization (default: auto from dim)')
+    parser.add_argument('--desc-dim', type=int, default=None,
+                        help='Descriptor dim for 2D factorization (default: dim // n_features)')
 
     # LLooM-specific
     parser.add_argument('--lloom-seq-pool-size', type=int, default=4,
