@@ -128,6 +128,9 @@ class FeatureAttn(nn.Module):
         # Output projection: pos_dim -> pos_dim (per position)
         self.o_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
 
+        # Learned projection + SiLU for gate input (per position)
+        self.gate_input_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
+
         # Block-diagonal gate: one (pos_dim, pos_dim) gate per position.
         self.gate_proj = nn.Parameter(
             torch.randn(self.n_pos, self.pos_dim, self.pos_dim)
@@ -154,6 +157,9 @@ class FeatureAttn(nn.Module):
             h = h.transpose(1, 2).contiguous()                         # (N, D/G, G)
         # h is now (N, n_pos, pos_dim)
 
+        # Activated gate input
+        h_act = F.silu(self.gate_input_proj(h))                        # (N, P, pd)
+
         # Feature-attention QKV (pos_dim -> 3*pos_dim, per position)
         qkv = self.qkv_proj(h)                                        # (N, P, 3*pd)
         q, k, v = qkv.split(self.pos_dim, dim=-1)                     # each (N, P, pd)
@@ -170,17 +176,18 @@ class FeatureAttn(nn.Module):
         y = y.transpose(1, 2).contiguous().view(N, self.n_pos, self.pos_dim)
         y = self.o_proj(y)                                             # (N, P, pd)
 
-        # Gate (on pre-attn content)
+        # Gate (on activated content)
+        y = y.reshape(N, self.n_pos * self.pos_dim)                    # (N, D)
         gate = torch.sigmoid(
-            torch.einsum('npd,pde->npe', h, self.gate_proj)
-        )                                                              # (N, P, pd)
-        y = y * gate                                                   # gated attn output
+            torch.einsum('npd,pde->npe', h_act, self.gate_proj)
+        ).reshape(N, self.n_pos * self.pos_dim)                        # (N, D)
+        y = self.feat_norm(y) * gate
 
-        # Transpose back if needed, flatten, norm
+        # Transpose back if needed, flatten
         if self.transpose_groups:
+            y = y.view(N, self.n_pos, self.pos_dim)
             y = y.transpose(1, 2).contiguous()                         # (N, G, D/G)
-        y = y.reshape(N, self.dim)                                     # (N, D)
-        y = self.feat_norm(y)
+            y = y.reshape(N, self.dim)
 
         return y.view(*orig_shape, self.dim)
 
