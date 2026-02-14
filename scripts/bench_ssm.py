@@ -290,19 +290,26 @@ class OuterMHABlock(nn.Module):
 
 
 class StupidAttnBlock(nn.Module):
-    """Element-wise QKV attention — D-dimensional gating per pair.
+    """Element-wise QKV attention with grouped heads.
 
-    For each pair (i, j), Q[i] * K[j] gives a D-dimensional gate
-    for V[j], which accumulates into position i. Every feature
-    independently decides how much to pull from each other position.
+    For each pair (i, j), Q[i] * K[j] gives an element-wise gate
+    for V[j]. Features are grouped into n_heads groups — within each
+    group, the element-wise Q*K product is summed to produce a single
+    scalar gate shared across that group's features.
 
-    Standard attention: scalar gate per pair (Q @ K^T -> one number).
-    This: element-wise gate per pair (Q * K -> D numbers).
+    n_heads=D: fully element-wise (each feature independent).
+    n_heads=1: standard single-scalar attention.
+    n_heads=4 with D=64: 4 groups of 16, each group gets a 16-dim
+    dot product for similarity (rich enough for pattern matching)
+    shared across 16 features.
     """
 
-    def __init__(self, d_model, causal=True):
+    def __init__(self, d_model, n_heads=4, causal=True):
         super().__init__()
         self.causal = causal
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        assert d_model % n_heads == 0
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                               groups=d_model, bias=True)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -311,19 +318,23 @@ class StupidAttnBlock(nn.Module):
 
     def forward(self, x):
         B, T, D = x.shape
+        H, hd = self.n_heads, self.head_dim
+
         # Causal conv
         h = F.pad(x.transpose(1, 2), (2, 0))
         h = self.conv(h).transpose(1, 2)  # (B, T, D)
 
-        q = self.q_proj(h)  # (B, T, D)
-        k = self.k_proj(h)  # (B, T, D)
-        v = self.v_proj(h)  # (B, T, D)
+        q = self.q_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
+        k = self.k_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
+        v = self.v_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
 
-        # Element-wise logits: Q[i] * K[j] for all pairs -> (B, T_i, T_j, D)
-        logits = q.unsqueeze(2) * k.unsqueeze(1)  # (B, T_i, T_j, D)
+        # Per-group dot product: sum element-wise Q*K within each head
+        # q: (B, T_i, 1, H, hd) * k: (B, 1, T_j, H, hd) -> (B, T_i, T_j, H, hd)
+        # Sum over hd -> (B, T_i, T_j, H) — one scalar per head per pair
+        logits = (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1)  # (B, T_i, T_j, H)
 
-        # SiLU² then mask and normalize over source positions
-        weights = F.silu(logits) ** 2  # (B, T_i, T_j, D)
+        # SiLU² then mask and normalize
+        weights = F.silu(logits) ** 2  # (B, T_i, T_j, H)
 
         if self.causal:
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
@@ -331,8 +342,9 @@ class StupidAttnBlock(nn.Module):
 
         weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
 
-        # Weighted sum of V[j] into position i
-        out = (weights * v.unsqueeze(1)).sum(dim=2)  # (B, T, D)
+        # Weighted sum of V[j] per head: (B, T_i, T_j, H, 1) * (B, 1, T_j, H, hd)
+        out = (weights.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)  # (B, T, H, hd)
+        out = out.reshape(B, T, D)
 
         return out
 
