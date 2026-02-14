@@ -500,6 +500,9 @@ class ULB2DBlock(nn.Module):
         self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
         self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
+        # --- Mid activation (between seq-attn and feat-attn) ---
+        self.mid_act = LearnableSwish(D)
+
         # --- Feat-attn sublayer (optional) ---
         self.use_feat_attn = config.use_feat_attn
         if config.use_feat_attn:
@@ -609,6 +612,9 @@ class ULB2DBlock(nn.Module):
             self._proj2d(h, self.w_attn_gate, self.attn_gate_bias))
         y_normed = self.attn_norm(y.reshape(b, t, D)).view(b, t, C_h, C_w)
         h = h + y_normed * attn_gate
+
+        # --- Mid activation (between seq-attn and feat-attn) ---
+        h = self.mid_act(h.reshape(b, t, D)).view(b, t, C_h, C_w)
 
         # --- Feat-attn sublayer (optional) ---
         if self.use_feat_attn:
