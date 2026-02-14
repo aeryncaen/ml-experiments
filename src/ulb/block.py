@@ -495,8 +495,7 @@ class ULB2DBlock(nn.Module):
             self.blend_bias = nn.Parameter(torch.full((C_h, 1), config.blend_gate_bias))
             self.silu2_norm = nn.RMSNorm(C_w)
 
-        # --- Post-attention norm + sigmoid gate ---
-        self.attn_norm = nn.RMSNorm(D)
+        # --- Post-attention sigmoid gate (no pre-gate norm) ---
         self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
         self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
@@ -511,7 +510,6 @@ class ULB2DBlock(nn.Module):
             self.feat_w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
             self.feat_w_o = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
             self.feat_norm = nn.RMSNorm(D)
-            self.feat_out_norm = nn.RMSNorm(D)
             self.w_feat_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
             self.feat_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
@@ -607,11 +605,10 @@ class ULB2DBlock(nn.Module):
         # --- Output projection ---
         y = self._proj2d(y, self.w_o)
 
-        # --- Gated delta accumulation ---
+        # --- Gated delta accumulation (no pre-gate norm) ---
         attn_gate = torch.sigmoid(
             self._proj2d(h, self.w_attn_gate, self.attn_gate_bias))
-        y_normed = self.attn_norm(y.reshape(b, t, D)).view(b, t, C_h, C_w)
-        h = h + y_normed * attn_gate
+        h = h + y * attn_gate
 
         # --- Mid activation (between seq-attn and feat-attn) ---
         h = self.mid_act(h.reshape(b, t, D)).view(b, t, C_h, C_w)
@@ -629,11 +626,9 @@ class ULB2DBlock(nn.Module):
             feat_out = F.scaled_dot_product_attention(fQ, fK, fV, is_causal=False)
             feat_out = feat_out.view(b, t, C_h, C_w)
             feat_out = self._proj2d(feat_out, self.feat_w_o)
-            feat_delta = self.feat_out_norm(
-                feat_out.reshape(b, t, D)).view(b, t, C_h, C_w)
             feat_gate = torch.sigmoid(
                 self._proj2d(h, self.w_feat_gate, self.feat_gate_bias))
-            h = h + feat_delta * feat_gate
+            h = h + feat_out * feat_gate
 
         # --- Down projection (no activation — output goes into residual) ---
         y = self._proj2d(h, self.w_down)
