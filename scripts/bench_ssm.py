@@ -433,6 +433,78 @@ class MHABlock(nn.Module):
         return h
 
 
+class MHAFeatMLPBlock(nn.Module):
+    """Causal MHA + feat-attn + SwiGLU MLP, with switchable feat-attn position.
+
+    Tests whether feat-attn can make MLP useful for algorithmic tasks.
+    feat_position='before_mlp': MHA → feat-attn → MLP
+    feat_position='after_mlp':  MHA → MLP → feat-attn
+    """
+
+    def __init__(self, d_model, n_heads=4, mlp_inner=0, feat_position='before_mlp'):
+        super().__init__()
+        assert feat_position in ('before_mlp', 'after_mlp')
+        self.feat_position = feat_position
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
+                              groups=d_model, bias=True)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+
+        # Feat-attn (2D tensor projections, same as ULB2DBlock's feat-attn)
+        C = int(d_model ** 0.5)
+        assert C * C == d_model, f"d_model ({d_model}) must be a perfect square"
+        self.C = C
+        init_scale = (C * C) ** -0.5
+        self.feat_wq = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wk = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wv = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wo = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_norm = RMSNorm(d_model)
+
+        # SwiGLU MLP
+        self.has_mlp = mlp_inner > 0
+        if self.has_mlp:
+            self.mlp_norm = RMSNorm(d_model)
+            self.gate_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.up_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.down_proj = nn.Linear(mlp_inner, d_model, bias=False)
+
+    def _feat_attn(self, h):
+        B, T, D = h.shape
+        C = self.C
+        x2d = self.feat_norm(h).view(B, T, C, C)
+        fQ = torch.einsum('...cd,cdef->...ef', x2d, self.feat_wq)
+        fK = torch.einsum('...cd,cdef->...ef', x2d, self.feat_wk)
+        fV = torch.einsum('...cd,cdef->...ef', x2d, self.feat_wv)
+        fQ = fQ.reshape(B * T, 1, C, C)
+        fK = fK.reshape(B * T, 1, C, C)
+        fV = fV.reshape(B * T, 1, C, C)
+        y = F.scaled_dot_product_attention(fQ, fK, fV, is_causal=False)
+        y = y.view(B, T, C, C)
+        y = torch.einsum('...cd,cdef->...ef', y, self.feat_wo)
+        return y.reshape(B, T, D)
+
+    def _mlp(self, h):
+        r = self.mlp_norm(h)
+        return self.down_proj(F.silu(self.gate_proj(r)) * self.up_proj(r))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        h = F.pad(x.transpose(1, 2), (2, 0))
+        h = self.conv(h).transpose(1, 2)
+        mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
+
+        if self.feat_position == 'before_mlp':
+            h = h + self._feat_attn(h)
+            if self.has_mlp:
+                h = h + self._mlp(h)
+        else:
+            if self.has_mlp:
+                h = h + self._mlp(h)
+            h = h + self._feat_attn(h)
+        return h
+
+
 class MHA2DBlock(nn.Module):
     """Causal MHA with 2D token representations.
 
@@ -1857,6 +1929,12 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # StupidAttn: pairwise element-wise multiply, gate back in
     try_add('StupidAttn', lambda: StupidAttnBlock(d_model=dim),
             f"StupidAttnBlock(d_model={dim})")
+
+    # MHA + feat-attn + MLP: test whether feat-attn makes MLP useful for algorithmic tasks
+    try_add('MHA+FA+MLP', lambda: MHAFeatMLPBlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp, feat_position='before_mlp'),
+            f"MHAFeatMLPBlock(d_model={dim}, mlp_inner={mha_mlp}, feat_position='before_mlp')")
+    try_add('MHA+MLP+FA', lambda: MHAFeatMLPBlock(d_model=dim, n_heads=4, mlp_inner=mha_mlp, feat_position='after_mlp'),
+            f"MHAFeatMLPBlock(d_model={dim}, mlp_inner={mha_mlp}, feat_position='after_mlp')")
 
     # MHA2D: 2D token representations with 2D QKV projections
     _sqrt_dim = int(dim ** 0.5)
