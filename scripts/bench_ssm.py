@@ -304,7 +304,7 @@ class StupidAttnBlock(nn.Module):
     shared across 16 features.
     """
 
-    def __init__(self, d_model, n_heads=4, causal=True):
+    def __init__(self, d_model, n_heads=4, causal=True, blend_gate_bias=-1.1):
         super().__init__()
         self.causal = causal
         self.n_heads = n_heads
@@ -315,6 +315,11 @@ class StupidAttnBlock(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        # Blend gate: per-head lerp between softmax and silu²
+        self.blend_gate_proj = nn.Linear(d_model, n_heads, bias=True)
+        nn.init.zeros_(self.blend_gate_proj.weight)
+        nn.init.constant_(self.blend_gate_proj.bias, blend_gate_bias)
+        self.silu2_norm = nn.RMSNorm(self.head_dim)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -333,17 +338,36 @@ class StupidAttnBlock(nn.Module):
         # Sum over hd -> (B, T_i, T_j, H) — one scalar per head per pair
         logits = (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1)  # (B, T_i, T_j, H)
 
-        # SiLU² then mask and normalize
-        weights = F.silu(logits) ** 2  # (B, T_i, T_j, H)
+        # Blend gate: per-head, content-dependent lerp
+        gate = torch.sigmoid(self.blend_gate_proj(h))  # (B, T, H)
+        gate = gate.unsqueeze(2)  # (B, T_i, 1, H) — broadcast over T_j
 
+        # Causal mask (shared by both branches)
+        causal_mask = None
         if self.causal:
-            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-            weights = weights.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), 0.0)
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
 
-        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
+        # Softmax branch
+        if causal_mask is not None:
+            softmax_logits = logits.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
+        else:
+            softmax_logits = logits
+        w_softmax = torch.softmax(softmax_logits / (hd ** 0.5), dim=2)  # (B, T_i, T_j, H)
 
-        # Weighted sum of V[j] per head: (B, T_i, T_j, H, 1) * (B, 1, T_j, H, hd)
-        out = (weights.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)  # (B, T, H, hd)
+        # SiLU² branch
+        w_silu2 = F.silu(logits) ** 2  # (B, T_i, T_j, H)
+        if causal_mask is not None:
+            w_silu2 = w_silu2.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(-1), 0.0)
+
+        # Weighted sum of V for each branch, then blend
+        # (B, T_i, T_j, H, 1) * (B, 1, T_j, H, hd) -> sum over T_j -> (B, T, H, hd)
+        y_softmax = (w_softmax.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
+        y_silu2 = (w_silu2.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
+        y_silu2 = self.silu2_norm(y_silu2)
+
+        # Blend: gate is (B, T_i, 1, H), need (B, T, H, 1) for broadcasting over hd
+        g = gate.squeeze(2).unsqueeze(-1)  # (B, T, H, 1)
+        out = (1 - g) * y_softmax + g * y_silu2
         out = out.reshape(B, T, D)
 
         return out
