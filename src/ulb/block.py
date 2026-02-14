@@ -198,10 +198,12 @@ class ULBBlock(nn.Module):
             from mha import FeatureAttn
             # Projected gate replaces raw h_up in skip-multiply
             self.gate_proj = nn.Linear(d, d, bias=False)
-            # Feature attention sublayer
+            # Feature attention sublayer (inherits attn_mode from ULB config)
             self.feat_attn = FeatureAttn(
                 d, feat_expansion=config.feat_expansion,
-                n_heads=config.feat_n_heads)
+                n_heads=config.feat_n_heads,
+                attn_mode=config.attn_mode,
+                blend_gate_bias=config.blend_gate_bias)
             # Pre-norm for feature attention
             self.feat_norm = nn.RMSNorm(d)
             # Content-dependent gate on feature-attention delta

@@ -72,53 +72,98 @@ class SwiGLU(nn.Module):
 
 
 class FeatureAttn(nn.Module):
-    """Feature-attention: replaces SwiGLU with attention over feature groups.
+    """Feature-attention: replaces SwiGLU with attention over features.
 
-    Expands each token from rank 1 (a single D-dim vector) to rank X
-    (X independent D-dim vectors), runs non-causal self-attention over
-    those X groups, then collapses back to rank 1.
+    Analogous to sequence-attention but orthogonal: sequence-attention asks
+    "which tokens are relevant?", feature-attention asks "which features
+    are relevant?".
 
-    Each feature group is a full D-dimensional representation. The expansion
-    factor is the number of groups (the rank), NOT a dimension multiplier.
-    This is what MLPs try to do (feature mixing) but with dynamic,
-    content-dependent attention instead of fixed learned weights.
+    Each token's D features are the sequence positions. The expansion factor
+    X gives each feature X channels (like multi-channel depth), so each
+    feature position has a richer representation to attend with.
+
+    Flow:
+        (N, D) -> expand each feature to X channels -> (N, D, X)
+        QKV at dim X per feature, attend over D features (non-causal)
+        -> (N, D, X) -> collapse channels -> (N, D)
+
+    With D=64, X=4: attention matrix is 64x64 (features attending to
+    features), each feature position has 4 channels.
 
     Args:
-        dim: Model dimension. Each feature group is D-dimensional.
-        feat_expansion: Number of feature groups (rank). Token goes from
-            (1, D) to (X, D) where X = feat_expansion.
-        n_heads: Number of attention heads within feature-attention.
-            Splits D into n_heads * head_dim.
+        dim: Model dimension (D). Number of feature positions.
+        feat_expansion: Channels per feature (X). Each feature goes from
+            1-dim to X-dim.
+        n_heads: Attention heads. Splits X into n_heads * head_dim.
+            X must be divisible by n_heads.
+        attn_mode: 'softmax', 'silu2', or 'blend'.
+        blend_gate_bias: Initial bias for blend gate (default -1.1, ~25% silu2).
     """
 
-    def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1):
+    def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1,
+                 attn_mode: str = 'softmax', blend_gate_bias: float = -1.1):
         super().__init__()
-        self.dim = dim
-        self.n_groups = feat_expansion
-        self.feat_dim = dim * feat_expansion
+        self.dim = dim              # D = number of feature positions
+        self.channels = feat_expansion  # X = channels per feature
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.head_dim = feat_expansion // n_heads
+        self.attn_mode = attn_mode
 
-        assert dim % n_heads == 0, (
-            f"dim ({dim}) must be divisible by n_heads ({n_heads})")
+        assert feat_expansion % n_heads == 0, (
+            f"feat_expansion ({feat_expansion}) must be divisible by n_heads ({n_heads})")
+        assert attn_mode in ('softmax', 'silu2', 'blend'), (
+            f"Unknown attn_mode: {attn_mode}")
 
-        # up_proj: D -> X*D (expand rank 1 to rank X)
-        self.w_up = nn.Linear(dim, self.feat_dim, bias=False)
+        # Channel expansion: each feature independently projected to X channels
+        # (D, X) weight — einsum('nd,dx->ndx', x, w_up) gives (N, D, X)
+        self.w_up = nn.Parameter(torch.randn(dim, feat_expansion) * (dim ** -0.5))
 
-        # Feature-attention QKV: D -> 3*D (applied per group, same scale as seq-attn)
-        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
+        # QKV projection per feature position: X -> 3*X
+        self.qkv_proj = nn.Linear(feat_expansion, 3 * feat_expansion, bias=False)
 
-        # Output projection: D -> D (mixes across heads, per group)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
+        # Output projection per feature: X -> X (mixes across heads)
+        self.o_proj = nn.Linear(feat_expansion, feat_expansion, bias=False)
 
-        # Gate projection: content-dependent gate (not raw content gating itself)
-        self.gate_proj = nn.Linear(self.feat_dim, self.feat_dim, bias=False)
+        # Gate: D -> D from original input, broadcast over channels
+        # "Given this token, which features should I let through?"
+        self.gate_proj = nn.Linear(dim, dim, bias=False)
 
         # Norm before gated combine
-        self.feat_norm = nn.RMSNorm(self.feat_dim)
+        self.feat_norm = nn.RMSNorm(feat_expansion)
 
-        # down_proj: X*D -> D (collapse back to rank 1)
-        self.w_down = nn.Linear(self.feat_dim, dim, bias=False)
+        # Collapse channels back: X -> 1 per feature (dot product across channels)
+        self.w_down = nn.Parameter(torch.randn(dim, feat_expansion) * (feat_expansion ** -0.5))
+
+        # Blend attention (optional)
+        if attn_mode == 'blend':
+            # Gate per feature position per head: X -> n_heads
+            self.blend_gate_proj = nn.Linear(feat_expansion, n_heads, bias=True)
+            nn.init.zeros_(self.blend_gate_proj.weight)
+            nn.init.constant_(self.blend_gate_proj.bias, blend_gate_bias)
+            self.silu2_norm = nn.RMSNorm(self.head_dim)
+
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                blend_gate: torch.Tensor | None = None) -> torch.Tensor:
+        """Dispatch to configured attention mode.
+
+        Args:
+            q, k, v:    (N, n_heads, D, head_dim)
+            blend_gate: (N, n_heads, D, 1) — only for blend mode.
+        Returns:
+            (N, n_heads, D, head_dim)
+        """
+        if self.attn_mode == 'silu2':
+            from ulb.attention import silu2_attention
+            return silu2_attention(q, k, v, is_causal=False)
+        elif self.attn_mode == 'blend':
+            from ulb.attention import silu2_attention
+            assert blend_gate is not None
+            g = blend_gate
+            y_softmax = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            y_silu2 = self.silu2_norm(silu2_attention(q, k, v, is_causal=False))
+            return (1 - g) * y_softmax + g * y_silu2
+        else:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -131,31 +176,38 @@ class FeatureAttn(nn.Module):
         N = x.reshape(-1, self.dim).shape[0]
         x_flat = x.reshape(N, self.dim)
 
-        # Expand from rank 1 to rank X: (N, D) -> (N, X*D) -> (N, X, D)
-        h_up = F.silu(self.w_up(x_flat))                      # (N, X*D)
-        h = h_up.view(N, self.n_groups, self.dim)              # (N, X, D)
+        # Expand each feature to X channels: (N, D) -> (N, D, X)
+        h = F.silu(torch.einsum('nd,dx->ndx', x_flat, self.w_up))  # (N, D, X)
 
-        # Feature-attention QKV (D -> 3D per group, same scale as seq-attn)
-        qkv = self.qkv_proj(h)                                 # (N, X, 3*D)
-        q, k, v = qkv.split(self.dim, dim=-1)                  # each (N, X, D)
+        # QKV per feature: X -> 3X, then split
+        qkv = self.qkv_proj(h)                                     # (N, D, 3X)
+        q, k, v = qkv.split(self.channels, dim=-1)                 # each (N, D, X)
 
-        # Reshape for multi-head: (N, n_heads, X, head_dim)
-        q = q.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
+        # Reshape for multi-head: (N, D, X) -> (N, D, n_heads, head_dim) -> (N, n_heads, D, head_dim)
+        q = q.view(N, self.dim, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(N, self.dim, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(N, self.dim, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Attend over feature groups (non-causal)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)  # (N, H, X, hd)
+        # Blend gate (computed from expanded features before attention)
+        blend_gate = None
+        if self.attn_mode == 'blend':
+            # h is (N, D, X) -> (N, D, n_heads) -> (N, n_heads, D, 1)
+            blend_gate = torch.sigmoid(self.blend_gate_proj(h))
+            blend_gate = blend_gate.transpose(1, 2).unsqueeze(-1)
 
-        # Concat heads and output projection
-        y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.dim)
-        y = self.o_proj(y)                                     # (N, X, D)
+        # Attend over D features (non-causal): 64x64 attention matrix
+        y = self._attend(q, k, v, blend_gate)                      # (N, H, D, hd)
 
-        # Flatten back, projected gate, project down
-        y = y.reshape(N, self.feat_dim)                         # (N, X*D)
-        gate = torch.sigmoid(self.gate_proj(h_up))                # (N, X*D)
-        y = self.feat_norm(y) * gate                            # sigmoid-gated
-        out = self.w_down(y)                                    # (N, D)
+        # Concat heads: (N, D, X)
+        y = y.transpose(1, 2).contiguous().view(N, self.dim, self.channels)
+        y = self.o_proj(y)                                          # (N, D, X)
+
+        # Projected gate from original input: which features to let through
+        gate = torch.sigmoid(self.gate_proj(x_flat))                # (N, D)
+        y = self.feat_norm(y) * gate.unsqueeze(-1)                  # (N, D, 1) broadcast over X
+
+        # Collapse channels: (N, D, X) -> (N, D) via per-feature dot product
+        out = torch.einsum('ndx,dx->nd', y, self.w_down)           # (N, D)
 
         return out.view(*orig_shape, self.dim)
 
@@ -283,14 +335,18 @@ class FeatureAttnBlock(nn.Module):
         dim: Model dimension.
         n_heads: Number of sequence-attention heads.
         feat_expansion: Feature expansion factor.
-        feat_group_dim: Feature group size.
         feat_n_heads: Heads within feature-attention.
         feat_first: If True, feature-attention runs before sequence-attention.
             Default False (sequence-attention first, like standard transformers).
+        feat_attn_mode: Attention mode for feature-attention: 'softmax',
+            'silu2', or 'blend'.
+        feat_blend_gate_bias: Blend gate bias init for feature-attention.
     """
 
     def __init__(self, dim: int, n_heads: int, feat_expansion: int = 4,
-                 feat_n_heads: int = 1, feat_first: bool = False):
+                 feat_n_heads: int = 1, feat_first: bool = False,
+                 feat_attn_mode: str = 'softmax',
+                 feat_blend_gate_bias: float = -1.1):
         super().__init__()
         self.feat_first = feat_first
 
@@ -304,7 +360,8 @@ class FeatureAttnBlock(nn.Module):
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
-                               n_heads=feat_n_heads)
+                               n_heads=feat_n_heads, attn_mode=feat_attn_mode,
+                               blend_gate_bias=feat_blend_gate_bias)
         # Content-dependent gate on feature-attention delta
         self.feat_gate_proj = nn.Linear(dim, dim, bias=False)
 
@@ -352,12 +409,15 @@ class FeatureAttnTransformer(nn.Module):
         feat_expansion: Number of feature groups (rank expansion).
         feat_n_heads: Heads within feature-attention.
         feat_first: If True, feature-attention runs before sequence-attention.
+        feat_attn_mode: Attention mode for feature-attention.
+        feat_blend_gate_bias: Blend gate bias init for feature-attention.
     """
 
     def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
                  n_layers: int = 4, max_seq_len: int = 256,
                  feat_expansion: int = 4, feat_n_heads: int = 1,
-                 feat_first: bool = False):
+                 feat_first: bool = False, feat_attn_mode: str = 'softmax',
+                 feat_blend_gate_bias: float = -1.1):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -366,7 +426,8 @@ class FeatureAttnTransformer(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, dim)
 
         self.blocks = nn.ModuleList([
-            FeatureAttnBlock(dim, n_heads, feat_expansion, feat_n_heads, feat_first)
+            FeatureAttnBlock(dim, n_heads, feat_expansion, feat_n_heads,
+                             feat_first, feat_attn_mode, feat_blend_gate_bias)
             for _ in range(n_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)
