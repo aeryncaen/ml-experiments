@@ -111,8 +111,11 @@ class FeatureAttn(nn.Module):
         # Output projection: D -> D (mixes across heads, per group)
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
-        # Gate projection: content-dependent gate (not raw content gating itself)
-        self.gate_proj = nn.Linear(self.feat_dim, self.feat_dim, bias=False)
+        # Block-diagonal gate projection: one D->D gate per group.
+        # Equivalent to a (X*D, X*D) matrix with only X diagonal DxD blocks.
+        self.gate_proj = nn.Parameter(
+            torch.randn(self.n_groups, dim, dim) * (dim ** -0.5)
+        )
 
         # Norm before gated combine
         self.feat_norm = nn.RMSNorm(self.feat_dim)
@@ -153,7 +156,9 @@ class FeatureAttn(nn.Module):
 
         # Flatten back, projected gate, project down
         y = y.reshape(N, self.feat_dim)                         # (N, X*D)
-        gate = torch.sigmoid(self.gate_proj(h_up))                # (N, X*D)
+        gate = torch.sigmoid(
+            torch.einsum('nxd,xde->nxe', h, self.gate_proj)
+        ).reshape(N, self.feat_dim)                                # (N, X*D)
         y = self.feat_norm(y) * gate                            # sigmoid-gated
         out = self.w_down(y)                                    # (N, D)
 

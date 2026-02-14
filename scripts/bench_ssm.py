@@ -300,7 +300,7 @@ class StupidAttnBlock(nn.Module):
     from head_dim -> 1, producing one gate per pair per head.
     """
 
-    def __init__(self, d_model, n_heads=4, causal=True):
+    def __init__(self, d_model, n_heads=64, causal=True):
         super().__init__()
         self.causal = causal
         self.n_heads = n_heads
