@@ -146,19 +146,6 @@ class CausalULB2D(nn.Module):
         self.final_norm = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
 
-        # Gated embed residual: content-dependent gate that mixes embedding
-        # back into the stream between blocks. One gate per layer (except first).
-        # Operates at residual width (C_w), not expanded width.
-        if n_layers > 1:
-            self.embed_gates = nn.ModuleList([
-                nn.ParameterDict({
-                    'w': nn.Parameter(torch.zeros(c_h, c_w, c_h, c_w)),
-                    'bias': nn.Parameter(torch.zeros(c_h, c_w)),
-                }) for _ in range(n_layers - 1)
-            ])
-        else:
-            self.embed_gates = None
-
         # Weight tying
         self.head.weight = self.token_embed.weight
 
@@ -195,19 +182,11 @@ class CausalULB2D(nn.Module):
         B, T = token_ids.shape
         C_h, C_w = self.c_h, self.c_w
 
-        embed = self.token_embed(token_ids)  # (B, T, D)
-        x = embed
+        x = self.token_embed(token_ids)  # (B, T, D)
 
-        for i, (norm, block) in enumerate(zip(self.norms, self.blocks)):
+        for norm, block in zip(self.norms, self.blocks):
             x_normed = norm(x).view(B, T, C_h, C_w)
-            x = block(x_normed).reshape(B, T, -1)
-            # Gated embed residual (after first layer)
-            if self.embed_gates is not None and i < len(self.embed_gates):
-                eg = self.embed_gates[i]
-                gate = torch.sigmoid(torch.einsum(
-                    '...cd,cdef->...ef', x.view(B, T, C_h, C_w), eg['w']
-                ) + eg['bias'])
-                x = x + gate.reshape(B, T, -1) * embed
+            x = x + block(x_normed).reshape(B, T, -1)
 
         return self.head(self.final_norm(x))
 
