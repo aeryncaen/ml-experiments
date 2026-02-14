@@ -433,6 +433,106 @@ class MHABlock(nn.Module):
         return h
 
 
+class MHA2DBlock(nn.Module):
+    """Causal MHA with 2D token representations.
+
+    Each token is a (C, D') matrix instead of a D-dim vector.
+    The block receives (B, T, D) where D = C * D', reshapes to (B, T, C, D').
+
+    QKV projections are 2D: W_q, W_k, W_v are each (C, D', C, D') tensors
+    that map (C, D') -> (C, D') matrices.
+
+    Attention score between token i and j: sum over elements of Q_i * K_j
+    (Frobenius inner product), scaled. Output is weighted sum of V matrices.
+
+    Multi-head: split D' into heads. Each head gets (C, head_dim).
+    Score per head: Frobenius inner product of (C, head_dim) matrices.
+    """
+
+    def __init__(self, d_model, n_channels=4, n_heads=4, mlp_inner=0):
+        super().__init__()
+        self.d_model = d_model
+        self.C = n_channels
+        self.D_prime = d_model // n_channels
+        self.n_heads = n_heads
+        assert d_model % n_channels == 0
+        assert self.D_prime % n_heads == 0
+        self.head_dim = self.D_prime // n_heads
+
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
+                              groups=d_model, bias=True)
+
+        # 2D QKV projections: (C, D', C, D') — map (C, D') matrix to (C, D') matrix
+        # Implemented as (C*D', C*D') linear but conceptually 2D-to-2D
+        self.w_q = nn.Parameter(torch.randn(self.C, self.D_prime, self.C, self.D_prime)
+                                * (self.C * self.D_prime) ** -0.5)
+        self.w_k = nn.Parameter(torch.randn(self.C, self.D_prime, self.C, self.D_prime)
+                                * (self.C * self.D_prime) ** -0.5)
+        self.w_v = nn.Parameter(torch.randn(self.C, self.D_prime, self.C, self.D_prime)
+                                * (self.C * self.D_prime) ** -0.5)
+
+        # Output projection: also 2D
+        self.w_o = nn.Parameter(torch.randn(self.C, self.D_prime, self.C, self.D_prime)
+                                * (self.C * self.D_prime) ** -0.5)
+
+        self.scale = (self.C * self.head_dim) ** -0.5
+
+        self.has_mlp = mlp_inner > 0
+        if self.has_mlp:
+            self.mlp_norm = RMSNorm(d_model)
+            self.gate_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.up_proj = nn.Linear(d_model, mlp_inner, bias=False)
+            self.down_proj = nn.Linear(mlp_inner, d_model, bias=False)
+
+    def _proj_2d(self, x, w):
+        """Apply 2D projection: x is (B, T, C, D'), w is (C, D', C, D')."""
+        return torch.einsum('btcd,cdef->btef', x, w)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        # Causal conv (on flat D)
+        h = F.pad(x.transpose(1, 2), (2, 0))
+        h = self.conv(h).transpose(1, 2)                               # (B, T, D)
+
+        # Reshape to 2D: (B, T, C, D')
+        h2d = h.view(B, T, self.C, self.D_prime)
+
+        # 2D QKV projections
+        Q = self._proj_2d(h2d, self.w_q)                               # (B, T, C, D')
+        K = self._proj_2d(h2d, self.w_k)
+        V = self._proj_2d(h2d, self.w_v)
+
+        # Multi-head: split D' into heads -> (B, T, C, n_heads, head_dim)
+        Q = Q.view(B, T, self.C, self.n_heads, self.head_dim)
+        K = K.view(B, T, self.C, self.n_heads, self.head_dim)
+        V = V.view(B, T, self.C, self.n_heads, self.head_dim)
+
+        # Attention scores: Frobenius inner product per head over (C, head_dim)
+        # Q: (B, T, C, H, hd) -> (B, H, T, C*hd) for score computation
+        Q_flat = Q.permute(0, 3, 1, 2, 4).reshape(B, self.n_heads, T, self.C * self.head_dim)
+        K_flat = K.permute(0, 3, 1, 2, 4).reshape(B, self.n_heads, T, self.C * self.head_dim)
+        V_flat = V.permute(0, 3, 1, 2, 4).reshape(B, self.n_heads, T, self.C * self.head_dim)
+
+        # Standard scaled dot-product attention (causal)
+        attn_out = F.scaled_dot_product_attention(Q_flat, K_flat, V_flat, is_causal=True)
+        # (B, H, T, C*hd)
+
+        # Reshape back to 2D: (B, T, C, D')
+        attn_out = attn_out.reshape(B, self.n_heads, T, self.C, self.head_dim)
+        attn_out = attn_out.permute(0, 2, 3, 1, 4).reshape(B, T, self.C, self.D_prime)
+
+        # 2D output projection
+        attn_out = self._proj_2d(attn_out, self.w_o)                   # (B, T, C, D')
+
+        # Flatten back to (B, T, D)
+        h = attn_out.reshape(B, T, D)
+
+        if self.has_mlp:
+            r = self.mlp_norm(h)
+            h = h + self.down_proj(F.silu(self.gate_proj(r)) * self.up_proj(r))
+        return h
+
+
 class FusedGateBlock(nn.Module):
     """Fused attention+MLP: up_proj → swish → QKV → attn → skip-multiply → swish → down_proj.
 
@@ -1678,6 +1778,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # StupidAttn: pairwise element-wise multiply, gate back in
     try_add('StupidAttn', lambda: StupidAttnBlock(d_model=dim),
             f"StupidAttnBlock(d_model={dim})")
+
+    # MHA2D: 2D token representations with 2D QKV projections
+    try_add('MHA2D', lambda: MHA2DBlock(d_model=dim, n_channels=4, n_heads=4, mlp_inner=mha_mlp),
+            f"MHA2DBlock(d_model={dim}, n_channels=4, n_heads=4, mlp_inner={mha_mlp})")
 
     # FeatAttn: MHA + feature-attention (no MLP)
     _ft = feat_transpose
