@@ -156,37 +156,31 @@ def factorize_dim(D, rank):
 # ---------------------------------------------------------------------------
 
 class BlockND(nn.Module):
-    """Causal self-attention + SwiGLU MLP using N-dimensional tensor projections.
+    """Causal self-attention using N-dimensional tensor projections.
 
-    All ranks use the same architecture: QKV seq-attn + SwiGLU MLP.
-    Only the projection structure changes:
-      1D: nn.Linear (flat matrix multiply)
-      ND: einsum with rank-2N tensor weights
+    Hidden state stays ND-shaped throughout: (B, T, *shape).
+    1D: standard nn.Linear QKV attention.
+    ND: einsum QKV attention over ND-shaped tokens.
+    No MLP (matching Zoology MQAR setup — state_mixer is Identity).
     """
 
-    def __init__(self, D, shape, n_heads=4, ffn_expand=2):
+    def __init__(self, shape, n_heads=4):
         super().__init__()
-        self.D = D
         self.shape = shape
         self.rank = len(shape)
+        self.D = math.prod(shape)
         self.n_heads = n_heads if self.rank == 1 else shape[0]
-        self.head_dim = D // self.n_heads
+        self.head_dim = self.D // self.n_heads
 
-        init_scale = D ** -0.5
-        mlp_inner = int(D * ffn_expand)
-        self.mlp_inner = mlp_inner
+        init_scale = self.D ** -0.5
 
         if self.rank == 1:
-            # Flat linear projections
+            D = self.D
             self.wq = nn.Linear(D, D, bias=False)
             self.wk = nn.Linear(D, D, bias=False)
             self.wv = nn.Linear(D, D, bias=False)
             self.wo = nn.Linear(D, D, bias=False)
-            self.gate_proj = nn.Linear(D, mlp_inner, bias=False)
-            self.up_proj = nn.Linear(D, mlp_inner, bias=False)
-            self.down_proj = nn.Linear(mlp_inner, D, bias=False)
         else:
-            # ND tensor projections via einsum
             n = self.rank
             in_chars = ''.join(chr(ord('c') + i) for i in range(n))
             out_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
@@ -198,94 +192,67 @@ class BlockND(nn.Module):
             self.seq_wv = nn.Parameter(torch.randn(*w_shape) * init_scale)
             self.seq_wo = nn.Parameter(torch.randn(*w_shape) * init_scale)
 
-            # SwiGLU MLP with ND tensor projections
-            # up/gate: (shape...) -> mlp_inner, down: mlp_inner -> (shape...)
-            # Factor mlp_inner into same-rank shape
-            mlp_shape = factorize_dim(mlp_inner, self.rank)
-            self.mlp_shape = mlp_shape
+        self.norm = RMSNorm(self.D)
 
-            mlp_up_shape = tuple(shape) + tuple(mlp_shape)
-            mlp_down_shape = tuple(mlp_shape) + tuple(shape)
-            mlp_up_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
-            self.mlp_einsum_up = f'...{in_chars},{in_chars}{mlp_up_chars}->...{mlp_up_chars}'
-            self.mlp_einsum_down = f'...{mlp_up_chars},{mlp_up_chars}{in_chars}->...{in_chars}'
-
-            mlp_init = math.prod(mlp_shape) ** -0.5
-            self.mlp_gate = nn.Parameter(torch.randn(*mlp_up_shape) * init_scale)
-            self.mlp_up = nn.Parameter(torch.randn(*mlp_up_shape) * init_scale)
-            self.mlp_down = nn.Parameter(torch.randn(*mlp_down_shape) * mlp_init)
-
-        self.norm1 = RMSNorm(D)
-        self.norm2 = RMSNorm(D)
-
-    def _proj_nd(self, x, w, einsum_str=None):
-        return torch.einsum(einsum_str or self.einsum_str, x, w)
+    def _proj_nd(self, x, w):
+        return torch.einsum(self.einsum_str, x, w)
 
     def forward(self, x):
-        B, T, D = x.shape
-        NH, HD = self.n_heads, self.head_dim
+        # x: (B, T, *shape)
+        B, T = x.shape[:2]
+        D, NH, HD = self.D, self.n_heads, self.head_dim
+        x_flat = x.reshape(B, T, D)
 
         if self.rank == 1:
-            # --- Seq-attn with flat linear ---
-            h = self.norm1(x)
+            h = self.norm(x_flat)
             q = self.wq(h).view(B, T, NH, HD).transpose(1, 2)
             k = self.wk(h).view(B, T, NH, HD).transpose(1, 2)
             v = self.wv(h).view(B, T, NH, HD).transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(B, T, D)
-            x = x + self.wo(y)
-            # --- SwiGLU MLP with flat linear ---
-            r = self.norm2(x)
-            x = x + self.down_proj(F.silu(self.gate_proj(r)) * self.up_proj(r))
-            return x
+            return x + self.wo(y)
 
-        # --- ND path: same architecture, tensor projections ---
-        shape = self.shape
-
-        # Seq-attn
-        h = self.norm1(x).view(B, T, *shape)
+        # ND path: x is (B, T, *shape)
+        h = self.norm(x_flat).view(B, T, *self.shape)
         Q = self._proj_nd(h, self.seq_wq)
         K = self._proj_nd(h, self.seq_wk)
         V = self._proj_nd(h, self.seq_wv)
-        Q = Q.view(B, T, NH, -1).permute(0, 2, 1, 3)
-        K = K.view(B, T, NH, -1).permute(0, 2, 1, 3)
-        V = V.view(B, T, NH, -1).permute(0, 2, 1, 3)
+        # Reshape for multi-head attention: first dim of shape = n_heads
+        Q = Q.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
+        K = K.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
+        V = V.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
         y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, *shape)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, *self.shape)
         y = self._proj_nd(y, self.seq_wo)
-        x = x + y.reshape(B, T, D)
-
-        # SwiGLU MLP
-        r = self.norm2(x).view(B, T, *shape)
-        gate = self._proj_nd(r, self.mlp_gate, self.mlp_einsum_up)
-        up = self._proj_nd(r, self.mlp_up, self.mlp_einsum_up)
-        h = F.silu(gate) * up
-        down = self._proj_nd(h, self.mlp_down, self.mlp_einsum_down)
-        x = x + down.reshape(B, T, D)
-
-        return x
+        return x + y
 
 
 class Model(nn.Module):
-    def __init__(self, D, shape, vocab_size=VOCAB_SIZE, n_layers=1, n_heads=4, ffn_expand=2):
+    def __init__(self, shape, vocab_size=VOCAB_SIZE, n_layers=1, n_heads=4):
         super().__init__()
-        self.D = D
         self.shape = shape
-        self.embed = nn.Embedding(vocab_size, D)
+        self.rank = len(shape)
+        self.D = math.prod(shape)
+        # Embedding: (vocab_size, D) — lookup returns (B, T, D), reshaped to ND
+        self.embed = nn.Embedding(vocab_size, self.D)
         self.blocks = nn.ModuleList([
-            BlockND(D, shape, n_heads=n_heads, ffn_expand=ffn_expand)
+            BlockND(shape, n_heads=n_heads)
             for _ in range(n_layers)
         ])
-        self.final_norm = RMSNorm(D)
-        self.head = nn.Linear(D, vocab_size, bias=False)
+        self.final_norm = RMSNorm(self.D)
+        self.head = nn.Linear(self.D, vocab_size, bias=False)
         # Tie embed and head weights (matching Zoology)
         self.head.weight = self.embed.weight
 
     def forward(self, x):
-        h = self.embed(x)
+        B, T = x.shape
+        h = self.embed(x)  # (B, T, D)
+        if self.rank > 1:
+            h = h.view(B, T, *self.shape)  # (B, T, *shape)
         for block in self.blocks:
             h = block(h)
-        return self.head(self.final_norm(h))
+        # Flatten back for head
+        return self.head(self.final_norm(h.reshape(B, T, self.D)))
 
 
 def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', label='',
@@ -295,6 +262,8 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=0.0)
 
     train_losses = []
+    train_accs = []
+    val_losses = []
     val_accs = []
 
     # Gradient snapshots
@@ -317,36 +286,43 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     val_x, val_t = val_x.to(device), val_t.to(device)
     n_batches = num_train_examples // B
 
-    # Register starting loss before any training
-    model.eval()
-    with torch.no_grad():
-        x0 = train_x[:B].to(device)
-        t0 = train_t[:B].to(device)
-        logits0 = model(x0)
-        loss0 = F.cross_entropy(logits0.reshape(-1, vocab_size), t0.reshape(-1),
-                                ignore_index=-100).item()
-    train_losses.append(loss0)
-    # Starting val acc
-    with torch.no_grad():
-        all_preds = []
-        val_bs = min(512, len(val_x))
-        for vi in range(0, len(val_x), val_bs):
-            vlogits = model(val_x[vi:vi+val_bs])
-            all_preds.append(vlogits.argmax(-1))
-        preds = torch.cat(all_preds, dim=0)
-        if task == 'mqar':
-            mask = val_t != -100
-            val_acc0 = (preds[mask] == val_t[mask]).float().mean().item()
-        else:
-            val_acc0 = (preds == val_t).float().mean().item()
-    val_accs.append(val_acc0)
-    print(f'  [{label}] start: loss={loss0:.4f}, val_acc={val_acc0:.3f}', flush=True)
+    # Helper to compute loss + acc over a dataset in batches
+    def eval_metrics(data_x, data_t):
+        model.eval()
+        total_loss = 0
+        total_correct = 0
+        total_count = 0
+        bs = min(512, len(data_x))
+        with torch.no_grad():
+            for i in range(0, len(data_x), bs):
+                bx = data_x[i:i+bs].to(device) if not data_x.is_cuda and device != 'cpu' else data_x[i:i+bs]
+                bt = data_t[i:i+bs].to(device) if not data_t.is_cuda and device != 'cpu' else data_t[i:i+bs]
+                logits = model(bx)
+                total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
+                                              ignore_index=-100).item() * len(bx)
+                preds = logits.argmax(-1)
+                if task == 'mqar':
+                    m = bt != -100
+                    total_correct += (preds[m] == bt[m]).sum().item()
+                    total_count += m.sum().item()
+                else:
+                    total_correct += (preds == bt).sum().item()
+                    total_count += bt.numel()
+        return total_loss / len(data_x), total_correct / max(total_count, 1)
+
+    # Register starting metrics before any training
+    tl0, ta0 = eval_metrics(train_x[:min(5000, len(train_x))], train_t[:min(5000, len(train_x))])
+    vl0, va0 = eval_metrics(val_x, val_t)
+    train_losses.append(tl0); train_accs.append(ta0)
+    val_losses.append(vl0); val_accs.append(va0)
+    print(f'  [{label}] start: train_loss={tl0:.4f} train_acc={ta0:.3f} val_loss={vl0:.4f} val_acc={va0:.3f}', flush=True)
 
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
         model.train()
         epoch_loss = 0
-        n_seen = 0
+        epoch_correct = 0
+        epoch_count = 0
 
         # Shuffle training data each epoch
         perm = torch.randperm(num_train_examples)
@@ -363,6 +339,17 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
             opt.zero_grad()
             loss.backward()
 
+            # Accumulate train acc from training logits (free, no extra forward pass)
+            with torch.no_grad():
+                preds = logits.argmax(-1)
+                if task == 'mqar':
+                    m = t != -100
+                    epoch_correct += (preds[m] == t[m]).sum().item()
+                    epoch_count += m.sum().item()
+                else:
+                    epoch_correct += (preds == t).sum().item()
+                    epoch_count += t.numel()
+
             # Snapshot (first batch of snapshot epochs only)
             if epoch in snapshot_epochs and batch_i == 0:
                 if epoch not in grad_snapshots:
@@ -376,37 +363,28 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
 
             opt.step()
             epoch_loss += loss.item()
-            n_seen += 1
 
         scheduler.step()
-        train_losses.append(epoch_loss / max(n_seen, 1))
+        train_losses.append(epoch_loss / n_batches)
+        train_accs.append(epoch_correct / max(epoch_count, 1))
 
-        # Eval (batch val to avoid OOM)
-        model.eval()
-        with torch.no_grad():
-            all_preds = []
-            val_bs = min(512, len(val_x))
-            for vi in range(0, len(val_x), val_bs):
-                vx = val_x[vi:vi+val_bs]
-                vlogits = model(vx)
-                all_preds.append(vlogits.argmax(-1))
-            preds = torch.cat(all_preds, dim=0)
-            if task == 'mqar':
-                mask = val_t != -100
-                val_acc = (preds[mask] == val_t[mask]).float().mean().item()
-            else:
-                val_acc = (preds == val_t).float().mean().item()
-            val_accs.append(val_acc)
+        # Val eval
+        vl_, va_ = eval_metrics(val_x, val_t)
+        val_losses.append(vl_)
+        val_accs.append(va_)
 
-        pbar.set_postfix(train_loss=f'{train_losses[-1]:.4f}', val_acc=f'{val_acc:.3f}')
+        pbar.set_postfix(tl=f'{train_losses[-1]:.4f}', ta=f'{train_accs[-1]:.3f}',
+                         vl=f'{vl_:.4f}', va=f'{va_:.3f}')
 
         # Early stop if solved
-        if val_acc > 0.99:
-            print(f'  [{label}] Early stop at epoch {epoch} — val_acc={val_acc:.3f}', flush=True)
+        if va_ > 0.99:
+            print(f'  [{label}] Early stop at epoch {epoch} — val_acc={va_:.3f}', flush=True)
             break
 
     return {
         'train_losses': train_losses,
+        'train_accs': train_accs,
+        'val_losses': val_losses,
         'val_accs': val_accs,
         'grad_snapshots': grad_snapshots,
         'weight_snapshots': weight_snapshots,
@@ -490,7 +468,7 @@ def main():
     for label, shape in shapes.items():
         torch.manual_seed(42)
         print(f"\n[{label}] Building model ({' x '.join(map(str, shape))})...", flush=True)
-        model = Model(D, shape, vocab_size=vocab_size, n_layers=args.n_layers, ffn_expand=2)
+        model = Model(shape, vocab_size=vocab_size, n_layers=args.n_layers)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
