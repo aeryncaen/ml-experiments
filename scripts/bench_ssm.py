@@ -537,10 +537,10 @@ class MHA2DSimpleBlock(nn.Module):
     """Seq-attn per channel + feat-attn per position on sqrt(D) x sqrt(D) tokens.
 
     Reshape (B, T, D) to (B, T, C, C) where C = sqrt(D).
-    1. Seq-attn: C independent causal attention streams over T positions,
-       each with C-dim QKV. Just plain attention, C natural heads.
-    2. Feat-attn: at each position, non-causal attention over C channels,
-       each with C-dim QKV.
+    1. Seq-attn: C independent causal attention streams over T positions.
+       QKV are full 2D projections (C,C,C,C) mapping (C,C) -> (C,C).
+    2. Feat-attn: at each position, non-causal attention over C channels.
+       QKV are full 2D projections (C,C,C,C).
     No expansions, no bottlenecks, no MLP.
     """
 
@@ -549,19 +549,29 @@ class MHA2DSimpleBlock(nn.Module):
         self.d_model = d_model
         self.C = n_channels or int(d_model ** 0.5)
         assert self.C * self.C == d_model, f"d_model ({d_model}) must be a perfect square"
+        C = self.C
 
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                               groups=d_model, bias=True)
 
-        # Seq-attn: QKV per channel, C -> 3C, shared across channels
-        self.seq_qkv = nn.Linear(self.C, 3 * self.C, bias=False)
-        self.seq_o = nn.Linear(self.C, self.C, bias=False)
+        # Seq-attn: full 2D QKV projections (C,C) -> (C,C)
+        init_scale = (C * C) ** -0.5
+        self.seq_wq = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.seq_wk = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.seq_wv = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.seq_wo = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
         self.seq_norm = RMSNorm(d_model)
 
-        # Feat-attn: QKV per position, C -> 3C, shared across positions
-        self.feat_qkv = nn.Linear(self.C, 3 * self.C, bias=False)
-        self.feat_o = nn.Linear(self.C, self.C, bias=False)
+        # Feat-attn: full 2D QKV projections (C,C) -> (C,C)
+        self.feat_wq = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wk = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wv = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
+        self.feat_wo = nn.Parameter(torch.randn(C, C, C, C) * init_scale)
         self.feat_norm = RMSNorm(d_model)
+
+    def _proj_2d(self, x, w):
+        """x: (..., C, C), w: (C, C, C, C) -> (..., C, C)"""
+        return torch.einsum('...cd,cdef->...ef', x, w)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -572,37 +582,32 @@ class MHA2DSimpleBlock(nn.Module):
         h = self.conv(h).transpose(1, 2)                               # (B, T, D)
 
         # --- Seq-attn: per-channel attention over T positions ---
-        h_normed = self.seq_norm(h).view(B, T, C, C)                  # (B, T, C, C)
-        # Treat each channel as an independent attention stream
-        # Reshape: (B, T, C, C) -> (B*C, T, C) — C streams of T positions with C-dim vecs
-        h_seq = h_normed.permute(0, 2, 1, 3).reshape(B * C, T, C)     # (B*C, T, C)
-        qkv = self.seq_qkv(h_seq)                                     # (B*C, T, 3C)
-        q, k, v = qkv.split(C, dim=-1)
-        # Single-head attention per channel (each channel IS a head)
-        q = q.unsqueeze(1)                                             # (B*C, 1, T, C)
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)    # (B*C, 1, T, C)
-        y = y.squeeze(1)                                               # (B*C, T, C)
-        y = self.seq_o(y)                                              # (B*C, T, C)
-        # Reshape back: (B*C, T, C) -> (B, C, T, C) -> (B, T, C, C) -> (B, T, D)
-        y = y.view(B, C, T, C).permute(0, 2, 1, 3).reshape(B, T, D)
-        h = h + y                                                      # residual
+        h2d = self.seq_norm(h).view(B, T, C, C)                       # (B, T, C, C)
+        Q = self._proj_2d(h2d, self.seq_wq)                           # (B, T, C, C)
+        K = self._proj_2d(h2d, self.seq_wk)
+        V = self._proj_2d(h2d, self.seq_wv)
+        # Each channel is a head: reshape to (B, C, T, C) for SDPA
+        Q = Q.permute(0, 2, 1, 3)                                     # (B, C, T, C)
+        K = K.permute(0, 2, 1, 3)
+        V = V.permute(0, 2, 1, 3)
+        y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)    # (B, C, T, C)
+        y = y.permute(0, 2, 1, 3).contiguous()                        # (B, T, C, C)
+        y = self._proj_2d(y, self.seq_wo)
+        h = h + y.reshape(B, T, D)                                    # residual
 
         # --- Feat-attn: per-position attention over C channels ---
-        h_normed = self.feat_norm(h).view(B, T, C, C)                 # (B, T, C, C)
-        # (B, T, C, C) -> (B*T, C, C) — each position attends over its C channels
-        h_feat = h_normed.reshape(B * T, C, C)
-        qkv = self.feat_qkv(h_feat)                                   # (B*T, C, 3C)
-        q, k, v = qkv.split(C, dim=-1)
-        q = q.unsqueeze(1)                                             # (B*T, 1, C, C)
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)   # (B*T, 1, C, C)
-        y = y.squeeze(1)                                               # (B*T, C, C)
-        y = self.feat_o(y)                                             # (B*T, C, C)
-        y = y.view(B, T, D)
-        h = h + y                                                      # residual
+        h2d = self.feat_norm(h).view(B, T, C, C)                      # (B, T, C, C)
+        Q = self._proj_2d(h2d, self.feat_wq)
+        K = self._proj_2d(h2d, self.feat_wk)
+        V = self._proj_2d(h2d, self.feat_wv)
+        # Each position independently: (B*T, 1, C, C) for single-head SDPA over C
+        Q = Q.reshape(B * T, 1, C, C)
+        K = K.reshape(B * T, 1, C, C)
+        V = V.reshape(B * T, 1, C, C)
+        y = F.scaled_dot_product_attention(Q, K, V, is_causal=False)   # (B*T, 1, C, C)
+        y = y.view(B, T, C, C)
+        y = self._proj_2d(y, self.feat_wo)
+        h = h + y.reshape(B, T, D)                                    # residual
 
         return h
 
