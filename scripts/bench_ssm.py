@@ -353,7 +353,7 @@ class FeatAttnBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_heads=4, feat_expansion=4,
-                 feat_n_heads=1, feat_first=False):
+                 feat_n_heads=1, feat_first=False, transpose_groups=False):
         super().__init__()
         self.feat_first = feat_first
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
@@ -362,7 +362,8 @@ class FeatAttnBlock(nn.Module):
         self.feat_norm = RMSNorm(d_model)
         from mha import FeatureAttn
         self.feat_attn = FeatureAttn(d_model, feat_expansion=feat_expansion,
-                                     n_heads=feat_n_heads)
+                                     n_heads=feat_n_heads,
+                                     transpose_groups=transpose_groups)
 
     def forward(self, x):
         B, T, D = x.shape

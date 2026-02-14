@@ -75,9 +75,17 @@ class FeatureAttn(nn.Module):
     """Feature-attention: attention over feature groups within each token.
 
     Partitions D into G groups of (D/G) dims each.  Runs non-causal
-    self-attention over the G groups, applies a content-dependent sigmoid
+    self-attention over the groups, applies a content-dependent sigmoid
     gate, and reshapes back to D.  No learned up/down projections — the
     grouping is a simple reshape.
+
+    Two modes controlled by ``transpose_groups``:
+      - False (default): reshape to (N, G, D/G).  G positions, each with
+        a (D/G)-dim vector.  Attention is a G×G matrix — "which groups
+        are relevant?"
+      - True: reshape to (N, D/G, G).  D/G positions, each with a G-dim
+        vector.  Attention is a (D/G)×(D/G) matrix — "which features
+        are relevant?"  This is closer to true feature-attention.
 
     Args:
         dim: Model dimension.
@@ -85,33 +93,45 @@ class FeatureAttn(nn.Module):
             G groups of (D // G) features each.  (Named feat_expansion for
             backward compat; there is no expansion.)
         n_heads: Number of attention heads within feature-attention.
-            Splits group_dim into n_heads * head_dim.
+        transpose_groups: If True, transpose the reshape so the attention
+            axis is D/G features instead of G groups.
     """
 
-    def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1):
+    def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1,
+                 transpose_groups: bool = False):
         super().__init__()
         self.dim = dim
         self.n_groups = feat_expansion
         self.group_dim = dim // feat_expansion
+        self.transpose_groups = transpose_groups
 
         assert dim % feat_expansion == 0, (
             f"dim ({dim}) must be divisible by n_groups ({feat_expansion})")
-        assert self.group_dim % n_heads == 0, (
-            f"group_dim ({self.group_dim}) must be divisible by n_heads ({n_heads})")
+
+        # When transposed: seq_len for attn = D/G, vec_dim = G
+        # When normal:     seq_len for attn = G,   vec_dim = D/G
+        if transpose_groups:
+            self.n_pos = self.group_dim   # number of "positions" in attn
+            self.pos_dim = self.n_groups  # dim of each position's vector
+        else:
+            self.n_pos = self.n_groups
+            self.pos_dim = self.group_dim
 
         self.n_heads = n_heads
-        self.head_dim = self.group_dim // n_heads
+        assert self.pos_dim % n_heads == 0, (
+            f"pos_dim ({self.pos_dim}) must be divisible by n_heads ({n_heads})")
+        self.head_dim = self.pos_dim // n_heads
 
-        # Feature-attention QKV: group_dim -> 3*group_dim (per group)
-        self.qkv_proj = nn.Linear(self.group_dim, 3 * self.group_dim, bias=False)
+        # Feature-attention QKV: pos_dim -> 3*pos_dim (per position)
+        self.qkv_proj = nn.Linear(self.pos_dim, 3 * self.pos_dim, bias=False)
 
-        # Output projection: group_dim -> group_dim (per group)
-        self.o_proj = nn.Linear(self.group_dim, self.group_dim, bias=False)
+        # Output projection: pos_dim -> pos_dim (per position)
+        self.o_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
 
-        # Block-diagonal gate: one (group_dim, group_dim) gate per group.
+        # Block-diagonal gate: one (pos_dim, pos_dim) gate per position.
         self.gate_proj = nn.Parameter(
-            torch.randn(self.n_groups, self.group_dim, self.group_dim)
-            * (self.group_dim ** -0.5)
+            torch.randn(self.n_pos, self.pos_dim, self.pos_dim)
+            * (self.pos_dim ** -0.5)
         )
 
         # Norm over full D before gated combine
@@ -128,31 +148,39 @@ class FeatureAttn(nn.Module):
         N = x.reshape(-1, self.dim).shape[0]
         x_flat = x.reshape(N, self.dim)
 
-        # Partition into groups: (N, D) -> (N, G, group_dim)
+        # Partition: (N, D) -> (N, G, D/G) then optionally transpose to (N, D/G, G)
         h = x_flat.view(N, self.n_groups, self.group_dim)
+        if self.transpose_groups:
+            h = h.transpose(1, 2).contiguous()                         # (N, D/G, G)
+        # h is now (N, n_pos, pos_dim)
 
-        # Feature-attention QKV (group_dim -> 3*group_dim, per group)
-        qkv = self.qkv_proj(h)                                        # (N, G, 3*gd)
-        q, k, v = qkv.split(self.group_dim, dim=-1)                   # each (N, G, gd)
+        # Feature-attention QKV (pos_dim -> 3*pos_dim, per position)
+        qkv = self.qkv_proj(h)                                        # (N, P, 3*pd)
+        q, k, v = qkv.split(self.pos_dim, dim=-1)                     # each (N, P, pd)
 
-        # Reshape for multi-head: (N, n_heads, G, head_dim)
-        q = q.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
+        # Reshape for multi-head: (N, n_heads, P, head_dim)
+        q = q.view(N, self.n_pos, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(N, self.n_pos, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(N, self.n_pos, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Attend over feature groups (non-causal)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)   # (N, H, G, hd)
+        # Attend over positions (non-causal)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)   # (N, H, P, hd)
 
         # Concat heads and output projection
-        y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.group_dim)
-        y = self.o_proj(y)                                             # (N, G, gd)
+        y = y.transpose(1, 2).contiguous().view(N, self.n_pos, self.pos_dim)
+        y = self.o_proj(y)                                             # (N, P, pd)
 
-        # Flatten, gate, norm
-        y = y.reshape(N, self.dim)                                     # (N, D)
+        # Gate (on pre-attn content)
         gate = torch.sigmoid(
-            torch.einsum('ngd,gde->nge', h, self.gate_proj)
-        ).reshape(N, self.dim)                                         # (N, D)
-        y = self.feat_norm(y) * gate
+            torch.einsum('npd,pde->npe', h, self.gate_proj)
+        )                                                              # (N, P, pd)
+        y = y * gate                                                   # gated attn output
+
+        # Transpose back if needed, flatten, norm
+        if self.transpose_groups:
+            y = y.transpose(1, 2).contiguous()                         # (N, G, D/G)
+        y = y.reshape(N, self.dim)                                     # (N, D)
+        y = self.feat_norm(y)
 
         return y.view(*orig_shape, self.dim)
 
@@ -287,7 +315,8 @@ class FeatureAttnBlock(nn.Module):
     """
 
     def __init__(self, dim: int, n_heads: int, feat_expansion: int = 4,
-                 feat_n_heads: int = 1, feat_first: bool = False):
+                 feat_n_heads: int = 1, feat_first: bool = False,
+                 transpose_groups: bool = False):
         super().__init__()
         self.feat_first = feat_first
 
@@ -301,7 +330,8 @@ class FeatureAttnBlock(nn.Module):
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
-                               n_heads=feat_n_heads)
+                               n_heads=feat_n_heads,
+                               transpose_groups=transpose_groups)
         # Content-dependent gate on feature-attention delta
         self.feat_gate_proj = nn.Linear(dim, dim, bias=False)
 
@@ -354,7 +384,7 @@ class FeatureAttnTransformer(nn.Module):
     def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
                  n_layers: int = 4, max_seq_len: int = 256,
                  feat_expansion: int = 4, feat_n_heads: int = 1,
-                 feat_first: bool = False):
+                 feat_first: bool = False, transpose_groups: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -363,7 +393,8 @@ class FeatureAttnTransformer(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, dim)
 
         self.blocks = nn.ModuleList([
-            FeatureAttnBlock(dim, n_heads, feat_expansion, feat_n_heads, feat_first)
+            FeatureAttnBlock(dim, n_heads, feat_expansion, feat_n_heads, feat_first,
+                             transpose_groups=transpose_groups)
             for _ in range(n_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)

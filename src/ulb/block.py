@@ -84,6 +84,7 @@ class ULBConfig:
     use_feat_attn: bool = False
     feat_expansion: int = 4    # number of D-dim feature groups (rank)
     feat_n_heads: int = 1
+    feat_transpose_groups: bool = False  # transpose reshape axis in FeatureAttn
 
     def __post_init__(self):
         if self.paired:
@@ -201,7 +202,8 @@ class ULBBlock(nn.Module):
             # Feature attention sublayer
             self.feat_attn = FeatureAttn(
                 d, feat_expansion=config.feat_expansion,
-                n_heads=config.feat_n_heads)
+                n_heads=config.feat_n_heads,
+                transpose_groups=config.feat_transpose_groups)
             # Pre-norm for feature attention
             self.feat_norm = nn.RMSNorm(d)
             # Content-dependent gate on feature-attention delta
