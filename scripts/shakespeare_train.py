@@ -397,13 +397,24 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
 
 
 def _resolve_c_h_c_w(args):
-    """Derive c_h, c_w from args. If not specified, auto-factor from --dim."""
+    """Derive c_h, c_w from args. If not specified, auto-factor from --dim.
+
+    Targets a 1:3 ratio (c_h:c_w) — fewer heads, more features.
+    c_w must be divisible by 4 for RoPE.
+    """
     c_h, c_w = args.c_h, args.c_w
     if c_h is None and c_w is None:
-        s = int(args.dim ** 0.5)
-        while s > 1 and args.dim % s != 0:
-            s -= 1
-        c_h, c_w = s, args.dim // s
+        dim = args.dim
+        # Target c_h ≈ dim^(1/2) / sqrt(3), c_w ≈ dim^(1/2) * sqrt(3)
+        # i.e. c_h ≈ (dim/3)^0.5, c_w ≈ (dim*3)^0.5
+        target_h = int((dim / 3) ** 0.5)
+        # Find closest factor of dim to target_h where dim//factor is divisible by 4
+        best = 1
+        for s in range(1, int(dim ** 0.5) + 1):
+            if dim % s == 0 and (dim // s) % 4 == 0:
+                if abs(s - target_h) <= abs(best - target_h):
+                    best = s
+        c_h, c_w = best, dim // best
     elif c_h is not None and c_w is None:
         c_w = args.dim // c_h
     elif c_w is not None and c_h is None:

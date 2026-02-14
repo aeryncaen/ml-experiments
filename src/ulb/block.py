@@ -391,8 +391,9 @@ class ULB2DConfig:
     Feat-attention uses non-causal attention over C_h channels at each position.
 
     Args:
-        c_h:     Channel height (number of seq-attn heads).
-        c_w:     Channel width (head_dim for seq-attn). Must be divisible by 4 (RoPE).
+        c_h:     Channel height / feature length (number of seq-attn heads).
+        c_w:     Channel width / number of features (head_dim for seq-attn).
+                 Must be divisible by 4 (RoPE). Target 1:3 ratio (c_h:c_w).
         is_causal: Whether seq-attention is causal.
         rope_base: Base for fixed RoPE inverse frequencies.
         use_blend: Use blend attention (softmax + silu2 lerp) instead of pure softmax.
@@ -400,8 +401,8 @@ class ULB2DConfig:
         use_feat_attn: Whether to include the feat-attn sublayer.
         k_lerp_bias: Initial K temporal mixing gate bias.
     """
-    c_h: int = 8
-    c_w: int = 8
+    c_h: int = 16
+    c_w: int = 48
     is_causal: bool = True
     rope_base: float = 10000.0
     use_blend: bool = True

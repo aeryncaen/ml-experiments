@@ -970,11 +970,15 @@ class GPTULB2D(nn.Module):
         from ulb.transformer import CausalULB2D
         c_h, c_w = HP.c_h, HP.c_w
         if c_h == 0 or c_w == 0:
-            # Auto-factor from d_model
-            s = int(HP.d_model ** 0.5)
-            while s > 1 and HP.d_model % s != 0:
-                s -= 1
-            c_h, c_w = s, HP.d_model // s
+            # Auto-factor from d_model, targeting 1:3 ratio (c_h:c_w)
+            dim = HP.d_model
+            target_h = int((dim / 3) ** 0.5)
+            best = 1
+            for s in range(1, int(dim ** 0.5) + 1):
+                if dim % s == 0 and (dim // s) % 4 == 0:
+                    if abs(s - target_h) <= abs(best - target_h):
+                        best = s
+            c_h, c_w = best, dim // best
         self.inner = CausalULB2D(
             vocab_size=HP.vocab_size,
             c_h=c_h,
