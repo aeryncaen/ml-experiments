@@ -97,7 +97,11 @@ class ULBConfig:
         # Resolve 2D feature-attention channel dims
         if self.feat_attn:
             if self.feat_c_h is None:
-                self.feat_c_h = int(self.d_model ** 0.5)
+                # Find the largest factor of d_model that is <= sqrt(d_model)
+                s = int(self.d_model ** 0.5)
+                while s > 1 and self.d_model % s != 0:
+                    s -= 1
+                self.feat_c_h = s
             if self.feat_c_w is None:
                 self.feat_c_w = self.d_model // self.feat_c_h
             assert self.feat_c_h * self.feat_c_w == self.d_model, (

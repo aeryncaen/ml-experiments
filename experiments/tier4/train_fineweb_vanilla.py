@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -935,6 +935,30 @@ class GPTS6(nn.Module):
         return logits, None
 
 
+class GPTULB(nn.Module):
+    """ULBBlendP wrapper for fineweb training (sigmoid gate, no feat-attn)."""
+    def __init__(self, feat_attn: bool = False):
+        super().__init__()
+        from ulb.transformer import CausalULB
+        self.inner = CausalULB(
+            vocab_size=HP.vocab_size,
+            dim=HP.d_model,
+            n_heads=HP.n_head,
+            n_layers=HP.n_layer,
+            max_seq_len=HP.seq_len,
+            paired=True,
+            attn_mode='blend',
+            feat_attn=feat_attn,
+        )
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        logits = self.inner(idx)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
@@ -948,6 +972,10 @@ def build_model() -> nn.Module:
         return GPTFusedGatedNeighbor()
     if HP.model_type == "s6":
         return GPTS6()
+    if HP.model_type == "ulb":
+        return GPTULB(feat_attn=False)
+    if HP.model_type == "ulb_fa":
+        return GPTULB(feat_attn=True)
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
