@@ -290,21 +290,17 @@ class OuterMHABlock(nn.Module):
 
 
 class StupidAttnBlock(nn.Module):
-    """Element-wise QKV attention with grouped heads.
+    """Pairwise gated value merge with no Q/K/V projections.
 
-    For each pair (i, j), Q[i] * K[j] gives an element-wise gate
-    for V[j]. Features are grouped into n_heads groups — within each
-    group, the element-wise Q*K product is summed to produce a single
-    scalar gate shared across that group's features.
+    For each pair (i, j), compute element-wise product h[i] * h[j],
+    project that product through G to get a sigmoid gate, and use that
+    gate to merge answering values h[j] into querying positions i.
 
-    n_heads=D: fully element-wise (each feature independent).
-    n_heads=1: standard single-scalar attention.
-    n_heads=4 with D=64: 4 groups of 16, each group gets a 16-dim
-    dot product for similarity (rich enough for pattern matching)
-    shared across 16 features.
+    Features are grouped into heads. Each head has its own projection G
+    from head_dim -> 1, producing one gate per pair per head.
     """
 
-    def __init__(self, d_model, n_heads=8, causal=True, blend_gate_bias=-1.1):
+    def __init__(self, d_model, n_heads=4, causal=True):
         super().__init__()
         self.causal = causal
         self.n_heads = n_heads
@@ -312,14 +308,9 @@ class StupidAttnBlock(nn.Module):
         assert d_model % n_heads == 0
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                               groups=d_model, bias=True)
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        # Blend gate: per-head lerp between softmax and silu²
-        self.blend_gate_proj = nn.Linear(d_model, n_heads, bias=True)
-        nn.init.zeros_(self.blend_gate_proj.weight)
-        nn.init.constant_(self.blend_gate_proj.bias, blend_gate_bias)
-        self.silu2_norm = nn.RMSNorm(self.head_dim)
+        # Per-head projection G: head_dim -> 1 (for pairwise gate logits)
+        self.g_proj = nn.Parameter(torch.randn(n_heads, self.head_dim) * (self.head_dim ** -0.5))
+        self.g_bias = nn.Parameter(torch.zeros(n_heads))
 
     def forward(self, x):
         B, T, D = x.shape
@@ -329,45 +320,25 @@ class StupidAttnBlock(nn.Module):
         h = F.pad(x.transpose(1, 2), (2, 0))
         h = self.conv(h).transpose(1, 2)  # (B, T, D)
 
-        q = self.q_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
-        k = self.k_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
-        v = self.v_proj(h).view(B, T, H, hd)  # (B, T, H, hd)
+        h_heads = h.view(B, T, H, hd)  # (B, T, H, hd)
 
-        # Per-group dot product: sum element-wise Q*K within each head
-        # q: (B, T_i, 1, H, hd) * k: (B, 1, T_j, H, hd) -> (B, T_i, T_j, H, hd)
-        # Sum over hd -> (B, T_i, T_j, H) — one scalar per head per pair
-        logits = (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1)  # (B, T_i, T_j, H)
+        # Pairwise element-wise products: (i,j) -> h[i] * h[j]
+        pair = h_heads.unsqueeze(2) * h_heads.unsqueeze(1)  # (B, T_i, T_j, H, hd)
 
-        # Blend gate: per-head, content-dependent lerp
-        gate = torch.sigmoid(self.blend_gate_proj(h))  # (B, T, H)
-        gate = gate.unsqueeze(2)  # (B, T_i, 1, H) — broadcast over T_j
+        # Project pairwise product through G, then sigmoid gate
+        logits = (pair * self.g_proj.view(1, 1, 1, H, hd)).sum(dim=-1)
+        logits = logits + self.g_bias.view(1, 1, 1, H)  # (B, T_i, T_j, H)
+        weights = torch.sigmoid(logits)
 
-        # Causal mask (shared by both branches)
-        causal_mask = None
+        # Causal mask + normalize over answering positions j
         if self.causal:
-            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=x.dtype))
+            weights = weights * mask.unsqueeze(0).unsqueeze(-1)
 
-        # Softmax branch
-        if causal_mask is not None:
-            softmax_logits = logits.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
-        else:
-            softmax_logits = logits
-        w_softmax = torch.softmax(softmax_logits / (hd ** 0.5), dim=2)  # (B, T_i, T_j, H)
+        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
 
-        # SiLU² branch
-        w_silu2 = F.silu(logits) ** 2  # (B, T_i, T_j, H)
-        if causal_mask is not None:
-            w_silu2 = w_silu2.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(-1), 0.0)
-
-        # Weighted sum of V for each branch, then blend
-        # (B, T_i, T_j, H, 1) * (B, 1, T_j, H, hd) -> sum over T_j -> (B, T, H, hd)
-        y_softmax = (w_softmax.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
-        y_silu2 = (w_silu2.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
-        y_silu2 = self.silu2_norm(y_silu2)
-
-        # Blend: gate is (B, T_i, 1, H), need (B, T, H, 1) for broadcasting over hd
-        g = gate.squeeze(2).unsqueeze(-1)  # (B, T, H, 1)
-        out = (1 - g) * y_softmax + g * y_silu2
+        # Merge answering values h[j] into querying position i
+        out = (weights.unsqueeze(-1) * h_heads.unsqueeze(1)).sum(dim=2)  # (B, T, H, hd)
         out = out.reshape(B, T, D)
 
         return out
