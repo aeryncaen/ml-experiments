@@ -44,7 +44,7 @@ class CausalULB(nn.Module):
                  is_causal: bool = True,
                  embed_lerp: bool = False,
                  use_feat_attn: bool = False,
-                 feat_expansion: int | None = None,
+                 feat_expansion: int = 4,
                  feat_n_heads: int = 1):
         super().__init__()
         from .block import ULBBlock, ULBConfig
@@ -58,8 +58,6 @@ class CausalULB(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.embed_lerp: EmbeddingLerp | None = EmbeddingLerp(dim) if embed_lerp else None
 
-        _feat_expansion: int = feat_expansion if feat_expansion is not None else dim
-
         config = ULBConfig(
             d_model=dim,
             n_heads=n_heads,
@@ -69,7 +67,7 @@ class CausalULB(nn.Module):
             k_mix=k_mix,
             is_causal=is_causal,
             use_feat_attn=use_feat_attn,
-            feat_expansion=_feat_expansion,
+            feat_expansion=feat_expansion,
             feat_n_heads=feat_n_heads,
         )
         self.blocks = nn.ModuleList([ULBBlock(config) for _ in range(n_layers)])

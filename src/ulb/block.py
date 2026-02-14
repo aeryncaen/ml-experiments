@@ -82,7 +82,7 @@ class ULBConfig:
 
     # Feature-attention (replaces raw skip-multiply with projected gate + feature attn)
     use_feat_attn: bool = False
-    feat_expansion: int = 64   # channels per feature (matches d_model for full-scale attention)
+    feat_expansion: int = 4    # number of feature groups (rank)
     feat_n_heads: int = 1
 
     def __post_init__(self):
