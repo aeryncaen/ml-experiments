@@ -155,8 +155,6 @@ class CausalULB2D(nn.Module):
     def _init_weights(self, n_layers: int, std: float = 0.02):
         """Uniform init for all 2D tensor params.
 
-        No Megatron-style output reduction — sigmoid gates on every
-        delta handle residual stream scaling adaptively.
         """
         cutoff = 3.0 * std
 
@@ -164,8 +162,7 @@ class CausalULB2D(nn.Module):
             if param.dim() == 4:
                 # 4D tensor projections
                 if any(name.endswith(s) for s in
-                         ('.w_attn_gate', '.w_feat_gate', '.w_k_gate', '.w_dd',
-                          '.w_blend')):
+                         ('.w_k_gate', '.w_dd', '.w_blend')):
                     pass  # keep zero-init
                 else:
                     nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
