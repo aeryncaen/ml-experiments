@@ -556,7 +556,7 @@ class ULB2DBlock(nn.Module):
 
         # --- Up projection (C_w -> E_w) ---
         h = self._proj2d(x, self.w_up)                          # (B, T, C_h, E_w)
-        h = self.up_act(h.reshape(b, t, I)).view(b, t, C_h, E_w)
+        h = self.up_act(h)
 
         # --- QKV (all at E_w) ---
         q = self._proj2d(h, self.w_q)                           # (B, T, C_h, E_w)
@@ -630,7 +630,7 @@ class ULB2DBlock(nn.Module):
         h = h + y * attn_gate
 
         # --- Mid activation (between seq-attn and feat-attn) ---
-        h = self.mid_act(h.reshape(b, t, I)).view(b, t, C_h, E_w)
+        h = self.mid_act(h)
 
         # --- Feat-attn sublayer (optional, at E_w) ---
         if self.use_feat_attn:
