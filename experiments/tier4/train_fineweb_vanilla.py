@@ -54,6 +54,10 @@ class HParams:
     d_model: int = _env_int("D_MODEL", 768)
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
+    # 2D factorization (ulb_2d): 0 = auto-factor from d_model
+    c_h: int = _env_int("C_H", 0)
+    c_w: int = _env_int("C_W", 0)
+
     # Fused gate knobs (0 = use d_model, no expansion)
     fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
 
@@ -964,14 +968,17 @@ class GPTULB2D(nn.Module):
     def __init__(self):
         super().__init__()
         from ulb.transformer import CausalULB2D
-        # Auto-factor d_model into c_h x c_w
-        s = int(HP.d_model ** 0.5)
-        while s > 1 and HP.d_model % s != 0:
-            s -= 1
+        c_h, c_w = HP.c_h, HP.c_w
+        if c_h == 0 or c_w == 0:
+            # Auto-factor from d_model
+            s = int(HP.d_model ** 0.5)
+            while s > 1 and HP.d_model % s != 0:
+                s -= 1
+            c_h, c_w = s, HP.d_model // s
         self.inner = CausalULB2D(
             vocab_size=HP.vocab_size,
-            c_h=s,
-            c_w=HP.d_model // s,
+            c_h=c_h,
+            c_w=c_w,
             n_layers=HP.n_layer,
             max_seq_len=HP.seq_len,
         )
@@ -1040,7 +1047,8 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
-    print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}")
+    _extra = f" c_h={HP.c_h} c_w={HP.c_w}" if HP.c_h > 0 and HP.c_w > 0 else ""
+    print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra}")
 
     train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
