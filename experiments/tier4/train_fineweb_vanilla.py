@@ -75,6 +75,8 @@ class HParams:
     warmup_steps: int = _env_int("WARMUP_STEPS", 200)
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
+    lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
+    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.25)  # fraction of steps for decay phase
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -1018,10 +1020,23 @@ def build_model() -> nn.Module:
 
 
 def lr_for_step(step: int) -> float:
+    # Warmup phase (same for all schedules)
     if step < HP.warmup_steps:
         return HP.lr * (step + 1) / max(1, HP.warmup_steps)
-    t = (step - HP.warmup_steps) / max(1, HP.train_steps - HP.warmup_steps)
-    return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
+
+    if HP.lr_schedule == "wsd":
+        # Warmup-Stable-Decay: hold peak LR, then cosine decay in final fraction
+        decay_steps = int(HP.train_steps * HP.wsd_decay_frac)
+        stable_end = HP.train_steps - decay_steps
+        if step <= stable_end:
+            return HP.lr
+        # Cosine decay from peak to ~0 over the decay phase
+        t = (step - stable_end) / max(1, decay_steps)
+        return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+    else:
+        # Default: cosine decay from warmup end to train_steps
+        t = (step - HP.warmup_steps) / max(1, HP.train_steps - HP.warmup_steps)
+        return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
 
 
 @torch.no_grad()
@@ -1052,7 +1067,10 @@ def main():
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
     _extra = f" c_h={HP.c_h} c_w={HP.c_w}" if HP.c_h > 0 and HP.c_w > 0 else ""
-    print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra}")
+    _sched = f"lr_schedule={HP.lr_schedule}"
+    if HP.lr_schedule == "wsd":
+        _sched += f" decay_frac={HP.wsd_decay_frac}"
+    print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
 
     train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
