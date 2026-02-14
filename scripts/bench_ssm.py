@@ -1534,7 +1534,7 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     if match_params:
         try:
             target_params = _count_stacked_params(
-                lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True)),
+                lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend')),
                 n_layers, dim
             )
             print(f"  Auto-sizing to match ULBBlendP: {target_params:,} params")
@@ -1618,11 +1618,11 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
 
     # FeatAttn: MHA + feature-attention (no MLP)
     try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4)")
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4.0, feat_group_dim=16)")
 
     # FeatAttnFirst: feature-attention before sequence-attention
     try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4, feat_first=True)")
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True)")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):
@@ -1677,8 +1677,8 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             f"FusedGateBlock(d_model={dim}, n_heads=4, paired=True, attn_mode='blend')")
 
     # ULB (Universal Learning Block) ablation family
-    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True)),
-            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True))")
+    try_add('ULBBlendP', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable')),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable'))")
 
     # K-mix ablation
     try_add('ULBBlendPNoK', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', k_mix='none', swish_mode='learnable')),
@@ -1697,6 +1697,10 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     # Paired-head ablation
     try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable')),
             f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable'))")
+
+    # ULB + feature-attention (projected gate + feat-attn sublayer)
+    try_add('ULBFeatAttn', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', use_feat_attn=True)),
+            f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=True, attn_mode='blend', use_feat_attn=True))")
 
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
     if _wanted('LLooM'):
