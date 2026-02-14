@@ -122,13 +122,13 @@ class CausalULB2D(nn.Module):
     def __init__(self, vocab_size: int, c_h: int = 8, c_w: int = 8,
                  n_layers: int = 4, max_seq_len: int = 256,
                  use_blend: bool = True, use_feat_attn: bool = True,
-                 is_causal: bool = True, expand: float = 1.75):
+                 is_causal: bool = True, ffn_expand: float = 8/3):
         super().__init__()
         from .block import ULB2DBlock, ULB2DConfig
         from .norm import RMSNorm
 
         config = ULB2DConfig(
-            c_h=c_h, c_w=c_w, expand=expand,
+            c_h=c_h, c_w=c_w, ffn_expand=ffn_expand,
             is_causal=is_causal, use_blend=use_blend,
             use_feat_attn=use_feat_attn,
         )
