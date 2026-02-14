@@ -85,6 +85,7 @@ class ULBConfig:
     feat_expansion: int = 4    # number of D-dim feature groups (rank)
     feat_n_heads: int = 1
     feat_transpose_groups: bool = False  # transpose reshape axis in FeatureAttn
+    feat_up_factor: int = 1              # up/down projection factor in FeatureAttn
 
     def __post_init__(self):
         if self.paired:
@@ -203,7 +204,8 @@ class ULBBlock(nn.Module):
             self.feat_attn = FeatureAttn(
                 d, feat_expansion=config.feat_expansion,
                 n_heads=config.feat_n_heads,
-                transpose_groups=config.feat_transpose_groups)
+                transpose_groups=config.feat_transpose_groups,
+                up_factor=config.feat_up_factor)
             # Pre-norm for feature attention
             self.feat_norm = nn.RMSNorm(d)
             # Content-dependent gate on feature-attention delta

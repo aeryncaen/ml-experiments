@@ -353,7 +353,8 @@ class FeatAttnBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_heads=4, feat_expansion=4,
-                 feat_n_heads=1, feat_first=False, transpose_groups=False):
+                 feat_n_heads=1, feat_first=False, transpose_groups=False,
+                 up_factor=1):
         super().__init__()
         self.feat_first = feat_first
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
@@ -363,7 +364,8 @@ class FeatAttnBlock(nn.Module):
         from mha import FeatureAttn
         self.feat_attn = FeatureAttn(d_model, feat_expansion=feat_expansion,
                                      n_heads=feat_n_heads,
-                                     transpose_groups=transpose_groups)
+                                     transpose_groups=transpose_groups,
+                                     up_factor=up_factor)
 
     def forward(self, x):
         B, T, D = x.shape
@@ -1676,13 +1678,13 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('StupidAttn', lambda: StupidAttnBlock(d_model=dim),
             f"StupidAttnBlock(d_model={dim})")
 
-    # FeatAttn: MHA + feature-attention (no MLP)
-    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4.0, feat_group_dim=16)")
+    # FeatAttn: MHA + feature-attention with 2x up/down projection (no MLP)
+    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4, up_factor=2),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4, up_factor=2)")
 
     # FeatAttnFirst: feature-attention before sequence-attention
-    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True)")
+    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True, up_factor=2),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True, up_factor=2)")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):

@@ -98,18 +98,21 @@ class FeatureAttn(nn.Module):
     """
 
     def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1,
-                 transpose_groups: bool = False):
+                 transpose_groups: bool = False, up_factor: int = 1):
         super().__init__()
         self.dim = dim
+        self.up_factor = up_factor
+        self.inner_dim = dim * up_factor
         self.n_groups = feat_expansion
-        self.group_dim = dim // feat_expansion
         self.transpose_groups = transpose_groups
 
-        assert dim % feat_expansion == 0, (
-            f"dim ({dim}) must be divisible by n_groups ({feat_expansion})")
+        assert self.inner_dim % feat_expansion == 0, (
+            f"inner_dim ({self.inner_dim}) must be divisible by n_groups ({feat_expansion})")
 
-        # When transposed: seq_len for attn = D/G, vec_dim = G
-        # When normal:     seq_len for attn = G,   vec_dim = D/G
+        self.group_dim = self.inner_dim // feat_expansion
+
+        # When transposed: seq_len for attn = inner/G, vec_dim = G
+        # When normal:     seq_len for attn = G,       vec_dim = inner/G
         if transpose_groups:
             self.n_pos = self.group_dim   # number of "positions" in attn
             self.pos_dim = self.n_groups  # dim of each position's vector
@@ -122,14 +125,19 @@ class FeatureAttn(nn.Module):
             f"pos_dim ({self.pos_dim}) must be divisible by n_heads ({n_heads})")
         self.head_dim = self.pos_dim // n_heads
 
+        # Up/down projections (identity when up_factor=1)
+        if up_factor > 1:
+            self.w_up = nn.Linear(dim, self.inner_dim, bias=False)
+            self.w_down = nn.Linear(self.inner_dim, dim, bias=False)
+        else:
+            self.w_up = None
+            self.w_down = None
+
         # Feature-attention QKV: pos_dim -> 3*pos_dim (per position)
         self.qkv_proj = nn.Linear(self.pos_dim, 3 * self.pos_dim, bias=False)
 
         # Output projection: pos_dim -> pos_dim (per position)
         self.o_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
-
-        # Learned projection + SiLU for gate input (per position)
-        self.gate_input_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
 
         # Block-diagonal gate: one (pos_dim, pos_dim) gate per position.
         self.gate_proj = nn.Parameter(
@@ -137,8 +145,8 @@ class FeatureAttn(nn.Module):
             * (self.pos_dim ** -0.5)
         )
 
-        # Norm over full D before gated combine
-        self.feat_norm = nn.RMSNorm(dim)
+        # Norm over inner_dim before gated combine
+        self.feat_norm = nn.RMSNorm(self.inner_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -151,14 +159,17 @@ class FeatureAttn(nn.Module):
         N = x.reshape(-1, self.dim).shape[0]
         x_flat = x.reshape(N, self.dim)
 
-        # Partition: (N, D) -> (N, G, D/G) then optionally transpose to (N, D/G, G)
-        h = x_flat.view(N, self.n_groups, self.group_dim)
-        if self.transpose_groups:
-            h = h.transpose(1, 2).contiguous()                         # (N, D/G, G)
-        # h is now (N, n_pos, pos_dim)
+        # Up-project with SiLU if up_factor > 1, else just use x
+        if self.w_up is not None:
+            h_inner = F.silu(self.w_up(x_flat))                        # (N, inner_dim)
+        else:
+            h_inner = x_flat                                           # (N, D)
 
-        # Activated gate input
-        h_act = F.silu(self.gate_input_proj(h))                        # (N, P, pd)
+        # Partition: (N, inner) -> (N, G, inner/G) then optionally transpose
+        h = h_inner.view(N, self.n_groups, self.group_dim)
+        if self.transpose_groups:
+            h = h.transpose(1, 2).contiguous()                         # (N, inner/G, G)
+        # h is now (N, n_pos, pos_dim)
 
         # Feature-attention QKV (pos_dim -> 3*pos_dim, per position)
         qkv = self.qkv_proj(h)                                        # (N, P, 3*pd)
@@ -176,17 +187,21 @@ class FeatureAttn(nn.Module):
         y = y.transpose(1, 2).contiguous().view(N, self.n_pos, self.pos_dim)
         y = self.o_proj(y)                                             # (N, P, pd)
 
-        # Gate (on activated content)
-        y = y.reshape(N, self.n_pos * self.pos_dim)                    # (N, D)
+        # Gate (on SiLU-activated content from up-projection)
+        y = y.reshape(N, self.inner_dim)                               # (N, inner)
         gate = torch.sigmoid(
-            torch.einsum('npd,pde->npe', h_act, self.gate_proj)
-        ).reshape(N, self.n_pos * self.pos_dim)                        # (N, D)
+            torch.einsum('npd,pde->npe', h, self.gate_proj)
+        ).reshape(N, self.inner_dim)                                   # (N, inner)
         y = self.feat_norm(y) * gate
 
-        # Transpose back if needed, flatten
-        if self.transpose_groups:
+        # Down-project if needed
+        if self.w_down is not None:
+            y = self.w_down(y)                                         # (N, D)
+
+        # Transpose back if needed
+        if self.transpose_groups and self.w_down is None:
             y = y.view(N, self.n_pos, self.pos_dim)
-            y = y.transpose(1, 2).contiguous()                         # (N, G, D/G)
+            y = y.transpose(1, 2).contiguous()
             y = y.reshape(N, self.dim)
 
         return y.view(*orig_shape, self.dim)
@@ -323,7 +338,7 @@ class FeatureAttnBlock(nn.Module):
 
     def __init__(self, dim: int, n_heads: int, feat_expansion: int = 4,
                  feat_n_heads: int = 1, feat_first: bool = False,
-                 transpose_groups: bool = False):
+                 transpose_groups: bool = False, up_factor: int = 1):
         super().__init__()
         self.feat_first = feat_first
 
@@ -338,7 +353,8 @@ class FeatureAttnBlock(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.ffn = FeatureAttn(dim, feat_expansion=feat_expansion,
                                n_heads=feat_n_heads,
-                               transpose_groups=transpose_groups)
+                               transpose_groups=transpose_groups,
+                               up_factor=up_factor)
         # Content-dependent gate on feature-attention delta
         self.feat_gate_proj = nn.Linear(dim, dim, bias=False)
 
@@ -391,7 +407,8 @@ class FeatureAttnTransformer(nn.Module):
     def __init__(self, vocab_size: int, dim: int = 128, n_heads: int = 4,
                  n_layers: int = 4, max_seq_len: int = 256,
                  feat_expansion: int = 4, feat_n_heads: int = 1,
-                 feat_first: bool = False, transpose_groups: bool = False):
+                 feat_first: bool = False, transpose_groups: bool = False,
+                 up_factor: int = 1):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -401,7 +418,7 @@ class FeatureAttnTransformer(nn.Module):
 
         self.blocks = nn.ModuleList([
             FeatureAttnBlock(dim, n_heads, feat_expansion, feat_n_heads, feat_first,
-                             transpose_groups=transpose_groups)
+                             transpose_groups=transpose_groups, up_factor=up_factor)
             for _ in range(n_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)
