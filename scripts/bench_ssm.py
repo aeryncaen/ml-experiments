@@ -304,7 +304,7 @@ class StupidAttnBlock(nn.Module):
     shared across 16 features.
     """
 
-    def __init__(self, d_model, n_heads=4, causal=True, blend_gate_bias=-1.1):
+    def __init__(self, d_model, n_heads=8, causal=True, blend_gate_bias=-1.1):
         super().__init__()
         self.causal = causal
         self.n_heads = n_heads
