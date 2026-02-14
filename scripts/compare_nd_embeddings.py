@@ -286,10 +286,11 @@ class Model(nn.Module):
         return self.head(self.final_norm(h))
 
 
-def train(model, n_epochs, task='mqar', B=64, L=64, lr=3e-4, device='cpu', label='',
-          vocab_size=8192, num_kv_pairs=4):
+def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', label='',
+          vocab_size=8192, num_kv_pairs=4, num_train_examples=100_000):
     model = model.to(device)
-    opt = optim.Adam(model.parameters(), lr=lr)
+    opt = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=0.0)
 
     train_losses = []
     val_accs = []
@@ -300,30 +301,34 @@ def train(model, n_epochs, task='mqar', B=64, L=64, lr=3e-4, device='cpu', label
     snapshot_epochs = sorted(set([0, n_epochs // 4, n_epochs // 2,
                                    3 * n_epochs // 4, n_epochs - 1]))
 
-    # Pre-generate val data
+    # Pre-generate datasets (matching Zoology: fixed dataset, iterate in batches)
+    print(f'  [{label}] Generating {num_train_examples} train + 3000 val examples...', flush=True)
     if task == 'mqar':
-        val_x, val_t = gen_mqar(512, L, vocab_size=vocab_size,
+        train_x, train_t = gen_mqar(num_train_examples, L, vocab_size=vocab_size,
+                                    num_kv_pairs=num_kv_pairs, seed=42)
+        val_x, val_t = gen_mqar(3000, L, vocab_size=vocab_size,
                                 num_kv_pairs=num_kv_pairs, seed=9999)
-        val_x, val_t = val_x.to(device), val_t.to(device)
-        ignore_index = -100
     else:
-        val_x, val_t = gen_mod_arith(512, L, device=device)
-        ignore_index = -100  # not used for mod_arith but keep consistent
+        train_x, train_t = gen_mod_arith(num_train_examples, L)
+        val_x, val_t = gen_mod_arith(3000, L)
+
+    val_x, val_t = val_x.to(device), val_t.to(device)
+    n_batches = num_train_examples // B
 
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
         model.train()
         epoch_loss = 0
-        n_batches = 20
+        n_seen = 0
+
+        # Shuffle training data each epoch
+        perm = torch.randperm(num_train_examples)
+        train_x_shuf = train_x[perm]
+        train_t_shuf = train_t[perm]
 
         for batch_i in range(n_batches):
-            if task == 'mqar':
-                x, t = gen_mqar(B, L, vocab_size=vocab_size,
-                                num_kv_pairs=num_kv_pairs,
-                                seed=epoch * n_batches + batch_i)
-                x, t = x.to(device), t.to(device)
-            else:
-                x, t = gen_mod_arith(B, L, device=device)
+            x = train_x_shuf[batch_i * B : (batch_i + 1) * B].to(device)
+            t = train_t_shuf[batch_i * B : (batch_i + 1) * B].to(device)
 
             logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
@@ -331,8 +336,8 @@ def train(model, n_epochs, task='mqar', B=64, L=64, lr=3e-4, device='cpu', label
             opt.zero_grad()
             loss.backward()
 
-            # Snapshot
-            if epoch in snapshot_epochs:
+            # Snapshot (first batch of snapshot epochs only)
+            if epoch in snapshot_epochs and batch_i == 0:
                 if epoch not in grad_snapshots:
                     grad_snapshots[epoch] = {}
                     weight_snapshots[epoch] = {}
@@ -344,20 +349,25 @@ def train(model, n_epochs, task='mqar', B=64, L=64, lr=3e-4, device='cpu', label
 
             opt.step()
             epoch_loss += loss.item()
+            n_seen += 1
 
-        train_losses.append(epoch_loss / n_batches)
+        scheduler.step()
+        train_losses.append(epoch_loss / max(n_seen, 1))
 
-        # Eval
+        # Eval (batch val to avoid OOM)
         model.eval()
         with torch.no_grad():
-            logits = model(val_x)
+            all_preds = []
+            val_bs = min(512, len(val_x))
+            for vi in range(0, len(val_x), val_bs):
+                vx = val_x[vi:vi+val_bs]
+                vlogits = model(vx)
+                all_preds.append(vlogits.argmax(-1))
+            preds = torch.cat(all_preds, dim=0)
             if task == 'mqar':
-                # Accuracy only on query positions (where label != -100)
                 mask = val_t != -100
-                preds = logits.argmax(-1)
                 val_acc = (preds[mask] == val_t[mask]).float().mean().item()
             else:
-                preds = logits.argmax(-1)
                 val_acc = (preds == val_t).float().mean().item()
             val_accs.append(val_acc)
 
@@ -391,10 +401,13 @@ def main():
                         help='Model dim (must be factorable into 2/3/4-way)')
     parser.add_argument('--task', type=str, default='mqar', choices=['mqar', 'mod_arith'],
                         help='Task: mqar (associative recall) or mod_arith')
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=64)
     parser.add_argument('--seq-len', type=int, default=64, help='Sequence length')
     parser.add_argument('--num-kv-pairs', type=int, default=4,
                         help='Number of key-value pairs (mqar only)')
+    parser.add_argument('--num-train-examples', type=int, default=100_000,
+                        help='Number of training examples (pre-generated)')
+    parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--n-layers', type=int, default=2)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--save', type=str, default=None)
@@ -449,9 +462,10 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
-        results[label] = train(model, args.epochs, task=args.task, L=args.seq_len,
-                               lr=args.lr, device=args.device, label=label,
-                               vocab_size=vocab_size, num_kv_pairs=args.num_kv_pairs)
+        results[label] = train(model, args.epochs, task=args.task, B=args.batch_size,
+                               L=args.seq_len, lr=args.lr, device=args.device, label=label,
+                               vocab_size=vocab_size, num_kv_pairs=args.num_kv_pairs,
+                               num_train_examples=args.num_train_examples)
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
