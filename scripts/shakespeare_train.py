@@ -391,6 +391,8 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         feat_attn=True,
+        feat_c_h=args.c_h,
+        feat_c_w=args.c_w,
     )
 
 
@@ -402,6 +404,8 @@ def build_ulb_2d(vocab_size: int, args) -> nn.Module:
         dim=args.dim,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
+        c_h=args.c_h,
+        c_w=args.c_w,
         is_causal=not args.no_causal,
     )
 
@@ -650,6 +654,8 @@ def build_llada_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         feat_attn=True,
+        feat_c_h=args.c_h,
+        feat_c_w=args.c_w,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
                       time_conditioning=args.time_cond,
@@ -664,6 +670,8 @@ def build_llada_ulb_2d(vocab_size: int, args) -> nn.Module:
         dim=args.dim,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len + args.gen_len,
+        c_h=args.c_h,
+        c_w=args.c_w,
         is_causal=not args.no_causal,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
@@ -2041,6 +2049,12 @@ def main():
                         help='Heads within feature-attention')
     parser.add_argument('--feat-first', action='store_true', default=False,
                         help='Run feature-attention before sequence-attention (feat-attn arch)')
+
+    # 2D factorization (ulb-2d, ulb-feat)
+    parser.add_argument('--c-h', type=int, default=None,
+                        help='Channel height for 2D factorization (default: auto from dim)')
+    parser.add_argument('--c-w', type=int, default=None,
+                        help='Channel width for 2D factorization (default: dim // c_h)')
 
     # LLooM-specific
     parser.add_argument('--lloom-seq-pool-size', type=int, default=4,
