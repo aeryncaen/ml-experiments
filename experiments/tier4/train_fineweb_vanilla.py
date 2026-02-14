@@ -965,6 +965,27 @@ class GPTULB(nn.Module):
         return logits, loss
 
 
+class GPTULB1D(nn.Module):
+    """Clean 1D ULB with silu² feat-attn MLP (for ablating 2D vs 1D)."""
+    def __init__(self):
+        super().__init__()
+        from ulb.transformer import CausalULB1D
+        self.inner = CausalULB1D(
+            vocab_size=HP.vocab_size,
+            d_model=HP.d_model,
+            n_heads=HP.n_head,
+            n_layers=HP.n_layer,
+            max_seq_len=HP.seq_len,
+        )
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        logits = self.inner(idx)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTULB2D(nn.Module):
     """True 2D ULB wrapper for fineweb training."""
     def __init__(self):
@@ -1013,7 +1034,7 @@ def build_model() -> nn.Module:
     if HP.model_type == "ulb":
         return GPTULB(feat_attn=False)
     if HP.model_type == "ulb_fa":
-        return GPTULB(feat_attn=True)
+        return GPTULB1D()
     if HP.model_type == "ulb_2d":
         return GPTULB2D()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")

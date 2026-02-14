@@ -101,6 +101,65 @@ class CausalULB(nn.Module):
         return self.head(self.final_norm(x))
 
 
+class CausalULB1D(nn.Module):
+    """Causal language model using clean 1D ULB blocks.
+
+    Same structure as CausalULB2D but with nn.Linear instead of 2D
+    tensor projections. For ablating 2D vs 1D.
+
+    Args:
+        vocab_size: Token vocabulary size.
+        d_model: Model dimension.
+        n_heads: Number of attention heads.
+        n_layers: Number of blocks.
+        max_seq_len: Maximum sequence length.
+        use_blend: Use blend attention (default True).
+        ffn_expand: Feat-attn MLP expansion ratio (default 8/3).
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 768, n_heads: int = 12,
+                 n_layers: int = 12, max_seq_len: int = 2048,
+                 use_blend: bool = True, ffn_expand: float = 8/3):
+        super().__init__()
+        from .block import ULB1DBlock, ULB1DConfig
+        from .norm import RMSNorm
+
+        config = ULB1DConfig(
+            d_model=d_model, n_heads=n_heads, ffn_expand=ffn_expand,
+            is_causal=True, use_blend=use_blend,
+        )
+        self.d_model = d_model
+
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.ModuleList([ULB1DBlock(config) for _ in range(n_layers)])
+        self.norms = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
+        self.final_norm = RMSNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        # Simple init — no megatron
+        self._init_weights(std=0.02)
+
+    def _init_weights(self, std: float = 0.02):
+        cutoff = 2.0 * std
+        for name, param in self.named_parameters():
+            if param.dim() >= 2 and 'embed' not in name and 'head' not in name:
+                if 'blend_gate_proj' in name:
+                    pass  # already initialized in block __init__
+                else:
+                    nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
+            elif 'embed' in name:
+                nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        x = self.token_embed(token_ids)
+        for norm, block in zip(self.norms, self.blocks):
+            x = x + block(norm(x))
+        return self.head(self.final_norm(x))
+
+
 class CausalULB2D(nn.Module):
     """Causal language model using true 2D ULB blocks.
 
