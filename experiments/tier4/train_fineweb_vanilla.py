@@ -964,9 +964,14 @@ class GPTULB2D(nn.Module):
     def __init__(self):
         super().__init__()
         from ulb.transformer import CausalULB2D
+        # Auto-factor d_model into c_h x c_w
+        s = int(HP.d_model ** 0.5)
+        while s > 1 and HP.d_model % s != 0:
+            s -= 1
         self.inner = CausalULB2D(
             vocab_size=HP.vocab_size,
-            dim=HP.d_model,
+            c_h=s,
+            c_w=HP.d_model // s,
             n_layers=HP.n_layer,
             max_seq_len=HP.seq_len,
         )

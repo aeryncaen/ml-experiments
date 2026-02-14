@@ -104,41 +104,40 @@ class CausalULB(nn.Module):
 class CausalULB2D(nn.Module):
     """Causal language model using true 2D ULB blocks.
 
-    Tokens are embedded as flat (B, T, D), reshaped to (B, T, C_h, C_w)
-    for processing through ULB2DBlocks, then flattened back for the LM head.
+    Tokens are embedded as flat (B, T, D) where D = c_h * c_w, reshaped to
+    (B, T, C_h, C_w) for processing through ULB2DBlocks, then flattened back
+    for the LM head.
 
     Args:
         vocab_size: Token vocabulary size.
-        dim: Model dimension (C_h * C_w).
+        c_h: Channel height (number of seq-attn heads).
+        c_w: Channel width (head_dim). Must be divisible by 4 (RoPE).
         n_layers: Number of ULB2D blocks.
         max_seq_len: Maximum sequence length.
-        c_h: Channel height. Default: auto-factored from dim.
-        c_w: Channel width. Default: dim // c_h.
         use_blend: Use blend attention (default True).
         use_feat_attn: Include feat-attn sublayer (default True).
         is_causal: Causal masking for seq-attn (default True).
     """
 
-    def __init__(self, vocab_size: int, dim: int = 64, n_layers: int = 4,
-                 max_seq_len: int = 256,
-                 c_h: int | None = None, c_w: int | None = None,
+    def __init__(self, vocab_size: int, c_h: int = 8, c_w: int = 8,
+                 n_layers: int = 4, max_seq_len: int = 256,
                  use_blend: bool = True, use_feat_attn: bool = True,
                  is_causal: bool = True):
         super().__init__()
         from .block import ULB2DBlock, ULB2DConfig
         from .norm import RMSNorm
 
-        self.vocab_size = vocab_size
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-
         config = ULB2DConfig(
-            d_model=dim, c_h=c_h, c_w=c_w,
+            c_h=c_h, c_w=c_w,
             is_causal=is_causal, use_blend=use_blend,
             use_feat_attn=use_feat_attn,
         )
-        self.c_h = config.c_h
-        self.c_w = config.c_w
+        dim = config.d_model
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.c_h = c_h
+        self.c_w = c_w
 
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([ULB2DBlock(config) for _ in range(n_layers)])

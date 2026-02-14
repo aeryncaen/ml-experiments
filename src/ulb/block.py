@@ -391,8 +391,7 @@ class ULB2DConfig:
     Feat-attention uses non-causal attention over C_h channels at each position.
 
     Args:
-        d_model: Total model dimension (C_h * C_w). Used for embedding/LM head.
-        c_h:     Channel height (number of seq-attn heads). Default: auto-factor.
+        c_h:     Channel height (number of seq-attn heads).
         c_w:     Channel width (head_dim for seq-attn). Must be divisible by 4 (RoPE).
         is_causal: Whether seq-attention is causal.
         rope_base: Base for fixed RoPE inverse frequencies.
@@ -401,9 +400,8 @@ class ULB2DConfig:
         use_feat_attn: Whether to include the feat-attn sublayer.
         k_lerp_bias: Initial K temporal mixing gate bias.
     """
-    d_model: int = 64
-    c_h: int | None = None
-    c_w: int | None = None
+    c_h: int = 8
+    c_w: int = 8
     is_causal: bool = True
     rope_base: float = 10000.0
     use_blend: bool = True
@@ -412,17 +410,12 @@ class ULB2DConfig:
     k_lerp_bias: float = -2.0
 
     def __post_init__(self):
-        if self.c_h is None:
-            s = int(self.d_model ** 0.5)
-            while s > 1 and self.d_model % s != 0:
-                s -= 1
-            self.c_h = s
-        if self.c_w is None:
-            self.c_w = self.d_model // self.c_h
-        assert self.c_h * self.c_w == self.d_model, (
-            f"c_h * c_w ({self.c_h} * {self.c_w}) != d_model ({self.d_model})")
         assert self.c_w % 4 == 0, (
             f"c_w ({self.c_w}) must be divisible by 4 for RoPE")
+
+    @property
+    def d_model(self) -> int:
+        return self.c_h * self.c_w
 
 
 class ULB2DBlock(nn.Module):

@@ -396,16 +396,31 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
     )
 
 
+def _resolve_c_h_c_w(args):
+    """Derive c_h, c_w from args. If not specified, auto-factor from --dim."""
+    c_h, c_w = args.c_h, args.c_w
+    if c_h is None and c_w is None:
+        s = int(args.dim ** 0.5)
+        while s > 1 and args.dim % s != 0:
+            s -= 1
+        c_h, c_w = s, args.dim // s
+    elif c_h is not None and c_w is None:
+        c_w = args.dim // c_h
+    elif c_w is not None and c_h is None:
+        c_h = args.dim // c_w
+    return c_h, c_w
+
+
 def build_ulb_2d(vocab_size: int, args) -> nn.Module:
     """Build a CausalULB2D — true end-to-end 2D token processing."""
     from ulb.transformer import CausalULB2D
+    c_h, c_w = _resolve_c_h_c_w(args)
     return CausalULB2D(
         vocab_size=vocab_size,
-        dim=args.dim,
+        c_h=c_h,
+        c_w=c_w,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
-        c_h=args.c_h,
-        c_w=args.c_w,
         is_causal=not args.no_causal,
     )
 
@@ -665,13 +680,13 @@ def build_llada_ulb_feat(vocab_size: int, args) -> nn.Module:
 def build_llada_ulb_2d(vocab_size: int, args) -> nn.Module:
     """Build LLaDA with CausalULB2D backbone (true end-to-end 2D)."""
     from ulb.transformer import CausalULB2D, LLaDAModel
+    c_h, c_w = _resolve_c_h_c_w(args)
     backbone = CausalULB2D(
         vocab_size=vocab_size,
-        dim=args.dim,
+        c_h=c_h,
+        c_w=c_w,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len + args.gen_len,
-        c_h=args.c_h,
-        c_w=args.c_w,
         is_causal=not args.no_causal,
     )
     return LLaDAModel(backbone, vocab_size, args.dim,
