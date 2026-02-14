@@ -139,16 +139,30 @@ class CausalULB2D(nn.Module):
         self.c_h = c_h
         self.c_w = c_w
 
+        self.n_layers = n_layers
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([ULB2DBlock(config) for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
         self.final_norm = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
 
+        # Gated embed residual: content-dependent gate that mixes embedding
+        # back into the stream between blocks. One gate per layer (except first).
+        # Operates at residual width (C_w), not expanded width.
+        if n_layers > 1:
+            self.embed_gates = nn.ModuleList([
+                nn.ParameterDict({
+                    'w': nn.Parameter(torch.zeros(c_h, c_w, c_h, c_w)),
+                    'bias': nn.Parameter(torch.zeros(c_h, c_w)),
+                }) for _ in range(n_layers - 1)
+            ])
+        else:
+            self.embed_gates = None
+
         # Weight tying
         self.head.weight = self.token_embed.weight
 
-        # Init (Megatron-style for 4D params)
+        # Init
         self._init_weights(n_layers)
 
     def _init_weights(self, n_layers: int, std: float = 0.02):
@@ -181,11 +195,19 @@ class CausalULB2D(nn.Module):
         B, T = token_ids.shape
         C_h, C_w = self.c_h, self.c_w
 
-        x = self.token_embed(token_ids)  # (B, T, D)
+        embed = self.token_embed(token_ids)  # (B, T, D)
+        x = embed
 
-        for norm, block in zip(self.norms, self.blocks):
+        for i, (norm, block) in enumerate(zip(self.norms, self.blocks)):
             x_normed = norm(x).view(B, T, C_h, C_w)
-            x = x + block(x_normed).reshape(B, T, -1)
+            x = block(x_normed).reshape(B, T, -1)
+            # Gated embed residual (after first layer)
+            if self.embed_gates is not None and i < len(self.embed_gates):
+                eg = self.embed_gates[i]
+                gate = torch.sigmoid(torch.einsum(
+                    '...cd,cdef->...ef', x.view(B, T, C_h, C_w), eg['w']
+                ) + eg['bias'])
+                x = x + gate.reshape(B, T, -1) * embed
 
         return self.head(self.final_norm(x))
 
