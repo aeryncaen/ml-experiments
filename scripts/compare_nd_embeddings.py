@@ -391,7 +391,61 @@ def main():
         results[label]['shape'] = shape
         print_leaderboard()
 
-    print("FINAL RESULTS:")
+    # --- Final comparison ---
+    print("\n" + "=" * 80)
+    print("LOSS COMPARISON (every 10 epochs)")
+    print("=" * 80)
+    header = f"{'Epoch':>6}"
+    for label in shapes:
+        header += f"  {label + ' loss':>10}  {label + ' acc':>10}"
+    print(header)
+    print("-" * 80)
+    for ep in range(0, args.epochs, max(1, args.epochs // 10)):
+        row = f"{ep:>6}"
+        for label in shapes:
+            row += f"  {results[label]['train_losses'][ep]:>10.4f}  {results[label]['val_accs'][ep]:>10.3f}"
+        print(row)
+    # Always print last epoch
+    ep = args.epochs - 1
+    row = f"{ep:>6}"
+    for label in shapes:
+        row += f"  {results[label]['train_losses'][ep]:>10.4f}  {results[label]['val_accs'][ep]:>10.3f}"
+    print(row)
+
+    print("\n" + "=" * 80)
+    print("GRADIENT SVD ANALYSIS (effective rank = fraction of SVs > 10% of max)")
+    print("=" * 80)
+    for label in shapes:
+        snap = results[label]['grad_snapshots']
+        print(f"\n  {label} ({' x '.join(map(str, shapes[label]))}):")
+        for epoch in sorted(snap.keys()):
+            for name, g in snap[epoch].items():
+                S = svd_spectrum(g)
+                eff_rank = (S > 0.1).sum().item()
+                total = len(S)
+                top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
+                short = name.split('.')[-1]
+                print(f"    epoch {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+
+    print("\n" + "=" * 80)
+    print("WEIGHT SVD ANALYSIS (trained)")
+    print("=" * 80)
+    for label in shapes:
+        snap = results[label]['weight_snapshots']
+        final_epoch = results[label]['snapshot_epochs'][-1]
+        print(f"\n  {label} ({' x '.join(map(str, shapes[label]))}):")
+        if final_epoch in snap:
+            for name, w in snap[final_epoch].items():
+                S = svd_spectrum(w)
+                eff_rank = (S > 0.1).sum().item()
+                total = len(S)
+                top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
+                short = name.split('.')[-1]
+                print(f"    {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+
+    print("\n" + "=" * 80)
+    print("FINAL LEADERBOARD")
+    print("=" * 80)
     print_leaderboard()
 
     # --- Plot ---
