@@ -297,8 +297,10 @@ class FeatAttnBlock(nn.Module):
     and projects back down.  This is dynamic content-dependent feature mixing.
     """
 
-    def __init__(self, d_model, n_heads=4, feat_expansion=4,
+    def __init__(self, d_model, n_heads=4, feat_expansion=None,
                  feat_n_heads=1, feat_first=False):
+        if feat_expansion is None:
+            feat_expansion = d_model
         super().__init__()
         self.feat_first = feat_first
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
@@ -1618,11 +1620,11 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
 
     # FeatAttn: MHA + feature-attention (no MLP)
     try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4)")
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion={dim})")
 
     # FeatAttnFirst: feature-attention before sequence-attention
     try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4, feat_first=True)")
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion={dim}, feat_first=True)")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):

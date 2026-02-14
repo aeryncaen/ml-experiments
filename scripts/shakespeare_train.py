@@ -301,7 +301,7 @@ def build_feat_attn(vocab_size: int, args) -> nn.Module:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_seq_len=args.seq_len,
-        feat_expansion=getattr(args, 'feat_expansion', 4),
+        feat_expansion=getattr(args, 'feat_expansion', args.dim),
         feat_n_heads=getattr(args, 'feat_n_heads', 1),
         feat_first=getattr(args, 'feat_first', False),
     )
@@ -391,7 +391,7 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
         use_feat_attn=True,
-        feat_expansion=getattr(args, 'feat_expansion', 4),
+        feat_expansion=getattr(args, 'feat_expansion', args.dim),
         feat_n_heads=getattr(args, 'feat_n_heads', 1),
     )
 
