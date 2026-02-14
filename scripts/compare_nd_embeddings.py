@@ -342,7 +342,7 @@ def train(model, n_epochs, B=64, L=32, lr=3e-4, device='cpu', label=''):
             val_acc = (preds == val_t).float().mean().item()
             val_accs.append(val_acc)
 
-        pbar.set_postfix(loss=f'{train_losses[-1]:.4f}', acc=f'{val_acc:.3f}')
+        pbar.set_postfix(train_loss=f'{train_losses[-1]:.4f}', val_acc=f'{val_acc:.3f}')
 
     return {
         'train_losses': train_losses,
@@ -415,8 +415,17 @@ def main():
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
 
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"{'Model':<8} {'Params':>12} {'Final Loss':>12} {'Final Val Acc':>14}")
+    print(f"{'-'*60}")
+    for label in shapes:
+        r = results[label]
+        print(f"{label:<8} {r['n_params']:>12,} {r['train_losses'][-1]:>12.4f} {r['val_accs'][-1]:>14.3f}")
+    print(f"{'='*60}\n")
+
     # --- Plot ---
-    print("\nPlotting...")
+    print("Plotting...")
     fig = plt.figure(figsize=(18, 12))
     gs = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.3)
 
