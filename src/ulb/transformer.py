@@ -150,28 +150,15 @@ class CausalULB2D(nn.Module):
         # Init
         self._init_weights(n_layers)
 
-    def _init_weights(self, n_layers: int, std: float = 0.02,
-                      cutoff_factor: float = 2.0):
-        """Init for all 2D tensor params (matches MHA megatron_init_).
-
-        - All projections: trunc_normal(std, cutoff=2*std)
-        - Output projections (w_o, feat_w_down): trunc_normal(std / sqrt(2*n_layers))
-        - Blend gate: zero-init
-        """
-        import math
-        out_std = std / math.sqrt(2.0 * n_layers)
-        cutoff = cutoff_factor * std
-        out_cutoff = cutoff_factor * out_std
+    def _init_weights(self, n_layers: int, std: float = 0.02):
+        """Init for all 2D tensor params."""
+        cutoff = 2.0 * std
 
         for name, param in self.named_parameters():
             if param.dim() == 4:
                 if any(name.endswith(s) for s in
                          ('.w_blend',)):
                     pass  # keep zero-init
-                elif any(name.endswith(s) for s in
-                         ('.w_o', '.feat_w_down')):
-                    nn.init.trunc_normal_(param, std=out_std,
-                                         a=-out_cutoff, b=out_cutoff)
                 else:
                     nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
             elif param.dim() == 2 and 'embed' in name:
