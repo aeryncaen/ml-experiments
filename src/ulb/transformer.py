@@ -43,9 +43,9 @@ class CausalULB(nn.Module):
                  k_mix: str = 'lerp',
                  is_causal: bool = True,
                  embed_lerp: bool = False,
-                 use_feat_attn: bool = False,
-                 feat_expansion: int = 4,
-                 feat_n_heads: int = 1):
+                 feat_attn: bool = False,
+                 feat_c_h: int | None = None,
+                 feat_c_w: int | None = None):
         super().__init__()
         from .block import ULBBlock, ULBConfig
         from .lerp import EmbeddingLerp
@@ -66,9 +66,9 @@ class CausalULB(nn.Module):
             inner_ratio=inner_ratio,
             k_mix=k_mix,
             is_causal=is_causal,
-            use_feat_attn=use_feat_attn,
-            feat_expansion=feat_expansion,
-            feat_n_heads=feat_n_heads,
+            feat_attn=feat_attn,
+            feat_c_h=feat_c_h,
+            feat_c_w=feat_c_w,
         )
         self.blocks = nn.ModuleList([ULBBlock(config) for _ in range(n_layers)])
         self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])

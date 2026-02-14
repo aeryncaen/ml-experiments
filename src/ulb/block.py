@@ -80,12 +80,10 @@ class ULBConfig:
     swish_mode: Literal['learnable', 'silu'] = 'learnable'
     inner_ratio: float = 1.75  # inner_dim = round(d_model * inner_ratio), snapped to n_heads*4
 
-    # Feature-attention (replaces raw skip-multiply with projected gate + feature attn)
-    use_feat_attn: bool = False
-    feat_expansion: int = 4    # number of D-dim feature groups (rank)
-    feat_n_heads: int = 1
-    feat_transpose_groups: bool = False  # transpose reshape axis in FeatureAttn
-    feat_up_factor: int = 1              # up/down projection factor in FeatureAttn
+    # 2D feature-attention (replaces MLP with attention over features)
+    feat_attn: bool = False
+    feat_c_h: int | None = None  # channel height; default sqrt(d_model)
+    feat_c_w: int | None = None  # channel width; default d_model // feat_c_h
 
     def __post_init__(self):
         if self.paired:
@@ -96,6 +94,15 @@ class ULBConfig:
         self._inner_dim = round(self.d_model * self.inner_ratio / snap) * snap
         assert self._inner_dim > 0, (
             f"inner_dim resolved to 0 (d_model={self.d_model}, inner_ratio={self.inner_ratio})")
+        # Resolve 2D feature-attention channel dims
+        if self.feat_attn:
+            if self.feat_c_h is None:
+                self.feat_c_h = int(self.d_model ** 0.5)
+            if self.feat_c_w is None:
+                self.feat_c_w = self.d_model // self.feat_c_h
+            assert self.feat_c_h * self.feat_c_w == self.d_model, (
+                f"feat_c_h * feat_c_w ({self.feat_c_h} * {self.feat_c_w}) "
+                f"!= d_model ({self.d_model})")
 
     @property
     def inner_dim(self) -> int:
@@ -194,22 +201,27 @@ class ULBBlock(nn.Module):
             self.blend_attn = BlendAttention(
                 d, n_heads, head_dim, init_bias=config.blend_gate_bias)
 
-        # --- Feature-attention (optional) ---
-        self.use_feat_attn = config.use_feat_attn
-        if config.use_feat_attn:
-            from mha import FeatureAttn
-            # Projected gate replaces raw h_up in skip-multiply
-            self.gate_proj = nn.Linear(d, d, bias=False)
-            # Feature attention sublayer
-            self.feat_attn = FeatureAttn(
-                d, feat_expansion=config.feat_expansion,
-                n_heads=config.feat_n_heads,
-                transpose_groups=config.feat_transpose_groups,
-                up_factor=config.feat_up_factor)
-            # Pre-norm for feature attention
+        # --- Sigmoid gate for attention delta (replaces skip-multiply) ---
+        self.attn_gate_proj = nn.Linear(d, d, bias=True)
+        nn.init.zeros_(self.attn_gate_proj.weight)
+        nn.init.zeros_(self.attn_gate_proj.bias)
+
+        # --- 2D Feature-attention (optional) ---
+        self.use_feat_attn = config.feat_attn
+        if config.feat_attn:
+            C_h, C_w = config.feat_c_h, config.feat_c_w
+            self.feat_c_h = C_h
+            self.feat_c_w = C_w
+            init_scale = (C_h * C_w) ** -0.5
+            self.feat_wq = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
+            self.feat_wk = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
+            self.feat_wv = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
+            self.feat_wo = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
             self.feat_norm = nn.RMSNorm(d)
-            # Content-dependent gate on feature-attention delta
-            self.feat_gate_proj = nn.Linear(d, d, bias=False)
+            self.feat_out_norm = nn.RMSNorm(d)
+            self.feat_gate_proj = nn.Linear(d, d, bias=True)
+            nn.init.zeros_(self.feat_gate_proj.weight)
+            nn.init.zeros_(self.feat_gate_proj.bias)
 
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 blend_gate: torch.Tensor | None = None) -> torch.Tensor:
@@ -229,34 +241,32 @@ class ULBBlock(nn.Module):
         else:
             return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-    def preprocess_qk(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor
-                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def preprocess_qk(self, k: torch.Tensor, h_up: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Apply temporal lerps, compute dd_angles and blend gate.
 
         Args:
-            q: (B, T, H, head_dim) — after QK norm + bias.
             k: (B, T, H, head_dim) — after QK norm + bias.
-            x: (B, T, D) — original pre-normed input (used by lerps and gates).
+            h_up: (B, T, D) — up-projected hidden state (content signal).
 
         Returns:
-            q: Preprocessed Q (B, T, H, head_dim).
             k: Preprocessed K (B, T, H, head_dim).
             dd_angles: Data-dependent rotation angles for RoPE.
             blend_gate: (B, H, T, 1) or None.
         """
         if self.k_lerp is not None:
-            k = self.k_lerp(k, x)
+            k = self.k_lerp(k, h_up)
         elif self.k_conv is not None:
             k = self.k_conv(k)
 
-        dd_angles = self.rope.compute_dd_angles(x)
+        dd_angles = self.rope.compute_dd_angles(h_up)
 
         blend_gate = None
         if self.config.attn_mode == 'blend':
             assert self.blend_attn is not None
-            blend_gate = self.blend_attn.compute_gate(x)
+            blend_gate = self.blend_attn.compute_gate(h_up)
 
-        return q, k, dd_angles, blend_gate
+        return k, dd_angles, blend_gate
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                dd_angles: torch.Tensor, blend_gate: torch.Tensor | None
@@ -330,7 +340,7 @@ class ULBBlock(nn.Module):
         k = self.k_norm(k) * self.k_bias
 
         # --- Preprocessing (lerps, RoPE angles, blend gate) ---
-        q, k, dd_angles, blend_gate = self.preprocess_qk(q, k, x)
+        k, dd_angles, blend_gate = self.preprocess_qk(k, h_up)
 
         # --- Attention ---
         y = self.attend(q, k, v, dd_angles, blend_gate)
@@ -339,21 +349,29 @@ class ULBBlock(nn.Module):
         # --- Output projection (inner_dim → d_model) ---
         y = self.o_proj(y)
 
-        # --- Skip-multiply ---
-        if self.use_feat_attn:
-            # Projected gate (not raw content gating itself)
-            gate = torch.sigmoid(self.gate_proj(h_up))
-            y = self.attn_norm(y) * gate
+        # --- Gated attention delta accumulation (replaces skip-multiply) ---
+        h_up = h_up + self.attn_norm(y) * torch.sigmoid(self.attn_gate_proj(h_up))
 
-            # Feature-attention with pre-norm residual + sigmoid gate
-            feat_delta = self.feat_attn(self.feat_norm(y))
-            feat_gate = torch.sigmoid(self.feat_gate_proj(y))
-            y = y + feat_delta * feat_gate
-        else:
-            y = self.attn_norm(y) * h_up
+        # --- 2D Feature-attention (optional) ---
+        if self.use_feat_attn:
+            C_h, C_w = self.feat_c_h, self.feat_c_w
+            feat_in = self.feat_norm(h_up).view(b, t, C_h, C_w)
+            fQ = torch.einsum('...cd,cdef->...ef', feat_in, self.feat_wq)
+            fK = torch.einsum('...cd,cdef->...ef', feat_in, self.feat_wk)
+            fV = torch.einsum('...cd,cdef->...ef', feat_in, self.feat_wv)
+            # Non-causal attention over C_h channels, each C_w dim
+            fQ = fQ.reshape(b * t, 1, C_h, C_w)
+            fK = fK.reshape(b * t, 1, C_h, C_w)
+            fV = fV.reshape(b * t, 1, C_h, C_w)
+            feat_out = F.scaled_dot_product_attention(fQ, fK, fV, is_causal=False)
+            feat_out = feat_out.view(b, t, C_h, C_w)
+            feat_delta = torch.einsum('...cd,cdef->...ef', feat_out, self.feat_wo)
+            feat_delta = feat_delta.reshape(b, t, d)
+            h_up = h_up + self.feat_out_norm(feat_delta) * torch.sigmoid(
+                self.feat_gate_proj(h_up))
 
         # --- Down projection ---
-        y = self.down_proj(self.down_act(y))
+        y = self.down_proj(self.down_act(h_up))
 
         return y
 
@@ -755,9 +773,14 @@ def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
     cutoff = cutoff_factor * std
     out_cutoff = cutoff_factor * out_std
 
+    # Gate projections use zero-init from __init__; skip them in Megatron init
+    _skip_linear = ('.attn_gate_proj', '.feat_gate_proj')
+
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            if name.endswith('.down_proj') or name.endswith('.o_proj') or name.endswith('.w_down'):
+            if any(name.endswith(s) for s in _skip_linear):
+                pass  # keep zero-init
+            elif name.endswith('.down_proj') or name.endswith('.o_proj') or name.endswith('.w_down'):
                 nn.init.trunc_normal_(module.weight, std=out_std,
                                       a=-out_cutoff, b=out_cutoff)
             elif name.endswith('.head'):
@@ -766,7 +789,17 @@ def ulb_megatron_init_(model: nn.Module, n_layers: int, std: float = 0.02,
                 nn.init.trunc_normal_(module.weight, std=std,
                                       a=-cutoff, b=cutoff)
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                if not any(name.endswith(s) for s in _skip_linear):
+                    nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.trunc_normal_(module.weight, std=std,
+                                  a=-cutoff, b=cutoff)
+
+    # 4D feature-attention tensor params
+    for name, param in model.named_parameters():
+        if name.endswith('.feat_wo'):
+            nn.init.trunc_normal_(param, std=out_std,
+                                  a=-out_cutoff, b=out_cutoff)
+        elif name.endswith(('.feat_wq', '.feat_wk', '.feat_wv')):
+            nn.init.trunc_normal_(param, std=std,
                                   a=-cutoff, b=cutoff)

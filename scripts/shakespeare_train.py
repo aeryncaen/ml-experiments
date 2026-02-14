@@ -378,7 +378,7 @@ def build_ulb(vocab_size: int, args) -> nn.Module:
 
 
 def build_ulb_feat(vocab_size: int, args) -> nn.Module:
-    """Build a CausalULB with feature-attention (projected gate + feat-attn sublayer)."""
+    """Build a CausalULB with 2D feature-attention."""
     from ulb.transformer import CausalULB
     return CausalULB(
         vocab_size=vocab_size,
@@ -390,9 +390,7 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
         k_mix=args.k_mix,
         is_causal=not args.no_causal,
         embed_lerp=args.embed_lerp,
-        use_feat_attn=True,
-        feat_expansion=getattr(args, 'feat_expansion', 4),
-        feat_n_heads=getattr(args, 'feat_n_heads', 1),
+        feat_attn=True,
     )
 
 
