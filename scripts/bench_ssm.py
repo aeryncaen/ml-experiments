@@ -326,8 +326,9 @@ class StupidAttnBlock(nn.Module):
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
 
-        # SiLU gate over source positions: D independent gates
-        weights = F.silu(logits)  # (B, T_i, T_j, D)
+        # SiLU² then normalize over source positions
+        weights = F.silu(logits) ** 2  # (B, T_i, T_j, D)
+        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
 
         # Weighted sum of V[j] into position i
         out = (weights * v.unsqueeze(1)).sum(dim=2)  # (B, T, D)
