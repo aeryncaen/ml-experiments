@@ -101,52 +101,56 @@ class FeatureAttn(nn.Module):
                  transpose_groups: bool = False, up_factor: int = 1):
         super().__init__()
         self.dim = dim
-        self.up_factor = up_factor
-        self.inner_dim = dim * up_factor
         self.n_groups = feat_expansion
+        self.group_dim = dim // feat_expansion
         self.transpose_groups = transpose_groups
+        self.up_factor = up_factor
 
-        assert self.inner_dim % feat_expansion == 0, (
-            f"inner_dim ({self.inner_dim}) must be divisible by n_groups ({feat_expansion})")
+        assert dim % feat_expansion == 0, (
+            f"dim ({dim}) must be divisible by n_groups ({feat_expansion})")
 
-        self.group_dim = self.inner_dim // feat_expansion
+        # Per-group channel expansion: group_dim -> group_dim * up_factor
+        self.wide_dim = self.group_dim * up_factor
 
-        # When transposed: seq_len for attn = inner/G, vec_dim = G
-        # When normal:     seq_len for attn = G,       vec_dim = inner/G
+        # After grouping + optional transpose, determine attn layout
         if transpose_groups:
-            self.n_pos = self.group_dim   # number of "positions" in attn
-            self.pos_dim = self.n_groups  # dim of each position's vector
+            self.n_pos = self.group_dim
+            self.pos_dim = self.n_groups
+            # Channel expansion on the pos_dim axis (G -> G * up_factor)
+            self.wide_pos_dim = self.n_groups * up_factor
         else:
             self.n_pos = self.n_groups
             self.pos_dim = self.group_dim
+            # Channel expansion on the pos_dim axis (group_dim -> group_dim * up_factor)
+            self.wide_pos_dim = self.group_dim * up_factor
 
         self.n_heads = n_heads
-        assert self.pos_dim % n_heads == 0, (
-            f"pos_dim ({self.pos_dim}) must be divisible by n_heads ({n_heads})")
-        self.head_dim = self.pos_dim // n_heads
+        assert self.wide_pos_dim % n_heads == 0, (
+            f"wide_pos_dim ({self.wide_pos_dim}) must be divisible by n_heads ({n_heads})")
+        self.head_dim = self.wide_pos_dim // n_heads
 
-        # Up/down projections (identity when up_factor=1)
+        # Per-group channel up/down (applied per position, shared across positions)
         if up_factor > 1:
-            self.w_up = nn.Linear(dim, self.inner_dim, bias=False)
-            self.w_down = nn.Linear(self.inner_dim, dim, bias=False)
+            self.chan_up = nn.Linear(self.pos_dim, self.wide_pos_dim, bias=False)
+            self.chan_down = nn.Linear(self.wide_pos_dim, self.pos_dim, bias=False)
         else:
-            self.w_up = None
-            self.w_down = None
+            self.chan_up = None
+            self.chan_down = None
 
-        # Feature-attention QKV: pos_dim -> 3*pos_dim (per position)
-        self.qkv_proj = nn.Linear(self.pos_dim, 3 * self.pos_dim, bias=False)
+        # Feature-attention QKV at wide dim
+        self.qkv_proj = nn.Linear(self.wide_pos_dim, 3 * self.wide_pos_dim, bias=False)
 
-        # Output projection: pos_dim -> pos_dim (per position)
-        self.o_proj = nn.Linear(self.pos_dim, self.pos_dim, bias=False)
+        # Output projection at wide dim
+        self.o_proj = nn.Linear(self.wide_pos_dim, self.wide_pos_dim, bias=False)
 
-        # Block-diagonal gate: one (pos_dim, pos_dim) gate per position.
+        # Block-diagonal gate at wide dim
         self.gate_proj = nn.Parameter(
-            torch.randn(self.n_pos, self.pos_dim, self.pos_dim)
-            * (self.pos_dim ** -0.5)
+            torch.randn(self.n_pos, self.wide_pos_dim, self.wide_pos_dim)
+            * (self.wide_pos_dim ** -0.5)
         )
 
-        # Norm over inner_dim before gated combine
-        self.feat_norm = nn.RMSNorm(self.inner_dim)
+        # Norm over full wide dim * n_pos before gated combine
+        self.feat_norm = nn.RMSNorm(self.n_pos * self.wide_pos_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -159,21 +163,20 @@ class FeatureAttn(nn.Module):
         N = x.reshape(-1, self.dim).shape[0]
         x_flat = x.reshape(N, self.dim)
 
-        # Up-project with SiLU if up_factor > 1, else just use x
-        if self.w_up is not None:
-            h_inner = F.silu(self.w_up(x_flat))                        # (N, inner_dim)
-        else:
-            h_inner = x_flat                                           # (N, D)
-
-        # Partition: (N, inner) -> (N, G, inner/G) then optionally transpose
-        h = h_inner.view(N, self.n_groups, self.group_dim)
+        # Partition: (N, D) -> (N, G, group_dim) then optionally transpose
+        h = x_flat.view(N, self.n_groups, self.group_dim)
         if self.transpose_groups:
-            h = h.transpose(1, 2).contiguous()                         # (N, inner/G, G)
+            h = h.transpose(1, 2).contiguous()
         # h is now (N, n_pos, pos_dim)
 
-        # Feature-attention QKV (pos_dim -> 3*pos_dim, per position)
-        qkv = self.qkv_proj(h)                                        # (N, P, 3*pd)
-        q, k, v = qkv.split(self.pos_dim, dim=-1)                     # each (N, P, pd)
+        # Per-group channel expansion with SiLU
+        if self.chan_up is not None:
+            h = F.silu(self.chan_up(h))                                 # (N, P, wide_pd)
+        # h is now (N, n_pos, wide_pos_dim)
+
+        # Feature-attention QKV
+        qkv = self.qkv_proj(h)                                        # (N, P, 3*wpd)
+        q, k, v = qkv.split(self.wide_pos_dim, dim=-1)
 
         # Reshape for multi-head: (N, n_heads, P, head_dim)
         q = q.view(N, self.n_pos, self.n_heads, self.head_dim).transpose(1, 2)
@@ -181,28 +184,28 @@ class FeatureAttn(nn.Module):
         v = v.view(N, self.n_pos, self.n_heads, self.head_dim).transpose(1, 2)
 
         # Attend over positions (non-causal)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)   # (N, H, P, hd)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
         # Concat heads and output projection
-        y = y.transpose(1, 2).contiguous().view(N, self.n_pos, self.pos_dim)
-        y = self.o_proj(y)                                             # (N, P, pd)
+        y = y.transpose(1, 2).contiguous().view(N, self.n_pos, self.wide_pos_dim)
+        y = self.o_proj(y)                                             # (N, P, wpd)
 
-        # Gate (on SiLU-activated content from up-projection)
-        y = y.reshape(N, self.inner_dim)                               # (N, inner)
+        # Gate (on activated content)
+        y = y.reshape(N, self.n_pos * self.wide_pos_dim)
         gate = torch.sigmoid(
             torch.einsum('npd,pde->npe', h, self.gate_proj)
-        ).reshape(N, self.inner_dim)                                   # (N, inner)
+        ).reshape(N, self.n_pos * self.wide_pos_dim)
         y = self.feat_norm(y) * gate
 
-        # Down-project if needed
-        if self.w_down is not None:
-            y = self.w_down(y)                                         # (N, D)
+        # Per-group channel collapse
+        y = y.view(N, self.n_pos, self.wide_pos_dim)
+        if self.chan_down is not None:
+            y = self.chan_down(y)                                       # (N, P, pos_dim)
 
-        # Transpose back if needed
-        if self.transpose_groups and self.w_down is None:
-            y = y.view(N, self.n_pos, self.pos_dim)
+        # Transpose back if needed, flatten
+        if self.transpose_groups:
             y = y.transpose(1, 2).contiguous()
-            y = y.reshape(N, self.dim)
+        y = y.reshape(N, self.dim)
 
         return y.view(*orig_shape, self.dim)
 
