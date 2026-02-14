@@ -407,7 +407,6 @@ class ULB2DConfig:
     is_causal: bool = True
     use_blend: bool = True
     blend_gate_bias: float = -1.1
-    k_lerp_bias: float = -2.0
 
     def __post_init__(self):
         assert self.c_w % 4 == 0, (
@@ -475,14 +474,11 @@ class ULB2DBlock(nn.Module):
         self.q_post_bias = nn.Parameter(torch.ones(C_w))
         self.k_post_bias = nn.Parameter(torch.ones(C_w))
 
-        # --- Sequence temporal lerp (all dims of x) ---
-        self.w_seq_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-        self.seq_gate_bias = nn.Parameter(torch.full((C_h, C_w), config.k_lerp_bias))
-
-        # --- Data-dependent RoPE (applied to x before QKV) ---
-        self.dd_pairs = C_w // 2  # half of dims get rotated
-        self.w_dd = nn.Parameter(torch.zeros(C_h, C_w, C_h, self.dd_pairs))
-        self.dd_bias = nn.Parameter(torch.zeros(C_h, self.dd_pairs))
+        # --- Standard RoPE ---
+        self.rope_pairs = C_w // 2
+        inv_freq = 1.0 / (10000.0 ** (
+            torch.arange(0, C_w, 2).float() / C_w))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         # --- Blend attention (optional) ---
         self.use_blend = config.use_blend
@@ -523,31 +519,23 @@ class ULB2DBlock(nn.Module):
         D = cfg.d_model
         b, t = x.shape[:2]
 
-        # --- Sequence temporal lerp (all dims, on x before QKV) ---
-        if t >= 2:
-            gate = torch.sigmoid(
-                self._proj2d(x, self.w_seq_gate, self.seq_gate_bias))  # (B, T, C_h, C_w)
-            x_prev = F.pad(x[:, :-1], (0, 0, 0, 0, 1, 0))
-            x = (1 - gate) * x + gate * x_prev
-
-        # --- Data-dependent RoPE (applied to x before QKV) ---
-        from .rope import apply_rotary
-        dp = self.dd_pairs
-        dd_deltas = self._proj2d(x, self.w_dd, self.dd_bias)    # (B, T, C_h, dp)
-        dd_angles = dd_deltas.cumsum(dim=1)
-
-        x_rot = torch.cat([x[..., :dp], x[..., dp:]], dim=-1)
-        x_rot = apply_rotary(x_rot, dd_angles.cos(), dd_angles.sin())
-        x = torch.cat([x_rot[..., :dp], x_rot[..., dp:]], dim=-1)
-
-        # --- QKV (all at C_w, from position-encoded x) ---
+        # --- QKV ---
         q = self._proj2d(x, self.w_q)                           # (B, T, C_h, C_w)
         k = self._proj2d(x, self.w_k, self.k_bias_param)
         v = self._proj2d(x, self.w_v, self.v_bias_param)
 
-        # QK norm + post-norm bias (per-head RMSNorm over C_w)
+        # QK norm + post-norm bias
         q = self.q_norm(q) * self.q_post_bias
         k = self.k_norm(k) * self.k_post_bias
+
+        # --- Standard RoPE on Q and K ---
+        from .rope import apply_rotary
+        pos = torch.arange(t, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(pos, self.inv_freq)                  # (T, C_w//2)
+        cos_f = freqs.cos()[None, :, None, :]                    # (1, T, 1, C_w//2)
+        sin_f = freqs.sin()[None, :, None, :]
+        q = apply_rotary(q, cos_f, sin_f)
+        k = apply_rotary(k, cos_f, sin_f)
 
         # --- Seq-attention (C_h heads, C_w head_dim) ---
         q_s = q.permute(0, 2, 1, 3)
