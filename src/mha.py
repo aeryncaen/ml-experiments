@@ -72,56 +72,50 @@ class SwiGLU(nn.Module):
 
 
 class FeatureAttn(nn.Module):
-    """Feature-attention: replaces SwiGLU with attention over feature groups.
+    """Feature-attention: attention over feature groups within each token.
 
-    Expands each token from rank 1 (a single D-dim vector) to rank X
-    (X independent D-dim vectors), runs non-causal self-attention over
-    those X groups, then collapses back to rank 1.
-
-    Each feature group is a full D-dimensional representation. The expansion
-    factor is the number of groups (the rank), NOT a dimension multiplier.
-    This is what MLPs try to do (feature mixing) but with dynamic,
-    content-dependent attention instead of fixed learned weights.
+    Partitions D into G groups of (D/G) dims each.  Runs non-causal
+    self-attention over the G groups, applies a content-dependent sigmoid
+    gate, and reshapes back to D.  No learned up/down projections — the
+    grouping is a simple reshape.
 
     Args:
-        dim: Model dimension. Each feature group is D-dimensional.
-        feat_expansion: Number of feature groups (rank). Token goes from
-            (1, D) to (X, D) where X = feat_expansion.
+        dim: Model dimension.
+        feat_expansion: Number of feature groups G.  D is partitioned into
+            G groups of (D // G) features each.  (Named feat_expansion for
+            backward compat; there is no expansion.)
         n_heads: Number of attention heads within feature-attention.
-            Splits D into n_heads * head_dim.
+            Splits group_dim into n_heads * head_dim.
     """
 
     def __init__(self, dim: int, feat_expansion: int = 4, n_heads: int = 1):
         super().__init__()
         self.dim = dim
         self.n_groups = feat_expansion
-        self.feat_dim = dim * feat_expansion
+        self.group_dim = dim // feat_expansion
+
+        assert dim % feat_expansion == 0, (
+            f"dim ({dim}) must be divisible by n_groups ({feat_expansion})")
+        assert self.group_dim % n_heads == 0, (
+            f"group_dim ({self.group_dim}) must be divisible by n_heads ({n_heads})")
+
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.head_dim = self.group_dim // n_heads
 
-        assert dim % n_heads == 0, (
-            f"dim ({dim}) must be divisible by n_heads ({n_heads})")
+        # Feature-attention QKV: group_dim -> 3*group_dim (per group)
+        self.qkv_proj = nn.Linear(self.group_dim, 3 * self.group_dim, bias=False)
 
-        # up_proj: D -> X*D (expand rank 1 to rank X)
-        self.w_up = nn.Linear(dim, self.feat_dim, bias=False)
+        # Output projection: group_dim -> group_dim (per group)
+        self.o_proj = nn.Linear(self.group_dim, self.group_dim, bias=False)
 
-        # Feature-attention QKV: D -> 3*D (applied per group, same scale as seq-attn)
-        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
-
-        # Output projection: D -> D (mixes across heads, per group)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-
-        # Block-diagonal gate projection: one D->D gate per group.
-        # Equivalent to a (X*D, X*D) matrix with only X diagonal DxD blocks.
+        # Block-diagonal gate: one (group_dim, group_dim) gate per group.
         self.gate_proj = nn.Parameter(
-            torch.randn(self.n_groups, dim, dim) * (dim ** -0.5)
+            torch.randn(self.n_groups, self.group_dim, self.group_dim)
+            * (self.group_dim ** -0.5)
         )
 
-        # Norm before gated combine
-        self.feat_norm = nn.RMSNorm(self.feat_dim)
-
-        # down_proj: X*D -> D (collapse back to rank 1)
-        self.w_down = nn.Linear(self.feat_dim, dim, bias=False)
+        # Norm over full D before gated combine
+        self.feat_norm = nn.RMSNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -134,35 +128,33 @@ class FeatureAttn(nn.Module):
         N = x.reshape(-1, self.dim).shape[0]
         x_flat = x.reshape(N, self.dim)
 
-        # Expand from rank 1 to rank X: (N, D) -> (N, X*D) -> (N, X, D)
-        h_up = F.silu(self.w_up(x_flat))                      # (N, X*D)
-        h = h_up.view(N, self.n_groups, self.dim)              # (N, X, D)
+        # Partition into groups: (N, D) -> (N, G, group_dim)
+        h = x_flat.view(N, self.n_groups, self.group_dim)
 
-        # Feature-attention QKV (D -> 3D per group, same scale as seq-attn)
-        qkv = self.qkv_proj(h)                                 # (N, X, 3*D)
-        q, k, v = qkv.split(self.dim, dim=-1)                  # each (N, X, D)
+        # Feature-attention QKV (group_dim -> 3*group_dim, per group)
+        qkv = self.qkv_proj(h)                                        # (N, G, 3*gd)
+        q, k, v = qkv.split(self.group_dim, dim=-1)                   # each (N, G, gd)
 
-        # Reshape for multi-head: (N, n_heads, X, head_dim)
+        # Reshape for multi-head: (N, n_heads, G, head_dim)
         q = q.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(N, self.n_groups, self.n_heads, self.head_dim).transpose(1, 2)
 
         # Attend over feature groups (non-causal)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)  # (N, H, X, hd)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)   # (N, H, G, hd)
 
         # Concat heads and output projection
-        y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.dim)
-        y = self.o_proj(y)                                     # (N, X, D)
+        y = y.transpose(1, 2).contiguous().view(N, self.n_groups, self.group_dim)
+        y = self.o_proj(y)                                             # (N, G, gd)
 
-        # Flatten back, projected gate, project down
-        y = y.reshape(N, self.feat_dim)                         # (N, X*D)
+        # Flatten, gate, norm
+        y = y.reshape(N, self.dim)                                     # (N, D)
         gate = torch.sigmoid(
-            torch.einsum('nxd,xde->nxe', h, self.gate_proj)
-        ).reshape(N, self.feat_dim)                                # (N, X*D)
-        y = self.feat_norm(y) * gate                            # sigmoid-gated
-        out = self.w_down(y)                                    # (N, D)
+            torch.einsum('ngd,gde->nge', h, self.gate_proj)
+        ).reshape(N, self.dim)                                         # (N, D)
+        y = self.feat_norm(y) * gate
 
-        return out.view(*orig_shape, self.dim)
+        return y.view(*orig_shape, self.dim)
 
 
 def _precompute_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> torch.Tensor:
