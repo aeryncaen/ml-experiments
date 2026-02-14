@@ -384,16 +384,17 @@ class ULBBlock(nn.Module):
 class ULB2DConfig:
     """Configuration for ULB2DBlock — true end-to-end 2D token processing.
 
-    Tokens live as (B, T, C_h, C_w) throughout. All projections are
-    (C_h, C_w, C_h, C_w) tensors applied via einsum('...cd,cdef->...ef', x, w).
-
-    Seq-attention uses C_h channels as heads, C_w as head_dim.
-    Feat-attention uses non-causal attention over C_h channels at each position.
+    Tokens live as (B, T, C_h, C_w) in the residual stream. Inside the block,
+    w_up expands to (C_h, E_w) where E_w = round(C_w * expand / 4) * 4. All
+    internal ops (seq-attn, feat-attn, gates, RoPE, k-lerp) work at the
+    expanded width. w_down compresses back to (C_h, C_w).
 
     Args:
-        c_h:     Channel height / feature length (number of seq-attn heads).
-        c_w:     Channel width / number of features (head_dim for seq-attn).
+        c_h:     Channel height (number of seq-attn heads).
+        c_w:     Channel width (residual stream feature dim per head).
                  Must be divisible by 4 (RoPE). Target 1:3 ratio (c_h:c_w).
+        expand:  Internal expansion ratio (default 1.75). E_w = C_w * expand,
+                 snapped to multiple of 4 for RoPE.
         is_causal: Whether seq-attention is causal.
         rope_base: Base for fixed RoPE inverse frequencies.
         use_blend: Use blend attention (softmax + silu2 lerp) instead of pure softmax.
@@ -403,6 +404,7 @@ class ULB2DConfig:
     """
     c_h: int = 16
     c_w: int = 48
+    expand: float = 1.75
     is_causal: bool = True
     rope_base: float = 10000.0
     use_blend: bool = True
@@ -413,10 +415,24 @@ class ULB2DConfig:
     def __post_init__(self):
         assert self.c_w % 4 == 0, (
             f"c_w ({self.c_w}) must be divisible by 4 for RoPE")
+        # Snap expanded width to multiple of 4 for RoPE
+        self._e_w = round(self.c_w * self.expand / 4) * 4
+        assert self._e_w > 0, (
+            f"e_w resolved to 0 (c_w={self.c_w}, expand={self.expand})")
 
     @property
     def d_model(self) -> int:
         return self.c_h * self.c_w
+
+    @property
+    def e_w(self) -> int:
+        """Expanded internal width."""
+        return self._e_w
+
+    @property
+    def inner_dim(self) -> int:
+        """Internal working dimension = C_h * E_w."""
+        return self.c_h * self._e_w
 
 
 class ULB2DBlock(nn.Module):
@@ -445,73 +461,76 @@ class ULB2DBlock(nn.Module):
             config = ULB2DConfig(**kwargs)
         self.config = config
         C_h = config.c_h
-        C_w = config.c_w
-        D = config.d_model
-        init_scale = (C_h * C_w) ** -0.5
+        C_w = config.c_w     # residual width
+        E_w = config.e_w     # expanded internal width
+        D = config.d_model    # C_h * C_w
+        I = config.inner_dim  # C_h * E_w
+        init_scale_in = (C_h * C_w) ** -0.5   # for projections from residual
+        init_scale = (C_h * E_w) ** -0.5       # for internal projections
 
-        # --- 2D Up/Down projections ---
-        self.w_up = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_down = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.up_act = LearnableSwish(D)
+        # --- 2D Up/Down projections (expand / compress) ---
+        self.w_up = nn.Parameter(torch.randn(C_h, C_w, C_h, E_w) * init_scale_in)
+        self.w_down = nn.Parameter(torch.randn(C_h, E_w, C_h, C_w) * init_scale)
+        self.up_act = LearnableSwish(I)
 
-        # --- 2D QKV + output projections ---
-        self.w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-        self.w_o = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
+        # --- 2D QKV + output projections (all at expanded width) ---
+        self.w_q = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+        self.w_k = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+        self.w_v = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+        self.w_o = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
 
-        # KV bias (as in ULBBlock — K and V have bias, Q does not)
-        self.k_bias_param = nn.Parameter(torch.zeros(C_h, C_w))
-        self.v_bias_param = nn.Parameter(torch.zeros(C_h, C_w))
+        # KV bias (at expanded width)
+        self.k_bias_param = nn.Parameter(torch.zeros(C_h, E_w))
+        self.v_bias_param = nn.Parameter(torch.zeros(C_h, E_w))
 
-        # --- QK norm + post-norm bias ---
-        self.q_norm = nn.RMSNorm(C_w)
-        self.k_norm = nn.RMSNorm(C_w)
-        self.q_post_bias = nn.Parameter(torch.ones(C_w))
-        self.k_post_bias = nn.Parameter(torch.ones(C_w))
+        # --- QK norm + post-norm bias (at expanded width) ---
+        self.q_norm = nn.RMSNorm(E_w)
+        self.k_norm = nn.RMSNorm(E_w)
+        self.q_post_bias = nn.Parameter(torch.ones(E_w))
+        self.k_post_bias = nn.Parameter(torch.ones(E_w))
 
-        # --- K temporal lerp (last quarter of C_w) ---
-        quarter = C_w // 4
+        # --- K temporal lerp (last quarter of E_w) ---
+        quarter = E_w // 4
         self.quarter = quarter
-        # Gate projection: 2D proj from (C_h, C_w) → (C_h, quarter)
-        self.w_k_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, quarter))
+        # Gate projection: from (C_h, E_w) → (C_h, quarter)
+        self.w_k_gate = nn.Parameter(torch.zeros(C_h, E_w, C_h, quarter))
         self.k_gate_bias = nn.Parameter(torch.full((C_h, quarter), config.k_lerp_bias))
 
-        # --- Hybrid RoPE ---
-        self.fixed_pairs = C_w // 4
-        self.dd_pairs = C_w // 4
+        # --- Hybrid RoPE (at expanded width) ---
+        self.fixed_pairs = E_w // 4
+        self.dd_pairs = E_w // 4
         inv_freq = 1.0 / (config.rope_base ** (
-            torch.arange(0, self.fixed_pairs * 2, 2).float() / C_w))
+            torch.arange(0, self.fixed_pairs * 2, 2).float() / E_w))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
-        # DD angle projection: 2D proj from (C_h, C_w) → (C_h, dd_pairs)
-        self.w_dd = nn.Parameter(torch.zeros(C_h, C_w, C_h, self.dd_pairs))
+        # DD angle projection: from (C_h, E_w) → (C_h, dd_pairs)
+        self.w_dd = nn.Parameter(torch.zeros(C_h, E_w, C_h, self.dd_pairs))
         self.dd_bias = nn.Parameter(torch.zeros(C_h, self.dd_pairs))
 
-        # --- Blend attention (optional) ---
+        # --- Blend attention (optional, at expanded width) ---
         self.use_blend = config.use_blend
         if config.use_blend:
-            # Gate: 2D proj from (C_h, C_w) → (C_h, 1)
-            self.w_blend = nn.Parameter(torch.zeros(C_h, C_w, C_h, 1))
+            # Gate: from (C_h, E_w) → (C_h, 1)
+            self.w_blend = nn.Parameter(torch.zeros(C_h, E_w, C_h, 1))
             self.blend_bias = nn.Parameter(torch.full((C_h, 1), config.blend_gate_bias))
-            self.silu2_norm = nn.RMSNorm(C_w)
+            self.silu2_norm = nn.RMSNorm(E_w)
 
-        # --- Post-attention sigmoid gate (no pre-gate norm) ---
-        self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-        self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
+        # --- Post-attention sigmoid gate (at expanded width) ---
+        self.w_attn_gate = nn.Parameter(torch.zeros(C_h, E_w, C_h, E_w))
+        self.attn_gate_bias = nn.Parameter(torch.ones(C_h, E_w))
 
         # --- Mid activation (between seq-attn and feat-attn) ---
-        self.mid_act = LearnableSwish(D)
+        self.mid_act = LearnableSwish(I)
 
-        # --- Feat-attn sublayer (optional) ---
+        # --- Feat-attn sublayer (optional, at expanded width) ---
         self.use_feat_attn = config.use_feat_attn
         if config.use_feat_attn:
-            self.feat_w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_o = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_norm = nn.RMSNorm(D)
-            self.w_feat_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-            self.feat_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
+            self.feat_w_q = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+            self.feat_w_k = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+            self.feat_w_v = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+            self.feat_w_o = nn.Parameter(torch.randn(C_h, E_w, C_h, E_w) * init_scale)
+            self.feat_norm = nn.RMSNorm(I)
+            self.w_feat_gate = nn.Parameter(torch.zeros(C_h, E_w, C_h, E_w))
+            self.feat_gate_bias = nn.Parameter(torch.ones(C_h, E_w))
 
         self.aux_loss = 0.0
 
@@ -524,26 +543,31 @@ class ULB2DBlock(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass. x: (B, T, C_h, C_w), returns (B, T, C_h, C_w)."""
+        """Forward pass. x: (B, T, C_h, C_w), returns (B, T, C_h, C_w).
+
+        Internally operates at expanded width E_w. w_up expands C_w -> E_w,
+        all ops work at E_w, w_down compresses E_w -> C_w.
+        """
         cfg = self.config
         C_h, C_w = cfg.c_h, cfg.c_w
-        D = cfg.d_model
+        E_w = cfg.e_w
+        I = cfg.inner_dim   # C_h * E_w
         b, t = x.shape[:2]
 
-        # --- Up projection ---
-        h = self._proj2d(x, self.w_up)                          # (B, T, C_h, C_w)
-        h = self.up_act(h.reshape(b, t, D)).view(b, t, C_h, C_w)
+        # --- Up projection (C_w -> E_w) ---
+        h = self._proj2d(x, self.w_up)                          # (B, T, C_h, E_w)
+        h = self.up_act(h.reshape(b, t, I)).view(b, t, C_h, E_w)
 
-        # --- QKV ---
-        q = self._proj2d(h, self.w_q)                           # (B, T, C_h, C_w)
+        # --- QKV (all at E_w) ---
+        q = self._proj2d(h, self.w_q)                           # (B, T, C_h, E_w)
         k = self._proj2d(h, self.w_k, self.k_bias_param)
         v = self._proj2d(h, self.w_v, self.v_bias_param)
 
-        # QK norm + post-norm bias (per-head RMSNorm over C_w)
-        q = self.q_norm(q) * self.q_post_bias                  # (B, T, C_h, C_w)
+        # QK norm + post-norm bias (per-head RMSNorm over E_w)
+        q = self.q_norm(q) * self.q_post_bias                  # (B, T, C_h, E_w)
         k = self.k_norm(k) * self.k_post_bias
 
-        # --- K temporal lerp (last quarter of C_w) ---
+        # --- K temporal lerp (last quarter of E_w) ---
         if t >= 2:
             qd = self.quarter
             gate = torch.sigmoid(
@@ -553,7 +577,7 @@ class ULB2DBlock(nn.Module):
             k_prev = F.pad(k_cur[:, :-1], (0, 0, 0, 0, 1, 0))
             k = torch.cat([k_static, (1 - gate) * k_cur + gate * k_prev], dim=-1)
 
-        # --- Hybrid RoPE (data-dependent + fixed) ---
+        # --- Hybrid RoPE (data-dependent + fixed, at E_w) ---
         dd_deltas = self._proj2d(h, self.w_dd, self.dd_bias)    # (B, T, C_h, dd_pairs)
         dd_angles = dd_deltas.cumsum(dim=1)
 
@@ -563,10 +587,6 @@ class ULB2DBlock(nn.Module):
         freqs = torch.outer(pos, self.inv_freq)                 # (T, fp)
         cos_f = freqs.cos()[None, :, None, :]                   # (1, T, 1, fp)
         sin_f = freqs.sin()[None, :, None, :]
-
-        for qk in (q, k):
-            # Can't modify in-place during autograd, so we'll do it below
-            pass
 
         # Apply RoPE to Q and K
         def apply_hybrid_rope(qk: torch.Tensor) -> torch.Tensor:
@@ -581,9 +601,8 @@ class ULB2DBlock(nn.Module):
         q = apply_hybrid_rope(q)
         k = apply_hybrid_rope(k)
 
-        # --- Seq-attention (C_h heads, C_w head_dim) ---
-        # Permute to (B, C_h, T, C_w) for SDPA
-        q_s = q.permute(0, 2, 1, 3)                            # (B, C_h, T, C_w)
+        # --- Seq-attention (C_h heads, E_w head_dim) ---
+        q_s = q.permute(0, 2, 1, 3)                            # (B, C_h, T, E_w)
         k_s = k.permute(0, 2, 1, 3)
         v_s = v.permute(0, 2, 1, 3)
 
@@ -598,39 +617,39 @@ class ULB2DBlock(nn.Module):
             y = (1 - blend_gate) * y_soft + blend_gate * y_silu2
         else:
             y = F.scaled_dot_product_attention(
-                q_s, k_s, v_s, is_causal=cfg.is_causal)         # (B, C_h, T, C_w)
+                q_s, k_s, v_s, is_causal=cfg.is_causal)         # (B, C_h, T, E_w)
 
-        y = y.permute(0, 2, 1, 3).contiguous()                  # (B, T, C_h, C_w)
+        y = y.permute(0, 2, 1, 3).contiguous()                  # (B, T, C_h, E_w)
 
         # --- Output projection ---
         y = self._proj2d(y, self.w_o)
 
-        # --- Gated delta accumulation (no pre-gate norm) ---
+        # --- Gated delta accumulation ---
         attn_gate = torch.sigmoid(
             self._proj2d(h, self.w_attn_gate, self.attn_gate_bias))
         h = h + y * attn_gate
 
         # --- Mid activation (between seq-attn and feat-attn) ---
-        h = self.mid_act(h.reshape(b, t, D)).view(b, t, C_h, C_w)
+        h = self.mid_act(h.reshape(b, t, I)).view(b, t, C_h, E_w)
 
-        # --- Feat-attn sublayer (optional) ---
+        # --- Feat-attn sublayer (optional, at E_w) ---
         if self.use_feat_attn:
-            feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)
+            feat_in = self.feat_norm(h.reshape(b, t, I)).view(b, t, C_h, E_w)
             fQ = self._proj2d(feat_in, self.feat_w_q)
             fK = self._proj2d(feat_in, self.feat_w_k)
             fV = self._proj2d(feat_in, self.feat_w_v)
-            # Non-causal attention over C_h channels, each C_w dim
-            fQ = fQ.reshape(b * t, 1, C_h, C_w)
-            fK = fK.reshape(b * t, 1, C_h, C_w)
-            fV = fV.reshape(b * t, 1, C_h, C_w)
+            # Non-causal attention over C_h channels, each E_w dim
+            fQ = fQ.reshape(b * t, 1, C_h, E_w)
+            fK = fK.reshape(b * t, 1, C_h, E_w)
+            fV = fV.reshape(b * t, 1, C_h, E_w)
             feat_out = F.scaled_dot_product_attention(fQ, fK, fV, is_causal=False)
-            feat_out = feat_out.view(b, t, C_h, C_w)
+            feat_out = feat_out.view(b, t, C_h, E_w)
             feat_out = self._proj2d(feat_out, self.feat_w_o)
             feat_gate = torch.sigmoid(
                 self._proj2d(h, self.w_feat_gate, self.feat_gate_bias))
             h = h + feat_out * feat_gate
 
-        # --- Down projection (no activation — output goes into residual) ---
+        # --- Down projection (E_w -> C_w, no activation) ---
         y = self._proj2d(h, self.w_down)
 
         return y
