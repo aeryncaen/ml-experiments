@@ -319,8 +319,8 @@ class StupidAttnBlock(nn.Module):
         k = self.k_proj(h)  # (B, T, D)
         v = self.v_proj(h)  # (B, T, D)
 
-        # Element-wise gate: Q[i] * K[j] for all pairs -> (B, T, T, D)
-        gate = q.unsqueeze(2) * k.unsqueeze(1)  # (B, T_i, T_j, D)
+        # Element-wise gate: sigmoid(Q[i] * K[j]) for all pairs -> (B, T, T, D)
+        gate = torch.sigmoid(q.unsqueeze(2) * k.unsqueeze(1))  # (B, T_i, T_j, D)
 
         # Gate V[j] and accumulate into position i
         gated_v = gate * v.unsqueeze(1)  # (B, T_i, T_j, D)
