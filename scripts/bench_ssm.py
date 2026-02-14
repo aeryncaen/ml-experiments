@@ -322,12 +322,13 @@ class StupidAttnBlock(nn.Module):
         # Element-wise logits: Q[i] * K[j] for all pairs -> (B, T_i, T_j, D)
         logits = q.unsqueeze(2) * k.unsqueeze(1)  # (B, T_i, T_j, D)
 
+        # SiLU² then mask and normalize over source positions
+        weights = F.silu(logits) ** 2  # (B, T_i, T_j, D)
+
         if self.causal:
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-            logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
+            weights = weights.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), 0.0)
 
-        # SiLU² then normalize over source positions
-        weights = F.silu(logits) ** 2  # (B, T_i, T_j, D)
         weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
 
         # Weighted sum of V[j] into position i
