@@ -399,7 +399,6 @@ class ULB2DConfig:
         rope_base: Base for fixed RoPE inverse frequencies.
         use_blend: Use blend attention (softmax + silu2 lerp) instead of pure softmax.
         blend_gate_bias: Initial blend gate bias.
-        use_feat_attn: Whether to include the feat-attn sublayer.
         k_lerp_bias: Initial K temporal mixing gate bias.
     """
     c_h: int = 16
@@ -409,7 +408,6 @@ class ULB2DConfig:
     rope_base: float = 10000.0
     use_blend: bool = True
     blend_gate_bias: float = -1.1
-    use_feat_attn: bool = True
     k_lerp_bias: float = -2.0
 
     def __post_init__(self):
@@ -443,8 +441,10 @@ class ULB2DBlock(nn.Module):
         y = seq_attn(q, k, v)                    # C_h heads, C_w head_dim, causal
         y = proj2d(y, w_o)                       # 2D output projection
         h = x + y * sigmoid(proj2d(x, w_gate))   # gated attn residual
-        [optional feat-attn sublayer with gated residual]
-        h = h + swiglu_ffn(norm(h))              # 2D SwiGLU FFN
+        # Feat-attn MLP (replaces both feat-attn and SwiGLU):
+        fQ,fK,fV = proj2d(norm(h), wfq/wfk/wfv) # expand C_w -> F_w
+        feat = silu2_attn(fQ, fK, fV)            # silu² over C_h features, F_w heads
+        h = h + proj2d(feat, w_down)             # compress F_w -> C_w
 
     Caller does: x = x + block(norm(x))  where x is (B, T, C_h, C_w).
     """
@@ -502,23 +502,14 @@ class ULB2DBlock(nn.Module):
         self.w_attn_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
         self.attn_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
 
-        # --- Feat-attn sublayer (optional) ---
-        self.use_feat_attn = config.use_feat_attn
-        if config.use_feat_attn:
-            self.feat_norm = nn.RMSNorm(D)
-            self.feat_w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.feat_w_o = nn.Parameter(torch.randn(C_h, C_w, C_h, C_w) * init_scale)
-            self.w_feat_gate = nn.Parameter(torch.zeros(C_h, C_w, C_h, C_w))
-            self.feat_gate_bias = nn.Parameter(torch.ones(C_h, C_w))
-
-        # --- 2D SwiGLU FFN (C_w -> F_w -> C_w) ---
+        # --- Feat-attn MLP: silu² attention over features replaces both
+        #     feat-attn and SwiGLU. Expand to F_w, attend, compress back. ---
         init_scale_ffn = (C_h * F_w) ** -0.5
-        self.ffn_norm = nn.RMSNorm(D)
-        self.w_ffn_gate = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
-        self.w_ffn_up = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
-        self.w_ffn_down = nn.Parameter(torch.randn(C_h, F_w, C_h, C_w) * init_scale_ffn)
+        self.feat_norm = nn.RMSNorm(D)
+        self.feat_w_q = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
+        self.feat_w_k = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
+        self.feat_w_v = nn.Parameter(torch.randn(C_h, C_w, C_h, F_w) * init_scale)
+        self.feat_w_down = nn.Parameter(torch.randn(C_h, F_w, C_h, C_w) * init_scale_ffn)
 
         self.aux_loss = 0.0
 
@@ -533,10 +524,11 @@ class ULB2DBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass. x: (B, T, C_h, C_w), returns (B, T, C_h, C_w).
 
-        Architecture: seq-attn → [feat-attn] → SwiGLU, all at residual width.
+        Architecture: seq-attn → feat-attn MLP (silu² over features), all at residual width.
         """
         cfg = self.config
         C_h, C_w = cfg.c_h, cfg.c_w
+        F_w = cfg.f_w
         D = cfg.d_model
         b, t = x.shape[:2]
 
@@ -608,27 +600,19 @@ class ULB2DBlock(nn.Module):
             self._proj2d(x, self.w_attn_gate, self.attn_gate_bias))
         h = x + y * attn_gate
 
-        # --- Feat-attn sublayer (optional) ---
-        if self.use_feat_attn:
-            feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)
-            fQ = self._proj2d(feat_in, self.feat_w_q)
-            fK = self._proj2d(feat_in, self.feat_w_k)
-            fV = self._proj2d(feat_in, self.feat_w_v)
-            fQ = fQ.reshape(b * t, 1, C_h, C_w)
-            fK = fK.reshape(b * t, 1, C_h, C_w)
-            fV = fV.reshape(b * t, 1, C_h, C_w)
-            feat_out = F.scaled_dot_product_attention(fQ, fK, fV, is_causal=False)
-            feat_out = feat_out.view(b, t, C_h, C_w)
-            feat_out = self._proj2d(feat_out, self.feat_w_o)
-            feat_gate = torch.sigmoid(
-                self._proj2d(h, self.w_feat_gate, self.feat_gate_bias))
-            h = h + feat_out * feat_gate
-
-        # --- 2D SwiGLU FFN ---
-        ffn_in = self.ffn_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)
-        gate = F.silu(self._proj2d(ffn_in, self.w_ffn_gate))    # (B, T, C_h, F_w)
-        up = self._proj2d(ffn_in, self.w_ffn_up)                # (B, T, C_h, F_w)
-        h = h + self._proj2d(gate * up, self.w_ffn_down)        # (B, T, C_h, C_w)
+        # --- Feat-attn MLP: silu² attention over C_h features at expanded F_w ---
+        feat_in = self.feat_norm(h.reshape(b, t, D)).view(b, t, C_h, C_w)
+        fQ = self._proj2d(feat_in, self.feat_w_q)               # (B, T, C_h, F_w)
+        fK = self._proj2d(feat_in, self.feat_w_k)
+        fV = self._proj2d(feat_in, self.feat_w_v)
+        # silu² attention: C_h features attend to each other, F_w is head_dim
+        # Layout for silu2_attention: (B, H, T, D) = (B*T, 1, C_h, F_w)
+        fQ = fQ.reshape(b * t, 1, C_h, F_w)
+        fK = fK.reshape(b * t, 1, C_h, F_w)
+        fV = fV.reshape(b * t, 1, C_h, F_w)
+        feat_out = silu2_attention(fQ, fK, fV, is_causal=False)  # (B*T, 1, C_h, F_w)
+        feat_out = feat_out.view(b, t, C_h, F_w)
+        h = h + self._proj2d(feat_out, self.feat_w_down)        # (B, T, C_h, C_w)
 
         return h
 

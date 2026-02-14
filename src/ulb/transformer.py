@@ -115,13 +115,12 @@ class CausalULB2D(nn.Module):
         n_layers: Number of ULB2D blocks.
         max_seq_len: Maximum sequence length.
         use_blend: Use blend attention (default True).
-        use_feat_attn: Include feat-attn sublayer (default True).
         is_causal: Causal masking for seq-attn (default True).
     """
 
     def __init__(self, vocab_size: int, c_h: int = 8, c_w: int = 8,
                  n_layers: int = 4, max_seq_len: int = 256,
-                 use_blend: bool = True, use_feat_attn: bool = True,
+                 use_blend: bool = True,
                  is_causal: bool = True, ffn_expand: float = 8/3):
         super().__init__()
         from .block import ULB2DBlock, ULB2DConfig
@@ -130,7 +129,6 @@ class CausalULB2D(nn.Module):
         config = ULB2DConfig(
             c_h=c_h, c_w=c_w, ffn_expand=ffn_expand,
             is_causal=is_causal, use_blend=use_blend,
-            use_feat_attn=use_feat_attn,
         )
         dim = config.d_model
         self.vocab_size = vocab_size
@@ -164,7 +162,7 @@ class CausalULB2D(nn.Module):
             if param.dim() == 4:
                 # 4D tensor projections
                 if any(name.endswith(s) for s in
-                         ('.w_attn_gate', '.w_feat_gate', '.w_k_gate', '.w_dd',
+                         ('.w_attn_gate', '.w_k_gate', '.w_dd',
                           '.w_blend')):
                     pass  # keep zero-init
                 else:
