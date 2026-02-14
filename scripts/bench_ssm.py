@@ -319,19 +319,18 @@ class StupidAttnBlock(nn.Module):
         k = self.k_proj(h)  # (B, T, D)
         v = self.v_proj(h)  # (B, T, D)
 
-        # Element-wise gate: sigmoid(Q[i] * K[j]) for all pairs -> (B, T, T, D)
-        gate = torch.sigmoid(q.unsqueeze(2) * k.unsqueeze(1))  # (B, T_i, T_j, D)
-
-        # Gate V[j] and accumulate into position i
-        gated_v = gate * v.unsqueeze(1)  # (B, T_i, T_j, D)
+        # Element-wise logits: Q[i] * K[j] for all pairs -> (B, T_i, T_j, D)
+        logits = q.unsqueeze(2) * k.unsqueeze(1)  # (B, T_i, T_j, D)
 
         if self.causal:
-            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=x.dtype))
-            gated_v = gated_v * mask.unsqueeze(0).unsqueeze(-1)
-            counts = mask.sum(dim=-1).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
-            out = gated_v.sum(dim=2) / counts  # (B, T, D)
-        else:
-            out = gated_v.mean(dim=2)  # (B, T, D)
+            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
+
+        # Softmax over source positions (dim=2): D independent distributions
+        weights = torch.softmax(logits, dim=2)  # (B, T_i, T_j, D)
+
+        # Weighted sum of V[j] into position i
+        out = (weights * v.unsqueeze(1)).sum(dim=2)  # (B, T, D)
 
         return out
 
