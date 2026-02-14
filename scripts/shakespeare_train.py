@@ -636,6 +636,41 @@ def build_llada_ulb(vocab_size: int, args) -> nn.Module:
                       subs_parameterization=args.subs)
 
 
+def build_llada_ulb_feat(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with CausalULB + feat-attn backbone."""
+    from ulb.transformer import CausalULB, LLaDAModel
+    backbone = CausalULB(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len + args.gen_len,
+        inner_ratio=args.inner_ratio,
+        k_mix=args.k_mix,
+        is_causal=not args.no_causal,
+        embed_lerp=args.embed_lerp,
+        feat_attn=True,
+    )
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
+
+
+def build_llada_ulb_2d(vocab_size: int, args) -> nn.Module:
+    """Build LLaDA with CausalULB2D backbone (true end-to-end 2D)."""
+    from ulb.transformer import CausalULB2D, LLaDAModel
+    backbone = CausalULB2D(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len + args.gen_len,
+        is_causal=not args.no_causal,
+    )
+    return LLaDAModel(backbone, vocab_size, args.dim,
+                      time_conditioning=args.time_cond,
+                      subs_parameterization=args.subs)
+
+
 def build_llada_mha_moe(vocab_size: int, args) -> nn.Module:
     """Build LLaDA with MoE-stacked BidirectionalMHALayer backbone."""
     from mha import BidirectionalMHALayer
@@ -868,6 +903,8 @@ ARCH_BUILDERS = {
 LLADA_BUILDERS = {
     'mha': build_llada_mha,
     'ulb': build_llada_ulb,
+    'ulb-feat': build_llada_ulb_feat,
+    'ulb-2d': build_llada_ulb_2d,
     'mha-moe': build_llada_mha_moe,
     'ulb-moe': build_llada_ulb_moe,
     'mha-poe': build_llada_mha_poe,

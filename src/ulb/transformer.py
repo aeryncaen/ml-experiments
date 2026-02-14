@@ -320,6 +320,13 @@ class LLaDAModel(nn.Module):
             # TransformerBlock-based (Causal or Bidirectional)
             for block in bb.blocks:
                 x = block(x, bb.rope_freqs)
+        elif hasattr(bb, 'c_h'):
+            # ULB2D-based — blocks expect (B, T, C_h, C_w)
+            B, T, D = x.shape
+            C_h, C_w = bb.c_h, bb.c_w
+            for norm, block in zip(bb.norms, bb.blocks):
+                x_normed = norm(x).view(B, T, C_h, C_w)
+                x = x + block(x_normed).reshape(B, T, D)
         elif hasattr(bb, 'norms'):
             # ULB-based
             for norm, block in zip(bb.norms, bb.blocks):
