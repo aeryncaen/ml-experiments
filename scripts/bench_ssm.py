@@ -1579,7 +1579,8 @@ def _find_knob(make_fn_factory, n_layers, dim, target_params, lo=1, hi=4096):
 def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_experts=4, top_k=2, moe=False,
                 poe=False, poe_max_hops=None,
                 poe_block_share_fraction=0.0, poe_router_share_fraction=0.0,
-                poe_hop_share_fraction=0.0, router_noise=1.0):
+                poe_hop_share_fraction=0.0, router_noise=1.0,
+                feat_transpose=False, feat_up_factor=2):
     """Build models with configurable depth.
     
     If match_params=True, auto-size SSM/MHA internal dimensions to match ULBBlendP param count.
@@ -1678,13 +1679,15 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('StupidAttn', lambda: StupidAttnBlock(d_model=dim),
             f"StupidAttnBlock(d_model={dim})")
 
-    # FeatAttn: MHA + feature-attention with 2x up/down projection (no MLP)
-    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4, up_factor=2),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4, up_factor=2)")
+    # FeatAttn: MHA + feature-attention (no MLP)
+    _ft = feat_transpose
+    _fu = feat_up_factor
+    try_add('FeatAttn', lambda: FeatAttnBlock(d_model=dim, n_heads=4, up_factor=_fu, transpose_groups=_ft),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_expansion=4, up_factor={_fu}, transpose={_ft})")
 
     # FeatAttnFirst: feature-attention before sequence-attention
-    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True, up_factor=2),
-            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True, up_factor=2)")
+    try_add('FeatAttnFirst', lambda: FeatAttnBlock(d_model=dim, n_heads=4, feat_first=True, up_factor=_fu, transpose_groups=_ft),
+            f"FeatAttnBlock(d_model={dim}, n_heads=4, feat_first=True, up_factor={_fu}, transpose={_ft})")
 
     # DualMHA: two independent MHA stacks, subtract outputs
     if _wanted('DualMHA'):
@@ -1851,6 +1854,10 @@ if __name__ == '__main__':
     parser.add_argument('--exit-ramp-scale', type=float, default=2.0,
                         help='Exit bias ramp scale for LLooM/PoE (exit_bias = exit_ramp_scale * hops_used/max_hops)')
     parser.add_argument('--top-k', type=int, default=2, help='Top-k expert selection per sample')
+    parser.add_argument('--feat-transpose', action='store_true',
+                        help='Transpose FeatureAttn groups: attend over D/G features instead of G groups')
+    parser.add_argument('--feat-up-factor', type=int, default=2,
+                        help='FeatureAttn up/down projection factor (default: 2)')
     parser.add_argument('--csv', type=str, default=None,
                         help='Output CSV file path (optional)')
     parser.add_argument('--save-dir', type=str, default=None,
@@ -1884,7 +1891,8 @@ if __name__ == '__main__':
                               poe_block_share_fraction=args.poe_block_share_fraction,
                               poe_router_share_fraction=args.poe_router_share_fraction,
                               poe_hop_share_fraction=args.poe_hop_share_fraction,
-                              router_noise=args.router_noise)
+                              router_noise=args.router_noise,
+                              feat_transpose=args.feat_transpose, feat_up_factor=args.feat_up_factor)
     all_names = list(models_info.keys())
     
     if not all_names:
@@ -1948,7 +1956,8 @@ if __name__ == '__main__':
                                 poe_block_share_fraction=args.poe_block_share_fraction,
                                 poe_router_share_fraction=args.poe_router_share_fraction,
                                 poe_hop_share_fraction=args.poe_hop_share_fraction,
-                                router_noise=args.router_noise)[name]
+                                router_noise=args.router_noise,
+                                feat_transpose=args.feat_transpose, feat_up_factor=args.feat_up_factor)[name]
             param_count = count_params(model)
             
             # Optionally compile the model
