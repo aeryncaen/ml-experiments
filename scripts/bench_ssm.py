@@ -2030,12 +2030,12 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('ULBBlend', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable')),
             f"ULBBlock(ULBConfig(d_model={dim}, n_heads=4, paired=False, attn_mode='blend', swish_mode='learnable'))")
 
-    # ULB + feature-attention sublayer (sigmoid gate + feat-attn with tensor projections)
+    # ULB + feature-attention sublayer (sigmoid gate + feat-attn with tensor projections, NOT true 2D)
     _sqrt_dim_ulb = int(dim ** 0.5)
     try_add('ULBBlendPFA', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', feat_attn=True, feat_c_h=_sqrt_dim_ulb, feat_c_w=_sqrt_dim_ulb)),
             f"ULBBlock(ULBConfig(d_model={dim}, feat_attn=True, feat_c_h={_sqrt_dim_ulb}, feat_c_w={_sqrt_dim_ulb}))")
 
-    # True end-to-end 2D ULB (tokens as (B,T,C,C) throughout)
+    # True end-to-end 2D ULB — all projections are (C,C,C,C) tensors, tokens as (B,T,C,C) throughout
     # Wrap to accept/return flat (B,T,D) for bench_ssm compatibility
     from ulb.block import ULB2DBlock, ULB2DConfig
     class _ULB2DFlat(nn.Module):
@@ -2049,9 +2049,9 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             y = self.block(x.view(B, T, self.c_h, self.c_w))
             self.aux_loss = self.block.aux_loss
             return y.reshape(B, T, D)
-    try_add('ULB2D', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim)),
+    try_add('ULBBlendP2D', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim)),
             f"ULB2DBlock(ULB2DConfig(d_model={dim}))")
-    try_add('ULB2D-noFA', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim, use_feat_attn=False)),
+    try_add('ULBBlendP2D-noFA', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim, use_feat_attn=False)),
             f"ULB2DBlock(ULB2DConfig(d_model={dim}, use_feat_attn=False))")
 
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
