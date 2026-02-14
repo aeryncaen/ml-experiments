@@ -1780,8 +1780,8 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
             f"StupidAttnBlock(d_model={dim})")
 
     # MHA2D: 2D token representations with 2D QKV projections
-    try_add('MHA2D', lambda: MHA2DBlock(d_model=dim, n_channels=4, n_heads=4, mlp_inner=mha_mlp),
-            f"MHA2DBlock(d_model={dim}, n_channels=4, n_heads=4, mlp_inner={mha_mlp})")
+    try_add('MHA2D', lambda: MHA2DBlock(d_model=dim, n_channels=8, n_heads=8, mlp_inner=mha_mlp),
+            f"MHA2DBlock(d_model={dim}, n_channels=8, n_heads=8, mlp_inner={mha_mlp})")
 
     # FeatAttn: MHA + feature-attention (no MLP)
     _ft = feat_transpose
