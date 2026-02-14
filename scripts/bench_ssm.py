@@ -1957,6 +1957,25 @@ def make_models(dim, n_layers=1, requested_models=None, match_params=True, n_exp
     try_add('ULBBlendPFA', lambda: ULBBlock(ULBConfig(d_model=dim, n_heads=4, paired=True, attn_mode='blend', swish_mode='learnable', feat_attn=True, feat_c_h=_sqrt_dim_ulb, feat_c_w=_sqrt_dim_ulb)),
             f"ULBBlock(ULBConfig(d_model={dim}, feat_attn=True, feat_c_h={_sqrt_dim_ulb}, feat_c_w={_sqrt_dim_ulb}))")
 
+    # True end-to-end 2D ULB (tokens as (B,T,C,C) throughout)
+    # Wrap to accept/return flat (B,T,D) for bench_ssm compatibility
+    from ulb.block import ULB2DBlock, ULB2DConfig
+    class _ULB2DFlat(nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            self.block = ULB2DBlock(cfg)
+            self.c_h, self.c_w = cfg.c_h, cfg.c_w
+            self.aux_loss = 0.0
+        def forward(self, x):
+            B, T, D = x.shape
+            y = self.block(x.view(B, T, self.c_h, self.c_w))
+            self.aux_loss = self.block.aux_loss
+            return y.reshape(B, T, D)
+    try_add('ULB2D', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim)),
+            f"ULB2DBlock(ULB2DConfig(d_model={dim}))")
+    try_add('ULB2D-noFA', lambda: _ULB2DFlat(ULB2DConfig(d_model=dim, use_feat_attn=False)),
+            f"ULB2DBlock(ULB2DConfig(d_model={dim}, use_feat_attn=False))")
+
     # LLooM: dual-paradigm adaptive routing (self-contained, bypasses stacking)
     if _wanted('LLooM'):
         try:

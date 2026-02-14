@@ -101,6 +101,96 @@ class CausalULB(nn.Module):
         return self.head(self.final_norm(x))
 
 
+class CausalULB2D(nn.Module):
+    """Causal language model using true 2D ULB blocks.
+
+    Tokens are embedded as flat (B, T, D), reshaped to (B, T, C_h, C_w)
+    for processing through ULB2DBlocks, then flattened back for the LM head.
+
+    Args:
+        vocab_size: Token vocabulary size.
+        dim: Model dimension (C_h * C_w).
+        n_layers: Number of ULB2D blocks.
+        max_seq_len: Maximum sequence length.
+        c_h: Channel height. Default: auto-factored from dim.
+        c_w: Channel width. Default: dim // c_h.
+        use_blend: Use blend attention (default True).
+        use_feat_attn: Include feat-attn sublayer (default True).
+        is_causal: Causal masking for seq-attn (default True).
+    """
+
+    def __init__(self, vocab_size: int, dim: int = 64, n_layers: int = 4,
+                 max_seq_len: int = 256,
+                 c_h: int | None = None, c_w: int | None = None,
+                 use_blend: bool = True, use_feat_attn: bool = True,
+                 is_causal: bool = True):
+        super().__init__()
+        from .block import ULB2DBlock, ULB2DConfig
+        from .norm import RMSNorm
+
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        config = ULB2DConfig(
+            d_model=dim, c_h=c_h, c_w=c_w,
+            is_causal=is_causal, use_blend=use_blend,
+            use_feat_attn=use_feat_attn,
+        )
+        self.c_h = config.c_h
+        self.c_w = config.c_w
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.blocks = nn.ModuleList([ULB2DBlock(config) for _ in range(n_layers)])
+        self.norms = nn.ModuleList([RMSNorm(dim) for _ in range(n_layers)])
+        self.final_norm = RMSNorm(dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        # Init (Megatron-style for 4D params)
+        self._init_weights(n_layers)
+
+    def _init_weights(self, n_layers: int, std: float = 0.02):
+        """Megatron-style init for 2D tensor params."""
+        out_std = std / math.sqrt(2.0 * n_layers)
+        cutoff = 3.0 * std
+        out_cutoff = 3.0 * out_std
+
+        for name, param in self.named_parameters():
+            if param.dim() == 4:
+                # 4D tensor projections
+                if any(name.endswith(s) for s in ('.w_o', '.w_down', '.feat_w_o')):
+                    nn.init.trunc_normal_(param, std=out_std, a=-out_cutoff, b=out_cutoff)
+                elif any(name.endswith(s) for s in
+                         ('.w_attn_gate', '.w_feat_gate', '.w_k_gate', '.w_dd',
+                          '.w_blend')):
+                    pass  # keep zero-init
+                else:
+                    nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
+            elif param.dim() == 2 and 'embed' in name:
+                nn.init.trunc_normal_(param, std=std, a=-cutoff, b=cutoff)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            token_ids: (B, T) token indices.
+        Returns:
+            (B, T, vocab_size) logits.
+        """
+        B, T = token_ids.shape
+        C_h, C_w = self.c_h, self.c_w
+
+        x = self.token_embed(token_ids)  # (B, T, D)
+
+        for norm, block in zip(self.norms, self.blocks):
+            x_normed = norm(x).view(B, T, C_h, C_w)
+            x = x + block(x_normed).reshape(B, T, -1)
+
+        return self.head(self.final_norm(x))
+
+
 class TimestepEmbedder(nn.Module):
     """Sinusoidal timestep embedding + MLP projection.
 

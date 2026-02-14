@@ -394,6 +394,18 @@ def build_ulb_feat(vocab_size: int, args) -> nn.Module:
     )
 
 
+def build_ulb_2d(vocab_size: int, args) -> nn.Module:
+    """Build a CausalULB2D — true end-to-end 2D token processing."""
+    from ulb.transformer import CausalULB2D
+    return CausalULB2D(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_layers=args.n_layers,
+        max_seq_len=args.seq_len,
+        is_causal=not args.no_causal,
+    )
+
+
 # --- MoE builders ---
 
 def build_mha_moe(vocab_size: int, args) -> nn.Module:
@@ -843,6 +855,7 @@ ARCH_BUILDERS = {
     'expandkv-mha': build_expandkv_mha,
     'ulb': build_ulb,
     'ulb-feat': build_ulb_feat,
+    'ulb-2d': build_ulb_2d,
     'mha-moe': build_mha_moe,
     'ulb-moe': build_ulb_moe,
     'mha-poe': build_mha_poe,

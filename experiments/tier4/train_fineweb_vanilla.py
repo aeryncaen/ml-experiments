@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -959,6 +959,26 @@ class GPTULB(nn.Module):
         return logits, loss
 
 
+class GPTULB2D(nn.Module):
+    """True 2D ULB wrapper for fineweb training."""
+    def __init__(self):
+        super().__init__()
+        from ulb.transformer import CausalULB2D
+        self.inner = CausalULB2D(
+            vocab_size=HP.vocab_size,
+            dim=HP.d_model,
+            n_layers=HP.n_layer,
+            max_seq_len=HP.seq_len,
+        )
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        logits = self.inner(idx)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
@@ -976,6 +996,8 @@ def build_model() -> nn.Module:
         return GPTULB(feat_attn=False)
     if HP.model_type == "ulb_fa":
         return GPTULB(feat_attn=True)
+    if HP.model_type == "ulb_2d":
+        return GPTULB2D()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
