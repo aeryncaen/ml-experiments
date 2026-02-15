@@ -307,7 +307,7 @@ class BlockND(nn.Module):
             return torch.einsum(self.einsum_str, x_nd, w).reshape(B, T, self.D)
         else:
             # 'matmul' mode or rank-1 einsum: reshape weight to (D,D) and matmul
-            return x_flat @ w.reshape(self.D, self.D).T
+            return x_flat @ w.reshape(self.D, self.D)
 
     def forward(self, hidden_states, residual=None):
         # Matches Zoology TransformerBlock.forward
