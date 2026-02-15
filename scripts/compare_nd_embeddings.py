@@ -661,7 +661,8 @@ def main():
                         help='Batch size (default: auto from seq_len, matching Zoology)')
     parser.add_argument('--n-layers', type=int, default=2)
     parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--save', type=str, default=None)
+    parser.add_argument('--save', type=str, default=None, help='Save plot to file')
+    parser.add_argument('--report', type=str, default=None, help='Write markdown report to file')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (default: auto-detect cuda/mps/cpu)')
     parser.add_argument('--compile', action='store_true',
@@ -994,9 +995,243 @@ def main():
 
     if args.save:
         plt.savefig(args.save, dpi=150, bbox_inches='tight')
-        print(f"Saved to {args.save}")
+        print(f"Saved plot to {args.save}")
     else:
         plt.show()
+
+    # --- Markdown report ---
+    if args.report:
+        md = []
+        md.append(f"# ND Embedding/Projection Comparison")
+        md.append(f"")
+        md.append(f"## Config")
+        md.append(f"")
+        md.append(f"| Setting | Value |")
+        md.append(f"|---------|-------|")
+        md.append(f"| Task | {task_name} |")
+        md.append(f"| d_model | {D} |")
+        md.append(f"| seq_len | {args.seq_len} |")
+        md.append(f"| kv_pairs | {args.num_kv_pairs} |")
+        md.append(f"| batch_size | {args.batch_size} |")
+        md.append(f"| epochs | {args.epochs} |")
+        md.append(f"| n_layers | {args.n_layers} |")
+        md.append(f"| lr | {args.lr} |")
+        md.append(f"| vocab_size | {vocab_size} |")
+        md.append(f"| compile | {args.compile} |")
+        md.append(f"| amp | {args.amp} |")
+        md.append(f"")
+
+        if args.save:
+            md.append(f"![Training curves]({args.save})")
+            md.append(f"")
+
+        # Leaderboard
+        md.append(f"## Leaderboard")
+        md.append(f"")
+        md.append(f"| Model | Shape | Proj | Params | Train Loss | Train Acc | Val Loss | Val Acc | Epochs | s/epoch |")
+        md.append(f"|-------|-------|------|--------|------------|-----------|----------|---------|--------|---------|")
+        for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
+            r = results[label]
+            shape_str = 'x'.join(map(str, r['shape']))
+            n_ep = len(r['train_losses']) - 1
+            spe = r.get('sec_per_epoch', 0)
+            md.append(f"| {label} | {shape_str} | {r['proj_mode']} | {r['n_params']:,} | "
+                      f"{r['train_losses'][-1]:.4f} | {r['train_accs'][-1]:.3f} | "
+                      f"{r['val_losses'][-1]:.4f} | {r['val_accs'][-1]:.3f} | {n_ep} | {spe:.1f}s |")
+        md.append(f"")
+
+        # Model configs
+        md.append(f"## Model Configs")
+        md.append(f"")
+        md.append(f"| Model | Shape | Proj | Params |")
+        md.append(f"|-------|-------|------|--------|")
+        for label, shape, proj_mode in configs:
+            shape_str = 'x'.join(map(str, shape))
+            n_params = results[label]['n_params'] if label in results else '?'
+            md.append(f"| {label} | {shape_str} | {proj_mode} | {n_params:,} |")
+        md.append(f"")
+
+        # Analysis 1: ND vs 1D
+        md.append(f"## Analysis")
+        md.append(f"")
+        md.append(f"### 1. ND Einsum vs 1D Baseline")
+        md.append(f"")
+        if baseline:
+            bm = final_metrics(baseline)
+            md.append(f"| Model | Val Acc | vs 1D | Val Loss | vs 1D | Epochs | vs 1D |")
+            md.append(f"|-------|---------|-------|----------|-------|--------|-------|")
+            md.append(f"| **1D (baseline)** | {bm['val_acc']:.4f} | — | {bm['val_loss']:.4f} | — | {bm['epochs']} | — |")
+            for label in sorted(einsum_models):
+                r = einsum_models[label]
+                m = final_metrics(r)
+                ad = m['val_acc'] - bm['val_acc']
+                ld = m['val_loss'] - bm['val_loss']
+                ed = m['epochs'] - bm['epochs']
+                md.append(f"| {label} | {m['val_acc']:.4f} | {'+' if ad>=0 else ''}{ad:.4f} | "
+                          f"{m['val_loss']:.4f} | {'+' if ld>=0 else ''}{ld:.4f} | "
+                          f"{m['epochs']} | {'+' if ed>=0 else ''}{ed} |")
+            md.append(f"")
+
+            avg_einsum_acc = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
+            if avg_einsum_acc > bm['val_acc'] + 0.001:
+                md.append(f"**Verdict:** ND einsum outperforms 1D (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+            elif avg_einsum_acc < bm['val_acc'] - 0.001:
+                md.append(f"**Verdict:** 1D outperforms ND einsum (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+            else:
+                md.append(f"**Verdict:** No meaningful difference (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+            md.append(f"")
+
+        # Analysis 2: Einsum vs Matmul
+        md.append(f"### 2. Einsum vs Matmul")
+        md.append(f"")
+        if matmul_models:
+            md.append(f"| Matmul Model | Val Acc | Epochs | vs Einsum Acc | vs Einsum Epochs |")
+            md.append(f"|--------------|---------|--------|---------------|------------------|")
+            for label, r in sorted(matmul_models.items()):
+                m = final_metrics(r)
+                rank = len(r['shape'])
+                einsum_label = f'{rank}D-1:3'
+                if einsum_label in einsum_models:
+                    em = final_metrics(einsum_models[einsum_label])
+                    ad = m['val_acc'] - em['val_acc']
+                    ed = m['epochs'] - em['epochs']
+                    md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | "
+                              f"{'+' if ad>=0 else ''}{ad:.4f} | {'+' if ed>=0 else ''}{ed} |")
+                else:
+                    md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | — | — |")
+            md.append(f"")
+
+            avg_matmul = np.mean([r['val_accs'][-1] for r in matmul_models.values()])
+            avg_einsum = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
+            if abs(avg_matmul - avg_einsum) < 0.001:
+                md.append(f"**Verdict:** Einsum and matmul equivalent — ND structure in weights alone doesn't help")
+            elif avg_einsum > avg_matmul:
+                md.append(f"**Verdict:** Einsum > matmul — ND contraction matters, not just ND weight shape")
+            else:
+                md.append(f"**Verdict:** Matmul >= einsum — ND contraction provides no benefit over reshape")
+            md.append(f"")
+
+        # Analysis 3: Ratio comparison
+        md.append(f"### 3. Ratio Comparison")
+        md.append(f"")
+        md.append(f"| Rank | Best | Best Acc | Worst | Worst Acc | Spread |")
+        md.append(f"|------|------|----------|-------|-----------|--------|")
+        for rank in [2, 3, 4]:
+            rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
+            if len(rank_models) < 2:
+                continue
+            best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+            worst = min(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+            spread = best[1]['val_accs'][-1] - worst[1]['val_accs'][-1]
+            md.append(f"| {rank}D | {best[0]} | {best[1]['val_accs'][-1]:.4f} | "
+                      f"{worst[0]} | {worst[1]['val_accs'][-1]:.4f} | {spread:.4f} |")
+        md.append(f"")
+
+        # Analysis 4: Rank comparison
+        md.append(f"### 4. Rank Comparison (best per rank)")
+        md.append(f"")
+        md.append(f"| Rank | Model | Val Acc | Val Loss | Epochs |")
+        md.append(f"|------|-------|---------|----------|--------|")
+        for rank in [1, 2, 3, 4]:
+            if rank == 1:
+                if baseline:
+                    bm = final_metrics(baseline)
+                    md.append(f"| 1D | 1D | {bm['val_acc']:.4f} | {bm['val_loss']:.4f} | {bm['epochs']} |")
+            else:
+                rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
+                if rank_models:
+                    best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+                    m = final_metrics(best[1])
+                    md.append(f"| {rank}D | {best[0]} | {m['val_acc']:.4f} | {m['val_loss']:.4f} | {m['epochs']} |")
+        md.append(f"")
+
+        # Analysis 5: SVD
+        md.append(f"### 5. Weight SVD Effective Rank")
+        md.append(f"")
+        md.append(f"| Model | Shape | Avg Eff Rank Frac |")
+        md.append(f"|-------|-------|-------------------|")
+        for label in all_labels:
+            r = results[label]
+            snap = r['weight_snapshots']
+            if not snap:
+                continue
+            last_epoch = max(snap.keys())
+            eff_ranks = []
+            for name, w in snap[last_epoch].items():
+                S = svd_spectrum(w)
+                eff_ranks.append((S > 0.1).float().mean().item())
+            if eff_ranks:
+                avg_eff = np.mean(eff_ranks)
+                shape_str = 'x'.join(map(str, r['shape']))
+                md.append(f"| {label} | {shape_str} | {avg_eff:.3f} |")
+        md.append(f"")
+
+        # Gradient SVD
+        md.append(f"### Gradient SVD (evolution)")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            snap = r['grad_snapshots']
+            shape_str = 'x'.join(map(str, r['shape']))
+            if not snap:
+                continue
+            md.append(f"**{label}** ({shape_str})")
+            md.append(f"")
+            md.append(f"| Epoch | Param | Eff Rank | Total | Frac | Top 5 SVs |")
+            md.append(f"|-------|-------|----------|-------|------|-----------|")
+            for epoch in sorted(snap.keys()):
+                for name, g in snap[epoch].items():
+                    S = svd_spectrum(g)
+                    eff_rank = (S > 0.1).sum().item()
+                    total = len(S)
+                    top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
+                    short = name.split('.')[-1]
+                    md.append(f"| {epoch} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
+            md.append(f"")
+
+        # Weight SVD evolution
+        md.append(f"### Weight SVD (evolution)")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            snap = r['weight_snapshots']
+            shape_str = 'x'.join(map(str, r['shape']))
+            if not snap:
+                continue
+            md.append(f"**{label}** ({shape_str})")
+            md.append(f"")
+            md.append(f"| Epoch | Param | Eff Rank | Total | Frac | Top 5 SVs |")
+            md.append(f"|-------|-------|----------|-------|------|-----------|")
+            for epoch in sorted(snap.keys()):
+                for name, w in snap[epoch].items():
+                    S = svd_spectrum(w)
+                    eff_rank = (S > 0.1).sum().item()
+                    total = len(S)
+                    top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
+                    short = name.split('.')[-1]
+                    md.append(f"| {epoch} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
+            md.append(f"")
+
+        # Epoch-by-epoch
+        md.append(f"### Epoch-by-Epoch Metrics")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            shape_str = 'x'.join(map(str, r['shape']))
+            md.append(f"**{label}** ({shape_str}, proj={r['proj_mode']})")
+            md.append(f"")
+            md.append(f"| Epoch | Train Loss | Train Acc | Val Loss | Val Acc |")
+            md.append(f"|-------|------------|-----------|----------|---------|")
+            for ep in epochs_to_show:
+                if ep < len(r['train_losses']):
+                    md.append(f"| {ep} | {r['train_losses'][ep]:.4f} | {r['train_accs'][ep]:.3f} | "
+                              f"{r['val_losses'][ep]:.4f} | {r['val_accs'][ep]:.3f} |")
+            md.append(f"")
+
+        report_text = '\n'.join(md)
+        with open(args.report, 'w') as f:
+            f.write(report_text)
+        print(f"Saved report to {args.report}")
 
 
 if __name__ == '__main__':
