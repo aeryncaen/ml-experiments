@@ -274,12 +274,10 @@ class BlockND(nn.Module):
         out_std = init_std / math.sqrt(2 * n_layers)
 
         if proj_mode == 'linear':
-            self.Wqkv = nn.Linear(self.D, 3 * self.D)
-            self.out_proj = nn.Linear(self.D, self.D)
+            self.Wqkv = nn.Linear(self.D, 3 * self.D, bias=False)
+            self.out_proj = nn.Linear(self.D, self.D, bias=False)
             nn.init.normal_(self.Wqkv.weight, std=init_std)
-            nn.init.zeros_(self.Wqkv.bias)
             nn.init.normal_(self.out_proj.weight, std=out_std)
-            nn.init.zeros_(self.out_proj.bias)
         else:
             # Both 'einsum' and 'matmul' store weights as ND tensors
             if self.rank > 1:
