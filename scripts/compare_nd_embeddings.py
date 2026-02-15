@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
-"""Compare 1D, 2D, 3D, and 4D embedding/projection structures on mod_arith.
+"""Compare ND embedding/projection structures on MQAR.
 
-Each model uses the same transformer skeleton (QKV seq-attn + feat-attn MLP)
-but with projections of different tensor rank:
+Tests all combinations of:
+  - Rank: 1D (flat linear), 2D, 3D, 4D (einsum over ND tensors)
+  - Ratio: 1:3 (small x large), 1:1 (balanced), 3:1 (large x small)
+  - Projection mode: einsum (true ND contraction) vs matmul (ND weight reshaped to 2D)
 
-  1D: flat nn.Linear(D, D) — standard transformer
-  2D: einsum('...cd, cdef -> ...ef')       w: (A,B, A,B)
-  3D: einsum('...cde, cdefgh -> ...fgh')   w: (A,B,C, A,B,C)
-  4D: einsum('...cdef, cdefghij -> ...ghij') w: (A,B,C,D, A,B,C,D)
+Architecture matches Zoology exactly: pre-norm TransformerBlock, MHA, no MLP,
+LayerNorm, position embeddings, tied embed/head, 0.02 init, cosine LR.
 
-All models have the same d_model and approximately matched param counts.
-Trains on cumulative modular arithmetic (short sequences), then compares:
-
-  1. Training loss curves
-  2. Validation accuracy curves
-  3. Gradient SVD spectra (how structured are the gradients)
-  4. Learned weight SVD spectra
+Outputs: train loss, train acc, val loss, val acc for all models.
 
 Usage:
-    python scripts/compare_nd_embeddings.py [--dim 64] [--epochs 100] [--save path.png]
+    python scripts/compare_nd_embeddings.py --dim 128 --epochs 64 --save results.png
 """
 
 import argparse
@@ -120,26 +114,34 @@ def _balanced_factor(n, parts):
     return (best,) + _balanced_factor(n // best, parts - 1)
 
 
-def factorize_dim(D, rank):
-    """Factor D into `rank` dimensions using 1:3 ratio structure.
+def factorize_dim(D, rank, ratio='1:3'):
+    """Factor D into `rank` dimensions with configurable ratio.
 
-    Mirrors the ULB architecture convention: first dimension is the number
-    of features (small), remaining dimensions form the descriptor (large).
-    Target ratio is 1:3 (n_features : desc_dim) for rank 2.
-    For rank > 2, the descriptor is further factored into balanced parts.
+    ratio controls the split between first dim and the rest:
+      '1:3' — first dim small, rest large (ULB convention)
+      '3:1' — first dim large, rest small (flipped)
+      '1:1' — balanced / square-ish
 
-    Examples for D=4096:
-        1D: (4096,)
-        2D: (32, 128)       — 32 features x 128 descriptor
-        3D: (32, 8, 16)     — 32 features x (8x16) descriptor
-        4D: (32, 4, 4, 8)   — 32 features x (4x4x8) descriptor
+    Examples for D=256, rank=2:
+        1:3 -> (8, 32)
+        3:1 -> (32, 8)
+        1:1 -> (16, 16)
     """
     if rank == 1:
         return (D,)
-    # First dim: target 1:3 ratio -> n_features ≈ sqrt(D/3)
-    target_nf = int((D / 3) ** 0.5)
+
+    if ratio == '1:1':
+        return _balanced_factor(D, rank)
+    elif ratio == '1:3':
+        target_nf = int((D / 3) ** 0.5)
+    elif ratio == '3:1':
+        target_nf = int((D * 3) ** 0.5)
+    else:
+        raise ValueError(f"Unknown ratio: {ratio}")
+
+    # Search ALL factor pairs (not just up to sqrt)
     best = 1
-    for s in range(2, int(D ** 0.5) + 1):
+    for s in range(2, D):
         if D % s == 0:
             if abs(s - target_nf) <= abs(best - target_nf):
                 best = s
@@ -147,7 +149,6 @@ def factorize_dim(D, rank):
     desc = D // nf
     if rank == 2:
         return (nf, desc)
-    # For rank > 2, factor descriptor into (rank-1) balanced parts
     return (nf,) + _balanced_factor(desc, rank - 1)
 
 
@@ -169,7 +170,14 @@ class BlockND(nn.Module):
     instead of nn.Linear for Wqkv and out_proj.
     """
 
-    def __init__(self, shape, n_layers=2, layer_idx=0, num_heads=1, dropout=0.1):
+    def __init__(self, shape, n_layers=2, layer_idx=0, num_heads=1, dropout=0.1,
+                 proj_mode='einsum'):
+        """
+        proj_mode:
+          'linear'  — nn.Linear (flat matmul), used for 1D
+          'einsum'  — einsum over ND-shaped weight tensors
+          'matmul'  — weight stored as ND tensor but reshaped to (D,D) for matmul
+        """
         super().__init__()
         self.shape = shape
         self.rank = len(shape)
@@ -177,11 +185,12 @@ class BlockND(nn.Module):
         self.num_heads = num_heads
         self.head_dim = self.D // num_heads
         self.n_layers = n_layers
+        self.proj_mode = proj_mode
 
         init_std = 0.02
         out_std = init_std / math.sqrt(2 * n_layers)
 
-        if self.rank == 1:
+        if proj_mode == 'linear':
             self.Wqkv = nn.Linear(self.D, 3 * self.D)
             self.out_proj = nn.Linear(self.D, self.D)
             nn.init.normal_(self.Wqkv.weight, std=init_std)
@@ -189,13 +198,14 @@ class BlockND(nn.Module):
             nn.init.normal_(self.out_proj.weight, std=out_std)
             nn.init.zeros_(self.out_proj.bias)
         else:
-            n = self.rank
-            in_chars = ''.join(chr(ord('c') + i) for i in range(n))
-            out_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
-            self.einsum_str = f'...{in_chars},{in_chars}{out_chars}->...{out_chars}'
+            # Both 'einsum' and 'matmul' store weights as ND tensors
+            if self.rank > 1:
+                n = self.rank
+                in_chars = ''.join(chr(ord('c') + i) for i in range(n))
+                out_chars = ''.join(chr(ord('c') + n + i) for i in range(n))
+                self.einsum_str = f'...{in_chars},{in_chars}{out_chars}->...{out_chars}'
 
             w_shape = tuple(shape) + tuple(shape)
-            # Wqkv: 3 separate ND projections for Q, K, V
             self.wq = nn.Parameter(torch.randn(*w_shape) * init_std)
             self.wk = nn.Parameter(torch.randn(*w_shape) * init_std)
             self.wv = nn.Parameter(torch.randn(*w_shape) * init_std)
@@ -208,11 +218,18 @@ class BlockND(nn.Module):
         self.dropout2 = nn.Dropout(0.0)
         self.attn_dropout = dropout
 
-    def _proj_nd(self, x, w):
-        return torch.einsum(self.einsum_str, x, w)
+    def _proj(self, x_flat, w):
+        """Project x_flat (B,T,D) through ND weight w using self.proj_mode."""
+        if self.proj_mode == 'einsum' and self.rank > 1:
+            B, T = x_flat.shape[:2]
+            x_nd = x_flat.view(B, T, *self.shape)
+            return torch.einsum(self.einsum_str, x_nd, w).reshape(B, T, self.D)
+        else:
+            # 'matmul' mode or rank-1 einsum: reshape weight to (D,D) and matmul
+            return x_flat @ w.reshape(self.D, self.D).T
 
     def forward(self, hidden_states, residual=None):
-        # Matches Zoology TransformerBlock.forward exactly
+        # Matches Zoology TransformerBlock.forward
         B, T = hidden_states.shape[:2]
         D, NH, HD = self.D, self.num_heads, self.head_dim
 
@@ -221,46 +238,33 @@ class BlockND(nn.Module):
         residual = (dropped + residual) if residual is not None else dropped
         h = self.norm1(residual)
 
-        if self.rank == 1:
-            qkv = self.Wqkv(h)
-            qkv = qkv.reshape(B, T, 3, NH, HD)
+        if self.proj_mode == 'linear':
+            qkv = self.Wqkv(h).reshape(B, T, 3, NH, HD)
             q, k, v = qkv.unbind(dim=2)
-            # Manual causal attention matching Zoology SelfAttention
-            softmax_scale = 1.0 / math.sqrt(HD)
-            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-            causal_mask = torch.triu(
-                torch.full((T, T), -10000.0, device=scores.device), 1
-            )
-            scores = scores + causal_mask.to(dtype=scores.dtype)
-            attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
-            attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
-            context = torch.einsum("bhts,bshd->bthd", attn, v)
-            hidden_states = self.out_proj(context.reshape(B, T, D))
         else:
-            h_nd = h.view(B, T, *self.shape)
-            Q = self._proj_nd(h_nd, self.wq)
-            K = self._proj_nd(h_nd, self.wk)
-            V = self._proj_nd(h_nd, self.wv)
-            q = Q.reshape(B, T, NH, HD)
-            k = K.reshape(B, T, NH, HD)
-            v = V.reshape(B, T, NH, HD)
-            softmax_scale = 1.0 / math.sqrt(HD)
-            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-            causal_mask = torch.triu(
-                torch.full((T, T), -10000.0, device=scores.device), 1
-            )
-            scores = scores + causal_mask.to(dtype=scores.dtype)
-            attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
-            attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
-            context = torch.einsum("bhts,bshd->bthd", attn, v)
-            context_nd = context.reshape(B, T, *self.shape)
-            hidden_states = self._proj_nd(context_nd, self.wo).reshape(B, T, D)
+            q = self._proj(h, self.wq).reshape(B, T, NH, HD)
+            k = self._proj(h, self.wk).reshape(B, T, NH, HD)
+            v = self._proj(h, self.wv).reshape(B, T, NH, HD)
+
+        softmax_scale = 1.0 / math.sqrt(HD)
+        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+        causal_mask = torch.triu(
+            torch.full((T, T), -10000.0, device=scores.device), 1
+        )
+        scores = scores + causal_mask.to(dtype=scores.dtype)
+        attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
+        attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
+        context = torch.einsum("bhts,bshd->bthd", attn, v).reshape(B, T, D)
+
+        if self.proj_mode == 'linear':
+            hidden_states = self.out_proj(context)
+        else:
+            hidden_states = self._proj(context, self.wo)
 
         # --- state mixer (Identity) ---
         dropped = self.dropout2(hidden_states)
         residual = (dropped + residual) if residual is not None else dropped
         hidden_states = self.norm2(residual)
-        # state_mixer is Identity, so hidden_states passes through
 
         return hidden_states, residual
 
@@ -269,7 +273,7 @@ class Model(nn.Module):
     """Matches Zoology LanguageModel + LMBackbone structure."""
 
     def __init__(self, shape, vocab_size=VOCAB_SIZE, n_layers=2, num_heads=1,
-                 max_position_embeddings=64, dropout=0.1):
+                 max_position_embeddings=64, dropout=0.1, proj_mode='einsum'):
         super().__init__()
         self.shape = shape
         self.rank = len(shape)
@@ -281,7 +285,7 @@ class Model(nn.Module):
 
         self.blocks = nn.ModuleList([
             BlockND(shape, n_layers=n_layers, layer_idx=i,
-                    num_heads=num_heads, dropout=dropout)
+                    num_heads=num_heads, dropout=dropout, proj_mode=proj_mode)
             for i in range(n_layers)
         ])
         self.drop_f = nn.Dropout(0.0)
@@ -473,14 +477,14 @@ def svd_spectrum(w):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--dim', type=int, default=4096,
-                        help='Model dim (must be factorable into 2/3/4-way)')
+    parser.add_argument('--dim', type=int, default=768,
+                        help='Model dim (768 gives clean 1:3 ratio: 16x48)')
     parser.add_argument('--task', type=str, default='mqar', choices=['mqar', 'mod_arith'],
                         help='Task: mqar (associative recall) or mod_arith')
     parser.add_argument('--epochs', type=int, default=64)
-    parser.add_argument('--seq-len', type=int, default=64, help='Sequence length')
-    parser.add_argument('--num-kv-pairs', type=int, default=4,
-                        help='Number of key-value pairs (mqar only)')
+    parser.add_argument('--seq-len', type=int, default=256, help='Sequence length')
+    parser.add_argument('--num-kv-pairs', type=int, default=16,
+                        help='Number of key-value pairs (mqar only, Zoology uses 16 for seq_len=256)')
     parser.add_argument('--num-train-examples', type=int, default=100_000,
                         help='Number of training examples (pre-generated)')
     parser.add_argument('--batch-size', type=int, default=512)
@@ -504,39 +508,56 @@ def main():
     vocab_size = VOCAB_SIZE if args.task == 'mqar' else MOD_BASE
     task_name = 'MQAR (associative recall)' if args.task == 'mqar' else 'Modular Arithmetic'
 
-    # Compute factorizations
-    shapes = {}
-    shapes['1D'] = (D,)
-    shapes['2D'] = factorize_dim(D, 2)
-    shapes['3D'] = factorize_dim(D, 3)
-    shapes['4D'] = factorize_dim(D, 4)
+    # Build all model configs: (label, shape, proj_mode)
+    configs = []
+
+    # 1D baseline
+    configs.append(('1D', (D,), 'linear'))
+
+    # 2D/3D/4D with all three ratios (skip duplicates)
+    seen_shapes = set()
+    for rank in [2, 3, 4]:
+        for ratio in ['1:3', '1:1', '3:1']:
+            shape = factorize_dim(D, rank, ratio=ratio)
+            key = (shape, 'einsum')
+            if key in seen_shapes:
+                print(f"  (skipping {rank}D-{ratio} = {'x'.join(map(str,shape))} — duplicate)")
+                continue
+            seen_shapes.add(key)
+            label = f'{rank}D-{ratio}'
+            configs.append((label, shape, 'einsum'))
+
+    # 2D ablation: einsum vs matmul (using 1:3 ratio)
+    shape_2d = factorize_dim(D, 2, ratio='1:3')
+    configs.append(('2D-matmul', shape_2d, 'matmul'))
 
     print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}")
     print(f"d_model = {D}")
-    for label, shape in shapes.items():
-        print(f"  {label}: {' x '.join(map(str, shape))} = {math.prod(shape)}")
+    print(f"\nModel configs:")
+    for label, shape, proj_mode in configs:
+        print(f"  {label:<14} shape={'x'.join(map(str, shape)):>15}  proj={proj_mode}")
 
-    colors = {'1D': 'C0', '2D': 'C1', '3D': 'C2', '4D': 'C3'}
     results = {}
 
     def print_leaderboard():
         if not results:
             return
-        print(f"\n{'='*90}")
-        print(f"{'Model':<8} {'Shape':>15} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epoch':>6}")
-        print(f"{'-'*90}")
+        W = 110
+        print(f"\n{'='*W}")
+        print(f"{'Model':<16} {'Shape':>15} {'Proj':>7} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epochs':>7}")
+        print(f"{'-'*W}")
         for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
-            n_ep = len(r['train_losses']) - 1  # -1 because index 0 is pre-training
-            print(f"{label:<8} {shape_str:>15} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>6}")
-        print(f"{'='*90}\n", flush=True)
+            n_ep = len(r['train_losses']) - 1
+            print(f"{label:<16} {shape_str:>15} {r['proj_mode']:>7} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>7}")
+        print(f"{'='*W}\n", flush=True)
 
-    for label, shape in shapes.items():
+    for label, shape, proj_mode in configs:
         torch.manual_seed(42)
-        print(f"\n[{label}] Building model ({' x '.join(map(str, shape))})...", flush=True)
+        print(f"\n[{label}] Building model ({' x '.join(map(str, shape))}, proj={proj_mode})...", flush=True)
         model = Model(shape, vocab_size=vocab_size, n_layers=args.n_layers,
-                      max_position_embeddings=args.seq_len)
+                      max_position_embeddings=args.seq_len, proj_mode=proj_mode)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
@@ -547,38 +568,37 @@ def main():
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
+        results[label]['proj_mode'] = proj_mode
         print_leaderboard()
 
+    all_labels = [label for label, _, _ in configs]
+
     # --- Final comparison ---
-    # Find max epoch count across all models (some may early-stop)
     max_ep = max(len(r['train_losses']) for r in results.values())
 
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 80)
     print("EPOCH-BY-EPOCH COMPARISON (every ~10 epochs)")
-    print("=" * 120)
-    header = f"{'Epoch':>6}"
-    for label in shapes:
-        header += f" | {label+' tl':>8} {label+' ta':>7} {label+' vl':>8} {label+' va':>7}"
-    print(header)
-    print("-" * 120)
+    print("=" * 80)
+    # Print per-model blocks (too many models for one wide row)
     step = max(1, max_ep // 10)
     epochs_to_show = sorted(set(list(range(0, max_ep, step)) + [max_ep - 1]))
-    for ep in epochs_to_show:
-        row = f"{ep:>6}"
-        for label in shapes:
-            r = results[label]
+    for label in all_labels:
+        r = results[label]
+        shape_str = 'x'.join(map(str, r['shape']))
+        print(f"\n  {label} ({shape_str}, proj={r['proj_mode']}):")
+        print(f"  {'Epoch':>6} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9}")
+        for ep in epochs_to_show:
             if ep < len(r['train_losses']):
-                row += f" | {r['train_losses'][ep]:>8.4f} {r['train_accs'][ep]:>7.3f} {r['val_losses'][ep]:>8.4f} {r['val_accs'][ep]:>7.3f}"
-            else:
-                row += f" | {'--':>8} {'--':>7} {'--':>8} {'--':>7}"
-        print(row)
+                print(f"  {ep:>6} {r['train_losses'][ep]:>11.4f} {r['train_accs'][ep]:>10.3f} {r['val_losses'][ep]:>10.4f} {r['val_accs'][ep]:>9.3f}")
 
     print("\n" + "=" * 80)
     print("GRADIENT SVD ANALYSIS (effective rank = fraction of SVs > 10% of max)")
     print("=" * 80)
-    for label in shapes:
-        snap = results[label]['grad_snapshots']
-        print(f"\n  {label} ({' x '.join(map(str, shapes[label]))}):")
+    for label in all_labels:
+        r = results[label]
+        snap = r['grad_snapshots']
+        shape_str = 'x'.join(map(str, r['shape']))
+        print(f"\n  {label} ({shape_str}):")
         for epoch in sorted(snap.keys()):
             for name, g in snap[epoch].items():
                 S = svd_spectrum(g)
@@ -591,10 +611,12 @@ def main():
     print("\n" + "=" * 80)
     print("WEIGHT SVD ANALYSIS (trained)")
     print("=" * 80)
-    for label in shapes:
-        snap = results[label]['weight_snapshots']
-        final_epoch = results[label]['snapshot_epochs'][-1]
-        print(f"\n  {label} ({' x '.join(map(str, shapes[label]))}):")
+    for label in all_labels:
+        r = results[label]
+        snap = r['weight_snapshots']
+        final_epoch = r['snapshot_epochs'][-1]
+        shape_str = 'x'.join(map(str, r['shape']))
+        print(f"\n  {label} ({shape_str}):")
         if final_epoch in snap:
             for name, w in snap[final_epoch].items():
                 S = svd_spectrum(w)
@@ -611,83 +633,27 @@ def main():
 
     # --- Plot ---
     print("Plotting...")
-    rank_labels = list(shapes.keys())  # ['1D', '2D', '3D', '4D']
-    n_ranks = len(rank_labels)
+    n_models = len(all_labels)
 
-    # Layout: 3 rows
-    #   Row 0: loss curve, val acc curve, final acc bar chart (shared across all)
-    #   Row 1: one grad SVD subplot per rank (4 columns)
-    #   Row 2: one weight SVD subplot per rank (4 columns)
-    fig = plt.figure(figsize=(20, 16))
-    gs = gridspec.GridSpec(3, n_ranks, hspace=0.4, wspace=0.3,
-                           height_ratios=[1, 1, 1])
+    # Layout: 2 rows — train loss + val loss on top, train acc + val acc on bottom
+    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
 
-    # Row 0, col 0-1: Training loss + Val accuracy (span 2 cols each)
-    ax_loss = fig.add_subplot(gs[0, :n_ranks // 2])
-    for label in rank_labels:
-        ax_loss.plot(results[label]['train_losses'], color=colors[label], alpha=0.8,
-                     label=f"{label}", linewidth=2)
-    ax_loss.set_xlabel('epoch')
-    ax_loss.set_ylabel('loss')
-    ax_loss.set_title('Training Loss')
-    ax_loss.legend(fontsize=10)
-    ax_loss.grid(True, alpha=0.3)
+    for label in all_labels:
+        r = results[label]
+        axes[0, 0].plot(r['train_losses'], alpha=0.8, label=label, linewidth=1.5)
+        axes[0, 1].plot(r['val_losses'], alpha=0.8, label=label, linewidth=1.5)
+        axes[1, 0].plot(r['train_accs'], alpha=0.8, label=label, linewidth=1.5)
+        axes[1, 1].plot(r['val_accs'], alpha=0.8, label=label, linewidth=1.5)
 
-    ax_acc = fig.add_subplot(gs[0, n_ranks // 2:])
-    for label in rank_labels:
-        ax_acc.plot(results[label]['val_accs'], color=colors[label], alpha=0.8,
-                    label=label, linewidth=2)
-    ax_acc.set_xlabel('epoch')
-    ax_acc.set_ylabel('accuracy')
-    ax_acc.set_title('Validation Accuracy')
-    ax_acc.legend(fontsize=10)
-    ax_acc.grid(True, alpha=0.3)
-
-    # Row 1: Gradient SVD — one subplot per rank
-    mid_epochs = {}
-    for label in rank_labels:
-        snaps = results[label]['snapshot_epochs']
-        mid_epochs[label] = snaps[len(snaps) // 2]
-
-    for i, label in enumerate(rank_labels):
-        ax = fig.add_subplot(gs[1, i])
-        snap = results[label]['grad_snapshots']
-        ep = mid_epochs[label]
-        if ep in snap:
-            for name, g in snap[ep].items():
-                S = svd_spectrum(g)
-                short = name.split('.')[-1]
-                ax.semilogy(S.numpy(), linewidth=1.5, alpha=0.8, label=short)
-        ax.set_title(f'{label} Grad SVD (ep {ep})', fontsize=10)
-        ax.set_xlabel('SV index')
-        if i == 0:
-            ax.set_ylabel('normalized SV')
+    for ax, title in zip(axes.flat, ['Train Loss', 'Val Loss', 'Train Acc', 'Val Acc']):
+        ax.set_title(title)
+        ax.set_xlabel('epoch')
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
-    # Row 2: Weight SVD — one subplot per rank
-    for i, label in enumerate(rank_labels):
-        ax = fig.add_subplot(gs[2, i])
-        snap = results[label]['weight_snapshots']
-        final_ep = results[label]['snapshot_epochs'][-1]
-        if final_ep in snap:
-            for name, w in snap[final_ep].items():
-                S = svd_spectrum(w)
-                short = name.split('.')[-1]
-                eff = (S > 0.1).sum().item()
-                ax.semilogy(S.numpy(), linewidth=1.5, alpha=0.8,
-                           label=f'{short} (rank {eff})')
-        ax.set_title(f'{label} Weight SVD (trained)', fontsize=10)
-        ax.set_xlabel('SV index')
-        if i == 0:
-            ax.set_ylabel('normalized SV')
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-
-    shape_strs = [f"{l}: {'x'.join(map(str, shapes[l]))}" for l in rank_labels]
-    fig.suptitle(f'1D vs 2D vs 3D vs 4D Projection Structure on {task_name} (D={D})\n'
-                 f'{" | ".join(shape_strs)}',
+    fig.suptitle(f'ND Embedding/Projection Comparison on {task_name} (D={D})',
                  fontsize=13, fontweight='bold')
+    fig.tight_layout()
 
     if args.save:
         plt.savefig(args.save, dpi=150, bbox_inches='tight')
