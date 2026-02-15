@@ -126,7 +126,7 @@ At $B = 8, T = 2048$, the largest attention matrix ($256 \times 256 \times 16384
 ### 3.2 Training
 
 - **Data**: FineWeb-10B
-- **Steps**: 20,000
+- **Steps**: 7,500
 - **Batch size**: 8
 - **Optimizer**: AdamW (β₁=0.9, β₂=0.95)
 - **Learning rate**: 3e-4 with cosine decay, 200 step warmup
@@ -196,7 +196,7 @@ At $B = 8, T = 2048$, the largest attention matrix ($256 \times 256 \times 16384
 
 <!-- TODO: Fill in after runs complete -->
 
-| Run ID | Val loss (20k steps) | Δ vs baseline |
+| Run ID | Val loss (7.5k steps) | Δ vs baseline |
 |--------|----------------------|---------------|
 | baseline | | — |
 | fa-256x8-softmax | | |
@@ -220,7 +220,7 @@ At $B = 8, T = 2048$, the largest attention matrix ($256 \times 256 \times 16384
 
 ### 4.3 Effect of factorization ratio
 
-<!-- TODO: Plot val loss at 20k steps vs N_f, one line per activation. This is the key plot — does the optimal ratio differ by activation? -->
+<!-- TODO: Plot val loss at 7.5k steps vs N_f, one line per activation. This is the key plot — does the optimal ratio differ by activation? -->
 
 ```
 [PLACEHOLDER: scatter/line plot — final val loss vs N_f, grouped by activation]
@@ -328,7 +328,7 @@ These would be run at whichever factorization ratio(s) win the initial sweep.
 
 <!-- TODO: If initial results are promising, add rows to the results table for these variants. -->
 
-| Run ID | Variant | Extra params/layer | Val loss (20k) | Δ vs shared QK |
+| Run ID | Variant | Extra params/layer | Val loss (7.5k) | Δ vs shared QK |
 |--------|---------|--------------------|----------------|----------------|
 | | separate Q/K | | | |
 | | GQA-style | | | |
@@ -380,19 +380,19 @@ All other hyperparameters (layers, heads, dim, training schedule) are identical 
 
 ```bash
 # SwiGLU Baseline
-MODEL_TYPE=transformer TRAIN_STEPS=20000 python train_fineweb_vanilla.py
+MODEL_TYPE=transformer TRAIN_STEPS=7500 python train_fineweb_vanilla.py
 
 # Feature attention sweep (example for one ratio)
 for act in softmax silu silu2; do
     MODEL_TYPE=feat_attn FA_N_FEATURES=64 FA_ACTIVATION=$act \
-        TRAIN_STEPS=20000 python train_fineweb_vanilla.py
+        TRAIN_STEPS=7500 python train_fineweb_vanilla.py
 done
 
 # Full sweep
 for nf in 256 128 64 32 16 8; do
     for act in softmax silu silu2; do
         MODEL_TYPE=feat_attn FA_N_FEATURES=$nf FA_ACTIVATION=$act \
-            TRAIN_STEPS=20000 python train_fineweb_vanilla.py
+            TRAIN_STEPS=7500 python train_fineweb_vanilla.py
     done
 done
 ```
