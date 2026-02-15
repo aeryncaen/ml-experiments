@@ -1281,7 +1281,10 @@ class GPTFusedSeqFeature(nn.Module):
 
     def __init__(self):
         super().__init__()
-        hidden = int(HP.d_model * 8 / 3)
+        if HP.fused_inner_dim > 0:
+            hidden = HP.fused_inner_dim
+        else:
+            hidden = int(HP.d_model * 8 / 3)
         hidden = ((hidden + 255) // 256) * 256
         nf = HP.fa_n_features
         act = HP.fa_activation
