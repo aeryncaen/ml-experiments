@@ -833,6 +833,136 @@ def main():
         else:
             print(f"    (no snapshots captured)")
 
+    # --- ANALYSIS ---
+    print("\n" + "=" * 80)
+    print("ANALYSIS")
+    print("=" * 80)
+
+    # Group models
+    baseline = results.get('1D')
+    einsum_models = {l: r for l, r in results.items() if r['proj_mode'] == 'einsum'}
+    matmul_models = {l: r for l, r in results.items() if r['proj_mode'] == 'matmul'}
+
+    def final_metrics(r):
+        return {
+            'val_acc': r['val_accs'][-1],
+            'val_loss': r['val_losses'][-1],
+            'train_acc': r['train_accs'][-1],
+            'train_loss': r['train_losses'][-1],
+            'epochs': len(r['train_losses']) - 1,
+        }
+
+    # 1. ND einsum vs 1D baseline
+    print("\n  1. ND EINSUM vs 1D BASELINE")
+    print("  " + "-" * 60)
+    if baseline:
+        bm = final_metrics(baseline)
+        print(f"     1D baseline: val_acc={bm['val_acc']:.4f}  val_loss={bm['val_loss']:.4f}  epochs={bm['epochs']}")
+        for label in sorted(einsum_models):
+            r = einsum_models[label]
+            m = final_metrics(r)
+            acc_diff = m['val_acc'] - bm['val_acc']
+            loss_diff = m['val_loss'] - bm['val_loss']
+            epoch_diff = m['epochs'] - bm['epochs']
+            sign_a = '+' if acc_diff >= 0 else ''
+            sign_l = '+' if loss_diff >= 0 else ''
+            sign_e = '+' if epoch_diff >= 0 else ''
+            print(f"     {label:<14} val_acc={m['val_acc']:.4f} ({sign_a}{acc_diff:.4f})  "
+                  f"val_loss={m['val_loss']:.4f} ({sign_l}{loss_diff:.4f})  "
+                  f"epochs={m['epochs']} ({sign_e}{epoch_diff})")
+
+        # Summary
+        best_einsum = max(einsum_models.items(), key=lambda x: x[1]['val_accs'][-1])
+        worst_einsum = min(einsum_models.items(), key=lambda x: x[1]['val_accs'][-1])
+        fastest_einsum = min(einsum_models.items(), key=lambda x: len(x[1]['val_accs']))
+        print(f"\n     Best ND einsum:    {best_einsum[0]} (val_acc={best_einsum[1]['val_accs'][-1]:.4f})")
+        print(f"     Worst ND einsum:   {worst_einsum[0]} (val_acc={worst_einsum[1]['val_accs'][-1]:.4f})")
+        print(f"     Fastest to converge: {fastest_einsum[0]} ({len(fastest_einsum[1]['val_accs'])-1} epochs)")
+
+        avg_einsum_acc = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
+        if avg_einsum_acc > bm['val_acc'] + 0.001:
+            print(f"\n     VERDICT: ND einsum outperforms 1D (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+        elif avg_einsum_acc < bm['val_acc'] - 0.001:
+            print(f"\n     VERDICT: 1D outperforms ND einsum (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+        else:
+            print(f"\n     VERDICT: No meaningful difference (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+
+    # 2. Einsum vs Matmul
+    print("\n  2. EINSUM vs MATMUL (same weights, different projection)")
+    print("  " + "-" * 60)
+    if matmul_models:
+        for label, r in sorted(matmul_models.items()):
+            m = final_metrics(r)
+            shape = r['shape']
+            # Find matching einsum model
+            rank = len(shape)
+            einsum_label = f'{rank}D-1:3'
+            if einsum_label in einsum_models:
+                em = final_metrics(einsum_models[einsum_label])
+                acc_diff = m['val_acc'] - em['val_acc']
+                epoch_diff = m['epochs'] - em['epochs']
+                print(f"     {label:<14} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}  "
+                      f"vs {einsum_label}: acc {'+' if acc_diff>=0 else ''}{acc_diff:.4f}  "
+                      f"epochs {'+' if epoch_diff>=0 else ''}{epoch_diff}")
+            else:
+                print(f"     {label:<14} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}")
+
+        avg_matmul = np.mean([r['val_accs'][-1] for r in matmul_models.values()])
+        avg_einsum = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
+        if abs(avg_matmul - avg_einsum) < 0.001:
+            print(f"\n     VERDICT: Einsum and matmul equivalent — ND structure in weights alone doesn't help")
+        elif avg_einsum > avg_matmul:
+            print(f"\n     VERDICT: Einsum > matmul — ND contraction matters, not just ND weight shape")
+        else:
+            print(f"\n     VERDICT: Matmul >= einsum — ND contraction provides no benefit over reshape")
+
+    # 3. Ratio comparison within each rank
+    print("\n  3. RATIO COMPARISON (within each rank)")
+    print("  " + "-" * 60)
+    for rank in [2, 3, 4]:
+        rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
+        if len(rank_models) < 2:
+            continue
+        best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+        worst = min(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+        spread = best[1]['val_accs'][-1] - worst[1]['val_accs'][-1]
+        print(f"     {rank}D: best={best[0]} ({best[1]['val_accs'][-1]:.4f})  "
+              f"worst={worst[0]} ({worst[1]['val_accs'][-1]:.4f})  spread={spread:.4f}")
+    
+    # 4. Rank comparison (best of each rank)
+    print("\n  4. RANK COMPARISON (best model per rank)")
+    print("  " + "-" * 60)
+    for rank in [1, 2, 3, 4]:
+        if rank == 1:
+            if baseline:
+                bm = final_metrics(baseline)
+                print(f"     1D: val_acc={bm['val_acc']:.4f}  val_loss={bm['val_loss']:.4f}  epochs={bm['epochs']}")
+        else:
+            rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
+            if rank_models:
+                best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+                m = final_metrics(best[1])
+                print(f"     {rank}D: val_acc={m['val_acc']:.4f}  val_loss={m['val_loss']:.4f}  "
+                      f"epochs={m['epochs']}  ({best[0]})")
+
+    # 5. SVD effective rank comparison
+    print("\n  5. WEIGHT SVD EFFECTIVE RANK (final snapshot)")
+    print("  " + "-" * 60)
+    for label in all_labels:
+        r = results[label]
+        snap = r['weight_snapshots']
+        if not snap:
+            continue
+        last_epoch = max(snap.keys())
+        eff_ranks = []
+        for name, w in snap[last_epoch].items():
+            S = svd_spectrum(w)
+            eff_ranks.append((S > 0.1).float().mean().item())
+        if eff_ranks:
+            avg_eff = np.mean(eff_ranks)
+            shape_str = 'x'.join(map(str, r['shape']))
+            print(f"     {label:<14} ({shape_str:>12}): avg eff_rank_frac={avg_eff:.3f}")
+
     print("\n" + "=" * 80)
     print("FINAL LEADERBOARD")
     print("=" * 80)
