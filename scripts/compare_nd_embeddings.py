@@ -158,28 +158,36 @@ def factorize_dim(D, rank):
 class BlockND(nn.Module):
     """Causal self-attention using N-dimensional tensor projections.
 
-    Hidden state stays ND-shaped throughout: (B, T, *shape).
-    1D: standard nn.Linear QKV attention.
-    ND: einsum QKV attention over ND-shaped tokens.
-    No MLP (matching Zoology MQAR setup — state_mixer is Identity).
+    Matches Zoology TransformerBlock exactly:
+      - Pre-norm with LayerNorm
+      - MHA: fused Wqkv -> causal attention -> out_proj
+      - state_mixer = Identity (no MLP)
+      - embed_dropout on layer 0, resid_dropout=0.0 elsewhere
+      - out_proj gets rescaled init: std=0.02 / sqrt(2*n_layers)
+
+    Only difference from Zoology: ND ranks use einsum projections
+    instead of nn.Linear for Wqkv and out_proj.
     """
 
-    def __init__(self, shape, n_heads=4):
+    def __init__(self, shape, n_layers=2, layer_idx=0, num_heads=1, dropout=0.1):
         super().__init__()
         self.shape = shape
         self.rank = len(shape)
         self.D = math.prod(shape)
-        self.n_heads = n_heads if self.rank == 1 else shape[0]
-        self.head_dim = self.D // self.n_heads
+        self.num_heads = num_heads
+        self.head_dim = self.D // num_heads
+        self.n_layers = n_layers
 
-        init_scale = self.D ** -0.5
+        init_std = 0.02
+        out_std = init_std / math.sqrt(2 * n_layers)
 
         if self.rank == 1:
-            D = self.D
-            self.wq = nn.Linear(D, D, bias=False)
-            self.wk = nn.Linear(D, D, bias=False)
-            self.wv = nn.Linear(D, D, bias=False)
-            self.wo = nn.Linear(D, D, bias=False)
+            self.Wqkv = nn.Linear(self.D, 3 * self.D)
+            self.out_proj = nn.Linear(self.D, self.D)
+            nn.init.normal_(self.Wqkv.weight, std=init_std)
+            nn.init.zeros_(self.Wqkv.bias)
+            nn.init.normal_(self.out_proj.weight, std=out_std)
+            nn.init.zeros_(self.out_proj.bias)
         else:
             n = self.rank
             in_chars = ''.join(chr(ord('c') + i) for i in range(n))
@@ -187,72 +195,130 @@ class BlockND(nn.Module):
             self.einsum_str = f'...{in_chars},{in_chars}{out_chars}->...{out_chars}'
 
             w_shape = tuple(shape) + tuple(shape)
-            self.seq_wq = nn.Parameter(torch.randn(*w_shape) * init_scale)
-            self.seq_wk = nn.Parameter(torch.randn(*w_shape) * init_scale)
-            self.seq_wv = nn.Parameter(torch.randn(*w_shape) * init_scale)
-            self.seq_wo = nn.Parameter(torch.randn(*w_shape) * init_scale)
+            # Wqkv: 3 separate ND projections for Q, K, V
+            self.wq = nn.Parameter(torch.randn(*w_shape) * init_std)
+            self.wk = nn.Parameter(torch.randn(*w_shape) * init_std)
+            self.wv = nn.Parameter(torch.randn(*w_shape) * init_std)
+            self.wo = nn.Parameter(torch.randn(*w_shape) * out_std)
 
-        self.norm = RMSNorm(self.D)
+        # Matching Zoology: LayerNorm, dropout
+        self.norm1 = nn.LayerNorm(self.D)
+        self.norm2 = nn.LayerNorm(self.D)
+        self.dropout1 = nn.Dropout(dropout if layer_idx == 0 else 0.0)
+        self.dropout2 = nn.Dropout(0.0)
+        self.attn_dropout = dropout
 
     def _proj_nd(self, x, w):
         return torch.einsum(self.einsum_str, x, w)
 
-    def forward(self, x):
-        # x: (B, T, *shape)
-        B, T = x.shape[:2]
-        D, NH, HD = self.D, self.n_heads, self.head_dim
-        x_flat = x.reshape(B, T, D)
+    def forward(self, hidden_states, residual=None):
+        # Matches Zoology TransformerBlock.forward exactly
+        B, T = hidden_states.shape[:2]
+        D, NH, HD = self.D, self.num_heads, self.head_dim
+
+        # --- sequence mixer (MHA) ---
+        dropped = self.dropout1(hidden_states.reshape(B, T, D))
+        residual = (dropped + residual) if residual is not None else dropped
+        h = self.norm1(residual)
 
         if self.rank == 1:
-            h = self.norm(x_flat)
-            q = self.wq(h).view(B, T, NH, HD).transpose(1, 2)
-            k = self.wk(h).view(B, T, NH, HD).transpose(1, 2)
-            v = self.wv(h).view(B, T, NH, HD).transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            y = y.transpose(1, 2).contiguous().view(B, T, D)
-            return x + self.wo(y)
+            qkv = self.Wqkv(h)
+            qkv = qkv.reshape(B, T, 3, NH, HD)
+            q, k, v = qkv.unbind(dim=2)
+            # Manual causal attention matching Zoology SelfAttention
+            softmax_scale = 1.0 / math.sqrt(HD)
+            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+            causal_mask = torch.triu(
+                torch.full((T, T), -10000.0, device=scores.device), 1
+            )
+            scores = scores + causal_mask.to(dtype=scores.dtype)
+            attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
+            attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
+            context = torch.einsum("bhts,bshd->bthd", attn, v)
+            hidden_states = self.out_proj(context.reshape(B, T, D))
+        else:
+            h_nd = h.view(B, T, *self.shape)
+            Q = self._proj_nd(h_nd, self.wq)
+            K = self._proj_nd(h_nd, self.wk)
+            V = self._proj_nd(h_nd, self.wv)
+            q = Q.reshape(B, T, NH, HD)
+            k = K.reshape(B, T, NH, HD)
+            v = V.reshape(B, T, NH, HD)
+            softmax_scale = 1.0 / math.sqrt(HD)
+            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+            causal_mask = torch.triu(
+                torch.full((T, T), -10000.0, device=scores.device), 1
+            )
+            scores = scores + causal_mask.to(dtype=scores.dtype)
+            attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
+            attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
+            context = torch.einsum("bhts,bshd->bthd", attn, v)
+            context_nd = context.reshape(B, T, *self.shape)
+            hidden_states = self._proj_nd(context_nd, self.wo).reshape(B, T, D)
 
-        # ND path: x is (B, T, *shape)
-        h = self.norm(x_flat).view(B, T, *self.shape)
-        Q = self._proj_nd(h, self.seq_wq)
-        K = self._proj_nd(h, self.seq_wk)
-        V = self._proj_nd(h, self.seq_wv)
-        # Reshape for multi-head attention: first dim of shape = n_heads
-        Q = Q.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
-        K = K.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
-        V = V.reshape(B, T, NH, HD).permute(0, 2, 1, 3)
-        y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, *self.shape)
-        y = self._proj_nd(y, self.seq_wo)
-        return x + y
+        # --- state mixer (Identity) ---
+        dropped = self.dropout2(hidden_states)
+        residual = (dropped + residual) if residual is not None else dropped
+        hidden_states = self.norm2(residual)
+        # state_mixer is Identity, so hidden_states passes through
+
+        return hidden_states, residual
 
 
 class Model(nn.Module):
-    def __init__(self, shape, vocab_size=VOCAB_SIZE, n_layers=1, n_heads=4):
+    """Matches Zoology LanguageModel + LMBackbone structure."""
+
+    def __init__(self, shape, vocab_size=VOCAB_SIZE, n_layers=2, num_heads=1,
+                 max_position_embeddings=64, dropout=0.1):
         super().__init__()
         self.shape = shape
         self.rank = len(shape)
         self.D = math.prod(shape)
-        # Embedding: (vocab_size, D) — lookup returns (B, T, D), reshaped to ND
-        self.embed = nn.Embedding(vocab_size, self.D)
+
+        # Token + position embeddings (matching Zoology TokenEmbeddings)
+        self.word_embeddings = nn.Embedding(vocab_size, self.D)
+        self.position_embeddings = nn.Embedding(max_position_embeddings, self.D)
+
         self.blocks = nn.ModuleList([
-            BlockND(shape, n_heads=n_heads)
-            for _ in range(n_layers)
+            BlockND(shape, n_layers=n_layers, layer_idx=i,
+                    num_heads=num_heads, dropout=dropout)
+            for i in range(n_layers)
         ])
-        self.final_norm = RMSNorm(self.D)
-        self.head = nn.Linear(self.D, vocab_size, bias=False)
+        self.drop_f = nn.Dropout(0.0)
+        self.ln_f = nn.LayerNorm(self.D)
+        self.lm_head = nn.Linear(self.D, vocab_size, bias=False)
+
         # Tie embed and head weights (matching Zoology)
-        self.head.weight = self.embed.weight
+        self.lm_head.weight = self.word_embeddings.weight
+
+        # Init all weights matching Zoology _init_weights
+        self._init_weights()
+
+    def _init_weights(self):
+        init_std = 0.02
+        nn.init.normal_(self.word_embeddings.weight, std=init_std)
+        nn.init.normal_(self.position_embeddings.weight, std=init_std)
+        # nn.Linear and nn.LayerNorm already handled by BlockND init
+        # ln_f is default init (ones/zeros) which is fine
 
     def forward(self, x):
         B, T = x.shape
-        h = self.embed(x)  # (B, T, D)
+        position_ids = torch.arange(T, dtype=torch.long, device=x.device)
+        h = self.word_embeddings(x) + self.position_embeddings(position_ids)
+
         if self.rank > 1:
-            h = h.view(B, T, *self.shape)  # (B, T, *shape)
+            h = h.view(B, T, *self.shape)
+
+        residual = None
         for block in self.blocks:
-            h = block(h)
-        # Flatten back for head
-        return self.head(self.final_norm(h.reshape(B, T, self.D)))
+            h, residual = block(h, residual)
+
+        # Final norm (matching LMBackbone)
+        dropped = self.drop_f(h.reshape(B, T, self.D))
+        residual = (dropped + residual) if residual is not None else dropped
+        output = self.ln_f(residual)
+
+        return self.lm_head(output)
 
 
 def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', label='',
@@ -468,7 +534,8 @@ def main():
     for label, shape in shapes.items():
         torch.manual_seed(42)
         print(f"\n[{label}] Building model ({' x '.join(map(str, shape))})...", flush=True)
-        model = Model(shape, vocab_size=vocab_size, n_layers=args.n_layers)
+        model = Model(shape, vocab_size=vocab_size, n_layers=args.n_layers,
+                      max_position_embeddings=args.seq_len)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
