@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -325,10 +326,20 @@ class Model(nn.Module):
 
 
 def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', label='',
-          vocab_size=8192, num_kv_pairs=4, num_train_examples=100_000):
+          vocab_size=8192, num_kv_pairs=4, num_train_examples=100_000,
+          use_compile=False, use_amp=False, profile=False):
     model = model.to(device)
+
+    if use_compile:
+        print(f'  [{label}] Compiling model with torch.compile()...', flush=True)
+        model = torch.compile(model)
+
     opt = optim.AdamW(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=0.0)
+
+    # AMP setup
+    amp_dtype = torch.bfloat16 if (use_amp and device == 'cuda') else None
+    amp_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype) if amp_dtype else None
 
     train_losses = []
     train_accs = []
@@ -368,7 +379,11 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
             for i in range(0, len(data_x), bs):
                 bx = data_x[i:i+bs]
                 bt = data_t[i:i+bs]
-                logits = model(bx)
+                if amp_ctx is not None:
+                    with amp_ctx:
+                        logits = model(bx)
+                else:
+                    logits = model(bx)
                 total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
                                               ignore_index=-100) * len(bx)
                 preds = logits.argmax(-1)
@@ -389,6 +404,7 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     val_losses.append(vl0); val_accs.append(va0)
     print(f'  [{label}] start: train_loss={tl0:.4f} train_acc={ta0:.3f} val_loss={vl0:.4f} val_acc={va0:.3f}', flush=True)
 
+    wall_start = time.perf_counter()
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
         model.train()
@@ -400,16 +416,42 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         perm = torch.randperm(num_train_examples, device=device)
         do_snapshot = epoch in snapshot_epochs
 
+        # Profiling timers (only on first epoch if --profile)
+        do_profile = profile and epoch == 0
+        if do_profile:
+            t_fwd = t_bwd = t_opt = 0.0
+
         for batch_i in range(n_batches):
             idx = perm[batch_i * B : (batch_i + 1) * B]
             x = train_x[idx]
             t = train_t[idx]
 
-            logits = model(x)
-            loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
-                                   ignore_index=-100)
+            if do_profile and device == 'cuda':
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
+
+            if amp_ctx is not None:
+                with amp_ctx:
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
+                                           ignore_index=-100)
+            else:
+                logits = model(x)
+                loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
+                                       ignore_index=-100)
+
+            if do_profile and device == 'cuda':
+                torch.cuda.synchronize()
+                _t1 = time.perf_counter()
+                t_fwd += _t1 - _t0
+
             opt.zero_grad()
             loss.backward()
+
+            if do_profile and device == 'cuda':
+                torch.cuda.synchronize()
+                _t2 = time.perf_counter()
+                t_bwd += _t2 - _t1
 
             # Accumulate on GPU — no sync
             with torch.no_grad():
@@ -434,7 +476,17 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
 
             opt.step()
 
+            if do_profile and device == 'cuda':
+                torch.cuda.synchronize()
+                _t3 = time.perf_counter()
+                t_opt += _t3 - _t2
+
         scheduler.step()
+
+        if do_profile and device == 'cuda':
+            torch.cuda.synchronize()
+            _eval_t0 = time.perf_counter()
+
         # Single sync point per epoch
         tl = (epoch_loss / n_batches).item()
         ta = (epoch_correct.float() / epoch_count.clamp(min=1)).item()
@@ -446,6 +498,20 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         val_losses.append(vl_)
         val_accs.append(va_)
 
+        if do_profile and device == 'cuda':
+            torch.cuda.synchronize()
+            _eval_t1 = time.perf_counter()
+            t_eval = _eval_t1 - _eval_t0
+            t_total = t_fwd + t_bwd + t_opt + t_eval
+            print(f'\n  [{label}] PROFILE (epoch 0, {n_batches} batches):')
+            print(f'    Forward:    {t_fwd:>7.2f}s ({t_fwd/t_total*100:>5.1f}%)')
+            print(f'    Backward:   {t_bwd:>7.2f}s ({t_bwd/t_total*100:>5.1f}%)')
+            print(f'    Optimizer:  {t_opt:>7.2f}s ({t_opt/t_total*100:>5.1f}%)')
+            print(f'    Eval:       {t_eval:>7.2f}s ({t_eval/t_total*100:>5.1f}%)')
+            print(f'    Total:      {t_total:>7.2f}s')
+            print(f'    Per batch:  {(t_fwd+t_bwd+t_opt)/n_batches*1000:>7.1f}ms (fwd+bwd+opt)')
+            print(flush=True)
+
         pbar.set_postfix(tl=f'{train_losses[-1]:.4f}', ta=f'{train_accs[-1]:.3f}',
                          vl=f'{vl_:.4f}', va=f'{va_:.3f}')
 
@@ -453,6 +519,11 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         if va_ > 0.99:
             print(f'  [{label}] Early stop at epoch {epoch} — val_acc={va_:.3f}', flush=True)
             break
+
+    wall_elapsed = time.perf_counter() - wall_start
+    actual_epochs = len(train_losses) - 1  # subtract initial metrics
+    sec_per_epoch = wall_elapsed / max(actual_epochs, 1)
+    print(f'  [{label}] Done: {actual_epochs} epochs in {wall_elapsed:.1f}s ({sec_per_epoch:.1f}s/epoch)', flush=True)
 
     return {
         'train_losses': train_losses,
@@ -462,6 +533,8 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         'grad_snapshots': grad_snapshots,
         'weight_snapshots': weight_snapshots,
         'snapshot_epochs': snapshot_epochs,
+        'wall_time': wall_elapsed,
+        'sec_per_epoch': sec_per_epoch,
     }
 
 
@@ -496,6 +569,12 @@ def main():
     parser.add_argument('--save', type=str, default=None)
     parser.add_argument('--device', type=str, default=None,
                         help='Device (default: auto-detect cuda/mps/cpu)')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile() on model (requires PyTorch 2.0+)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Use automatic mixed precision (bf16 on CUDA)')
+    parser.add_argument('--profile', action='store_true',
+                        help='Profile first model: time forward, backward, optimizer, eval separately')
     args = parser.parse_args()
 
     if args.device is None:
@@ -545,15 +624,16 @@ def main():
     def print_leaderboard():
         if not results:
             return
-        W = 110
+        W = 120
         print(f"\n{'='*W}")
-        print(f"{'Model':<16} {'Shape':>15} {'Proj':>7} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epochs':>7}")
+        print(f"{'Model':<16} {'Shape':>15} {'Proj':>7} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epochs':>7} {'s/epoch':>8}")
         print(f"{'-'*W}")
         for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
             n_ep = len(r['train_losses']) - 1
-            print(f"{label:<16} {shape_str:>15} {r['proj_mode']:>7} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>7}")
+            spe = r.get('sec_per_epoch', 0)
+            print(f"{label:<16} {shape_str:>15} {r['proj_mode']:>7} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>7} {spe:>7.1f}s")
         print(f"{'='*W}\n", flush=True)
 
     for label, shape, proj_mode in configs:
@@ -564,10 +644,13 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
         torch.manual_seed(42)  # same data sequence
+        is_first = (label == configs[0][0])
         results[label] = train(model, args.epochs, task=args.task, B=args.batch_size,
                                L=args.seq_len, lr=args.lr, device=args.device, label=label,
                                vocab_size=vocab_size, num_kv_pairs=args.num_kv_pairs,
-                               num_train_examples=args.num_train_examples)
+                               num_train_examples=args.num_train_examples,
+                               use_compile=args.compile, use_amp=args.amp,
+                               profile=(args.profile and is_first))
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
