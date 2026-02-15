@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -1063,6 +1063,108 @@ class ThreeStageFSABlock(nn.Module):
         return x
 
 
+class QVOBlock(nn.Module):
+    """Three-stage block: feature attention → seq attention → MLP.
+
+    Only 3 projections: Q, V, O. No K projection at all.
+    Q is used as both Q and K for both feature and sequence attention.
+
+    Stage 1 — Feature attention:
+      q_feat = Q_proj(ln1(x)).view(B*T, N_f, D_f)   # Q=K
+      v_feat = V_proj(ln1(x)).view(B*T, N_f, D_f)
+      feat_out = SiLU(feat_attn(q, q, v)) + x
+
+    Stage 2 — Sequence attention:
+      q_seq = Q_proj(ln1(x)).view(B, T, NH, HD) + RoPE
+      v_seq = V_proj(ln1(x)).view(B, T, NH, HD)
+      seq_out = attn(q, q, v) + x'
+
+    Stage 3 — MLP:
+      out = SwiGLU(seq_out) + seq_out
+
+    Saves 768*768 = ~590K params per layer vs QKVO. Same effective arch as
+    ThreeStageFSABlock with Q=K (where K was dead weight).
+    """
+
+    def __init__(self, d_model: int, n_head: int, n_features: int,
+                 feat_activation: str = 'softmax'):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.n_features = n_features
+        self.desc_dim = d_model // n_features
+        self.feat_activation = feat_activation
+
+        assert d_model % n_features == 0, (
+            f"d_model ({d_model}) must be divisible by n_features ({n_features})")
+
+        # Only 3 projections: Q, V, O — no K
+        self.ln1 = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = Rotary(self.head_dim)
+
+        # MLP
+        self.ln3 = RMSNorm(d_model)
+        self.mlp = MLP(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        NH = self.n_head
+        HD = self.head_dim
+        NF = self.n_features
+        DD = self.desc_dim
+
+        # Project Q and V once — no K
+        h = self.ln1(x)
+        q = self.q_proj(h)  # (B, T, D) — used as both Q and K
+        v = self.v_proj(h)  # (B, T, D)
+
+        # ── Stage 1: Feature attention — Q=K, reshape as (N_f, D_f) ──
+        q_feat = q.view(B * T, NF, DD)
+        v_feat = v.view(B * T, NF, DD)
+
+        scale = DD ** -0.5
+        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
+
+        if self.feat_activation == 'softmax':
+            weights = torch.softmax(scores, dim=-1)
+        elif self.feat_activation == 'silu':
+            weights = F.silu(scores)
+        elif self.feat_activation == 'silu2':
+            weights = F.silu(scores).square()
+        else:
+            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
+
+        feat_out = torch.bmm(weights, v_feat)
+        feat_out = F.silu(feat_out.view(B, T, D))
+        x = x + feat_out  # residual
+
+        # ── Stage 2: Sequence attention — Q=K, reshape as (N_heads, H_dim), apply RoPE ──
+        q_seq = q.view(B, T, NH, HD)
+        v_seq = v.view(B, T, NH, HD)
+
+        cos, sin = self.rotary(q_seq)
+        q_seq = apply_rotary(q_seq, cos, sin)
+        k_seq = apply_rotary(q.view(B, T, NH, HD), cos, sin)  # same Q as K, with RoPE
+
+        if HAS_FLASH_ATTN:
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+        else:
+            q_seq, k_seq, v_seq = q_seq.transpose(1, 2), k_seq.transpose(1, 2), v_seq.transpose(1, 2)
+            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            seq_out = seq_out.transpose(1, 2)
+
+        seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
+        x = x + seq_out  # residual
+
+        # ── Stage 3: MLP ──
+        x = x + self.mlp(self.ln3(x))
+
+        return x
+
+
 class DualQBlock(nn.Module):
     """Three-stage block: feature attention → seq attention → MLP.
 
@@ -1756,6 +1858,41 @@ class GPTThreeStage(nn.Module):
         return logits, loss
 
 
+class GPTQVO(nn.Module):
+    """GPT with QVO blocks: Q + V + O only, no K projection.
+
+    Same architecture as ThreeStageFSA with Q=K, but K weight is removed.
+    Saves ~590K params per layer (768*768).
+    """
+
+    def __init__(self):
+        super().__init__()
+        nf = HP.fa_n_features
+        act = HP.fa_activation
+        assert HP.d_model % nf == 0, (
+            f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([
+            QVOBlock(HP.d_model, HP.n_head, nf, act)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTThreeStageFSA(nn.Module):
     """GPT with three-stage blocks: feat attn → seq attn → MLP.
 
@@ -1878,6 +2015,8 @@ def build_model() -> nn.Module:
         return GPTThreeStage()
     if HP.model_type == "three_stage_fsa":
         return GPTThreeStageFSA()
+    if HP.model_type == "qvo":
+        return GPTQVO()
     if HP.model_type == "dual_q":
         return GPTDualQ()
     if HP.model_type == "transformer_shift":
