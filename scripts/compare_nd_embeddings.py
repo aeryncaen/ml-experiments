@@ -302,6 +302,19 @@ def train(model, train_data, val_data, n_steps, B, L, lr, vocab_size, device, la
     # Metrics at eval checkpoints: list of (step, train_loss, train_acc, val_loss, val_acc)
     metrics_log = []
 
+    # Gradient tracking at every eval step
+    # grad_norms_log: list of dicts with step + per-param gradient info
+    grad_norms_log = []
+
+    # Identify projection params and their shapes for per-axis analysis
+    proj_param_names = []
+    proj_param_shapes = {}
+    for name, p in model.named_parameters():
+        is_proj = any(k in name for k in ('wq', 'wk', 'wv', 'wo', 'Wqkv', 'out_proj'))
+        if is_proj:
+            proj_param_names.append(name)
+            proj_param_shapes[name] = tuple(p.shape)
+
     # Snapshot schedule
     snapshot_steps = sorted(set([0, n_steps // 4, n_steps // 2, 3 * n_steps // 4, n_steps - 1]))
     grad_snapshots = {}
@@ -366,6 +379,51 @@ def train(model, train_data, val_data, n_steps, B, L, lr, vocab_size, device, la
                     grad_snapshots[step][name] = p.grad.detach().cpu().clone()
                     weight_snapshots[step][name] = p.detach().cpu().clone()
 
+        # Gradient analysis at eval steps (before opt.step so gradients are fresh)
+        if (step + 1) % eval_every == 0 or step == n_steps - 1 or step == 0:
+            entry = {'step': step}
+            for name in proj_param_names:
+                p = dict(model.named_parameters())[name]
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                w = p.detach()
+
+                # Overall gradient norm
+                g_norm = g.norm().item()
+                w_norm = w.norm().item()
+                entry[f'{name}|grad_norm'] = g_norm
+                entry[f'{name}|weight_norm'] = w_norm
+                entry[f'{name}|grad_weight_ratio'] = g_norm / max(w_norm, 1e-12)
+
+                # Per-axis gradient norms: for each axis i, compute norm along all OTHER axes
+                # This shows how gradient energy distributes across tensor dimensions
+                n_dims = g.dim()
+                for axis in range(n_dims):
+                    # Norm along all dims except this one -> shape is (size_of_axis,)
+                    dims_to_reduce = [d for d in range(n_dims) if d != axis]
+                    if dims_to_reduce:
+                        axis_norms = g.norm(dim=dims_to_reduce)  # (size_of_axis,)
+                        entry[f'{name}|axis{axis}_mean'] = axis_norms.mean().item()
+                        entry[f'{name}|axis{axis}_std'] = axis_norms.std().item()
+                        entry[f'{name}|axis{axis}_max'] = axis_norms.max().item()
+                        entry[f'{name}|axis{axis}_min'] = axis_norms.min().item()
+                    else:
+                        entry[f'{name}|axis0_mean'] = g_norm
+                        entry[f'{name}|axis0_std'] = 0.0
+                        entry[f'{name}|axis0_max'] = g_norm
+                        entry[f'{name}|axis0_min'] = g_norm
+
+                # Gradient sparsity: fraction of elements with |grad| < 1% of max |grad|
+                g_abs = g.abs()
+                g_max = g_abs.max().item()
+                if g_max > 0:
+                    entry[f'{name}|grad_sparsity'] = (g_abs < 0.01 * g_max).float().mean().item()
+                else:
+                    entry[f'{name}|grad_sparsity'] = 1.0
+
+            grad_norms_log.append(entry)
+
         opt.step()
         scheduler.step()
 
@@ -394,6 +452,9 @@ def train(model, train_data, val_data, n_steps, B, L, lr, vocab_size, device, la
         'steps': steps_list,
         'grad_snapshots': grad_snapshots,
         'weight_snapshots': weight_snapshots,
+        'grad_norms_log': grad_norms_log,
+        'proj_param_names': proj_param_names,
+        'proj_param_shapes': proj_param_shapes,
         'wall_time': wall_elapsed,
         'ms_per_step': wall_elapsed / n_steps * 1000,
     }
@@ -570,6 +631,144 @@ def main():
         else:
             print(f"    (no snapshots captured)")
 
+    # --- GRADIENT ANALYSIS ---
+    print("\n" + "=" * 120)
+    print("GRADIENT ANALYSIS")
+    print("=" * 120)
+
+    # 6a. Gradient norms over training
+    print("\n  6a. GRADIENT NORMS OVER TRAINING (per projection param)")
+    print("  " + "-" * 100)
+    for label in all_labels:
+        r = results[label]
+        gnlog = r.get('grad_norms_log', [])
+        shape_str = 'x'.join(map(str, r['shape']))
+        pnames = r.get('proj_param_names', [])
+        if not gnlog or not pnames:
+            print(f"\n  {label} ({shape_str}): (no gradient data)")
+            continue
+        print(f"\n  {label} ({shape_str}, proj={r['proj_mode']}):")
+        # Show a compact table: step | param_short | grad_norm | weight_norm | grad/weight ratio | sparsity
+        print(f"    {'Step':>6} {'Param':<14} {'Grad Norm':>11} {'Weight Norm':>12} {'Grad/W Ratio':>13} {'Sparsity':>9}")
+        for entry in gnlog:
+            step = entry['step']
+            for pn in pnames:
+                gn = entry.get(f'{pn}|grad_norm')
+                if gn is None:
+                    continue
+                wn = entry.get(f'{pn}|weight_norm', 0)
+                gwr = entry.get(f'{pn}|grad_weight_ratio', 0)
+                sp = entry.get(f'{pn}|grad_sparsity', 0)
+                short = pn.split('.')[-1]
+                print(f"    {step:>6} {short:<14} {gn:>11.6f} {wn:>12.6f} {gwr:>13.6f} {sp:>9.3f}")
+
+    # 6b. Per-axis gradient distribution (ND structure analysis)
+    print("\n  6b. PER-AXIS GRADIENT NORMS (how gradients distribute across tensor dims)")
+    print("  " + "-" * 100)
+    for label in all_labels:
+        r = results[label]
+        gnlog = r.get('grad_norms_log', [])
+        pshapes = r.get('proj_param_shapes', {})
+        pnames = r.get('proj_param_names', [])
+        shape_str = 'x'.join(map(str, r['shape']))
+        if not gnlog or not pnames:
+            continue
+        # Only show for models with ND params (ndim > 2)
+        nd_params = [pn for pn in pnames if len(pshapes.get(pn, ())) > 2]
+        if not nd_params:
+            print(f"\n  {label} ({shape_str}): 1D/2D params — no per-axis structure")
+            continue
+        print(f"\n  {label} ({shape_str}):")
+        # Show last entry (final step) per-axis breakdown
+        entry = gnlog[-1]
+        step = entry['step']
+        for pn in nd_params:
+            n_dims = len(pshapes[pn])
+            short = pn.split('.')[-1]
+            print(f"    {short} (shape={pshapes[pn]}) at step {step}:")
+            print(f"      {'Axis':>6} {'Dim Size':>9} {'Mean Norm':>11} {'Std Norm':>10} {'Max Norm':>10} {'Min Norm':>10} {'Max/Min':>8}")
+            for axis in range(n_dims):
+                amean = entry.get(f'{pn}|axis{axis}_mean', 0)
+                astd = entry.get(f'{pn}|axis{axis}_std', 0)
+                amax = entry.get(f'{pn}|axis{axis}_max', 0)
+                amin = entry.get(f'{pn}|axis{axis}_min', 0)
+                ratio = amax / max(amin, 1e-12)
+                dim_size = pshapes[pn][axis]
+                print(f"      {axis:>6} {dim_size:>9} {amean:>11.6f} {astd:>10.6f} {amax:>10.6f} {amin:>10.6f} {ratio:>8.2f}")
+
+    # 6c. Gradient flow comparison: 1D vs ND
+    print("\n  6c. GRADIENT FLOW COMPARISON (1D vs ND)")
+    print("  " + "-" * 100)
+    # Collect average gradient norms at final step for each model
+    flow_summary = {}
+    for label in all_labels:
+        r = results[label]
+        gnlog = r.get('grad_norms_log', [])
+        pnames = r.get('proj_param_names', [])
+        if not gnlog or not pnames:
+            continue
+        last = gnlog[-1]
+        norms = [last.get(f'{pn}|grad_norm', 0) for pn in pnames if last.get(f'{pn}|grad_norm') is not None]
+        ratios = [last.get(f'{pn}|grad_weight_ratio', 0) for pn in pnames if last.get(f'{pn}|grad_weight_ratio') is not None]
+        sparsities = [last.get(f'{pn}|grad_sparsity', 0) for pn in pnames if last.get(f'{pn}|grad_sparsity') is not None]
+        if norms:
+            flow_summary[label] = {
+                'avg_grad_norm': np.mean(norms),
+                'max_grad_norm': np.max(norms),
+                'min_grad_norm': np.min(norms),
+                'avg_grad_weight_ratio': np.mean(ratios),
+                'avg_sparsity': np.mean(sparsities),
+            }
+
+    if flow_summary:
+        print(f"    {'Model':<20} {'Avg Grad Norm':>14} {'Max Grad Norm':>14} {'Min Grad Norm':>14} {'Avg G/W Ratio':>14} {'Avg Sparsity':>13}")
+        for label in all_labels:
+            if label in flow_summary:
+                fs = flow_summary[label]
+                print(f"    {label:<20} {fs['avg_grad_norm']:>14.6f} {fs['max_grad_norm']:>14.6f} {fs['min_grad_norm']:>14.6f} {fs['avg_grad_weight_ratio']:>14.6f} {fs['avg_sparsity']:>13.3f}")
+
+        # Compare 1D vs ND averages
+        baseline_flow = flow_summary.get('1D')
+        if baseline_flow:
+            nd_flows = {l: f for l, f in flow_summary.items() if l != '1D'}
+            if nd_flows:
+                avg_nd_norm = np.mean([f['avg_grad_norm'] for f in nd_flows.values()])
+                avg_nd_ratio = np.mean([f['avg_grad_weight_ratio'] for f in nd_flows.values()])
+                avg_nd_sparsity = np.mean([f['avg_sparsity'] for f in nd_flows.values()])
+                print(f"\n    1D avg grad norm:       {baseline_flow['avg_grad_norm']:.6f}")
+                print(f"    ND avg grad norm:       {avg_nd_norm:.6f}  ({avg_nd_norm/baseline_flow['avg_grad_norm']:.2f}x of 1D)")
+                print(f"    1D avg G/W ratio:       {baseline_flow['avg_grad_weight_ratio']:.6f}")
+                print(f"    ND avg G/W ratio:       {avg_nd_ratio:.6f}  ({avg_nd_ratio/max(baseline_flow['avg_grad_weight_ratio'], 1e-12):.2f}x of 1D)")
+                print(f"    1D avg sparsity:        {baseline_flow['avg_sparsity']:.3f}")
+                print(f"    ND avg sparsity:        {avg_nd_sparsity:.3f}")
+
+    # 6d. Gradient norm evolution (early vs mid vs late training)
+    print("\n  6d. GRADIENT NORM EVOLUTION (early → mid → late)")
+    print("  " + "-" * 100)
+    for label in all_labels:
+        r = results[label]
+        gnlog = r.get('grad_norms_log', [])
+        pnames = r.get('proj_param_names', [])
+        if not gnlog or len(gnlog) < 3:
+            continue
+        shape_str = 'x'.join(map(str, r['shape']))
+        early = gnlog[0]
+        mid = gnlog[len(gnlog) // 2]
+        late = gnlog[-1]
+        print(f"\n  {label} ({shape_str}):")
+        print(f"    {'Param':<14} {'Early Norm':>11} {'Mid Norm':>11} {'Late Norm':>11} {'Late/Early':>11} {'Early G/W':>10} {'Late G/W':>10}")
+        for pn in pnames:
+            en = early.get(f'{pn}|grad_norm')
+            mn = mid.get(f'{pn}|grad_norm')
+            ln = late.get(f'{pn}|grad_norm')
+            if en is None:
+                continue
+            ratio_change = ln / max(en, 1e-12)
+            egw = early.get(f'{pn}|grad_weight_ratio', 0)
+            lgw = late.get(f'{pn}|grad_weight_ratio', 0)
+            short = pn.split('.')[-1]
+            print(f"    {short:<14} {en:>11.6f} {mn:>11.6f} {ln:>11.6f} {ratio_change:>11.4f}x {egw:>10.6f} {lgw:>10.6f}")
+
     # --- ANALYSIS ---
     print("\n" + "=" * 80)
     print("ANALYSIS")
@@ -702,8 +901,8 @@ def main():
     print("Plotting...")
     n_models = len(all_labels)
 
-    # Layout: 2 rows — train loss + val loss on top, train acc + val acc on bottom
-    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+    # Layout: 3 rows — loss/acc on top 2 rows, gradient norms + grad/weight ratio on bottom
+    fig, axes = plt.subplots(3, 2, figsize=(18, 15))
 
     for label in all_labels:
         r = results[label]
@@ -712,11 +911,44 @@ def main():
         axes[1, 0].plot(r['train_accs'], alpha=0.8, label=label, linewidth=1.5)
         axes[1, 1].plot(r['val_accs'], alpha=0.8, label=label, linewidth=1.5)
 
-    for ax, title in zip(axes.flat, ['Train Loss', 'Val Loss', 'Train Acc', 'Val Acc']):
+    for ax, title in zip(axes[:2].flat, ['Train Loss', 'Val Loss', 'Train Acc', 'Val Acc']):
         ax.set_title(title)
         ax.set_xlabel('eval checkpoint')
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
+
+    # Gradient norm plots
+    for label in all_labels:
+        r = results[label]
+        gnlog = r.get('grad_norms_log', [])
+        pnames = r.get('proj_param_names', [])
+        if not gnlog or not pnames:
+            continue
+        steps_g = [e['step'] for e in gnlog]
+        # Average grad norm across all proj params
+        avg_norms = []
+        avg_ratios = []
+        for e in gnlog:
+            norms = [e.get(f'{pn}|grad_norm', 0) for pn in pnames if e.get(f'{pn}|grad_norm') is not None]
+            ratios = [e.get(f'{pn}|grad_weight_ratio', 0) for pn in pnames if e.get(f'{pn}|grad_weight_ratio') is not None]
+            avg_norms.append(np.mean(norms) if norms else 0)
+            avg_ratios.append(np.mean(ratios) if ratios else 0)
+        axes[2, 0].plot(steps_g, avg_norms, alpha=0.8, label=label, linewidth=1.5)
+        axes[2, 1].plot(steps_g, avg_ratios, alpha=0.8, label=label, linewidth=1.5)
+
+    axes[2, 0].set_title('Avg Gradient Norm (proj params)')
+    axes[2, 0].set_xlabel('step')
+    axes[2, 0].set_ylabel('grad norm')
+    axes[2, 0].legend(fontsize=7)
+    axes[2, 0].grid(True, alpha=0.3)
+    axes[2, 0].set_yscale('log')
+
+    axes[2, 1].set_title('Avg Gradient/Weight Ratio (proj params)')
+    axes[2, 1].set_xlabel('step')
+    axes[2, 1].set_ylabel('grad/weight ratio')
+    axes[2, 1].legend(fontsize=7)
+    axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].set_yscale('log')
 
     fig.suptitle(f'ND Embedding/Projection Comparison on {task_name} (D={D})',
                  fontsize=13, fontweight='bold')
@@ -893,6 +1125,126 @@ def main():
                 shape_str = 'x'.join(map(str, r['shape']))
                 md.append(f"| {label} | {shape_str} | {avg_eff:.3f} |")
         md.append(f"")
+
+        # Gradient Analysis
+        md.append(f"## Gradient Analysis")
+        md.append(f"")
+
+        # 6a. Gradient flow comparison table
+        md.append(f"### 6a. Gradient Flow Comparison (final step)")
+        md.append(f"")
+        md.append(f"| Model | Avg Grad Norm | Max Grad Norm | Min Grad Norm | Avg G/W Ratio | Avg Sparsity |")
+        md.append(f"|-------|---------------|---------------|---------------|---------------|--------------|")
+        for label in all_labels:
+            if label in flow_summary:
+                fs = flow_summary[label]
+                md.append(f"| {label} | {fs['avg_grad_norm']:.6f} | {fs['max_grad_norm']:.6f} | "
+                          f"{fs['min_grad_norm']:.6f} | {fs['avg_grad_weight_ratio']:.6f} | {fs['avg_sparsity']:.3f} |")
+        md.append(f"")
+
+        baseline_flow = flow_summary.get('1D')
+        if baseline_flow:
+            nd_flows = {l: f for l, f in flow_summary.items() if l != '1D'}
+            if nd_flows:
+                avg_nd_norm = np.mean([f['avg_grad_norm'] for f in nd_flows.values()])
+                avg_nd_ratio = np.mean([f['avg_grad_weight_ratio'] for f in nd_flows.values()])
+                md.append(f"- 1D avg grad norm: {baseline_flow['avg_grad_norm']:.6f}")
+                md.append(f"- ND avg grad norm: {avg_nd_norm:.6f} ({avg_nd_norm/baseline_flow['avg_grad_norm']:.2f}x of 1D)")
+                md.append(f"- 1D avg G/W ratio: {baseline_flow['avg_grad_weight_ratio']:.6f}")
+                md.append(f"- ND avg G/W ratio: {avg_nd_ratio:.6f} ({avg_nd_ratio/max(baseline_flow['avg_grad_weight_ratio'], 1e-12):.2f}x of 1D)")
+                md.append(f"")
+
+        # 6b. Per-axis gradient norms for ND models
+        md.append(f"### 6b. Per-Axis Gradient Norms (final step)")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            gnlog = r.get('grad_norms_log', [])
+            pshapes = r.get('proj_param_shapes', {})
+            pnames = r.get('proj_param_names', [])
+            if not gnlog or not pnames:
+                continue
+            nd_params = [pn for pn in pnames if len(pshapes.get(pn, ())) > 2]
+            if not nd_params:
+                continue
+            shape_str = 'x'.join(map(str, r['shape']))
+            entry = gnlog[-1]
+            step = entry['step']
+            md.append(f"**{label}** ({shape_str}) at step {step}")
+            md.append(f"")
+            for pn in nd_params:
+                n_dims = len(pshapes[pn])
+                short = pn.split('.')[-1]
+                md.append(f"*{short}* (shape={pshapes[pn]})")
+                md.append(f"")
+                md.append(f"| Axis | Dim Size | Mean Norm | Std Norm | Max Norm | Min Norm | Max/Min |")
+                md.append(f"|------|----------|-----------|----------|----------|----------|---------|")
+                for axis in range(n_dims):
+                    amean = entry.get(f'{pn}|axis{axis}_mean', 0)
+                    astd = entry.get(f'{pn}|axis{axis}_std', 0)
+                    amax = entry.get(f'{pn}|axis{axis}_max', 0)
+                    amin = entry.get(f'{pn}|axis{axis}_min', 0)
+                    ratio = amax / max(amin, 1e-12)
+                    dim_size = pshapes[pn][axis]
+                    md.append(f"| {axis} | {dim_size} | {amean:.6f} | {astd:.6f} | {amax:.6f} | {amin:.6f} | {ratio:.2f} |")
+                md.append(f"")
+
+        # 6c. Gradient norm evolution (early vs mid vs late)
+        md.append(f"### 6c. Gradient Norm Evolution")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            gnlog = r.get('grad_norms_log', [])
+            pnames = r.get('proj_param_names', [])
+            if not gnlog or len(gnlog) < 3 or not pnames:
+                continue
+            shape_str = 'x'.join(map(str, r['shape']))
+            early = gnlog[0]
+            mid = gnlog[len(gnlog) // 2]
+            late = gnlog[-1]
+            md.append(f"**{label}** ({shape_str})")
+            md.append(f"")
+            md.append(f"| Param | Early Norm | Mid Norm | Late Norm | Late/Early | Early G/W | Late G/W |")
+            md.append(f"|-------|------------|----------|-----------|------------|-----------|----------|")
+            for pn in pnames:
+                en = early.get(f'{pn}|grad_norm')
+                mn = mid.get(f'{pn}|grad_norm')
+                ln = late.get(f'{pn}|grad_norm')
+                if en is None:
+                    continue
+                ratio_change = ln / max(en, 1e-12)
+                egw = early.get(f'{pn}|grad_weight_ratio', 0)
+                lgw = late.get(f'{pn}|grad_weight_ratio', 0)
+                short = pn.split('.')[-1]
+                md.append(f"| {short} | {en:.6f} | {mn:.6f} | {ln:.6f} | {ratio_change:.4f}x | {egw:.6f} | {lgw:.6f} |")
+            md.append(f"")
+
+        # 6d. Full gradient norms log
+        md.append(f"### 6d. Gradient Norms Over Training (all eval steps)")
+        md.append(f"")
+        for label in all_labels:
+            r = results[label]
+            gnlog = r.get('grad_norms_log', [])
+            pnames = r.get('proj_param_names', [])
+            if not gnlog or not pnames:
+                continue
+            shape_str = 'x'.join(map(str, r['shape']))
+            md.append(f"**{label}** ({shape_str})")
+            md.append(f"")
+            md.append(f"| Step | Param | Grad Norm | Weight Norm | G/W Ratio | Sparsity |")
+            md.append(f"|------|-------|-----------|-------------|-----------|----------|")
+            for entry in gnlog:
+                step = entry['step']
+                for pn in pnames:
+                    gn = entry.get(f'{pn}|grad_norm')
+                    if gn is None:
+                        continue
+                    wn = entry.get(f'{pn}|weight_norm', 0)
+                    gwr = entry.get(f'{pn}|grad_weight_ratio', 0)
+                    sp = entry.get(f'{pn}|grad_sparsity', 0)
+                    short = pn.split('.')[-1]
+                    md.append(f"| {step} | {short} | {gn:.6f} | {wn:.6f} | {gwr:.6f} | {sp:.3f} |")
+            md.append(f"")
 
         # Gradient SVD
         md.append(f"### Gradient SVD (evolution)")
