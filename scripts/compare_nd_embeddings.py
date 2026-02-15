@@ -557,12 +557,13 @@ def main():
     parser.add_argument('--task', type=str, default='mqar', choices=['mqar', 'mod_arith'],
                         help='Task: mqar (associative recall) or mod_arith')
     parser.add_argument('--epochs', type=int, default=64)
-    parser.add_argument('--seq-len', type=int, default=256, help='Sequence length')
-    parser.add_argument('--num-kv-pairs', type=int, default=16,
-                        help='Number of key-value pairs (mqar only, Zoology uses 16 for seq_len=256)')
+    parser.add_argument('--seq-len', type=int, default=1024, help='Sequence length')
+    parser.add_argument('--num-kv-pairs', type=int, default=None,
+                        help='Number of key-value pairs (default: auto from seq_len, matching Zoology)')
     parser.add_argument('--num-train-examples', type=int, default=100_000,
                         help='Number of training examples (pre-generated)')
-    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Batch size (default: auto from seq_len, matching Zoology)')
     parser.add_argument('--n-layers', type=int, default=2)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--save', type=str, default=None)
@@ -584,6 +585,28 @@ def main():
         else:
             args.device = 'cpu'
     print(f"Using device: {args.device}")
+
+    # Auto-compute kv_pairs and batch_size from seq_len (matching Zoology ripple_mqar.py)
+    ZOOLOGY_SEQKV = {64: 4, 256: 16, 512: 32, 1024: 64, 4096: 256}
+    if args.num_kv_pairs is None:
+        if args.seq_len in ZOOLOGY_SEQKV:
+            args.num_kv_pairs = ZOOLOGY_SEQKV[args.seq_len]
+        else:
+            args.num_kv_pairs = args.seq_len // 16
+        print(f"Auto kv_pairs={args.num_kv_pairs} for seq_len={args.seq_len}")
+
+    if args.batch_size is None:
+        if args.seq_len <= 128:
+            args.batch_size = 512
+        elif args.seq_len <= 512:
+            args.batch_size = 256
+        elif args.seq_len <= 2048:
+            args.batch_size = 128
+        elif args.seq_len <= 4096:
+            args.batch_size = 64
+        else:
+            args.batch_size = 32
+        print(f"Auto batch_size={args.batch_size} for seq_len={args.seq_len}")
 
     D = args.dim
     vocab_size = VOCAB_SIZE if args.task == 'mqar' else MOD_BASE
@@ -612,7 +635,7 @@ def main():
     shape_2d = factorize_dim(D, 2, ratio='1:3')
     configs.append(('2D-matmul', shape_2d, 'matmul'))
 
-    print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}")
+    print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}, kv_pairs={args.num_kv_pairs}, batch={args.batch_size}")
     print(f"d_model = {D}")
     print(f"\nModel configs:")
     for label, shape, proj_mode in configs:
