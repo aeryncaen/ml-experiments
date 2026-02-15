@@ -506,7 +506,7 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
 
         # Shuffle via index permutation on device (no copy)
         perm = torch.randperm(num_train_examples, device=device)
-        do_snapshot = epoch in snapshot_epochs
+        do_snapshot = (epoch in snapshot_epochs) or (epoch == n_epochs - 1)
 
         # Profiling timers (only on first epoch if --profile)
         do_profile = profile and epoch == 0
@@ -558,11 +558,13 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
                     epoch_count += t.numel()
 
             # Snapshot (first batch of snapshot epochs only)
+            # Capture all projection weights: wq/wk/wv/wo (ND) or Wqkv/out_proj (1D)
             if do_snapshot and batch_i == 0:
                 grad_snapshots[epoch] = {}
                 weight_snapshots[epoch] = {}
                 for name, p in model.named_parameters():
-                    if p.grad is not None and ('wq' in name or 'seq_wq' in name):
+                    is_proj = any(k in name for k in ('wq', 'wk', 'wv', 'wo', 'Wqkv', 'out_proj'))
+                    if p.grad is not None and is_proj:
                         grad_snapshots[epoch][name] = p.grad.detach().cpu().clone()
                         weight_snapshots[epoch][name] = p.detach().cpu().clone()
 
@@ -812,22 +814,24 @@ def main():
                 print(f"    epoch {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
 
     print("\n" + "=" * 80)
-    print("WEIGHT SVD ANALYSIS (trained)")
+    print("WEIGHT SVD ANALYSIS (evolution over training)")
     print("=" * 80)
     for label in all_labels:
         r = results[label]
         snap = r['weight_snapshots']
-        final_epoch = r['snapshot_epochs'][-1]
         shape_str = 'x'.join(map(str, r['shape']))
         print(f"\n  {label} ({shape_str}):")
-        if final_epoch in snap:
-            for name, w in snap[final_epoch].items():
-                S = svd_spectrum(w)
-                eff_rank = (S > 0.1).sum().item()
-                total = len(S)
-                top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
-                short = name.split('.')[-1]
-                print(f"    {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+        if snap:
+            for epoch in sorted(snap.keys()):
+                for name, w in snap[epoch].items():
+                    S = svd_spectrum(w)
+                    eff_rank = (S > 0.1).sum().item()
+                    total = len(S)
+                    top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
+                    short = name.split('.')[-1]
+                    print(f"    epoch {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+        else:
+            print(f"    (no snapshots captured)")
 
     print("\n" + "=" * 80)
     print("FINAL LEADERBOARD")
