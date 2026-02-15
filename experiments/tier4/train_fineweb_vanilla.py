@@ -965,13 +965,12 @@ class ThreeStageFSABlock(nn.Module):
     Compute Q/K/V projections once from ln1(x), then:
 
     Stage 1 — Feature attention (reorganize own features):
-      q_feat = Q.view(B*T, N_f, D_f)
-      k_feat = K.view(B*T, N_f, D_f)
-      v_feat = V.view(B*T, N_f, D_f)
-      feat_out = SiLU(feat_attn(q_feat, k_feat, v_feat)) + x
+      q_feat = Q_pre_rope.view(B*T, N_f, D_f)   # reuse Q before RoPE
+      v_feat = ln1(x).view(B*T, N_f, D_f)
+      feat_out = SiLU(feat_attn(q_feat, q_feat, v_feat)) + x
 
     Stage 2 — Sequence attention (tokens talk with reorganized repr):
-      Reshape same Q, K, V as (N_heads, H_dim), apply RoPE
+      Apply RoPE to Q, K from the SAME projections
       seq_out = attn(q, k, v) + feat_out
 
     Stage 3 — MLP (enrichment):
@@ -992,7 +991,7 @@ class ThreeStageFSABlock(nn.Module):
         assert d_model % n_features == 0, (
             f"d_model ({d_model}) must be divisible by n_features ({n_features})")
 
-        # Projections shared by both feature and sequence attention
+        # Shared projections for both feature and sequence attention
         self.ln1 = RMSNorm(d_model)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -1000,7 +999,10 @@ class ThreeStageFSABlock(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-        # MLP
+        # Stage 2: layer norm before seq attention (after feat attn residual)
+        self.ln2 = RMSNorm(d_model)
+
+        # Stage 3: MLP (standard SwiGLU)
         self.ln3 = RMSNorm(d_model)
         self.mlp = MLP(d_model)
 
@@ -1011,19 +1013,18 @@ class ThreeStageFSABlock(nn.Module):
         NF = self.n_features
         DD = self.desc_dim
 
-        # Project Q/K/V once, use for both attentions
+        # Compute Q/K/V projections once
         h = self.ln1(x)
         q = self.q_proj(h)  # (B, T, D)
-        k = self.k_proj(h)  # (B, T, D)
-        v = self.v_proj(h)  # (B, T, D)
+        k = self.k_proj(h).view(B, T, NH, HD)
+        v = self.v_proj(h).view(B, T, NH, HD)
 
-        # ── Stage 1: Feature attention — reshape as (N_f, D_f) ──
+        # ── Stage 1: Feature attention (using pre-RoPE Q) ──
         q_feat = q.view(B * T, NF, DD)
-        k_feat = k.view(B * T, NF, DD)
-        v_feat = v.view(B * T, NF, DD)
+        v_feat = h.view(B * T, NF, DD)
 
         scale = DD ** -0.5
-        scores = torch.bmm(q_feat, k_feat.transpose(-2, -1)) * scale
+        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
 
         if self.feat_activation == 'softmax':
             weights = torch.softmax(scores, dim=-1)
@@ -1038,20 +1039,21 @@ class ThreeStageFSABlock(nn.Module):
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
-        # ── Stage 2: Sequence attention — reshape as (N_heads, H_dim), apply RoPE ──
-        q_seq = q.view(B, T, NH, HD)
-        k_seq = k.view(B, T, NH, HD)
-        v_seq = v.view(B, T, NH, HD)
+        # ── Stage 2: Sequence attention (RoPE on same Q/K) ──
+        h2 = self.ln2(x)
+        # Re-project Q from post-feat-attn state for seq attention
+        # but K/V come from the original projections (pre-feat-attn)
+        q_seq = self.q_proj(h2).view(B, T, NH, HD)
 
         cos, sin = self.rotary(q_seq)
         q_seq = apply_rotary(q_seq, cos, sin)
-        k_seq = apply_rotary(k_seq, cos, sin)
+        k = apply_rotary(k, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+            seq_out = flash_attn_func(q_seq, k, v, causal=True)
         else:
-            q_seq, k_seq, v_seq = q_seq.transpose(1, 2), k_seq.transpose(1, 2), v_seq.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            q_seq, k, v = q_seq.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            seq_out = F.scaled_dot_product_attention(q_seq, k, v, is_causal=True)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
