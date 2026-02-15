@@ -352,6 +352,8 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         train_x, train_t = gen_mod_arith(num_train_examples, L)
         val_x, val_t = gen_mod_arith(3000, L)
 
+    # Move entire dataset to device once
+    train_x, train_t = train_x.to(device), train_t.to(device)
     val_x, val_t = val_x.to(device), val_t.to(device)
     n_batches = num_train_examples // B
 
@@ -364,8 +366,8 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         bs = min(512, len(data_x))
         with torch.no_grad():
             for i in range(0, len(data_x), bs):
-                bx = data_x[i:i+bs].to(device) if not data_x.is_cuda and device != 'cpu' else data_x[i:i+bs]
-                bt = data_t[i:i+bs].to(device) if not data_t.is_cuda and device != 'cpu' else data_t[i:i+bs]
+                bx = data_x[i:i+bs]
+                bt = data_t[i:i+bs]
                 logits = model(bx)
                 total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
                                               ignore_index=-100).item() * len(bx)
@@ -393,14 +395,13 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         epoch_correct = 0
         epoch_count = 0
 
-        # Shuffle training data each epoch
-        perm = torch.randperm(num_train_examples)
-        train_x_shuf = train_x[perm]
-        train_t_shuf = train_t[perm]
+        # Shuffle via index permutation on device (no copy)
+        perm = torch.randperm(num_train_examples, device=device)
 
         for batch_i in range(n_batches):
-            x = train_x_shuf[batch_i * B : (batch_i + 1) * B].to(device)
-            t = train_t_shuf[batch_i * B : (batch_i + 1) * B].to(device)
+            idx = perm[batch_i * B : (batch_i + 1) * B]
+            x = train_x[idx]
+            t = train_t[idx]
 
             logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
