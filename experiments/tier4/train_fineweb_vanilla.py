@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -57,6 +57,10 @@ class HParams:
     # 2D factorization (ulb_2d): 0 = auto-factor from d_model
     n_features: int = _env_int("N_FEATURES", 0)
     desc_dim: int = _env_int("DESC_DIM", 0)
+
+    # Feature-attention MLP knobs (feat_attn model type)
+    fa_n_features: int = _env_int("FA_N_FEATURES", 64)       # features to attend over (must divide hidden=2048)
+    fa_activation: str = os.environ.get("FA_ACTIVATION", "softmax")  # softmax | silu | silu2
 
     # Fused gate knobs (0 = use d_model, no expansion)
     fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
@@ -709,15 +713,79 @@ class TransformerShiftBlock(nn.Module):
 
 
 class MLP(nn.Module):
+    """SwiGLU MLP: gate_proj + up_proj → SiLU gating → down_proj."""
+
     def __init__(self, d_model: int):
         super().__init__()
-        hidden = int(4 * d_model)
-        self.fc1 = nn.Linear(d_model, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, d_model, bias=False)
+        hidden = int(d_model * 8 / 3)
+        # Snap to multiple of 256 for hardware efficiency
+        hidden = ((hidden + 255) // 256) * 256
+        self.gate_proj = nn.Linear(d_model, hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("tf/mlp"):
-            return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class FeatureAttentionMLP(nn.Module):
+    """SwiGLU MLP with feature attention replacing element-wise gating.
+
+    SwiGLU:         out = down_proj(SiLU(gate_proj(x)) * up_proj(x))
+    Feature Attn:   out = down_proj(feat_attn(gate_proj(x), up_proj(x)))
+
+    gate_proj provides shared Q=K (Reformer-style), up_proj provides V.
+    Attention is over n_features (non-causal, within each token).
+    Same three projections, same param count as SwiGLU.
+
+    Args:
+        d_model:    Input/output dimension.
+        n_features: Number of features to attend over.
+        activation: Attention activation — 'softmax', 'silu', or 'silu2'.
+    """
+
+    def __init__(self, d_model: int, n_features: int, activation: str = 'softmax'):
+        super().__init__()
+        hidden = int(d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        assert hidden % n_features == 0, (
+            f"MLP hidden dim ({hidden}) must be divisible by n_features ({n_features})")
+        self.n_features = n_features
+        self.desc_dim = hidden // n_features
+        self.hidden = hidden
+        self.activation = activation
+        self.gate_proj = nn.Linear(d_model, hidden, bias=False)  # → shared Q=K
+        self.up_proj = nn.Linear(d_model, hidden, bias=False)    # → V
+        self.down_proj = nn.Linear(hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("fa/mlp"):
+            B, T, D = x.shape
+            NF = self.n_features
+            DD = self.desc_dim
+
+            # gate_proj → Q=K, up_proj → V
+            qk = self.gate_proj(x).view(B * T, NF, DD)  # shared Q and K
+            v = self.up_proj(x).view(B * T, NF, DD)
+
+            # Attention scores from gate (Q=K, Reformer-style)
+            scale = DD ** -0.5
+            scores = torch.bmm(qk, qk.transpose(-2, -1)) * scale  # (B*T, NF, NF)
+
+            # Activation
+            if self.activation == 'softmax':
+                weights = torch.softmax(scores, dim=-1)
+            elif self.activation == 'silu':
+                weights = F.silu(scores)
+            elif self.activation == 'silu2':
+                weights = F.silu(scores).square()
+            else:
+                raise ValueError(f"Unknown FA_ACTIVATION: {self.activation}")
+
+            # Attend over V (from up_proj)
+            out = torch.bmm(weights, v)  # (B*T, NF, DD)
+            return self.down_proj(out.view(B, T, self.hidden))
 
 
 class TransformerBlock(nn.Module):
@@ -732,6 +800,24 @@ class TransformerBlock(nn.Module):
         with torch.autograd.profiler.record_function("tf/block_attn"):
             x = x + self.attn(self.ln1(x))
         with torch.autograd.profiler.record_function("tf/block_mlp"):
+            x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class TransformerFeatureAttnBlock(nn.Module):
+    """Transformer block with feature attention MLP (replacing GELU with feature self-attn)."""
+
+    def __init__(self, d_model: int, n_head: int, n_features: int, activation: str):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.attn = SelfAttention(d_model, n_head)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = FeatureAttentionMLP(d_model, n_features, activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("fa/block_attn"):
+            x = x + self.attn(self.ln1(x))
+        with torch.autograd.profiler.record_function("fa/block_mlp"):
             x = x + self.mlp(self.ln2(x))
         return x
 
@@ -1018,9 +1104,49 @@ class GPTULB2D(nn.Module):
         return logits, loss
 
 
+class GPTFeatureAttn(nn.Module):
+    """GPT with feature attention MLP — SwiGLU gating replaced by feature self-attention.
+
+    Same three projections (gate/up/down), same param count as GPTTransformer.
+    Configured via FA_N_FEATURES and FA_ACTIVATION.
+    """
+
+    def __init__(self):
+        super().__init__()
+        nf = HP.fa_n_features
+        act = HP.fa_activation
+        hidden = int(HP.d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        assert hidden % nf == 0, (
+            f"MLP hidden dim ({hidden}) not divisible by FA_N_FEATURES ({nf}). "
+            f"Valid: {[f for f in [8, 16, 32, 64, 128, 256] if hidden % f == 0]}")
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([
+            TransformerFeatureAttnBlock(HP.d_model, HP.n_head, nf, act)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
+    if HP.model_type == "feat_attn":
+        return GPTFeatureAttn()
     if HP.model_type == "transformer_shift":
         return GPTTransformerShift()
     if HP.model_type == "transformer_s4d":
@@ -1088,6 +1214,9 @@ def main():
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
     _extra = f" n_features={HP.n_features} desc_dim={HP.desc_dim}" if HP.n_features > 0 and HP.desc_dim > 0 else ""
+    if HP.model_type == "feat_attn":
+        hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
+        _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
