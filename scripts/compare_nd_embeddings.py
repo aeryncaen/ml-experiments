@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Compare ND embedding/projection structures on MQAR.
+"""Compare ND embedding/projection structures on Shakespeare char-level LM.
 
 Tests all combinations of:
   - Rank: 1D (flat linear), 2D, 3D, 4D (einsum over ND tensors)
   - Ratio: 1:3 (small x large), 1:1 (balanced), 3:1 (large x small)
   - Projection mode: einsum (true ND contraction) vs matmul (ND weight reshaped to 2D)
 
-Architecture matches Zoology exactly: pre-norm TransformerBlock, MHA, no MLP,
+Architecture: pre-norm TransformerBlock, MHA, no MLP,
 LayerNorm, position embeddings, tied embed/head, 0.02 init, cosine LR.
 
-Outputs: train loss, train acc, val loss, val acc for all models.
-
 Usage:
-    python scripts/compare_nd_embeddings.py --dim 128 --epochs 64 --save results.png
+    python scripts/compare_nd_embeddings.py --save results.png --report results.md
 """
 
 import argparse
 import math
+import os
 import time
+import urllib.request
 
 import torch
 import torch.nn as nn
@@ -29,156 +29,25 @@ import numpy as np
 from tqdm import tqdm
 
 
-VOCAB_SIZE = 8192
-MOD_BASE = 5
+SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+SHAKESPEARE_PATH = os.path.join(os.path.dirname(__file__), "shakespeare.txt")
 
 
-def gen_mod_arith(B, L, device='cpu'):
-    x = torch.randint(0, MOD_BASE, (B, L), device=device)
-    target = x.cumsum(dim=1) % MOD_BASE
-    return x, target
+def load_shakespeare():
+    """Download and return Shakespeare text, with char-level encoding."""
+    if not os.path.exists(SHAKESPEARE_PATH):
+        print(f"Downloading Shakespeare to {SHAKESPEARE_PATH}...")
+        urllib.request.urlretrieve(SHAKESPEARE_URL, SHAKESPEARE_PATH)
+    with open(SHAKESPEARE_PATH, 'r') as f:
+        text = f.read()
+    chars = sorted(set(text))
+    stoi = {c: i for i, c in enumerate(chars)}
+    itos = {i: c for c, i in stoi.items()}
+    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+    return data, stoi, itos, len(chars)
 
 
-def gen_forgetting_mqar(num_examples, seq_len, vocab_size=8192, num_kv_pairs=4,
-                        num_updates=None, power_a=0.01, seed=42):
-    """Generate forgetting MQAR data (from Zoology).
 
-    Same as MQAR but some keys appear twice with different values.
-    Model must return the LAST (most recent) value. Tests memory overwrite.
-
-    num_updates defaults to max(1, num_kv_pairs // 2) matching Zoology ripple_tasks.py.
-    """
-    if num_updates is None:
-        num_updates = max(1, num_kv_pairs // 2)
-
-    rng = np.random.default_rng(seed)
-
-    total_kv_slots = num_kv_pairs + num_updates
-    context_size = total_kv_slots * 2
-
-    key_vocab = np.arange(1, vocab_size // 2)
-    val_vocab = np.arange(vocab_size // 2, vocab_size)
-
-    keys = np.stack([rng.choice(key_vocab, num_kv_pairs, replace=False)
-                     for _ in range(num_examples)])
-    original_values = np.stack([rng.choice(val_vocab, num_kv_pairs, replace=False)
-                                for _ in range(num_examples)])
-
-    # Select which keys get updated and generate new values
-    update_indices = np.stack([rng.choice(num_kv_pairs, size=num_updates, replace=False)
-                               for _ in range(num_examples)])
-    update_keys = np.take_along_axis(keys, update_indices, axis=1)
-
-    updated_values = np.zeros((num_examples, num_updates), dtype=np.int64)
-    for i in range(num_examples):
-        for j in range(num_updates):
-            available = val_vocab[val_vocab != original_values[i, update_indices[i, j]]]
-            updated_values[i, j] = rng.choice(available)
-
-    # Final values: original, then overwrite updated ones
-    final_values = original_values.copy()
-    for i in range(num_examples):
-        for j, idx in enumerate(update_indices[i]):
-            final_values[i, idx] = updated_values[i, j]
-
-    # Build context: [original KVs] [update KVs]
-    original_context = np.zeros((num_examples, num_kv_pairs * 2), dtype=np.int64)
-    original_context[:, 0::2] = keys
-    original_context[:, 1::2] = original_values
-
-    update_context = np.zeros((num_examples, num_updates * 2), dtype=np.int64)
-    update_context[:, 0::2] = update_keys
-    update_context[:, 1::2] = updated_values
-
-    kvs = np.concatenate([original_context, update_context], axis=1)
-
-    # Power-law gaps for query placement
-    space = (seq_len - context_size) // 2
-    p = power_a * np.arange(1, space + 1) ** (power_a - 1)
-    p = p / p.sum()
-
-    log_p = np.log(p)
-    gumbel = rng.gumbel(size=(num_examples, space))
-    gap_idx = np.argpartition(-(log_p + gumbel), num_kv_pairs, axis=1)[:, :num_kv_pairs]
-
-    # Build query section
-    queries = np.zeros((num_examples, seq_len - context_size + 1), dtype=np.int64)
-    np.put_along_axis(queries, gap_idx * 2, values=keys, axis=1)
-
-    examples = np.concatenate([kvs, queries], axis=1)
-
-    # Labels: FINAL values (after updates)
-    labels = np.full((num_examples, seq_len + 1), -100, dtype=np.int64)
-    np.put_along_axis(labels, gap_idx * 2 + context_size + 1, values=final_values, axis=1)
-
-    inputs = torch.tensor(examples[:, :-1])
-    labels = torch.tensor(labels[:, 1:])
-
-    # Fill non-query/non-kv positions with random tokens
-    mask = inputs == 0
-    inputs[mask] = torch.randint(vocab_size, size=inputs.shape)[mask]
-
-    return inputs, labels
-
-
-def gen_mqar(num_examples, seq_len, vocab_size=8192, num_kv_pairs=4, power_a=0.01, seed=42):
-    """Generate multi-query associative recall data (from Zoology).
-
-    Sequence contains key-value pairs, then queries. Model must recall the
-    value associated with each queried key.
-
-    Returns (inputs, labels) tensors. Labels are -100 except at query positions.
-    """
-    rng = np.random.default_rng(seed)
-    context_size = num_kv_pairs * 2
-
-    key_vocab = np.arange(1, vocab_size // 2)
-    val_vocab = np.arange(vocab_size // 2, vocab_size)
-
-    keys = np.stack([rng.choice(key_vocab, num_kv_pairs, replace=False)
-                     for _ in range(num_examples)])
-    values = np.stack([rng.choice(val_vocab, num_kv_pairs, replace=False)
-                       for _ in range(num_examples)])
-
-    # Build context: key val key val ...
-    kvs = np.zeros((num_examples, context_size), dtype=np.int64)
-    kvs[:, 0::2] = keys
-    kvs[:, 1::2] = values
-
-    # Power-law gaps for query placement
-    space = (seq_len - context_size) // 2
-    p = power_a * np.arange(1, space + 1) ** (power_a - 1)
-    p = p / p.sum()
-
-    log_p = np.log(p)
-    gumbel = rng.gumbel(size=(num_examples, space))
-    gap_idx = np.argpartition(-(log_p + gumbel), num_kv_pairs, axis=1)[:, :num_kv_pairs]
-
-    # Build query section
-    queries = np.zeros((num_examples, seq_len - context_size + 1), dtype=np.int64)
-    np.put_along_axis(queries, gap_idx * 2, values=keys, axis=1)
-
-    examples = np.concatenate([kvs, queries], axis=1)
-
-    labels = np.full((num_examples, seq_len + 1), -100, dtype=np.int64)
-    np.put_along_axis(labels, gap_idx * 2 + context_size + 1, values=values, axis=1)
-
-    inputs = torch.tensor(examples[:, :-1])
-    labels = torch.tensor(labels[:, 1:])
-
-    # Fill non-query/non-kv positions with random tokens
-    mask = inputs == 0
-    inputs[mask] = torch.randint(vocab_size, size=inputs.shape)[mask]
-
-    return inputs, labels
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.w = nn.Parameter(torch.ones(dim))
-    def forward(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.w
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +226,9 @@ class BlockND(nn.Module):
 
 
 class Model(nn.Module):
-    """Matches Zoology LanguageModel + LMBackbone structure."""
+    """Transformer LM: pre-norm blocks, MHA, no MLP, tied embed/head."""
 
-    def __init__(self, shape, vocab_size=VOCAB_SIZE, n_layers=2, num_heads=1,
+    def __init__(self, shape, vocab_size=65, n_layers=2, num_heads=1,
                  max_position_embeddings=64, dropout=0.1, proj_mode='einsum'):
         super().__init__()
         self.shape = shape
@@ -412,9 +281,9 @@ class Model(nn.Module):
         return self.lm_head(output)
 
 
-def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', label='',
-          vocab_size=8192, num_kv_pairs=4, num_train_examples=100_000,
-          use_compile=False, use_amp=False, profile=False):
+def train(model, train_data, val_data, n_steps, B, L, lr, vocab_size, device, label,
+          use_compile=False, use_amp=False, profile=False, eval_every=100):
+    """Step-based training on char-level Shakespeare."""
     model = model.to(device)
 
     if use_compile:
@@ -422,212 +291,111 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
         model = torch.compile(model)
 
     opt = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=0.0)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_steps, eta_min=0.0)
 
-    # AMP setup
     amp_dtype = torch.bfloat16 if (use_amp and device == 'cuda') else None
     amp_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype) if amp_dtype else None
 
-    train_losses = []
-    train_accs = []
-    val_losses = []
-    val_accs = []
+    train_data = train_data.to(device)
+    val_data = val_data.to(device)
 
-    # Gradient snapshots
+    # Metrics at eval checkpoints: list of (step, train_loss, train_acc, val_loss, val_acc)
+    metrics_log = []
+
+    # Snapshot schedule
+    snapshot_steps = sorted(set([0, n_steps // 4, n_steps // 2, 3 * n_steps // 4, n_steps - 1]))
     grad_snapshots = {}
     weight_snapshots = {}
-    snapshot_epochs = sorted(set([0, n_epochs // 4, n_epochs // 2,
-                                   3 * n_epochs // 4, n_epochs - 1]))
 
-    # Pre-generate datasets (matching Zoology: fixed dataset, iterate in batches)
-    print(f'  [{label}] Generating {num_train_examples} train + 3000 val examples...', flush=True)
-    if task in ('mqar', 'forgetting_mqar'):
-        train_x, train_t = gen_mqar(num_train_examples, L, vocab_size=vocab_size,
-                                     num_kv_pairs=num_kv_pairs, seed=42)
-        val_x, val_t = gen_mqar(3000, L, vocab_size=vocab_size,
-                                 num_kv_pairs=num_kv_pairs, seed=9999)
-    elif task == 'forgetting_mqar':
-        train_x, train_t = gen_forgetting_mqar(num_train_examples, L, vocab_size=vocab_size,
-                                                num_kv_pairs=num_kv_pairs, seed=42)
-        val_x, val_t = gen_forgetting_mqar(3000, L, vocab_size=vocab_size,
-                                            num_kv_pairs=num_kv_pairs, seed=9999)
-    else:
-        train_x, train_t = gen_mod_arith(num_train_examples, L)
-        val_x, val_t = gen_mod_arith(3000, L)
+    def get_batch(data, batch_size, seq_len):
+        ix = torch.randint(len(data) - seq_len - 1, (batch_size,), device=device)
+        x = torch.stack([data[i:i+seq_len] for i in ix])
+        y = torch.stack([data[i+1:i+seq_len+1] for i in ix])
+        return x, y
 
-    # Move entire dataset to device once
-    train_x, train_t = train_x.to(device), train_t.to(device)
-    val_x, val_t = val_x.to(device), val_t.to(device)
-    n_batches = num_train_examples // B
-
-    # Helper to compute loss + acc over a dataset in batches (no mid-loop syncs)
-    def eval_metrics(data_x, data_t):
+    def eval_loss(data, n_batches=20):
         model.eval()
         total_loss = torch.zeros(1, device=device)
         total_correct = torch.zeros(1, dtype=torch.long, device=device)
         total_count = torch.zeros(1, dtype=torch.long, device=device)
-        bs = min(512, len(data_x))
         with torch.no_grad():
-            for i in range(0, len(data_x), bs):
-                bx = data_x[i:i+bs]
-                bt = data_t[i:i+bs]
+            for _ in range(n_batches):
+                x, y = get_batch(data, B, L)
                 if amp_ctx is not None:
                     with amp_ctx:
-                        logits = model(bx)
+                        logits = model(x)
                 else:
-                    logits = model(bx)
-                total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
-                                              ignore_index=-100) * len(bx)
-                preds = logits.argmax(-1)
-                if task in ('mqar', 'forgetting_mqar'):
-                    m = bt != -100
-                    total_correct += (preds[m] == bt[m]).sum()
-                    total_count += m.sum()
-                else:
-                    total_correct += (preds == bt).sum()
-                    total_count += bt.numel()
-        # Single sync point
-        return (total_loss / len(data_x)).item(), (total_correct.float() / total_count.clamp(min=1)).item()
+                    logits = model(x)
+                total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
+                total_correct += (logits.argmax(-1) == y).sum()
+                total_count += y.numel()
+        model.train()
+        return (total_loss / n_batches).item(), (total_correct.float() / total_count).item()
 
-    # Register starting metrics before any training
-    tl0, ta0 = eval_metrics(train_x[:min(5000, len(train_x))], train_t[:min(5000, len(train_x))])
-    vl0, va0 = eval_metrics(val_x, val_t)
-    train_losses.append(tl0); train_accs.append(ta0)
-    val_losses.append(vl0); val_accs.append(va0)
+    # Initial metrics
+    tl0, ta0 = eval_loss(train_data)
+    vl0, va0 = eval_loss(val_data)
+    metrics_log.append((0, tl0, ta0, vl0, va0))
     print(f'  [{label}] start: train_loss={tl0:.4f} train_acc={ta0:.3f} val_loss={vl0:.4f} val_acc={va0:.3f}', flush=True)
 
     wall_start = time.perf_counter()
-    pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
-    for epoch in pbar:
-        model.train()
-        epoch_loss = torch.zeros(1, device=device)
-        epoch_correct = torch.zeros(1, dtype=torch.long, device=device)
-        epoch_count = torch.zeros(1, dtype=torch.long, device=device)
+    model.train()
+    pbar = tqdm(range(n_steps), desc=f'{label}', leave=True)
 
-        # Shuffle via index permutation on device (no copy)
-        perm = torch.randperm(num_train_examples, device=device)
-        do_snapshot = (epoch in snapshot_epochs) or (epoch == n_epochs - 1)
+    for step in pbar:
+        x, y = get_batch(train_data, B, L)
 
-        # Profiling timers (only on first epoch if --profile)
-        do_profile = profile and epoch == 0
-        if do_profile:
-            t_fwd = t_bwd = t_opt = 0.0
-
-        for batch_i in range(n_batches):
-            idx = perm[batch_i * B : (batch_i + 1) * B]
-            x = train_x[idx]
-            t = train_t[idx]
-
-            if do_profile and device == 'cuda':
-                torch.cuda.synchronize()
-                _t0 = time.perf_counter()
-
-            if amp_ctx is not None:
-                with amp_ctx:
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
-                                           ignore_index=-100)
-            else:
+        if amp_ctx is not None:
+            with amp_ctx:
                 logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, vocab_size), t.reshape(-1),
-                                       ignore_index=-100)
+                loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
+        else:
+            logits = model(x)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
 
-            if do_profile and device == 'cuda':
-                torch.cuda.synchronize()
-                _t1 = time.perf_counter()
-                t_fwd += _t1 - _t0
+        opt.zero_grad()
+        loss.backward()
 
-            opt.zero_grad()
-            loss.backward()
+        # Snapshot
+        if step in snapshot_steps:
+            grad_snapshots[step] = {}
+            weight_snapshots[step] = {}
+            for name, p in model.named_parameters():
+                is_proj = any(k in name for k in ('wq', 'wk', 'wv', 'wo', 'Wqkv', 'out_proj'))
+                if p.grad is not None and is_proj:
+                    grad_snapshots[step][name] = p.grad.detach().cpu().clone()
+                    weight_snapshots[step][name] = p.detach().cpu().clone()
 
-            if do_profile and device == 'cuda':
-                torch.cuda.synchronize()
-                _t2 = time.perf_counter()
-                t_bwd += _t2 - _t1
-
-            # Accumulate on GPU — no sync
-            with torch.no_grad():
-                epoch_loss += loss.detach()
-                preds = logits.argmax(-1)
-                if task in ('mqar', 'forgetting_mqar'):
-                    m = t != -100
-                    epoch_correct += (preds[m] == t[m]).sum()
-                    epoch_count += m.sum()
-                else:
-                    epoch_correct += (preds == t).sum()
-                    epoch_count += t.numel()
-
-            # Snapshot (first batch of snapshot epochs only)
-            # Capture all projection weights: wq/wk/wv/wo (ND) or Wqkv/out_proj (1D)
-            if do_snapshot and batch_i == 0:
-                grad_snapshots[epoch] = {}
-                weight_snapshots[epoch] = {}
-                for name, p in model.named_parameters():
-                    is_proj = any(k in name for k in ('wq', 'wk', 'wv', 'wo', 'Wqkv', 'out_proj'))
-                    if p.grad is not None and is_proj:
-                        grad_snapshots[epoch][name] = p.grad.detach().cpu().clone()
-                        weight_snapshots[epoch][name] = p.detach().cpu().clone()
-
-            opt.step()
-
-            if do_profile and device == 'cuda':
-                torch.cuda.synchronize()
-                _t3 = time.perf_counter()
-                t_opt += _t3 - _t2
-
+        opt.step()
         scheduler.step()
 
-        if do_profile and device == 'cuda':
-            torch.cuda.synchronize()
-            _eval_t0 = time.perf_counter()
-
-        # Eval on train subset + val set with final weights (not mid-training averages)
-        train_sub = min(5000, num_train_examples)
-        tl, ta = eval_metrics(train_x[:train_sub], train_t[:train_sub])
-        train_losses.append(tl)
-        train_accs.append(ta)
-
-        vl_, va_ = eval_metrics(val_x, val_t)
-        val_losses.append(vl_)
-        val_accs.append(va_)
-
-        if do_profile and device == 'cuda':
-            torch.cuda.synchronize()
-            _eval_t1 = time.perf_counter()
-            t_eval = _eval_t1 - _eval_t0
-            t_total = t_fwd + t_bwd + t_opt + t_eval
-            print(f'\n  [{label}] PROFILE (epoch 0, {n_batches} batches):')
-            print(f'    Forward:    {t_fwd:>7.2f}s ({t_fwd/t_total*100:>5.1f}%)')
-            print(f'    Backward:   {t_bwd:>7.2f}s ({t_bwd/t_total*100:>5.1f}%)')
-            print(f'    Optimizer:  {t_opt:>7.2f}s ({t_opt/t_total*100:>5.1f}%)')
-            print(f'    Eval:       {t_eval:>7.2f}s ({t_eval/t_total*100:>5.1f}%)')
-            print(f'    Total:      {t_total:>7.2f}s')
-            print(f'    Per batch:  {(t_fwd+t_bwd+t_opt)/n_batches*1000:>7.1f}ms (fwd+bwd+opt)')
-            print(flush=True)
-
-        pbar.set_postfix(tl=f'{train_losses[-1]:.4f}', ta=f'{train_accs[-1]:.3f}',
-                         vl=f'{vl_:.4f}', va=f'{va_:.3f}')
-
-        # Early stop if solved
-        if va_ > 0.99:
-            print(f'  [{label}] Early stop at epoch {epoch} — val_acc={va_:.3f}', flush=True)
-            break
+        # Eval
+        if (step + 1) % eval_every == 0 or step == n_steps - 1:
+            tl, ta = eval_loss(train_data)
+            vl, va = eval_loss(val_data)
+            metrics_log.append((step + 1, tl, ta, vl, va))
+            pbar.set_postfix(tl=f'{tl:.4f}', ta=f'{ta:.3f}', vl=f'{vl:.4f}', va=f'{va:.3f}')
 
     wall_elapsed = time.perf_counter() - wall_start
-    actual_epochs = len(train_losses) - 1  # subtract initial metrics
-    sec_per_epoch = wall_elapsed / max(actual_epochs, 1)
-    print(f'  [{label}] Done: {actual_epochs} epochs in {wall_elapsed:.1f}s ({sec_per_epoch:.1f}s/epoch)', flush=True)
+    print(f'  [{label}] Done: {n_steps} steps in {wall_elapsed:.1f}s ({wall_elapsed/n_steps*1000:.1f}ms/step)', flush=True)
+
+    # Extract final metrics as lists for compatibility with analysis code
+    steps_list = [m[0] for m in metrics_log]
+    train_losses = [m[1] for m in metrics_log]
+    train_accs = [m[2] for m in metrics_log]
+    val_losses = [m[3] for m in metrics_log]
+    val_accs = [m[4] for m in metrics_log]
 
     return {
         'train_losses': train_losses,
         'train_accs': train_accs,
         'val_losses': val_losses,
         'val_accs': val_accs,
+        'steps': steps_list,
         'grad_snapshots': grad_snapshots,
         'weight_snapshots': weight_snapshots,
-        'snapshot_epochs': snapshot_epochs,
         'wall_time': wall_elapsed,
-        'sec_per_epoch': sec_per_epoch,
+        'ms_per_step': wall_elapsed / n_steps * 1000,
     }
 
 
@@ -646,21 +414,14 @@ def svd_spectrum(w):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--dim', type=int, default=768,
-                        help='Model dim (768 gives clean 1:3 ratio: 16x48)')
-    parser.add_argument('--task', type=str, default='mqar',
-                        choices=['mqar', 'forgetting_mqar', 'mod_arith'],
-                        help='Task: mqar, forgetting_mqar (in-place editing), or mod_arith')
-    parser.add_argument('--epochs', type=int, default=64)
-    parser.add_argument('--seq-len', type=int, default=1024, help='Sequence length')
-    parser.add_argument('--num-kv-pairs', type=int, default=None,
-                        help='Number of key-value pairs (default: auto from seq_len, matching Zoology)')
-    parser.add_argument('--num-train-examples', type=int, default=100_000,
-                        help='Number of training examples (pre-generated)')
-    parser.add_argument('--batch-size', type=int, default=None,
-                        help='Batch size (default: auto from seq_len, matching Zoology)')
+    parser.add_argument('--dim', type=int, default=64,
+                        help='Model dim')
+    parser.add_argument('--steps', type=int, default=2000, help='Training steps')
+    parser.add_argument('--seq-len', type=int, default=80, help='Sequence length')
+    parser.add_argument('--batch-size', type=int, default=512, help='Batch size')
     parser.add_argument('--n-layers', type=int, default=2)
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--eval-every', type=int, default=100, help='Eval every N steps')
     parser.add_argument('--save', type=str, default=None, help='Save plot to file')
     parser.add_argument('--report', type=str, default=None, help='Write markdown report to file')
     parser.add_argument('--device', type=str, default=None,
@@ -682,32 +443,16 @@ def main():
             args.device = 'cpu'
     print(f"Using device: {args.device}")
 
-    # Auto-compute kv_pairs and batch_size from seq_len (Zoology ripple_mqar.py)
-    if args.num_kv_pairs is None:
-        args.num_kv_pairs = args.seq_len // 16
-        print(f"Auto kv_pairs={args.num_kv_pairs} for seq_len={args.seq_len}")
-
-    if args.batch_size is None:
-        if args.seq_len <= 128:
-            args.batch_size = 512
-        elif args.seq_len <= 512:
-            args.batch_size = 256
-        elif args.seq_len <= 2048:
-            args.batch_size = 128
-        elif args.seq_len <= 4096:
-            args.batch_size = 64
-        else:
-            args.batch_size = 32
-        print(f"Auto batch_size={args.batch_size} for seq_len={args.seq_len}")
+    # Load Shakespeare
+    all_data, stoi, itos, vocab_size = load_shakespeare()
+    n = int(0.9 * len(all_data))
+    train_data = all_data[:n]
+    val_data = all_data[n:]
+    print(f"Shakespeare: {len(all_data):,} chars, vocab_size={vocab_size}, "
+          f"train={len(train_data):,}, val={len(val_data):,}")
 
     D = args.dim
-    vocab_size = VOCAB_SIZE if args.task in ('mqar', 'forgetting_mqar') else MOD_BASE
-    task_names = {
-        'mqar': 'MQAR (associative recall)',
-        'forgetting_mqar': 'Forgetting MQAR (in-place editing)',
-        'mod_arith': 'Modular Arithmetic',
-    }
-    task_name = task_names[args.task]
+    task_name = f'Shakespeare char-LM (seq_len={args.seq_len})'
 
     # Build all model configs: (label, shape, proj_mode)
     configs = []
@@ -743,14 +488,13 @@ def main():
             return
         W = 120
         print(f"\n{'='*W}")
-        print(f"{'Model':<16} {'Shape':>15} {'Proj':>7} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epochs':>7} {'s/epoch':>8}")
+        print(f"{'Model':<20} {'Shape':>15} {'Proj':>7} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'ms/step':>8}")
         print(f"{'-'*W}")
-        for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
+        for label in sorted(results, key=lambda l: results[l]['val_losses'][-1]):
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
-            n_ep = len(r['train_losses']) - 1
-            spe = r.get('sec_per_epoch', 0)
-            print(f"{label:<16} {shape_str:>15} {r['proj_mode']:>7} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>7} {spe:>7.1f}s")
+            mps = r.get('ms_per_step', 0)
+            print(f"{label:<20} {shape_str:>15} {r['proj_mode']:>7} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {mps:>7.1f}")
         print(f"{'='*W}\n", flush=True)
 
     for label, shape, proj_mode in configs:
@@ -759,15 +503,15 @@ def main():
         model = Model(shape, vocab_size=vocab_size, n_layers=args.n_layers,
                       max_position_embeddings=args.seq_len, proj_mode=proj_mode)
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"[{label}] {n_params:,} params, training {args.epochs} epochs on {args.device}...", flush=True)
-        torch.manual_seed(42)  # same data sequence
+        print(f"[{label}] {n_params:,} params, {args.steps} steps on {args.device}...", flush=True)
+        torch.manual_seed(42)
         is_first = (label == configs[0][0])
-        results[label] = train(model, args.epochs, task=args.task, B=args.batch_size,
-                               L=args.seq_len, lr=args.lr, device=args.device, label=label,
-                               vocab_size=vocab_size, num_kv_pairs=args.num_kv_pairs,
-                               num_train_examples=args.num_train_examples,
+        results[label] = train(model, train_data, val_data, n_steps=args.steps,
+                               B=args.batch_size, L=args.seq_len, lr=args.lr,
+                               vocab_size=vocab_size, device=args.device, label=label,
                                use_compile=args.compile, use_amp=args.amp,
-                               profile=(args.profile and is_first))
+                               profile=(args.profile and is_first),
+                               eval_every=args.eval_every)
         results[label]['model'] = model
         results[label]['n_params'] = n_params
         results[label]['shape'] = shape
@@ -777,22 +521,17 @@ def main():
     all_labels = [label for label, _, _ in configs]
 
     # --- Final comparison ---
-    max_ep = max(len(r['train_losses']) for r in results.values())
-
     print("\n" + "=" * 80)
-    print("EPOCH-BY-EPOCH COMPARISON (every ~10 epochs)")
+    print("STEP-BY-STEP COMPARISON")
     print("=" * 80)
-    # Print per-model blocks (too many models for one wide row)
-    step = max(1, max_ep // 10)
-    epochs_to_show = sorted(set(list(range(0, max_ep, step)) + [max_ep - 1]))
     for label in all_labels:
         r = results[label]
         shape_str = 'x'.join(map(str, r['shape']))
+        steps = r.get('steps', list(range(len(r['train_losses']))))
         print(f"\n  {label} ({shape_str}, proj={r['proj_mode']}):")
-        print(f"  {'Epoch':>6} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9}")
-        for ep in epochs_to_show:
-            if ep < len(r['train_losses']):
-                print(f"  {ep:>6} {r['train_losses'][ep]:>11.4f} {r['train_accs'][ep]:>10.3f} {r['val_losses'][ep]:>10.4f} {r['val_accs'][ep]:>9.3f}")
+        print(f"  {'Step':>6} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9}")
+        for i, s in enumerate(steps):
+            print(f"  {s:>6} {r['train_losses'][i]:>11.4f} {r['train_accs'][i]:>10.3f} {r['val_losses'][i]:>10.4f} {r['val_accs'][i]:>9.3f}")
 
     print("\n" + "=" * 80)
     print("GRADIENT SVD ANALYSIS (effective rank = fraction of SVs > 10% of max)")
@@ -847,7 +586,7 @@ def main():
             'val_loss': r['val_losses'][-1],
             'train_acc': r['train_accs'][-1],
             'train_loss': r['train_losses'][-1],
-            'epochs': len(r['train_losses']) - 1,
+            'final_step': r.get('steps', list(range(len(r['train_losses']))))[-1],
         }
 
     # 1. ND einsum vs 1D baseline
@@ -855,35 +594,29 @@ def main():
     print("  " + "-" * 60)
     if baseline:
         bm = final_metrics(baseline)
-        print(f"     1D baseline: val_acc={bm['val_acc']:.4f}  val_loss={bm['val_loss']:.4f}  epochs={bm['epochs']}")
+        print(f"     1D baseline: val_loss={bm['val_loss']:.4f}  val_acc={bm['val_acc']:.4f}")
         for label in sorted(einsum_models):
             r = einsum_models[label]
             m = final_metrics(r)
-            acc_diff = m['val_acc'] - bm['val_acc']
             loss_diff = m['val_loss'] - bm['val_loss']
-            epoch_diff = m['epochs'] - bm['epochs']
-            sign_a = '+' if acc_diff >= 0 else ''
+            acc_diff = m['val_acc'] - bm['val_acc']
             sign_l = '+' if loss_diff >= 0 else ''
-            sign_e = '+' if epoch_diff >= 0 else ''
-            print(f"     {label:<14} val_acc={m['val_acc']:.4f} ({sign_a}{acc_diff:.4f})  "
-                  f"val_loss={m['val_loss']:.4f} ({sign_l}{loss_diff:.4f})  "
-                  f"epochs={m['epochs']} ({sign_e}{epoch_diff})")
+            sign_a = '+' if acc_diff >= 0 else ''
+            print(f"     {label:<20} val_loss={m['val_loss']:.4f} ({sign_l}{loss_diff:.4f})  "
+                  f"val_acc={m['val_acc']:.4f} ({sign_a}{acc_diff:.4f})")
 
-        # Summary
-        best_einsum = max(einsum_models.items(), key=lambda x: x[1]['val_accs'][-1])
-        worst_einsum = min(einsum_models.items(), key=lambda x: x[1]['val_accs'][-1])
-        fastest_einsum = min(einsum_models.items(), key=lambda x: len(x[1]['val_accs']))
-        print(f"\n     Best ND einsum:    {best_einsum[0]} (val_acc={best_einsum[1]['val_accs'][-1]:.4f})")
-        print(f"     Worst ND einsum:   {worst_einsum[0]} (val_acc={worst_einsum[1]['val_accs'][-1]:.4f})")
-        print(f"     Fastest to converge: {fastest_einsum[0]} ({len(fastest_einsum[1]['val_accs'])-1} epochs)")
+        best_einsum = min(einsum_models.items(), key=lambda x: x[1]['val_losses'][-1])
+        worst_einsum = max(einsum_models.items(), key=lambda x: x[1]['val_losses'][-1])
+        print(f"\n     Best ND einsum:    {best_einsum[0]} (val_loss={best_einsum[1]['val_losses'][-1]:.4f})")
+        print(f"     Worst ND einsum:   {worst_einsum[0]} (val_loss={worst_einsum[1]['val_losses'][-1]:.4f})")
 
-        avg_einsum_acc = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
-        if avg_einsum_acc > bm['val_acc'] + 0.001:
-            print(f"\n     VERDICT: ND einsum outperforms 1D (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
-        elif avg_einsum_acc < bm['val_acc'] - 0.001:
-            print(f"\n     VERDICT: 1D outperforms ND einsum (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+        avg_einsum_loss = np.mean([r['val_losses'][-1] for r in einsum_models.values()])
+        if avg_einsum_loss < bm['val_loss'] - 0.01:
+            print(f"\n     VERDICT: ND einsum outperforms 1D (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
+        elif avg_einsum_loss > bm['val_loss'] + 0.01:
+            print(f"\n     VERDICT: 1D outperforms ND einsum (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
         else:
-            print(f"\n     VERDICT: No meaningful difference (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+            print(f"\n     VERDICT: No meaningful difference (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
 
     # 2. Einsum vs Matmul
     print("\n  2. EINSUM vs MATMUL (same weights, different projection)")
@@ -891,7 +624,6 @@ def main():
     if matmul_models:
         for label, r in sorted(matmul_models.items()):
             m = final_metrics(r)
-            # Find matching einsum model (same shape)
             einsum_match = None
             for el, er in einsum_models.items():
                 if er['shape'] == r['shape']:
@@ -900,19 +632,17 @@ def main():
             if einsum_match:
                 el, er = einsum_match
                 em = final_metrics(er)
-                acc_diff = m['val_acc'] - em['val_acc']
-                epoch_diff = m['epochs'] - em['epochs']
-                print(f"     {label:<20} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}  "
-                      f"vs {el}: acc {'+' if acc_diff>=0 else ''}{acc_diff:.4f}  "
-                      f"epochs {'+' if epoch_diff>=0 else ''}{epoch_diff}")
+                loss_diff = m['val_loss'] - em['val_loss']
+                print(f"     {label:<20} val_loss={m['val_loss']:.4f}  "
+                      f"vs {el}: {'+' if loss_diff>=0 else ''}{loss_diff:.4f}")
             else:
-                print(f"     {label:<20} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}")
+                print(f"     {label:<20} val_loss={m['val_loss']:.4f}")
 
-        avg_matmul = np.mean([r['val_accs'][-1] for r in matmul_models.values()])
-        avg_einsum = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
-        if abs(avg_matmul - avg_einsum) < 0.001:
+        avg_matmul = np.mean([r['val_losses'][-1] for r in matmul_models.values()])
+        avg_einsum = np.mean([r['val_losses'][-1] for r in einsum_models.values()])
+        if abs(avg_matmul - avg_einsum) < 0.01:
             print(f"\n     VERDICT: Einsum and matmul equivalent — ND structure in weights alone doesn't help")
-        elif avg_einsum > avg_matmul:
+        elif avg_einsum < avg_matmul:
             print(f"\n     VERDICT: Einsum > matmul — ND contraction matters, not just ND weight shape")
         else:
             print(f"\n     VERDICT: Matmul >= einsum — ND contraction provides no benefit over reshape")
@@ -924,11 +654,11 @@ def main():
         rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
         if len(rank_models) < 2:
             continue
-        best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
-        worst = min(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
-        spread = best[1]['val_accs'][-1] - worst[1]['val_accs'][-1]
-        print(f"     {rank}D: best={best[0]} ({best[1]['val_accs'][-1]:.4f})  "
-              f"worst={worst[0]} ({worst[1]['val_accs'][-1]:.4f})  spread={spread:.4f}")
+        best = min(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
+        worst = max(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
+        spread = worst[1]['val_losses'][-1] - best[1]['val_losses'][-1]
+        print(f"     {rank}D: best={best[0]} (val_loss={best[1]['val_losses'][-1]:.4f})  "
+              f"worst={worst[0]} (val_loss={worst[1]['val_losses'][-1]:.4f})  spread={spread:.4f}")
     
     # 4. Rank comparison (best of each rank)
     print("\n  4. RANK COMPARISON (best model per rank)")
@@ -937,14 +667,13 @@ def main():
         if rank == 1:
             if baseline:
                 bm = final_metrics(baseline)
-                print(f"     1D: val_acc={bm['val_acc']:.4f}  val_loss={bm['val_loss']:.4f}  epochs={bm['epochs']}")
+                print(f"     1D: val_loss={bm['val_loss']:.4f}  val_acc={bm['val_acc']:.4f}")
         else:
             rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
             if rank_models:
-                best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+                best = min(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
                 m = final_metrics(best[1])
-                print(f"     {rank}D: val_acc={m['val_acc']:.4f}  val_loss={m['val_loss']:.4f}  "
-                      f"epochs={m['epochs']}  ({best[0]})")
+                print(f"     {rank}D: val_loss={m['val_loss']:.4f}  val_acc={m['val_acc']:.4f}  ({best[0]})")
 
     # 5. SVD effective rank comparison
     print("\n  5. WEIGHT SVD EFFECTIVE RANK (final snapshot)")
@@ -985,7 +714,7 @@ def main():
 
     for ax, title in zip(axes.flat, ['Train Loss', 'Val Loss', 'Train Acc', 'Val Acc']):
         ax.set_title(title)
-        ax.set_xlabel('epoch')
+        ax.set_xlabel('eval checkpoint')
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
@@ -1013,7 +742,7 @@ def main():
         md.append(f"| seq_len | {args.seq_len} |")
         md.append(f"| kv_pairs | {args.num_kv_pairs} |")
         md.append(f"| batch_size | {args.batch_size} |")
-        md.append(f"| epochs | {args.epochs} |")
+        md.append(f"| steps | {args.steps} |")
         md.append(f"| n_layers | {args.n_layers} |")
         md.append(f"| lr | {args.lr} |")
         md.append(f"| vocab_size | {vocab_size} |")
@@ -1028,16 +757,15 @@ def main():
         # Leaderboard
         md.append(f"## Leaderboard")
         md.append(f"")
-        md.append(f"| Model | Shape | Proj | Params | Train Loss | Train Acc | Val Loss | Val Acc | Epochs | s/epoch |")
-        md.append(f"|-------|-------|------|--------|------------|-----------|----------|---------|--------|---------|")
-        for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
+        md.append(f"| Model | Shape | Proj | Params | Train Loss | Train Acc | Val Loss | Val Acc | ms/step |")
+        md.append(f"|-------|-------|------|--------|------------|-----------|----------|---------|---------|")
+        for label in sorted(results, key=lambda l: results[l]['val_losses'][-1]):
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
-            n_ep = len(r['train_losses']) - 1
-            spe = r.get('sec_per_epoch', 0)
+            mps = r.get('ms_per_step', 0)
             md.append(f"| {label} | {shape_str} | {r['proj_mode']} | {r['n_params']:,} | "
                       f"{r['train_losses'][-1]:.4f} | {r['train_accs'][-1]:.3f} | "
-                      f"{r['val_losses'][-1]:.4f} | {r['val_accs'][-1]:.3f} | {n_ep} | {spe:.1f}s |")
+                      f"{r['val_losses'][-1]:.4f} | {r['val_accs'][-1]:.3f} | {mps:.1f} |")
         md.append(f"")
 
         # Model configs
@@ -1058,35 +786,33 @@ def main():
         md.append(f"")
         if baseline:
             bm = final_metrics(baseline)
-            md.append(f"| Model | Val Acc | vs 1D | Val Loss | vs 1D | Epochs | vs 1D |")
-            md.append(f"|-------|---------|-------|----------|-------|--------|-------|")
-            md.append(f"| **1D (baseline)** | {bm['val_acc']:.4f} | — | {bm['val_loss']:.4f} | — | {bm['epochs']} | — |")
+            md.append(f"| Model | Val Loss | vs 1D | Val Acc | vs 1D |")
+            md.append(f"|-------|----------|-------|---------|-------|")
+            md.append(f"| **1D (baseline)** | {bm['val_loss']:.4f} | — | {bm['val_acc']:.4f} | — |")
             for label in sorted(einsum_models):
                 r = einsum_models[label]
                 m = final_metrics(r)
-                ad = m['val_acc'] - bm['val_acc']
                 ld = m['val_loss'] - bm['val_loss']
-                ed = m['epochs'] - bm['epochs']
-                md.append(f"| {label} | {m['val_acc']:.4f} | {'+' if ad>=0 else ''}{ad:.4f} | "
-                          f"{m['val_loss']:.4f} | {'+' if ld>=0 else ''}{ld:.4f} | "
-                          f"{m['epochs']} | {'+' if ed>=0 else ''}{ed} |")
+                ad = m['val_acc'] - bm['val_acc']
+                md.append(f"| {label} | {m['val_loss']:.4f} | {'+' if ld>=0 else ''}{ld:.4f} | "
+                          f"{m['val_acc']:.4f} | {'+' if ad>=0 else ''}{ad:.4f} |")
             md.append(f"")
 
-            avg_einsum_acc = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
-            if avg_einsum_acc > bm['val_acc'] + 0.001:
-                md.append(f"**Verdict:** ND einsum outperforms 1D (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
-            elif avg_einsum_acc < bm['val_acc'] - 0.001:
-                md.append(f"**Verdict:** 1D outperforms ND einsum (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+            avg_einsum_loss = np.mean([r['val_losses'][-1] for r in einsum_models.values()])
+            if avg_einsum_loss < bm['val_loss'] - 0.01:
+                md.append(f"**Verdict:** ND einsum outperforms 1D (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
+            elif avg_einsum_loss > bm['val_loss'] + 0.01:
+                md.append(f"**Verdict:** 1D outperforms ND einsum (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
             else:
-                md.append(f"**Verdict:** No meaningful difference (avg val_acc {avg_einsum_acc:.4f} vs {bm['val_acc']:.4f})")
+                md.append(f"**Verdict:** No meaningful difference (avg val_loss {avg_einsum_loss:.4f} vs {bm['val_loss']:.4f})")
             md.append(f"")
 
         # Analysis 2: Einsum vs Matmul
         md.append(f"### 2. Einsum vs Matmul")
         md.append(f"")
         if matmul_models:
-            md.append(f"| Matmul Model | Val Acc | Epochs | vs Einsum Acc | vs Einsum Epochs |")
-            md.append(f"|--------------|---------|--------|---------------|------------------|")
+            md.append(f"| Matmul Model | Val Loss | vs Einsum |")
+            md.append(f"|--------------|----------|-----------|")
             for label, r in sorted(matmul_models.items()):
                 m = final_metrics(r)
                 einsum_match = None
@@ -1097,19 +823,18 @@ def main():
                 if einsum_match:
                     el, er = einsum_match
                     em = final_metrics(er)
-                    ad = m['val_acc'] - em['val_acc']
-                    ed = m['epochs'] - em['epochs']
-                    md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | "
-                              f"{'+' if ad>=0 else ''}{ad:.4f} ({el}) | {'+' if ed>=0 else ''}{ed} |")
+                    ld = m['val_loss'] - em['val_loss']
+                    md.append(f"| {label} | {m['val_loss']:.4f} | "
+                              f"{'+' if ld>=0 else ''}{ld:.4f} ({el}) |")
                 else:
-                    md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | — | — |")
+                    md.append(f"| {label} | {m['val_loss']:.4f} | — |")
             md.append(f"")
 
-            avg_matmul = np.mean([r['val_accs'][-1] for r in matmul_models.values()])
-            avg_einsum = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
-            if abs(avg_matmul - avg_einsum) < 0.001:
+            avg_matmul = np.mean([r['val_losses'][-1] for r in matmul_models.values()])
+            avg_einsum = np.mean([r['val_losses'][-1] for r in einsum_models.values()])
+            if abs(avg_matmul - avg_einsum) < 0.01:
                 md.append(f"**Verdict:** Einsum and matmul equivalent — ND structure in weights alone doesn't help")
-            elif avg_einsum > avg_matmul:
+            elif avg_einsum < avg_matmul:
                 md.append(f"**Verdict:** Einsum > matmul — ND contraction matters, not just ND weight shape")
             else:
                 md.append(f"**Verdict:** Matmul >= einsum — ND contraction provides no benefit over reshape")
@@ -1118,35 +843,35 @@ def main():
         # Analysis 3: Ratio comparison
         md.append(f"### 3. Ratio Comparison")
         md.append(f"")
-        md.append(f"| Rank | Best | Best Acc | Worst | Worst Acc | Spread |")
-        md.append(f"|------|------|----------|-------|-----------|--------|")
+        md.append(f"| Rank | Best | Best Loss | Worst | Worst Loss | Spread |")
+        md.append(f"|------|------|-----------|-------|------------|--------|")
         for rank in [2, 3, 4]:
             rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
             if len(rank_models) < 2:
                 continue
-            best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
-            worst = min(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
-            spread = best[1]['val_accs'][-1] - worst[1]['val_accs'][-1]
-            md.append(f"| {rank}D | {best[0]} | {best[1]['val_accs'][-1]:.4f} | "
-                      f"{worst[0]} | {worst[1]['val_accs'][-1]:.4f} | {spread:.4f} |")
+            best = min(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
+            worst = max(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
+            spread = worst[1]['val_losses'][-1] - best[1]['val_losses'][-1]
+            md.append(f"| {rank}D | {best[0]} | {best[1]['val_losses'][-1]:.4f} | "
+                      f"{worst[0]} | {worst[1]['val_losses'][-1]:.4f} | {spread:.4f} |")
         md.append(f"")
 
         # Analysis 4: Rank comparison
         md.append(f"### 4. Rank Comparison (best per rank)")
         md.append(f"")
-        md.append(f"| Rank | Model | Val Acc | Val Loss | Epochs |")
-        md.append(f"|------|-------|---------|----------|--------|")
+        md.append(f"| Rank | Model | Val Loss | Val Acc |")
+        md.append(f"|------|-------|----------|---------|")
         for rank in [1, 2, 3, 4]:
             if rank == 1:
                 if baseline:
                     bm = final_metrics(baseline)
-                    md.append(f"| 1D | 1D | {bm['val_acc']:.4f} | {bm['val_loss']:.4f} | {bm['epochs']} |")
+                    md.append(f"| 1D | 1D | {bm['val_loss']:.4f} | {bm['val_acc']:.4f} |")
             else:
                 rank_models = {l: r for l, r in einsum_models.items() if len(r['shape']) == rank}
                 if rank_models:
-                    best = max(rank_models.items(), key=lambda x: x[1]['val_accs'][-1])
+                    best = min(rank_models.items(), key=lambda x: x[1]['val_losses'][-1])
                     m = final_metrics(best[1])
-                    md.append(f"| {rank}D | {best[0]} | {m['val_acc']:.4f} | {m['val_loss']:.4f} | {m['epochs']} |")
+                    md.append(f"| {rank}D | {best[0]} | {m['val_loss']:.4f} | {m['val_acc']:.4f} |")
         md.append(f"")
 
         # Analysis 5: SVD
@@ -1216,20 +941,20 @@ def main():
                     md.append(f"| {epoch} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
             md.append(f"")
 
-        # Epoch-by-epoch
-        md.append(f"### Epoch-by-Epoch Metrics")
+        # Step-by-step
+        md.append(f"### Step-by-Step Metrics")
         md.append(f"")
         for label in all_labels:
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
+            steps = r.get('steps', list(range(len(r['train_losses']))))
             md.append(f"**{label}** ({shape_str}, proj={r['proj_mode']})")
             md.append(f"")
-            md.append(f"| Epoch | Train Loss | Train Acc | Val Loss | Val Acc |")
-            md.append(f"|-------|------------|-----------|----------|---------|")
-            for ep in epochs_to_show:
-                if ep < len(r['train_losses']):
-                    md.append(f"| {ep} | {r['train_losses'][ep]:.4f} | {r['train_accs'][ep]:.3f} | "
-                              f"{r['val_losses'][ep]:.4f} | {r['val_accs'][ep]:.3f} |")
+            md.append(f"| Step | Train Loss | Train Acc | Val Loss | Val Acc |")
+            md.append(f"|------|------------|-----------|----------|---------|")
+            for i, s in enumerate(steps):
+                md.append(f"| {s} | {r['train_losses'][i]:.4f} | {r['train_accs'][i]:.3f} | "
+                          f"{r['val_losses'][i]:.4f} | {r['val_accs'][i]:.3f} |")
             md.append(f"")
 
         report_text = '\n'.join(md)
