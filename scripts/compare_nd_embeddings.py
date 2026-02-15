@@ -357,12 +357,12 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     val_x, val_t = val_x.to(device), val_t.to(device)
     n_batches = num_train_examples // B
 
-    # Helper to compute loss + acc over a dataset in batches
+    # Helper to compute loss + acc over a dataset in batches (no mid-loop syncs)
     def eval_metrics(data_x, data_t):
         model.eval()
-        total_loss = 0
-        total_correct = 0
-        total_count = 0
+        total_loss = torch.zeros(1, device=device)
+        total_correct = torch.zeros(1, dtype=torch.long, device=device)
+        total_count = torch.zeros(1, dtype=torch.long, device=device)
         bs = min(512, len(data_x))
         with torch.no_grad():
             for i in range(0, len(data_x), bs):
@@ -370,16 +370,17 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
                 bt = data_t[i:i+bs]
                 logits = model(bx)
                 total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
-                                              ignore_index=-100).item() * len(bx)
+                                              ignore_index=-100) * len(bx)
                 preds = logits.argmax(-1)
                 if task == 'mqar':
                     m = bt != -100
-                    total_correct += (preds[m] == bt[m]).sum().item()
-                    total_count += m.sum().item()
+                    total_correct += (preds[m] == bt[m]).sum()
+                    total_count += m.sum()
                 else:
-                    total_correct += (preds == bt).sum().item()
+                    total_correct += (preds == bt).sum()
                     total_count += bt.numel()
-        return total_loss / len(data_x), total_correct / max(total_count, 1)
+        # Single sync point
+        return (total_loss / len(data_x)).item(), (total_correct.float() / total_count.clamp(min=1)).item()
 
     # Register starting metrics before any training
     tl0, ta0 = eval_metrics(train_x[:min(5000, len(train_x))], train_t[:min(5000, len(train_x))])
@@ -391,12 +392,13 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
     pbar = tqdm(range(n_epochs), desc=f'{label} training', leave=True)
     for epoch in pbar:
         model.train()
-        epoch_loss = 0
-        epoch_correct = 0
-        epoch_count = 0
+        epoch_loss = torch.zeros(1, device=device)
+        epoch_correct = torch.zeros(1, dtype=torch.long, device=device)
+        epoch_count = torch.zeros(1, dtype=torch.long, device=device)
 
         # Shuffle via index permutation on device (no copy)
         perm = torch.randperm(num_train_examples, device=device)
+        do_snapshot = epoch in snapshot_epochs
 
         for batch_i in range(n_batches):
             idx = perm[batch_i * B : (batch_i + 1) * B]
@@ -409,34 +411,35 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
             opt.zero_grad()
             loss.backward()
 
-            # Accumulate train acc from training logits (free, no extra forward pass)
+            # Accumulate on GPU — no sync
             with torch.no_grad():
+                epoch_loss += loss.detach()
                 preds = logits.argmax(-1)
                 if task == 'mqar':
                     m = t != -100
-                    epoch_correct += (preds[m] == t[m]).sum().item()
-                    epoch_count += m.sum().item()
+                    epoch_correct += (preds[m] == t[m]).sum()
+                    epoch_count += m.sum()
                 else:
-                    epoch_correct += (preds == t).sum().item()
+                    epoch_correct += (preds == t).sum()
                     epoch_count += t.numel()
 
             # Snapshot (first batch of snapshot epochs only)
-            if epoch in snapshot_epochs and batch_i == 0:
-                if epoch not in grad_snapshots:
-                    grad_snapshots[epoch] = {}
-                    weight_snapshots[epoch] = {}
+            if do_snapshot and batch_i == 0:
+                grad_snapshots[epoch] = {}
+                weight_snapshots[epoch] = {}
                 for name, p in model.named_parameters():
                     if p.grad is not None and ('wq' in name or 'seq_wq' in name):
-                        if name not in grad_snapshots[epoch]:
-                            grad_snapshots[epoch][name] = p.grad.detach().cpu().clone()
-                            weight_snapshots[epoch][name] = p.detach().cpu().clone()
+                        grad_snapshots[epoch][name] = p.grad.detach().cpu().clone()
+                        weight_snapshots[epoch][name] = p.detach().cpu().clone()
 
             opt.step()
-            epoch_loss += loss.item()
 
         scheduler.step()
-        train_losses.append(epoch_loss / n_batches)
-        train_accs.append(epoch_correct / max(epoch_count, 1))
+        # Single sync point per epoch
+        tl = (epoch_loss / n_batches).item()
+        ta = (epoch_correct.float() / epoch_count.clamp(min=1)).item()
+        train_losses.append(tl)
+        train_accs.append(ta)
 
         # Val eval
         vl_, va_ = eval_metrics(val_x, val_t)
