@@ -953,6 +953,106 @@ class FusedSeqFeatureAttnBlock(nn.Module):
         return x + out
 
 
+class FusedQKVBlock(nn.Module):
+    """Fused block with full Q/K/V projections shared across seq + feature attention.
+
+    Flow:
+      q = Q_proj(x)                          # (B, T, H)
+      k = K_proj(x)                          # (B, T, H)
+      v = V_proj(x)                          # (B, T, H)
+
+      seq_out = seq_attn(q, k, v)            # causal, RoPE, over T
+      seq_out = seq_out + v                   # skip from V around seq attn
+
+      feat_out = feat_attn(q, q, seq_out)    # Q=K from q, over N_f
+      out = SiLU(feat_out)
+      out = down_proj(out)
+
+    Params: Q(d,H) + K(d,H) + V(d,H) + down(H,d) = 4*d*H
+    At d=768, H=2304: 124M params with 12 layers.
+    """
+
+    def __init__(self, d_model: int, hidden: int, n_seq_heads: int,
+                 n_features: int, feat_activation: str = 'softmax'):
+        super().__init__()
+        self.d_model = d_model
+        self.hidden = hidden
+        self.n_seq_heads = n_seq_heads
+        self.seq_head_dim = hidden // n_seq_heads
+        self.n_features = n_features
+        self.desc_dim = hidden // n_features
+        self.feat_activation = feat_activation
+
+        assert hidden % n_seq_heads == 0, f"hidden ({hidden}) must be divisible by n_seq_heads ({n_seq_heads})"
+        assert hidden % n_features == 0, f"hidden ({hidden}) must be divisible by n_features ({n_features})"
+
+        self.ln = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, hidden, bias=False)
+        self.k_proj = nn.Linear(d_model, hidden, bias=False)
+        self.v_proj = nn.Linear(d_model, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, d_model, bias=False)
+        self.rotary = Rotary(self.seq_head_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        NH = self.n_seq_heads
+        HD = self.seq_head_dim
+        NF = self.n_features
+        DD = self.desc_dim
+        H = self.hidden
+
+        h = self.ln(x)
+
+        # Full Q, K, V projections
+        q = self.q_proj(h)   # (B, T, H)
+        k = self.k_proj(h)   # (B, T, H)
+        v = self.v_proj(h)   # (B, T, H)
+
+        # ── Sequence attention (causal, RoPE, separate Q/K) ──
+        q_seq = q.view(B, T, NH, HD)
+        k_seq = k.view(B, T, NH, HD)
+        v_seq = v.view(B, T, NH, HD)
+        cos, sin = self.rotary(q_seq)
+        q_seq = apply_rotary(q_seq, cos, sin)
+        k_seq = apply_rotary(k_seq, cos, sin)
+
+        if HAS_FLASH_ATTN:
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+        else:
+            q_seq = q_seq.transpose(1, 2)
+            k_seq = k_seq.transpose(1, 2)
+            v_seq = v_seq.transpose(1, 2)
+            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            seq_out = seq_out.transpose(1, 2)
+
+        seq_out = seq_out.contiguous().view(B, T, H)
+
+        # Skip connection: V around seq attention
+        seq_out = seq_out + v
+
+        # ── Feature attention (non-causal, Q=K from q) ──
+        q_feat = q.view(B * T, NF, DD)
+        seq_feat = seq_out.view(B * T, NF, DD)
+
+        scale = DD ** -0.5
+        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
+
+        if self.feat_activation == 'softmax':
+            weights = torch.softmax(scores, dim=-1)
+        elif self.feat_activation == 'silu':
+            weights = F.silu(scores)
+        elif self.feat_activation == 'silu2':
+            weights = F.silu(scores).square()
+        else:
+            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
+
+        out = torch.bmm(weights, seq_feat)  # (B*T, NF, DD)
+        out = F.silu(out.view(B, T, H))     # post-activation
+        out = self.down_proj(out)
+
+        return x + out
+
+
 class TransformerMamba3Block(nn.Module):
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
@@ -1314,6 +1414,43 @@ class GPTFusedSeqFeature(nn.Module):
         return logits, loss
 
 
+class GPTFusedQKV(nn.Module):
+    """GPT with fused QKV blocks — full Q/K/V shared across seq + feature attention."""
+
+    def __init__(self):
+        super().__init__()
+        if HP.fused_inner_dim > 0:
+            hidden = HP.fused_inner_dim
+        else:
+            hidden = int(HP.d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        nf = HP.fa_n_features
+        act = HP.fa_activation
+        n_seq_heads = hidden // 64
+        assert hidden % nf == 0, (
+            f"hidden ({hidden}) not divisible by FA_N_FEATURES ({nf})")
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([
+            FusedQKVBlock(HP.d_model, hidden, n_seq_heads, nf, act)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
@@ -1321,6 +1458,8 @@ def build_model() -> nn.Module:
         return GPTFeatureAttn()
     if HP.model_type == "fused_seq_feat":
         return GPTFusedSeqFeature()
+    if HP.model_type == "fused_qkv":
+        return GPTFusedQKV()
     if HP.model_type == "transformer_shift":
         return GPTTransformerShift()
     if HP.model_type == "transformer_s4d":
