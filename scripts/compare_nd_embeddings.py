@@ -250,10 +250,17 @@ class BlockND(nn.Module):
         q = q.transpose(1, 2)  # (B, NH, T, HD)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # Force bf16 for FlashAttention dispatch in SDPA
+        orig_dtype = q.dtype
+        if q.dtype == torch.float32 and q.is_cuda:
+            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+
         context = F.scaled_dot_product_attention(
             q, k, v, is_causal=True,
             dropout_p=self.attn_dropout if self.training else 0.0,
         )
+        context = context.to(orig_dtype)
         context = context.transpose(1, 2).contiguous().reshape(B, T, D)
 
         if self.proj_mode == 'linear':
