@@ -727,9 +727,10 @@ def main():
             label = f'{rank}D-{ratio}'
             configs.append((label, shape, 'einsum'))
 
-    # 2D ablation: einsum vs matmul (using 1:3 ratio)
-    shape_2d = factorize_dim(D, 2, ratio='1:3')
-    configs.append(('2D-matmul', shape_2d, 'matmul'))
+    # Matmul ablation for each rank (using 1:3 ratio)
+    for rank in [2, 3, 4]:
+        shape = factorize_dim(D, rank, ratio='1:3')
+        configs.append((f'{rank}D-matmul', shape, 'matmul'))
 
     print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}, kv_pairs={args.num_kv_pairs}, batch={args.batch_size}")
     print(f"d_model = {D}")
