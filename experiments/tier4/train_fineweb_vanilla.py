@@ -999,10 +999,7 @@ class ThreeStageFSABlock(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-        # Stage 2: layer norm before seq attention (after feat attn residual)
-        self.ln2 = RMSNorm(d_model)
-
-        # Stage 3: MLP (standard SwiGLU)
+        # MLP
         self.ln3 = RMSNorm(d_model)
         self.mlp = MLP(d_model)
 
@@ -1040,10 +1037,7 @@ class ThreeStageFSABlock(nn.Module):
         x = x + feat_out  # residual
 
         # ── Stage 2: Sequence attention (RoPE on same Q/K) ──
-        h2 = self.ln2(x)
-        # Re-project Q from post-feat-attn state for seq attention
-        # but K/V come from the original projections (pre-feat-attn)
-        q_seq = self.q_proj(h2).view(B, T, NH, HD)
+        q_seq = q.view(B, T, NH, HD)
 
         cos, sin = self.rotary(q_seq)
         q_seq = apply_rotary(q_seq, cos, sin)
