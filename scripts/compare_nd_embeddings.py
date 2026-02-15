@@ -715,23 +715,20 @@ def main():
     # 1D baseline
     configs.append(('1D', (D,), 'linear'))
 
-    # 2D/3D/4D with all three ratios (skip duplicates)
-    seen_shapes = set()
+    # 2D/3D/4D with all three ratios, both einsum and matmul (skip duplicates)
+    seen = set()
     for rank in [2, 3, 4]:
         for ratio in ['1:3', '1:1', '3:1']:
             shape = factorize_dim(D, rank, ratio=ratio)
-            key = (shape, 'einsum')
-            if key in seen_shapes:
-                print(f"  (skipping {rank}D-{ratio} = {'x'.join(map(str,shape))} — duplicate)")
-                continue
-            seen_shapes.add(key)
-            label = f'{rank}D-{ratio}'
-            configs.append((label, shape, 'einsum'))
-
-    # Matmul ablation for each rank (using 1:3 ratio)
-    for rank in [2, 3, 4]:
-        shape = factorize_dim(D, rank, ratio='1:3')
-        configs.append((f'{rank}D-matmul', shape, 'matmul'))
+            for proj_mode in ['einsum', 'matmul']:
+                key = (shape, proj_mode)
+                if key in seen:
+                    print(f"  (skipping {rank}D-{ratio}-{proj_mode} = {'x'.join(map(str,shape))} — duplicate)")
+                    continue
+                seen.add(key)
+                suffix = f'-{proj_mode}' if proj_mode == 'matmul' else ''
+                label = f'{rank}D-{ratio}{suffix}'
+                configs.append((label, shape, proj_mode))
 
     print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}, kv_pairs={args.num_kv_pairs}, batch={args.batch_size}")
     print(f"d_model = {D}")
@@ -894,19 +891,22 @@ def main():
     if matmul_models:
         for label, r in sorted(matmul_models.items()):
             m = final_metrics(r)
-            shape = r['shape']
-            # Find matching einsum model
-            rank = len(shape)
-            einsum_label = f'{rank}D-1:3'
-            if einsum_label in einsum_models:
-                em = final_metrics(einsum_models[einsum_label])
+            # Find matching einsum model (same shape)
+            einsum_match = None
+            for el, er in einsum_models.items():
+                if er['shape'] == r['shape']:
+                    einsum_match = (el, er)
+                    break
+            if einsum_match:
+                el, er = einsum_match
+                em = final_metrics(er)
                 acc_diff = m['val_acc'] - em['val_acc']
                 epoch_diff = m['epochs'] - em['epochs']
-                print(f"     {label:<14} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}  "
-                      f"vs {einsum_label}: acc {'+' if acc_diff>=0 else ''}{acc_diff:.4f}  "
+                print(f"     {label:<20} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}  "
+                      f"vs {el}: acc {'+' if acc_diff>=0 else ''}{acc_diff:.4f}  "
                       f"epochs {'+' if epoch_diff>=0 else ''}{epoch_diff}")
             else:
-                print(f"     {label:<14} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}")
+                print(f"     {label:<20} val_acc={m['val_acc']:.4f}  epochs={m['epochs']}")
 
         avg_matmul = np.mean([r['val_accs'][-1] for r in matmul_models.values()])
         avg_einsum = np.mean([r['val_accs'][-1] for r in einsum_models.values()])
@@ -1089,14 +1089,18 @@ def main():
             md.append(f"|--------------|---------|--------|---------------|------------------|")
             for label, r in sorted(matmul_models.items()):
                 m = final_metrics(r)
-                rank = len(r['shape'])
-                einsum_label = f'{rank}D-1:3'
-                if einsum_label in einsum_models:
-                    em = final_metrics(einsum_models[einsum_label])
+                einsum_match = None
+                for el, er in einsum_models.items():
+                    if er['shape'] == r['shape']:
+                        einsum_match = (el, er)
+                        break
+                if einsum_match:
+                    el, er = einsum_match
+                    em = final_metrics(er)
                     ad = m['val_acc'] - em['val_acc']
                     ed = m['epochs'] - em['epochs']
                     md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | "
-                              f"{'+' if ad>=0 else ''}{ad:.4f} | {'+' if ed>=0 else ''}{ed} |")
+                              f"{'+' if ad>=0 else ''}{ad:.4f} ({el}) | {'+' if ed>=0 else ''}{ed} |")
                 else:
                     md.append(f"| {label} | {m['val_acc']:.4f} | {m['epochs']} | — | — |")
             md.append(f"")
