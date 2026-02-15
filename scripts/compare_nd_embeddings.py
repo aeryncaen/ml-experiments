@@ -475,7 +475,7 @@ def main():
                 label = f'{rank}D-{ratio}{suffix}'
                 configs.append((label, shape, proj_mode))
 
-    print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}, kv_pairs={args.num_kv_pairs}, batch={args.batch_size}")
+    print(f"Task: {task_name}, vocab_size={vocab_size}, seq_len={args.seq_len}, batch={args.batch_size}")
     print(f"d_model = {D}")
     print(f"\nModel configs:")
     for label, shape, proj_mode in configs:
@@ -548,7 +548,7 @@ def main():
                 total = len(S)
                 top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
                 short = name.split('.')[-1]
-                print(f"    epoch {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+                print(f"    step {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
 
     print("\n" + "=" * 80)
     print("WEIGHT SVD ANALYSIS (evolution over training)")
@@ -566,7 +566,7 @@ def main():
                     total = len(S)
                     top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
                     short = name.split('.')[-1]
-                    print(f"    epoch {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
+                    print(f"    step {epoch:>4} | {short:<12} | eff_rank {eff_rank}/{total} ({eff_rank/total:.1%}) | top5 SVs: [{top5}]")
         else:
             print(f"    (no snapshots captured)")
 
@@ -740,7 +740,6 @@ def main():
         md.append(f"| Task | {task_name} |")
         md.append(f"| d_model | {D} |")
         md.append(f"| seq_len | {args.seq_len} |")
-        md.append(f"| kv_pairs | {args.num_kv_pairs} |")
         md.append(f"| batch_size | {args.batch_size} |")
         md.append(f"| steps | {args.steps} |")
         md.append(f"| n_layers | {args.n_layers} |")
@@ -906,16 +905,16 @@ def main():
                 continue
             md.append(f"**{label}** ({shape_str})")
             md.append(f"")
-            md.append(f"| Epoch | Param | Eff Rank | Total | Frac | Top 5 SVs |")
-            md.append(f"|-------|-------|----------|-------|------|-----------|")
-            for epoch in sorted(snap.keys()):
-                for name, g in snap[epoch].items():
+            md.append(f"| Step | Param | Eff Rank | Total | Frac | Top 5 SVs |")
+            md.append(f"|------|-------|----------|-------|------|-----------|")
+            for step_k in sorted(snap.keys()):
+                for name, g in snap[step_k].items():
                     S = svd_spectrum(g)
                     eff_rank = (S > 0.1).sum().item()
                     total = len(S)
                     top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
                     short = name.split('.')[-1]
-                    md.append(f"| {epoch} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
+                    md.append(f"| {step_k} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
             md.append(f"")
 
         # Weight SVD evolution
@@ -929,16 +928,16 @@ def main():
                 continue
             md.append(f"**{label}** ({shape_str})")
             md.append(f"")
-            md.append(f"| Epoch | Param | Eff Rank | Total | Frac | Top 5 SVs |")
-            md.append(f"|-------|-------|----------|-------|------|-----------|")
-            for epoch in sorted(snap.keys()):
-                for name, w in snap[epoch].items():
+            md.append(f"| Step | Param | Eff Rank | Total | Frac | Top 5 SVs |")
+            md.append(f"|------|-------|----------|-------|------|-----------|")
+            for step_k in sorted(snap.keys()):
+                for name, w in snap[step_k].items():
                     S = svd_spectrum(w)
                     eff_rank = (S > 0.1).sum().item()
                     total = len(S)
                     top5 = ', '.join(f'{s:.3f}' for s in S[:5].numpy())
                     short = name.split('.')[-1]
-                    md.append(f"| {epoch} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
+                    md.append(f"| {step_k} | {short} | {eff_rank} | {total} | {eff_rank/total:.1%} | {top5} |")
             md.append(f"")
 
         # Step-by-step
