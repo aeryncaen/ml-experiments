@@ -39,6 +39,88 @@ def gen_mod_arith(B, L, device='cpu'):
     return x, target
 
 
+def gen_forgetting_mqar(num_examples, seq_len, vocab_size=8192, num_kv_pairs=4,
+                        num_updates=None, power_a=0.01, seed=42):
+    """Generate forgetting MQAR data (from Zoology).
+
+    Same as MQAR but some keys appear twice with different values.
+    Model must return the LAST (most recent) value. Tests memory overwrite.
+
+    num_updates defaults to max(1, num_kv_pairs // 2) matching Zoology ripple_tasks.py.
+    """
+    if num_updates is None:
+        num_updates = max(1, num_kv_pairs // 2)
+
+    rng = np.random.default_rng(seed)
+
+    total_kv_slots = num_kv_pairs + num_updates
+    context_size = total_kv_slots * 2
+
+    key_vocab = np.arange(1, vocab_size // 2)
+    val_vocab = np.arange(vocab_size // 2, vocab_size)
+
+    keys = np.stack([rng.choice(key_vocab, num_kv_pairs, replace=False)
+                     for _ in range(num_examples)])
+    original_values = np.stack([rng.choice(val_vocab, num_kv_pairs, replace=False)
+                                for _ in range(num_examples)])
+
+    # Select which keys get updated and generate new values
+    update_indices = np.stack([rng.choice(num_kv_pairs, size=num_updates, replace=False)
+                               for _ in range(num_examples)])
+    update_keys = np.take_along_axis(keys, update_indices, axis=1)
+
+    updated_values = np.zeros((num_examples, num_updates), dtype=np.int64)
+    for i in range(num_examples):
+        for j in range(num_updates):
+            available = val_vocab[val_vocab != original_values[i, update_indices[i, j]]]
+            updated_values[i, j] = rng.choice(available)
+
+    # Final values: original, then overwrite updated ones
+    final_values = original_values.copy()
+    for i in range(num_examples):
+        for j, idx in enumerate(update_indices[i]):
+            final_values[i, idx] = updated_values[i, j]
+
+    # Build context: [original KVs] [update KVs]
+    original_context = np.zeros((num_examples, num_kv_pairs * 2), dtype=np.int64)
+    original_context[:, 0::2] = keys
+    original_context[:, 1::2] = original_values
+
+    update_context = np.zeros((num_examples, num_updates * 2), dtype=np.int64)
+    update_context[:, 0::2] = update_keys
+    update_context[:, 1::2] = updated_values
+
+    kvs = np.concatenate([original_context, update_context], axis=1)
+
+    # Power-law gaps for query placement
+    space = (seq_len - context_size) // 2
+    p = power_a * np.arange(1, space + 1) ** (power_a - 1)
+    p = p / p.sum()
+
+    log_p = np.log(p)
+    gumbel = rng.gumbel(size=(num_examples, space))
+    gap_idx = np.argpartition(-(log_p + gumbel), num_kv_pairs, axis=1)[:, :num_kv_pairs]
+
+    # Build query section
+    queries = np.zeros((num_examples, seq_len - context_size + 1), dtype=np.int64)
+    np.put_along_axis(queries, gap_idx * 2, values=keys, axis=1)
+
+    examples = np.concatenate([kvs, queries], axis=1)
+
+    # Labels: FINAL values (after updates)
+    labels = np.full((num_examples, seq_len + 1), -100, dtype=np.int64)
+    np.put_along_axis(labels, gap_idx * 2 + context_size + 1, values=final_values, axis=1)
+
+    inputs = torch.tensor(examples[:, :-1])
+    labels = torch.tensor(labels[:, 1:])
+
+    # Fill non-query/non-kv positions with random tokens
+    mask = inputs == 0
+    inputs[mask] = torch.randint(vocab_size, size=inputs.shape)[mask]
+
+    return inputs, labels
+
+
 def gen_mqar(num_examples, seq_len, vocab_size=8192, num_kv_pairs=4, power_a=0.01, seed=42):
     """Generate multi-query associative recall data (from Zoology).
 
@@ -361,11 +443,16 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
 
     # Pre-generate datasets (matching Zoology: fixed dataset, iterate in batches)
     print(f'  [{label}] Generating {num_train_examples} train + 3000 val examples...', flush=True)
-    if task == 'mqar':
+    if task in ('mqar', 'forgetting_mqar'):
         train_x, train_t = gen_mqar(num_train_examples, L, vocab_size=vocab_size,
-                                    num_kv_pairs=num_kv_pairs, seed=42)
+                                     num_kv_pairs=num_kv_pairs, seed=42)
         val_x, val_t = gen_mqar(3000, L, vocab_size=vocab_size,
-                                num_kv_pairs=num_kv_pairs, seed=9999)
+                                 num_kv_pairs=num_kv_pairs, seed=9999)
+    elif task == 'forgetting_mqar':
+        train_x, train_t = gen_forgetting_mqar(num_train_examples, L, vocab_size=vocab_size,
+                                                num_kv_pairs=num_kv_pairs, seed=42)
+        val_x, val_t = gen_forgetting_mqar(3000, L, vocab_size=vocab_size,
+                                            num_kv_pairs=num_kv_pairs, seed=9999)
     else:
         train_x, train_t = gen_mod_arith(num_train_examples, L)
         val_x, val_t = gen_mod_arith(3000, L)
@@ -394,7 +481,7 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
                 total_loss += F.cross_entropy(logits.reshape(-1, vocab_size), bt.reshape(-1),
                                               ignore_index=-100) * len(bx)
                 preds = logits.argmax(-1)
-                if task == 'mqar':
+                if task in ('mqar', 'forgetting_mqar'):
                     m = bt != -100
                     total_correct += (preds[m] == bt[m]).sum()
                     total_count += m.sum()
@@ -464,7 +551,7 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
             with torch.no_grad():
                 epoch_loss += loss.detach()
                 preds = logits.argmax(-1)
-                if task == 'mqar':
+                if task in ('mqar', 'forgetting_mqar'):
                     m = t != -100
                     epoch_correct += (preds[m] == t[m]).sum()
                     epoch_count += m.sum()
@@ -561,8 +648,9 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dim', type=int, default=768,
                         help='Model dim (768 gives clean 1:3 ratio: 16x48)')
-    parser.add_argument('--task', type=str, default='mqar', choices=['mqar', 'mod_arith'],
-                        help='Task: mqar (associative recall) or mod_arith')
+    parser.add_argument('--task', type=str, default='mqar',
+                        choices=['mqar', 'forgetting_mqar', 'mod_arith'],
+                        help='Task: mqar, forgetting_mqar (in-place editing), or mod_arith')
     parser.add_argument('--epochs', type=int, default=64)
     parser.add_argument('--seq-len', type=int, default=1024, help='Sequence length')
     parser.add_argument('--num-kv-pairs', type=int, default=None,
@@ -612,8 +700,13 @@ def main():
         print(f"Auto batch_size={args.batch_size} for seq_len={args.seq_len}")
 
     D = args.dim
-    vocab_size = VOCAB_SIZE if args.task == 'mqar' else MOD_BASE
-    task_name = 'MQAR (associative recall)' if args.task == 'mqar' else 'Modular Arithmetic'
+    vocab_size = VOCAB_SIZE if args.task in ('mqar', 'forgetting_mqar') else MOD_BASE
+    task_names = {
+        'mqar': 'MQAR (associative recall)',
+        'forgetting_mqar': 'Forgetting MQAR (in-place editing)',
+        'mod_arith': 'Modular Arithmetic',
+    }
+    task_name = task_names[args.task]
 
     # Build all model configs: (label, shape, proj_mode)
     configs = []
