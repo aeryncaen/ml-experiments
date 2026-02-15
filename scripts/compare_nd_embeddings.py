@@ -586,13 +586,9 @@ def main():
             args.device = 'cpu'
     print(f"Using device: {args.device}")
 
-    # Auto-compute kv_pairs and batch_size from seq_len (matching Zoology ripple_mqar.py)
-    ZOOLOGY_SEQKV = {64: 4, 256: 16, 512: 32, 1024: 64, 4096: 256}
+    # Auto-compute kv_pairs and batch_size from seq_len (Zoology ripple_mqar.py)
     if args.num_kv_pairs is None:
-        if args.seq_len in ZOOLOGY_SEQKV:
-            args.num_kv_pairs = ZOOLOGY_SEQKV[args.seq_len]
-        else:
-            args.num_kv_pairs = args.seq_len // 16
+        args.num_kv_pairs = args.seq_len // 16
         print(f"Auto kv_pairs={args.num_kv_pairs} for seq_len={args.seq_len}")
 
     if args.batch_size is None:
