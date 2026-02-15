@@ -246,15 +246,14 @@ class BlockND(nn.Module):
             k = self._proj(h, self.wk).reshape(B, T, NH, HD)
             v = self._proj(h, self.wv).reshape(B, T, NH, HD)
 
-        softmax_scale = 1.0 / math.sqrt(HD)
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        causal_mask = torch.triu(
-            torch.full((T, T), -10000.0, device=scores.device), 1
+        q = q.transpose(1, 2)  # (B, NH, T, HD)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        context = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True,
+            dropout_p=self.attn_dropout if self.training else 0.0,
         )
-        scores = scores + causal_mask.to(dtype=scores.dtype)
-        attn = torch.softmax(scores, dim=-1, dtype=v.dtype)
-        attn = F.dropout(attn, self.attn_dropout if self.training else 0.0)
-        context = torch.einsum("bhts,bshd->bthd", attn, v).reshape(B, T, D)
+        context = context.transpose(1, 2).contiguous().reshape(B, T, D)
 
         if self.proj_mode == 'linear':
             hidden_states = self.out_proj(context)
