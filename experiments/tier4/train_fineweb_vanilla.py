@@ -47,7 +47,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -956,6 +956,112 @@ class ThreeStageBlock(nn.Module):
         return x
 
 
+class ThreeStageFSABlock(nn.Module):
+    """Three-stage block: feature attention → seq attention → MLP.
+
+    Compute Q/K/V projections once from ln1(x), then:
+
+    Stage 1 — Feature attention (reorganize own features):
+      q_feat = Q_pre_rope.view(B*T, N_f, D_f)   # reuse Q before RoPE
+      v_feat = ln1(x).view(B*T, N_f, D_f)
+      feat_out = SiLU(feat_attn(q_feat, q_feat, v_feat)) + x
+
+    Stage 2 — Sequence attention (tokens talk with reorganized repr):
+      Apply RoPE to Q, K from the SAME projections
+      seq_out = attn(q, k, v) + feat_out
+
+    Stage 3 — MLP (enrichment):
+      out = SwiGLU(seq_out) + seq_out
+
+    Zero extra params vs baseline — same as ThreeStageBlock, just stages 1 and 2 swapped.
+    """
+
+    def __init__(self, d_model: int, n_head: int, n_features: int,
+                 feat_activation: str = 'softmax'):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.n_features = n_features
+        self.desc_dim = d_model // n_features
+        self.feat_activation = feat_activation
+
+        assert d_model % n_features == 0, (
+            f"d_model ({d_model}) must be divisible by n_features ({n_features})")
+
+        # Shared projections for both feature and sequence attention
+        self.ln1 = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = Rotary(self.head_dim)
+
+        # Stage 2: layer norm before seq attention (after feat attn residual)
+        self.ln2 = RMSNorm(d_model)
+
+        # Stage 3: MLP (standard SwiGLU)
+        self.ln3 = RMSNorm(d_model)
+        self.mlp = MLP(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        NH = self.n_head
+        HD = self.head_dim
+        NF = self.n_features
+        DD = self.desc_dim
+
+        # Compute Q/K/V projections once
+        h = self.ln1(x)
+        q = self.q_proj(h)  # (B, T, D)
+        k = self.k_proj(h).view(B, T, NH, HD)
+        v = self.v_proj(h).view(B, T, NH, HD)
+
+        # ── Stage 1: Feature attention (using pre-RoPE Q) ──
+        q_feat = q.view(B * T, NF, DD)
+        v_feat = h.view(B * T, NF, DD)
+
+        scale = DD ** -0.5
+        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
+
+        if self.feat_activation == 'softmax':
+            weights = torch.softmax(scores, dim=-1)
+        elif self.feat_activation == 'silu':
+            weights = F.silu(scores)
+        elif self.feat_activation == 'silu2':
+            weights = F.silu(scores).square()
+        else:
+            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
+
+        feat_out = torch.bmm(weights, v_feat)
+        feat_out = F.silu(feat_out.view(B, T, D))
+        x = x + feat_out  # residual
+
+        # ── Stage 2: Sequence attention (RoPE on same Q/K) ──
+        h2 = self.ln2(x)
+        # Re-project Q from post-feat-attn state for seq attention
+        # but K/V come from the original projections (pre-feat-attn)
+        q_seq = self.q_proj(h2).view(B, T, NH, HD)
+
+        cos, sin = self.rotary(q_seq)
+        q_seq = apply_rotary(q_seq, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        if HAS_FLASH_ATTN:
+            seq_out = flash_attn_func(q_seq, k, v, causal=True)
+        else:
+            q_seq, k, v = q_seq.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            seq_out = F.scaled_dot_product_attention(q_seq, k, v, is_causal=True)
+            seq_out = seq_out.transpose(1, 2)
+
+        seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
+        x = x + seq_out  # residual
+
+        # ── Stage 3: MLP ──
+        x = x + self.mlp(self.ln3(x))
+
+        return x
+
+
 class FusedSeqFeatureAttnBlock(nn.Module):
     """Fused block: shared QK/V projections → seq attention → feature attention → down.
 
@@ -1547,6 +1653,43 @@ class GPTThreeStage(nn.Module):
         return logits, loss
 
 
+class GPTThreeStageFSA(nn.Module):
+    """GPT with three-stage blocks: feat attn → seq attn → MLP.
+
+    Reversed order from GPTThreeStage to test whether reorganizing features
+    before inter-token communication helps. Zero extra params — reuses Q
+    projection for both feature attention (pre-RoPE Q as feat Q=K) and
+    sequence attention (re-projected from post-feat-attn state + RoPE).
+    """
+
+    def __init__(self):
+        super().__init__()
+        nf = HP.fa_n_features
+        act = HP.fa_activation
+        assert HP.d_model % nf == 0, (
+            f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
+        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.blocks = nn.ModuleList([
+            ThreeStageFSABlock(HP.d_model, HP.n_head, nf, act)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(_init_weights)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = self.wte(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
 class GPTFusedQKV(nn.Module):
     """GPT with fused QKV blocks — full Q/K/V shared across seq + feature attention."""
 
@@ -1595,6 +1738,8 @@ def build_model() -> nn.Module:
         return GPTFusedQKV()
     if HP.model_type == "three_stage":
         return GPTThreeStage()
+    if HP.model_type == "three_stage_fsa":
+        return GPTThreeStageFSA()
     if HP.model_type == "transformer_shift":
         return GPTTransformerShift()
     if HP.model_type == "transformer_s4d":
