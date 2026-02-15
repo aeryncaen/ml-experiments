@@ -487,13 +487,12 @@ def train(model, n_epochs, task='mqar', B=512, L=64, lr=3e-4, device='cpu', labe
             torch.cuda.synchronize()
             _eval_t0 = time.perf_counter()
 
-        # Single sync point per epoch
-        tl = (epoch_loss / n_batches).item()
-        ta = (epoch_correct.float() / epoch_count.clamp(min=1)).item()
+        # Eval on train subset + val set with final weights (not mid-training averages)
+        train_sub = min(5000, num_train_examples)
+        tl, ta = eval_metrics(train_x[:train_sub], train_t[:train_sub])
         train_losses.append(tl)
         train_accs.append(ta)
 
-        # Val eval
         vl_, va_ = eval_metrics(val_x, val_t)
         val_losses.append(vl_)
         val_accs.append(va_)
