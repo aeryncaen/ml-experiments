@@ -522,14 +522,15 @@ def main():
     def print_leaderboard():
         if not results:
             return
-        print(f"\n{'='*70}")
-        print(f"{'Model':<8} {'Shape':>20} {'Params':>12} {'Final Loss':>12} {'Val Acc':>10}")
-        print(f"{'-'*70}")
+        print(f"\n{'='*90}")
+        print(f"{'Model':<8} {'Shape':>15} {'Params':>10} {'Train Loss':>11} {'Train Acc':>10} {'Val Loss':>10} {'Val Acc':>9} {'Epoch':>6}")
+        print(f"{'-'*90}")
         for label in sorted(results, key=lambda l: results[l]['val_accs'][-1], reverse=True):
             r = results[label]
             shape_str = 'x'.join(map(str, r['shape']))
-            print(f"{label:<8} {shape_str:>20} {r['n_params']:>12,} {r['train_losses'][-1]:>12.4f} {r['val_accs'][-1]:>10.3f}")
-        print(f"{'='*70}\n", flush=True)
+            n_ep = len(r['train_losses']) - 1  # -1 because index 0 is pre-training
+            print(f"{label:<8} {shape_str:>15} {r['n_params']:>10,} {r['train_losses'][-1]:>11.4f} {r['train_accs'][-1]:>10.3f} {r['val_losses'][-1]:>10.4f} {r['val_accs'][-1]:>9.3f} {n_ep:>6}")
+        print(f"{'='*90}\n", flush=True)
 
     for label, shape in shapes.items():
         torch.manual_seed(42)
@@ -549,25 +550,28 @@ def main():
         print_leaderboard()
 
     # --- Final comparison ---
-    print("\n" + "=" * 80)
-    print("LOSS COMPARISON (every 10 epochs)")
-    print("=" * 80)
+    # Find max epoch count across all models (some may early-stop)
+    max_ep = max(len(r['train_losses']) for r in results.values())
+
+    print("\n" + "=" * 120)
+    print("EPOCH-BY-EPOCH COMPARISON (every ~10 epochs)")
+    print("=" * 120)
     header = f"{'Epoch':>6}"
     for label in shapes:
-        header += f"  {label + ' loss':>10}  {label + ' acc':>10}"
+        header += f" | {label+' tl':>8} {label+' ta':>7} {label+' vl':>8} {label+' va':>7}"
     print(header)
-    print("-" * 80)
-    for ep in range(0, args.epochs, max(1, args.epochs // 10)):
+    print("-" * 120)
+    step = max(1, max_ep // 10)
+    epochs_to_show = sorted(set(list(range(0, max_ep, step)) + [max_ep - 1]))
+    for ep in epochs_to_show:
         row = f"{ep:>6}"
         for label in shapes:
-            row += f"  {results[label]['train_losses'][ep]:>10.4f}  {results[label]['val_accs'][ep]:>10.3f}"
+            r = results[label]
+            if ep < len(r['train_losses']):
+                row += f" | {r['train_losses'][ep]:>8.4f} {r['train_accs'][ep]:>7.3f} {r['val_losses'][ep]:>8.4f} {r['val_accs'][ep]:>7.3f}"
+            else:
+                row += f" | {'--':>8} {'--':>7} {'--':>8} {'--':>7}"
         print(row)
-    # Always print last epoch
-    ep = args.epochs - 1
-    row = f"{ep:>6}"
-    for label in shapes:
-        row += f"  {results[label]['train_losses'][ep]:>10.4f}  {results[label]['val_accs'][ep]:>10.3f}"
-    print(row)
 
     print("\n" + "=" * 80)
     print("GRADIENT SVD ANALYSIS (effective rank = fraction of SVs > 10% of max)")
