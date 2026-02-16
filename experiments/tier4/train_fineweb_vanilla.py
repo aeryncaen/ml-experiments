@@ -84,6 +84,7 @@ class HParams:
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.33)  # fraction of steps for decay phase
+    grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -394,6 +395,48 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+
+
+def feature_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    activation: str = 'softmax',
+) -> torch.Tensor:
+    """Memory-efficient feature attention over (B*T, N_features, desc_dim) tensors.
+
+    For softmax activation, uses F.scaled_dot_product_attention which avoids
+    materializing the (B*T, N_f, N_f) score matrix (memory-efficient backend).
+    For silu/silu2, falls back to explicit bmm since SDPA only supports softmax.
+
+    Args:
+        q: (B*T, N_f, D_f) query (often Q=K)
+        k: (B*T, N_f, D_f) key
+        v: (B*T, N_f, D_f) value
+        activation: 'softmax' | 'silu' | 'silu2'
+
+    Returns:
+        (B*T, N_f, D_f) attended output
+    """
+    if activation == 'softmax':
+        # Reshape to (B*T, 1, N_f, D_f) — single "head", N_f "sequence" positions
+        # SDPA handles scaling internally and uses memory-efficient backend
+        out = F.scaled_dot_product_attention(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+            is_causal=False,
+        )
+        return out.squeeze(1)
+    else:
+        # silu/silu2: must materialize scores — SDPA doesn't support these
+        scale = k.shape[-1] ** -0.5
+        scores = torch.bmm(q, k.transpose(-2, -1)) * scale
+        if activation == 'silu':
+            weights = F.silu(scores)
+        elif activation == 'silu2':
+            weights = F.silu(scores).square()
+        else:
+            raise ValueError(f"Unknown feature attention activation: {activation}")
+        return torch.bmm(weights, v)
 
 
 class SelfAttention(nn.Module):
@@ -791,21 +834,7 @@ class FeatureAttentionMLP(nn.Module):
                 qk = self.qk_rms_norm(qk)
 
             # Attention scores from gate (Q=K, Reformer-style)
-            scale = DD ** -0.5
-            scores = torch.bmm(qk, qk.transpose(-2, -1)) * scale  # (B*T, NF, NF)
-
-            # Activation
-            if self.activation == 'softmax':
-                weights = torch.softmax(scores, dim=-1)
-            elif self.activation == 'silu':
-                weights = F.silu(scores)
-            elif self.activation == 'silu2':
-                weights = F.silu(scores).square()
-            else:
-                raise ValueError(f"Unknown FA_ACTIVATION: {self.activation}")
-
-            # Attend over V (from up_proj)
-            out = torch.bmm(weights, v)  # (B*T, NF, DD)
+            out = feature_attention(qk, qk, v, self.activation)
             out = out.view(B, T, self.hidden)
 
             # Post-attention element-wise activation
@@ -938,18 +967,7 @@ class ThreeStageBlock(nn.Module):
         v_feat = h2.view(B * T, NF, DD)
 
         scale = DD ** -0.5
-        scores = torch.bmm(q_feat, k_feat.transpose(-2, -1)) * scale
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        feat_out = torch.bmm(weights, v_feat)
+        feat_out = feature_attention(q_feat, k_feat, v_feat, self.feat_activation)
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
@@ -1019,19 +1037,7 @@ class ThreeStageFSABlock(nn.Module):
         q_feat = q.view(B * T, NF, DD)
         v_feat = h.view(B * T, NF, DD)
 
-        scale = DD ** -0.5
-        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        feat_out = torch.bmm(weights, v_feat)
+        feat_out = feature_attention(q_feat, q_feat, v_feat, self.feat_activation)
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
@@ -1121,19 +1127,7 @@ class QVOBlock(nn.Module):
         q_feat = q.view(B * T, NF, DD)
         v_feat = v.view(B * T, NF, DD)
 
-        scale = DD ** -0.5
-        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        feat_out = torch.bmm(weights, v_feat)
+        feat_out = feature_attention(q_feat, q_feat, v_feat, self.feat_activation)
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
@@ -1223,19 +1217,7 @@ class DualQBlock(nn.Module):
         v = self.v_proj(h)  # (B, T, D) — shared with seq attn
         v_feat = v.view(B * T, NF, DD)
 
-        scale = DD ** -0.5
-        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale  # Q=K
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        feat_out = torch.bmm(weights, v_feat)
+        feat_out = feature_attention(q_feat, q_feat, v_feat, self.feat_activation)
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
@@ -1343,19 +1325,7 @@ class FusedSeqFeatureAttnBlock(nn.Module):
         qk_feat = qk.view(B * T, NF, DD)
         out_feat = out.view(B * T, NF, DD)
 
-        scale = DD ** -0.5
-        scores = torch.bmm(qk_feat, qk_feat.transpose(-2, -1)) * scale
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        out = torch.bmm(weights, out_feat)  # (B*T, NF, DD)
+        out = feature_attention(qk_feat, qk_feat, out_feat, self.feat_activation)
         out = F.silu(out.view(B, T, H))     # post-activation
         out = self.down_proj(out)
 
@@ -1443,19 +1413,7 @@ class FusedQKVBlock(nn.Module):
         q_feat = q.view(B * T, NF, DD)
         seq_feat = seq_out.view(B * T, NF, DD)
 
-        scale = DD ** -0.5
-        scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
-
-        if self.feat_activation == 'softmax':
-            weights = torch.softmax(scores, dim=-1)
-        elif self.feat_activation == 'silu':
-            weights = F.silu(scores)
-        elif self.feat_activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feat_activation: {self.feat_activation}")
-
-        out = torch.bmm(weights, seq_feat)  # (B*T, NF, DD)
+        out = feature_attention(q_feat, q_feat, seq_feat, self.feat_activation)
         out = F.silu(out.view(B, T, H))     # post-activation
         out = self.down_proj(out)
 
@@ -1511,6 +1469,16 @@ def _init_weights(m: nn.Module):
         nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
 
+def _run_blocks(blocks: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
+    """Run a sequence of blocks with optional gradient checkpointing."""
+    for block in blocks:
+        if HP.grad_ckpt and x.requires_grad:
+            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+        else:
+            x = block(x)
+    return x
+
+
 class GPTTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1522,9 +1490,7 @@ class GPTTransformer(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1544,9 +1510,7 @@ class GPTTransformerConv(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1566,9 +1530,7 @@ class GPTTransformerShift(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1592,9 +1554,7 @@ class GPTGatedNeighbor(nn.Module):
             nn.init.constant_(block.attn.gate_proj.bias, -2.0)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1626,7 +1586,10 @@ class GPTFusedGatedNeighbor(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
         for block in self.blocks:
-            x = x + block(x)
+            if HP.grad_ckpt and x.requires_grad:
+                x = x + torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = x + block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1774,9 +1737,7 @@ class GPTFeatureAttn(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1812,9 +1773,7 @@ class GPTFusedSeqFeature(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1843,9 +1802,7 @@ class GPTThreeStage(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1878,9 +1835,7 @@ class GPTQVO(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1915,9 +1870,7 @@ class GPTThreeStageFSA(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1950,9 +1903,7 @@ class GPTDualQ(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1987,9 +1938,7 @@ class GPTFusedQKV(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        for block in self.blocks:
-            x = block(x)
+        x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
