@@ -16,7 +16,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
-    import flash_attn_interface
+    from flash_attn.cute import flash_attn_func
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
@@ -421,10 +421,10 @@ def feature_attention(
     if activation == 'softmax':
         # (B*T, N_f, D_f) -> (B*T, N_f, 1, D_f) — 1 head, N_f seq positions
         assert HAS_FLASH_ATTN, "flash_attn required for softmax feature attention"
-        out = flash_attn_interface.flash_attn_func(
+        out = flash_attn_func(
             q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2),
             causal=False,
-        )[0]
+        )
         return out.squeeze(2)
     else:
         # silu/silu2: must materialize scores — flash only supports softmax
@@ -460,7 +460,7 @@ class SelfAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         if HAS_FLASH_ATTN:
-            y = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]  # (b, t, h, d)
+            y = flash_attn_func(q, k, v, causal=True)  # (b, t, h, d)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -522,7 +522,7 @@ class ShiftAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         if HAS_FLASH_ATTN:
-            y = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]
+            y = flash_attn_func(q, k, v, causal=True)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -575,7 +575,7 @@ class GatedNeighborAttention(nn.Module):
         gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim)
         k = self._gated_neighbor(k, gate)
         if HAS_FLASH_ATTN:
-            y = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]
+            y = flash_attn_func(q, k, v, causal=True)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -709,7 +709,7 @@ class FusedGatedNeighborBlock(nn.Module):
 
             # Attention on interleaved 2T sequence
             if HAS_FLASH_ATTN:
-                y = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]
+                y = flash_attn_func(q, k, v, causal=True)
             else:
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -725,7 +725,7 @@ class FusedGatedNeighborBlock(nn.Module):
 
             # Attention
             if HAS_FLASH_ATTN:
-                y = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]
+                y = flash_attn_func(q, k, v, causal=True)
             else:
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -951,7 +951,7 @@ class ThreeStageBlock(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_interface.flash_attn_func(q, k, v, causal=True)[0]
+            seq_out = flash_attn_func(q, k, v, causal=True)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             seq_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -1050,7 +1050,7 @@ class ThreeStageFSABlock(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_interface.flash_attn_func(q_seq, k, v, causal=True)[0]
+            seq_out = flash_attn_func(q_seq, k, v, causal=True)
         else:
             q_seq, k, v = q_seq.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             seq_out = F.scaled_dot_product_attention(q_seq, k, v, is_causal=True)
@@ -1140,7 +1140,7 @@ class QVOBlock(nn.Module):
         k_seq = apply_rotary(q.view(B, T, NH, HD), cos, sin)  # same Q as K, with RoPE
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_interface.flash_attn_func(q_seq, k_seq, v_seq, causal=True)[0]
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
         else:
             q_seq, k_seq, v_seq = q_seq.transpose(1, 2), k_seq.transpose(1, 2), v_seq.transpose(1, 2)
             seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
@@ -1230,7 +1230,7 @@ class DualQBlock(nn.Module):
         q_seq = apply_rotary(q_seq, cos, sin)  # Q=K, RoPE applied once
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_interface.flash_attn_func(q_seq, q_seq, v_seq, causal=True)[0]
+            seq_out = flash_attn_func(q_seq, q_seq, v_seq, causal=True)
         else:
             q_seq, v_seq = q_seq.transpose(1, 2), v_seq.transpose(1, 2)
             seq_out = F.scaled_dot_product_attention(q_seq, q_seq, v_seq, is_causal=True)
@@ -1311,7 +1311,7 @@ class FusedSeqFeatureAttnBlock(nn.Module):
         k_seq = apply_rotary(qk_seq, cos, sin)  # Q=K, same RoPE
 
         if HAS_FLASH_ATTN:
-            out = flash_attn_interface.flash_attn_func(q_seq, k_seq, v_seq, causal=True)[0]
+            out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
         else:
             q_seq = q_seq.transpose(1, 2)
             k_seq = k_seq.transpose(1, 2)
@@ -1396,7 +1396,7 @@ class FusedQKVBlock(nn.Module):
         k_seq = apply_rotary(k_seq, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_interface.flash_attn_func(q_seq, k_seq, v_seq, causal=True)[0]
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
         else:
             q_seq = q_seq.transpose(1, 2)
             k_seq = k_seq.transpose(1, 2)
