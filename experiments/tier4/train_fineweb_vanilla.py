@@ -1010,10 +1010,9 @@ class ThreeStageFSABlock(nn.Module):
         NF = self.n_features
         DD = self.desc_dim
 
-        # Compute Q/K/V projections once
+        # Project Q and V; defer K to after feature attention
         h = self.ln1(x)
         q = self.q_proj(h)  # (B, T, D)
-        k = self.k_proj(h).view(B, T, NH, HD)
         v = self.v_proj(h).view(B, T, NH, HD)
 
         # ── Stage 1: Feature attention (using pre-RoPE Q) ──
@@ -1036,8 +1035,9 @@ class ThreeStageFSABlock(nn.Module):
         feat_out = F.silu(feat_out.view(B, T, D))
         x = x + feat_out  # residual
 
-        # ── Stage 2: Sequence attention (RoPE on same Q/K) ──
+        # ── Stage 2: Sequence attention — K computed here since feat attn doesn't need it ──
         q_seq = q.view(B, T, NH, HD)
+        k = self.k_proj(h).view(B, T, NH, HD)
 
         cos, sin = self.rotary(q_seq)
         q_seq = apply_rotary(q_seq, cos, sin)
