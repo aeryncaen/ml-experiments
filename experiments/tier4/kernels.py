@@ -31,7 +31,7 @@ if HAS_CUTE_FLASH:
     @torch.library.custom_op("cute_flash::fwd", mutates_args=(), device_types="cuda")
     def _cute_flash_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                             causal: int) -> tuple[torch.Tensor, torch.Tensor]:
-        out, lse = _flash_attn_fwd(q, k, v, causal=bool(causal))
+        out, lse = _flash_attn_fwd(q, k, v, causal=bool(causal), return_lse=True)
         return out, lse.contiguous()
 
     @_cute_flash_fwd_op.register_fake
