@@ -23,14 +23,28 @@ except ImportError:
 
 if HAS_CUTE_FLASH:
 
-    def _cute_flash_fwd(q, k, v, causal):
-        """Raw forward: cast to bf16, call CuTE-DSL, return (out, lse)."""
-        q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
-        out, lse = _flash_attn_fwd(q, k, v, causal=causal)
-        return out, lse, q, k, v
+    # Register as custom ops so torch.compile treats them as opaque.
+    # Inputs MUST already be bf16 — casting happens in the autograd.Function
+    # to avoid output-aliases-input errors from custom_op.
 
-    def _cute_flash_bwd(q, k, v, out, lse, dout, causal):
-        """Raw backward: call CuTE-DSL bwd."""
+    @torch.library.custom_op("cute_flash::fwd", mutates_args=(), device_types="cuda")
+    def _cute_flash_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            causal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        out, lse = _flash_attn_fwd(q, k, v, causal=causal)
+        return out, lse
+
+    @_cute_flash_fwd_op.register_fake
+    def _cute_flash_fwd_fake(q, k, v, causal):
+        out = torch.empty_like(q)
+        # lse shape: (batch, nheads, seqlen) as float32
+        lse = torch.empty(q.shape[0], q.shape[2], q.shape[1],
+                          dtype=torch.float32, device=q.device)
+        return out, lse
+
+    @torch.library.custom_op("cute_flash::bwd", mutates_args=(), device_types="cuda")
+    def _cute_flash_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            out: torch.Tensor, lse: torch.Tensor, dout: torch.Tensor,
+                            causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dq, dk, dv = _flash_attn_bwd(
             q, k, v, out, dout, lse,
             None,  # softmax_scale (auto)
@@ -38,30 +52,6 @@ if HAS_CUTE_FLASH:
             0.0,   # softcap
         )
         return dq, dk, dv
-
-    # Register as custom ops so torch.compile treats them as opaque
-    @torch.library.custom_op("cute_flash::fwd", mutates_args=(), device_types="cuda")
-    def _cute_flash_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                            causal: bool) -> tuple[torch.Tensor, torch.Tensor,
-                                                    torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _cute_flash_fwd(q, k, v, causal)
-
-    @_cute_flash_fwd_op.register_fake
-    def _cute_flash_fwd_fake(q, k, v, causal):
-        q_bf = q.to(torch.bfloat16)
-        k_bf = k.to(torch.bfloat16)
-        v_bf = v.to(torch.bfloat16)
-        out = torch.empty_like(q_bf)
-        # lse shape: (batch, nheads, seqlen) as float32
-        lse = torch.empty(q.shape[0], q.shape[2], q.shape[1],
-                          dtype=torch.float32, device=q.device)
-        return out, lse, q_bf, k_bf, v_bf
-
-    @torch.library.custom_op("cute_flash::bwd", mutates_args=(), device_types="cuda")
-    def _cute_flash_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                            out: torch.Tensor, lse: torch.Tensor, dout: torch.Tensor,
-                            causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _cute_flash_bwd(q, k, v, out, lse, dout, causal)
 
     @_cute_flash_bwd_op.register_fake
     def _cute_flash_bwd_fake(q, k, v, out, lse, dout, causal):
@@ -72,8 +62,10 @@ if HAS_CUTE_FLASH:
 
         @staticmethod
         def forward(ctx, q, k, v, causal):
-            out, lse, q_bf, k_bf, v_bf = _cute_flash_fwd_op(q, k, v, causal)
-            ctx.save_for_backward(q_bf, k_bf, v_bf, out, lse)
+            # Cast to bf16 here (outside the custom op) to avoid aliasing issues
+            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+            out, lse = _cute_flash_fwd_op(q, k, v, causal)
+            ctx.save_for_backward(q, k, v, out, lse)
             ctx.causal = causal
             return out
 
