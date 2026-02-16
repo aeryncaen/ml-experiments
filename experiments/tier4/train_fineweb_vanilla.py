@@ -86,6 +86,15 @@ class HParams:
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
+    # LLaDA (masked diffusion LM)
+    llada: bool = _env_bool("LLADA", False)
+    llada_subs: bool = _env_bool("LLADA_SUBS", True)
+    llada_antithetic: bool = _env_bool("LLADA_ANTITHETIC", True)
+
+    @property
+    def is_causal(self) -> bool:
+        return not self.llada
+
 
 HP = HParams()
 
@@ -415,10 +424,10 @@ class SelfAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         if HAS_FLASH_ATTN:
-            y = flash_attn_func(q, k, v, causal=True)  # (b, t, h, d)
+            y = flash_attn_func(q, k, v, causal=HP.is_causal)  # (b, t, h, d)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
             y = y.transpose(1, 2)
         y = y.contiguous().view(b, t, c)
         return self.proj(y)
@@ -477,10 +486,10 @@ class ShiftAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         if HAS_FLASH_ATTN:
-            y = flash_attn_func(q, k, v, causal=True)
+            y = flash_attn_func(q, k, v, causal=HP.is_causal)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
             y = y.transpose(1, 2)
         y = y.contiguous().view(b, t, c)
         return self.proj(y)
@@ -530,10 +539,10 @@ class GatedNeighborAttention(nn.Module):
         gate = torch.sigmoid(self.gate_proj(x)).view(b, t, self.n_head, self.half_dim)
         k = self._gated_neighbor(k, gate)
         if HAS_FLASH_ATTN:
-            y = flash_attn_func(q, k, v, causal=True)
+            y = flash_attn_func(q, k, v, causal=HP.is_causal)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
             y = y.transpose(1, 2)
         y = y.contiguous().view(b, t, c)
         return self.proj(y)
@@ -664,10 +673,10 @@ class FusedGatedNeighborBlock(nn.Module):
 
             # Attention on interleaved 2T sequence
             if HAS_FLASH_ATTN:
-                y = flash_attn_func(q, k, v, causal=True)
+                y = flash_attn_func(q, k, v, causal=HP.is_causal)
             else:
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
                 y = y.transpose(1, 2)
 
             # Reshape back: (b, t*2, n2, hd) -> (b, t, n_head, hd)
@@ -680,10 +689,10 @@ class FusedGatedNeighborBlock(nn.Module):
 
             # Attention
             if HAS_FLASH_ATTN:
-                y = flash_attn_func(q, k, v, causal=True)
+                y = flash_attn_func(q, k, v, causal=HP.is_causal)
             else:
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
                 y = y.transpose(1, 2)
 
         y = y.contiguous().view(b, t, self.inner_dim)
@@ -906,10 +915,10 @@ class ThreeStageBlock(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q, k, v, causal=True)
+            seq_out = flash_attn_func(q, k, v, causal=HP.is_causal)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            seq_out = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
@@ -1005,10 +1014,10 @@ class ThreeStageFSABlock(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q_seq, k, v, causal=True)
+            seq_out = flash_attn_func(q_seq, k, v, causal=HP.is_causal)
         else:
             q_seq, k, v = q_seq.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q_seq, k, v, is_causal=True)
+            seq_out = F.scaled_dot_product_attention(q_seq, k, v, is_causal=HP.is_causal)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
@@ -1095,10 +1104,10 @@ class QVOBlock(nn.Module):
         k_seq = apply_rotary(q.view(B, T, NH, HD), cos, sin)  # same Q as K, with RoPE
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=HP.is_causal)
         else:
             q_seq, k_seq, v_seq = q_seq.transpose(1, 2), k_seq.transpose(1, 2), v_seq.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=HP.is_causal)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
@@ -1185,10 +1194,10 @@ class DualQBlock(nn.Module):
         q_seq = apply_rotary(q_seq, cos, sin)  # Q=K, RoPE applied once
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q_seq, q_seq, v_seq, causal=True)
+            seq_out = flash_attn_func(q_seq, q_seq, v_seq, causal=HP.is_causal)
         else:
             q_seq, v_seq = q_seq.transpose(1, 2), v_seq.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q_seq, q_seq, v_seq, is_causal=True)
+            seq_out = F.scaled_dot_product_attention(q_seq, q_seq, v_seq, is_causal=HP.is_causal)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = self.out_proj(seq_out.contiguous().view(B, T, D))
@@ -1266,12 +1275,12 @@ class FusedSeqFeatureAttnBlock(nn.Module):
         k_seq = apply_rotary(qk_seq, cos, sin)  # Q=K, same RoPE
 
         if HAS_FLASH_ATTN:
-            out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+            out = flash_attn_func(q_seq, k_seq, v_seq, causal=HP.is_causal)
         else:
             q_seq = q_seq.transpose(1, 2)
             k_seq = k_seq.transpose(1, 2)
             v_seq = v_seq.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=HP.is_causal)
             out = out.transpose(1, 2)
 
         out = out.contiguous().view(B, T, H)
@@ -1351,12 +1360,12 @@ class FusedQKVBlock(nn.Module):
         k_seq = apply_rotary(k_seq, cos, sin)
 
         if HAS_FLASH_ATTN:
-            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=True)
+            seq_out = flash_attn_func(q_seq, k_seq, v_seq, causal=HP.is_causal)
         else:
             q_seq = q_seq.transpose(1, 2)
             k_seq = k_seq.transpose(1, 2)
             v_seq = v_seq.transpose(1, 2)
-            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
+            seq_out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=HP.is_causal)
             seq_out = seq_out.transpose(1, 2)
 
         seq_out = seq_out.contiguous().view(B, T, H)
@@ -1902,6 +1911,83 @@ class GPTFusedQKV(nn.Module):
         return logits, loss
 
 
+# ── LLaDA wrapper ───────────────────────────────────────────────────────────
+
+class LLaDAWrapper(nn.Module):
+    """Wraps any GPT model for masked diffusion (LLaDA) training.
+
+    Adds a learned mask embedding that replaces masked token positions at the
+    embedding level. The backbone runs bidirectionally (HP.is_causal=False).
+    Loss is computed only on masked positions, weighted by 1/p_mask.
+    """
+
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+        self.mask_embed = nn.Parameter(torch.randn(HP.d_model) * 0.02)
+
+    def forward(self, idx: torch.Tensor, mask: torch.Tensor,
+                p_mask: torch.Tensor | None = None):
+        """Forward pass for LLaDA.
+
+        Args:
+            idx: (B, T) ground-truth token IDs (clean x0)
+            mask: (B, T) bool, True = masked
+            p_mask: (B,) mask probability per sample (for loss weighting)
+
+        Returns:
+            (logits, loss) where loss is None if p_mask is None
+        """
+        # Embed tokens, then replace masked positions with mask_embed
+        x = self.backbone.wte(idx)
+        x = torch.where(mask.unsqueeze(-1), self.mask_embed, x)
+
+        # Run through backbone blocks + final norm + head
+        x = _run_blocks(self.backbone.blocks, x)
+        x = self.backbone.ln_f(x)
+        logits = self.backbone.lm_head(x)
+
+        # SUBS parameterization: at unmasked positions, force logits to one-hot
+        if HP.llada_subs:
+            one_hot = torch.full_like(logits, float('-inf'))
+            one_hot.scatter_(-1, idx.unsqueeze(-1), 0.0)
+            logits = torch.where(mask.unsqueeze(-1), logits, one_hot)
+
+        loss = None
+        if p_mask is not None:
+            per_token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), idx.view(-1), reduction='none'
+            ).view_as(idx)
+            # Weight masked tokens by 1/p_mask, ignore unmasked
+            p_mask_expanded = p_mask[:, None].expand_as(idx)
+            weighted = per_token_loss[mask] / p_mask_expanded[mask]
+            B, T = idx.shape
+            loss = weighted.sum() / (B * T)
+
+        return logits, loss
+
+
+def llada_make_mask(batch: torch.Tensor, device: torch.device):
+    """Create LLaDA training masks with optional antithetic sampling.
+
+    Returns:
+        mask: (B, T) bool — True = masked
+        p_mask: (B,) — mask probability per sample
+    """
+    B, T = batch.shape
+    eps = 1e-3
+
+    if HP.llada_antithetic:
+        offset = torch.arange(B, device=device, dtype=torch.float32) / B
+        t = (torch.rand(1, device=device) / B + offset) % 1.0
+    else:
+        t = torch.rand(B, device=device)
+
+    p_mask = (1.0 - eps) * t + eps  # (B,) in [eps, 1.0]
+    mask = torch.rand(B, T, device=device) < p_mask[:, None]
+    return mask, p_mask
+
+
 def build_model() -> nn.Module:
     if HP.model_type == "transformer":
         return GPTTransformer()
@@ -1938,6 +2024,13 @@ def build_model() -> nn.Module:
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
+def build_model_maybe_llada() -> nn.Module:
+    backbone = build_model()
+    if HP.llada:
+        return LLaDAWrapper(backbone)
+    return backbone
+
+
 def lr_for_step(step: int) -> float:
     # Warmup phase (same for all schedules)
     if step < HP.warmup_steps:
@@ -1964,11 +2057,22 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     loss_sum = torch.zeros(1, device=device)
     for _ in range(HP.val_steps):
         x, y = val_stream.next_batch(device)
-        if device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
+        if HP.llada:
+            # Fixed 50% mask for consistent evaluation
+            B, T = x.shape
+            mask = torch.rand(B, T, device=device) < 0.5
+            p_mask = torch.full((B,), 0.5, device=device)
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, mask, p_mask)
+            else:
+                _, loss = model(x, mask, p_mask)
         else:
-            _, loss = model(x, y)
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+            else:
+                _, loss = model(x, y)
         loss_sum += loss
     loss_sum /= HP.val_steps
     if world_size > 1:
@@ -1996,11 +2100,14 @@ def main():
     _tok_per_step = _eff_bs * HP.seq_len
     print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
     print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,}")
+    if HP.llada:
+        _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
+        print0(rank, _llada_feats)
 
     train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
 
-    model = build_model().to(device)
+    model = build_model_maybe_llada().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print0(rank, f"parameters={n_params:,}")
 
@@ -2056,11 +2163,19 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         for _micro in range(HP.grad_accum):
             x, y = train_stream.next_batch(device)
-            if device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, loss = model(x, y)
+            if HP.llada:
+                mask, p_mask = llada_make_mask(x, device)
+                if device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        _, loss = model(x, mask, p_mask)
+                else:
+                    _, loss = model(x, mask, p_mask)
             else:
-                _, loss = model(x, y)
+                if device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        _, loss = model(x, y)
+                else:
+                    _, loss = model(x, y)
             loss = loss / HP.grad_accum
             loss.backward()
         if HP.grad_clip > 0:
