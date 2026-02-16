@@ -72,6 +72,7 @@ class HParams:
 
     train_steps: int = _env_int("TRAIN_STEPS", 2000)
     batch_size: int = _env_int("BATCH_SIZE", 8)
+    grad_accum: int = _env_int("GRAD_ACCUM", 1)
     val_steps: int = _env_int("VAL_STEPS", 32)
     val_every: int = _env_int("VAL_EVERY", 100)
     lr: float = _env_float("LR", 3e-4)
@@ -1991,7 +1992,10 @@ def main():
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
+    _eff_bs = HP.batch_size * HP.grad_accum
+    _tok_per_step = _eff_bs * HP.seq_len
     print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
+    print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,}")
 
     train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
@@ -2049,15 +2053,16 @@ def main():
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        x, y = train_stream.next_batch(device)
-        if device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
-        else:
-            _, loss = model(x, y)
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        for _micro in range(HP.grad_accum):
+            x, y = train_stream.next_batch(device)
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+            else:
+                _, loss = model(x, y)
+            loss = loss / HP.grad_accum
+            loss.backward()
         if HP.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(decay_params + no_decay_params, HP.grad_clip)
         optimizer.step()
