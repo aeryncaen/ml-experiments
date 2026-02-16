@@ -421,6 +421,9 @@ def feature_attention(
     if activation == 'softmax':
         # (B*T, N_f, D_f) -> (B*T, N_f, 1, D_f) — 1 head, N_f seq positions
         assert HAS_FLASH_ATTN, "flash_attn required for softmax feature attention"
+        # Ensure matching dtypes (autocast can leave v in a different dtype than q/k)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
         out = flash_attn_func(
             q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2),
             causal=False,
