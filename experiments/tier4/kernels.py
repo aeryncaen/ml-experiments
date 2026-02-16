@@ -23,15 +23,16 @@ except ImportError:
 
 if HAS_CUTE_FLASH:
 
-    # Register as custom ops so torch.compile treats them as opaque.
-    # Inputs MUST already be bf16 — casting happens in the autograd.Function
-    # to avoid output-aliases-input errors from custom_op.
+    # Register as custom ops with register_autograd so torch.compile treats
+    # them as fully opaque. No autograd.Function needed — the framework handles it.
+    # Inputs MUST already be bf16 — casting happens in flash_attn_func().
+    # Using int instead of bool for causal to avoid inductor edge cases.
 
     @torch.library.custom_op("cute_flash::fwd", mutates_args=(), device_types="cuda")
     def _cute_flash_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                            causal: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        out, lse = _flash_attn_fwd(q, k, v, causal=causal)
-        return out, lse
+                            causal: int) -> tuple[torch.Tensor, torch.Tensor]:
+        out, lse = _flash_attn_fwd(q, k, v, causal=bool(causal))
+        return out, lse.contiguous()
 
     @_cute_flash_fwd_op.register_fake
     def _cute_flash_fwd_fake(q, k, v, causal):
@@ -44,11 +45,11 @@ if HAS_CUTE_FLASH:
     @torch.library.custom_op("cute_flash::bwd", mutates_args=(), device_types="cuda")
     def _cute_flash_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                             out: torch.Tensor, lse: torch.Tensor, dout: torch.Tensor,
-                            causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                            causal: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dq, dk, dv = _flash_attn_bwd(
             q, k, v, out, dout, lse,
             None,  # softmax_scale (auto)
-            causal,
+            bool(causal),
             0.0,   # softcap
         )
         return dq, dk, dv
@@ -57,29 +58,26 @@ if HAS_CUTE_FLASH:
     def _cute_flash_bwd_fake(q, k, v, out, lse, dout, causal):
         return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
-    class _CuteFlashAttn(torch.autograd.Function):
-        """Thin wrapper around CuTE-DSL flash attention custom ops."""
+    def _cute_flash_setup_context(ctx, inputs, output):
+        q, k, v, causal = inputs
+        out, lse = output
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.causal = causal
 
-        @staticmethod
-        def forward(ctx, q, k, v, causal):
-            # Cast to bf16 here (outside the custom op) to avoid aliasing issues
-            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
-            out, lse = _cute_flash_fwd_op(q, k, v, causal)
-            ctx.save_for_backward(q, k, v, out, lse)
-            ctx.causal = causal
-            return out
+    def _cute_flash_backward(ctx, grad_out, grad_lse):
+        q, k, v, out, lse = ctx.saved_tensors
+        dq, dk, dv = _cute_flash_bwd_op(q, k, v, out, lse, grad_out, ctx.causal)
+        return dq, dk, dv, None
 
-        @staticmethod
-        def backward(ctx, dout):
-            q, k, v, out, lse = ctx.saved_tensors
-            dq, dk, dv = _cute_flash_bwd_op(q, k, v, out, dout, lse, ctx.causal)
-            return dq, dk, dv, None
-
-    torch.compiler.allow_in_graph(_CuteFlashAttn)
+    _cute_flash_fwd_op.register_autograd(
+        _cute_flash_backward, setup_context=_cute_flash_setup_context
+    )
 
     def flash_attn_func(q, k, v, causal=False):
         """Drop-in replacement for flash_attn_func, compatible with torch.compile."""
-        return _CuteFlashAttn.apply(q, k, v, causal)
+        q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+        out, _lse = _cute_flash_fwd_op(q, k, v, int(causal))
+        return out
 
 else:
     def flash_attn_func(q, k, v, causal=False):
@@ -295,22 +293,18 @@ def _feat_attn_bwd_fake(q, k, v, dout):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
-class _FusedFeatureAttention(torch.autograd.Function):
-    """Fused bmm-softmax-bmm via triton custom ops."""
+def _feat_attn_setup_context(ctx, inputs, output):
+    q, k, v = inputs
+    ctx.save_for_backward(q, k, v)
 
-    @staticmethod
-    def forward(ctx, q, k, v):
-        ctx.save_for_backward(q, k, v)
-        return _feat_attn_fwd_op(q, k, v)
+def _feat_attn_backward(ctx, dout):
+    q, k, v = ctx.saved_tensors
+    dq, dk, dv = _feat_attn_bwd_op(q, k, v, dout)
+    return dq, dk, dv
 
-    @staticmethod
-    def backward(ctx, dout):
-        q, k, v = ctx.saved_tensors
-        dq, dk, dv = _feat_attn_bwd_op(q, k, v, dout)
-        return dq, dk, dv
-
-
-torch.compiler.allow_in_graph(_FusedFeatureAttention)
+_feat_attn_fwd_op.register_autograd(
+    _feat_attn_backward, setup_context=_feat_attn_setup_context
+)
 
 
 def feature_attention(q, k, v, activation='softmax'):
@@ -330,7 +324,7 @@ def feature_attention(q, k, v, activation='softmax'):
     v = v.to(q.dtype)
 
     if activation == 'softmax':
-        return _FusedFeatureAttention.apply(q, k, v)
+        return _feat_attn_fwd_op(q, k, v)
     else:
         scale = k.shape[-1] ** -0.5
         scores = torch.bmm(q, k.transpose(-2, -1)) * scale
