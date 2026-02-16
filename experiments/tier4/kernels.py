@@ -28,6 +28,7 @@ if HAS_CUTE_FLASH:
 
         @staticmethod
         def forward(ctx, q, k, v, causal):
+            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
             out, lse = _flash_attn_fwd(q, k, v, causal=causal)
             ctx.save_for_backward(q, k, v, out, lse)
             ctx.causal = causal
