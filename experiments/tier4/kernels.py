@@ -23,29 +23,66 @@ except ImportError:
 
 if HAS_CUTE_FLASH:
 
+    def _cute_flash_fwd(q, k, v, causal):
+        """Raw forward: cast to bf16, call CuTE-DSL, return (out, lse)."""
+        q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+        out, lse = _flash_attn_fwd(q, k, v, causal=causal)
+        return out, lse, q, k, v
+
+    def _cute_flash_bwd(q, k, v, out, lse, dout, causal):
+        """Raw backward: call CuTE-DSL bwd."""
+        dq, dk, dv = _flash_attn_bwd(
+            q, k, v, out, dout, lse,
+            None,  # softmax_scale (auto)
+            causal,
+            0.0,   # softcap
+        )
+        return dq, dk, dv
+
+    # Register as custom ops so torch.compile treats them as opaque
+    @torch.library.custom_op("cute_flash::fwd", mutates_args=(), device_types="cuda")
+    def _cute_flash_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            causal: bool) -> tuple[torch.Tensor, torch.Tensor,
+                                                    torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _cute_flash_fwd(q, k, v, causal)
+
+    @_cute_flash_fwd_op.register_fake
+    def _cute_flash_fwd_fake(q, k, v, causal):
+        q_bf = q.to(torch.bfloat16)
+        k_bf = k.to(torch.bfloat16)
+        v_bf = v.to(torch.bfloat16)
+        out = torch.empty_like(q_bf)
+        # lse shape: (batch, nheads, seqlen) as float32
+        lse = torch.empty(q.shape[0], q.shape[2], q.shape[1],
+                          dtype=torch.float32, device=q.device)
+        return out, lse, q_bf, k_bf, v_bf
+
+    @torch.library.custom_op("cute_flash::bwd", mutates_args=(), device_types="cuda")
+    def _cute_flash_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            out: torch.Tensor, lse: torch.Tensor, dout: torch.Tensor,
+                            causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _cute_flash_bwd(q, k, v, out, lse, dout, causal)
+
+    @_cute_flash_bwd_op.register_fake
+    def _cute_flash_bwd_fake(q, k, v, out, lse, dout, causal):
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
     class _CuteFlashAttn(torch.autograd.Function):
-        """Thin wrapper around CuTE-DSL flash attention, opaque to torch.compile."""
+        """Thin wrapper around CuTE-DSL flash attention custom ops."""
 
         @staticmethod
         def forward(ctx, q, k, v, causal):
-            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
-            out, lse = _flash_attn_fwd(q, k, v, causal=causal)
-            ctx.save_for_backward(q, k, v, out, lse)
+            out, lse, q_bf, k_bf, v_bf = _cute_flash_fwd_op(q, k, v, causal)
+            ctx.save_for_backward(q_bf, k_bf, v_bf, out, lse)
             ctx.causal = causal
             return out
 
         @staticmethod
         def backward(ctx, dout):
             q, k, v, out, lse = ctx.saved_tensors
-            dq, dk, dv = _flash_attn_bwd(
-                q, k, v, out, dout, lse,
-                None,  # softmax_scale (auto)
-                ctx.causal,
-                0.0,   # softcap
-            )
+            dq, dk, dv = _cute_flash_bwd_op(q, k, v, out, dout, lse, ctx.causal)
             return dq, dk, dv, None
 
-    # Mark as opaque to torch.compile
     torch.compiler.allow_in_graph(_CuteFlashAttn)
 
     def flash_attn_func(q, k, v, causal=False):
