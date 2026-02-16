@@ -405,9 +405,9 @@ def feature_attention(
 ) -> torch.Tensor:
     """Memory-efficient feature attention over (B*T, N_features, desc_dim) tensors.
 
-    For softmax activation, uses F.scaled_dot_product_attention which avoids
-    materializing the (B*T, N_f, N_f) score matrix (memory-efficient backend).
-    For silu/silu2, falls back to explicit bmm since SDPA only supports softmax.
+    For softmax activation, uses flash_attn_func directly — reshape to
+    (B*T, N_f, 1, D_f) treating features as "sequence" and 1 "head".
+    For silu/silu2, falls back to explicit bmm since flash only supports softmax.
 
     Args:
         q: (B*T, N_f, D_f) query (often Q=K)
@@ -419,15 +419,15 @@ def feature_attention(
         (B*T, N_f, D_f) attended output
     """
     if activation == 'softmax':
-        # Reshape to (B*T, 1, N_f, D_f) — single "head", N_f "sequence" positions
-        # SDPA handles scaling internally and uses memory-efficient backend
-        out = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
-            is_causal=False,
+        # (B*T, N_f, D_f) -> (B*T, N_f, 1, D_f) — 1 head, N_f seq positions
+        assert HAS_FLASH_ATTN, "flash_attn required for softmax feature attention"
+        out = flash_attn_func(
+            q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2),
+            causal=False,
         )
-        return out.squeeze(1)
+        return out.squeeze(2)
     else:
-        # silu/silu2: must materialize scores — SDPA doesn't support these
+        # silu/silu2: must materialize scores — flash only supports softmax
         scale = k.shape[-1] ** -0.5
         scores = torch.bmm(q, k.transpose(-2, -1)) * scale
         if activation == 'silu':
