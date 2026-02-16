@@ -75,43 +75,54 @@ def _fused_feat_attn_fwd_kernel(
     stride_vb, stride_vn, stride_vd,
     stride_ob, stride_on, stride_od,
     scale,
-    N_F: tl.constexpr,
+    actual_N: tl.constexpr,  # actual feature count (e.g. 48)
+    BLOCK_N: tl.constexpr,   # padded to next power of 2 (e.g. 64)
     D_F: tl.constexpr,
 ):
     """One program per batch element. Computes fused QK^T -> softmax -> @V."""
     bid = tl.program_id(0)
 
-    # Offsets for this batch element
     q_base = Q_ptr + bid * stride_qb
     k_base = K_ptr + bid * stride_kb
     v_base = V_ptr + bid * stride_vb
     o_base = O_ptr + bid * stride_ob
 
-    # Load Q (N_F, D_F) and K (N_F, D_F)
-    offs_n = tl.arange(0, N_F)
+    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D_F)
+    mask_n = offs_n < actual_N
 
-    q = tl.load(q_base + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd)  # (N_F, D_F)
-    k = tl.load(k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)  # (N_F, D_F)
+    # Load Q, K with masking for padded rows (BLOCK_N, D_F)
+    q = tl.load(q_base + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                mask=mask_n[:, None], other=0.0)
+    k = tl.load(k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                mask=mask_n[:, None], other=0.0)
 
-    # Scores = Q @ K^T * scale -> (N_F, N_F)
+    # Scores = Q @ K^T * scale -> (BLOCK_N, BLOCK_N)
     scores = tl.dot(q, tl.trans(k)) * scale
 
-    # Online softmax (row-wise)
-    row_max = tl.max(scores, axis=1)  # (N_F,)
+    # Mask out padded positions (rows and cols) with -inf for softmax
+    mask_2d = mask_n[:, None] & mask_n[None, :]
+    scores = tl.where(mask_2d, scores, float('-inf'))
+
+    # Softmax (row-wise)
+    row_max = tl.max(scores, axis=1)
     scores = scores - row_max[:, None]
     weights = tl.exp(scores)
-    row_sum = tl.sum(weights, axis=1)  # (N_F,)
-    weights = weights / row_sum[:, None]
+    # Zero out padded rows so they don't contribute
+    weights = tl.where(mask_2d, weights, 0.0)
+    row_sum = tl.sum(weights, axis=1)
+    weights = weights / tl.where(row_sum > 0, row_sum, 1.0)[:, None]
 
-    # Load V (N_F, D_F)
-    v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)  # (N_F, D_F)
+    # Load V (BLOCK_N, D_F)
+    v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=mask_n[:, None], other=0.0)
 
-    # Output = weights @ V -> (N_F, D_F)
+    # Output = weights @ V -> (BLOCK_N, D_F)
     out = tl.dot(weights.to(v.dtype), v)
 
-    # Store O (N_F, D_F)
-    tl.store(o_base + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od, out)
+    # Store only valid rows
+    tl.store(o_base + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od,
+             out, mask=mask_n[:, None])
 
 
 @triton.jit
@@ -126,7 +137,8 @@ def _fused_feat_attn_bwd_kernel(
     stride_dkb, stride_dkn, stride_dkd,
     stride_dvb, stride_dvn, stride_dvd,
     scale,
-    N_F: tl.constexpr,
+    actual_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     D_F: tl.constexpr,
 ):
     """Backward: recompute weights from Q,K, then compute dQ,dK,dV."""
@@ -140,44 +152,55 @@ def _fused_feat_attn_bwd_kernel(
     dk_base = dK_ptr + bid * stride_dkb
     dv_base = dV_ptr + bid * stride_dvb
 
-    offs_n = tl.arange(0, N_F)
+    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D_F)
+    mask_n = offs_n < actual_N
 
-    # Reload Q, K, V, dO
-    q = tl.load(q_base + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd).to(tl.float32)
-    k = tl.load(k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd).to(tl.float32)
-    v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd).to(tl.float32)
-    do = tl.load(do_base + offs_n[:, None] * stride_don + offs_d[None, :] * stride_dod).to(tl.float32)
+    # Reload Q, K, V, dO with masking
+    q = tl.load(q_base + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                mask=mask_n[:, None], other=0.0).to(tl.float32)
+    k = tl.load(k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                mask=mask_n[:, None], other=0.0).to(tl.float32)
+    v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=mask_n[:, None], other=0.0).to(tl.float32)
+    do = tl.load(do_base + offs_n[:, None] * stride_don + offs_d[None, :] * stride_dod,
+                 mask=mask_n[:, None], other=0.0).to(tl.float32)
 
     # Recompute softmax weights
+    mask_2d = mask_n[:, None] & mask_n[None, :]
     scores = tl.dot(q, tl.trans(k)) * scale
+    scores = tl.where(mask_2d, scores, float('-inf'))
     row_max = tl.max(scores, axis=1)
     scores = scores - row_max[:, None]
     weights = tl.exp(scores)
+    weights = tl.where(mask_2d, weights, 0.0)
     row_sum = tl.sum(weights, axis=1)
-    weights = weights / row_sum[:, None]  # (N_F, N_F)
+    weights = weights / tl.where(row_sum > 0, row_sum, 1.0)[:, None]
 
-    # dV = weights^T @ dO  -> (N_F, D_F)
+    # dV = weights^T @ dO  -> (BLOCK_N, D_F)
     dv = tl.dot(tl.trans(weights), do)
 
-    # dweights = dO @ V^T  -> (N_F, N_F)
+    # dweights = dO @ V^T  -> (BLOCK_N, BLOCK_N)
     dweights = tl.dot(do, tl.trans(v))
 
     # dsoftmax: d_scores = weights * (dweights - rowsum(dweights * weights))
-    row_dot = tl.sum(dweights * weights, axis=1)  # (N_F,)
+    row_dot = tl.sum(dweights * weights, axis=1)
     d_scores = weights * (dweights - row_dot[:, None]) * scale
 
-    # dQ = d_scores @ K  -> (N_F, D_F)
+    # dQ = d_scores @ K  -> (BLOCK_N, D_F)
     dq = tl.dot(d_scores, k)
 
-    # dK = d_scores^T @ Q  -> (N_F, D_F)
+    # dK = d_scores^T @ Q  -> (BLOCK_N, D_F)
     dk = tl.dot(tl.trans(d_scores), q)
 
-    # Store gradients (cast back to input dtype)
+    # Store gradients, masked to valid rows
     in_dtype = Q_ptr.dtype.element_ty
-    tl.store(dq_base + offs_n[:, None] * stride_dqn + offs_d[None, :] * stride_dqd, dq.to(in_dtype))
-    tl.store(dk_base + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd, dk.to(in_dtype))
-    tl.store(dv_base + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd, dv.to(in_dtype))
+    tl.store(dq_base + offs_n[:, None] * stride_dqn + offs_d[None, :] * stride_dqd,
+             dq.to(in_dtype), mask=mask_n[:, None])
+    tl.store(dk_base + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd,
+             dk.to(in_dtype), mask=mask_n[:, None])
+    tl.store(dv_base + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd,
+             dv.to(in_dtype), mask=mask_n[:, None])
 
 
 class _FusedFeatureAttention(torch.autograd.Function):
@@ -192,6 +215,8 @@ class _FusedFeatureAttention(torch.autograd.Function):
         B, N_F, D_F = q.shape
         assert k.shape == (B, N_F, D_F) and v.shape == (B, N_F, D_F)
         scale = D_F ** -0.5
+        # Pad N_F to next power of 2 for triton
+        BLOCK_N = triton.next_power_of_2(N_F)
         out = torch.empty_like(v)
 
         grid = (B,)
@@ -202,13 +227,15 @@ class _FusedFeatureAttention(torch.autograd.Function):
             v.stride(0), v.stride(1), v.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
             scale,
-            N_F=N_F,
+            actual_N=N_F,
+            BLOCK_N=BLOCK_N,
             D_F=D_F,
             num_warps=1,
         )
 
         ctx.save_for_backward(q, k, v)
         ctx.scale = scale
+        ctx.BLOCK_N = BLOCK_N
         return out
 
     @staticmethod
@@ -231,7 +258,8 @@ class _FusedFeatureAttention(torch.autograd.Function):
             dk.stride(0), dk.stride(1), dk.stride(2),
             dv.stride(0), dv.stride(1), dv.stride(2),
             ctx.scale,
-            N_F=N_F,
+            actual_N=N_F,
+            BLOCK_N=ctx.BLOCK_N,
             D_F=D_F,
             num_warps=1,
         )
