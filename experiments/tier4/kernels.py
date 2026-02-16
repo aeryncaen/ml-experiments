@@ -203,66 +203,81 @@ def _fused_feat_attn_bwd_kernel(
              dv.to(in_dtype), mask=mask_n[:, None])
 
 
-class _FusedFeatureAttention(torch.autograd.Function):
-    """Fused bmm-softmax-bmm via triton. One program per batch element.
+def _feat_attn_fwd(q, k, v):
+    """Forward: fused QK^T -> softmax -> @V via triton."""
+    B, N_F, D_F = q.shape
+    scale = D_F ** -0.5
+    BLOCK_N = triton.next_power_of_2(N_F)
+    out = torch.empty_like(v)
+    _fused_feat_attn_fwd_kernel[(B,)](
+        q, k, v, out,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        scale,
+        actual_N=N_F, BLOCK_N=BLOCK_N, D_F=D_F,
+        num_warps=1,
+    )
+    return out
 
-    No intermediate score matrix in global memory. Everything in SRAM.
-    Q=K supported (pass same tensor for both).
-    """
+
+def _feat_attn_bwd(q, k, v, dout):
+    """Backward: recompute weights, compute dQ,dK,dV via triton."""
+    B, N_F, D_F = q.shape
+    scale = D_F ** -0.5
+    BLOCK_N = triton.next_power_of_2(N_F)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    _fused_feat_attn_bwd_kernel[(B,)](
+        q, k, v, dout, dq, dk, dv,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        dout.stride(0), dout.stride(1), dout.stride(2),
+        dq.stride(0), dq.stride(1), dq.stride(2),
+        dk.stride(0), dk.stride(1), dk.stride(2),
+        dv.stride(0), dv.stride(1), dv.stride(2),
+        scale,
+        actual_N=N_F, BLOCK_N=BLOCK_N, D_F=D_F,
+        num_warps=1,
+    )
+    return dq, dk, dv
+
+
+# Register as proper custom ops so torch.compile treats them as opaque
+@torch.library.custom_op("feat_attn::fwd", mutates_args=(), device_types="cuda")
+def _feat_attn_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return _feat_attn_fwd(q, k, v)
+
+@_feat_attn_fwd_op.register_fake
+def _feat_attn_fwd_fake(q, k, v):
+    return torch.empty_like(v)
+
+
+@torch.library.custom_op("feat_attn::bwd", mutates_args=(), device_types="cuda")
+def _feat_attn_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                       dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _feat_attn_bwd(q, k, v, dout)
+
+@_feat_attn_bwd_op.register_fake
+def _feat_attn_bwd_fake(q, k, v, dout):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+class _FusedFeatureAttention(torch.autograd.Function):
+    """Fused bmm-softmax-bmm via triton custom ops."""
 
     @staticmethod
     def forward(ctx, q, k, v):
-        B, N_F, D_F = q.shape
-        assert k.shape == (B, N_F, D_F) and v.shape == (B, N_F, D_F)
-        scale = D_F ** -0.5
-        # Pad N_F to next power of 2 for triton
-        BLOCK_N = triton.next_power_of_2(N_F)
-        out = torch.empty_like(v)
-
-        grid = (B,)
-        _fused_feat_attn_fwd_kernel[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            out.stride(0), out.stride(1), out.stride(2),
-            scale,
-            actual_N=N_F,
-            BLOCK_N=BLOCK_N,
-            D_F=D_F,
-            num_warps=1,
-        )
-
         ctx.save_for_backward(q, k, v)
-        ctx.scale = scale
-        ctx.BLOCK_N = BLOCK_N
-        return out
+        return _feat_attn_fwd_op(q, k, v)
 
     @staticmethod
     def backward(ctx, dout):
         q, k, v = ctx.saved_tensors
-        B, N_F, D_F = q.shape
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-
-        grid = (B,)
-        _fused_feat_attn_bwd_kernel[grid](
-            q, k, v, dout,
-            dq, dk, dv,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            dout.stride(0), dout.stride(1), dout.stride(2),
-            dq.stride(0), dq.stride(1), dq.stride(2),
-            dk.stride(0), dk.stride(1), dk.stride(2),
-            dv.stride(0), dv.stride(1), dv.stride(2),
-            ctx.scale,
-            actual_N=N_F,
-            BLOCK_N=ctx.BLOCK_N,
-            D_F=D_F,
-            num_warps=1,
-        )
+        dq, dk, dv = _feat_attn_bwd_op(q, k, v, dout)
         return dq, dk, dv
 
 
