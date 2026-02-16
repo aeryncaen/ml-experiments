@@ -2068,7 +2068,7 @@ def main():
         optimizer.step()
 
         if step % 20 == 0:
-            loss_t = loss.detach()
+            loss_t = loss.detach() * HP.grad_accum
             if world_size > 1:
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
