@@ -15,16 +15,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-try:
-    import flash_attn.cute.interface as _cute_iface
-    # Blackwell B-series reports cc=12 but CuTE-DSL allowlist stops at 11;
-    # sm100 kernels work fine, just need to pass the assert
-    _orig_get_cc = _cute_iface._get_device_capability
-    _cute_iface._get_device_capability = lambda: 10 if _orig_get_cc() >= 10 else _orig_get_cc()
-    from flash_attn.cute import flash_attn_func
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
+from kernels import flash_attn_func, feature_attention, HAS_CUTE_FLASH as HAS_FLASH_ATTN
 
 from s6 import USBBlock, USBConfig
 
@@ -400,51 +391,6 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
-
-
-def feature_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    activation: str = 'softmax',
-) -> torch.Tensor:
-    """Memory-efficient feature attention over (B*T, N_features, desc_dim) tensors.
-
-    For softmax activation, uses flash_attn_func directly — reshape to
-    (B*T, N_f, 1, D_f) treating features as "sequence" and 1 "head".
-    For silu/silu2, falls back to explicit bmm since flash only supports softmax.
-
-    Args:
-        q: (B*T, N_f, D_f) query (often Q=K)
-        k: (B*T, N_f, D_f) key
-        v: (B*T, N_f, D_f) value
-        activation: 'softmax' | 'silu' | 'silu2'
-
-    Returns:
-        (B*T, N_f, D_f) attended output
-    """
-    if activation == 'softmax':
-        # (B*T, N_f, D_f) -> (B*T, N_f, 1, D_f) — 1 head, N_f seq positions
-        assert HAS_FLASH_ATTN, "flash_attn required for softmax feature attention"
-        # Ensure matching dtypes (autocast can leave v in a different dtype than q/k)
-        k = k.to(q.dtype)
-        v = v.to(q.dtype)
-        out = flash_attn_func(
-            q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2),
-            causal=False,
-        )
-        return out.squeeze(2)
-    else:
-        # silu/silu2: must materialize scores — flash only supports softmax
-        scale = k.shape[-1] ** -0.5
-        scores = torch.bmm(q, k.transpose(-2, -1)) * scale
-        if activation == 'silu':
-            weights = F.silu(scores)
-        elif activation == 'silu2':
-            weights = F.silu(scores).square()
-        else:
-            raise ValueError(f"Unknown feature attention activation: {activation}")
-        return torch.bmm(weights, v)
 
 
 class SelfAttention(nn.Module):
