@@ -16,6 +16,11 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
+    import flash_attn.cute.interface as _cute_iface
+    # Blackwell B-series reports cc=12 but CuTE-DSL allowlist stops at 11;
+    # sm100 kernels work fine, just need to pass the assert
+    _orig_get_cc = _cute_iface._get_device_capability
+    _cute_iface._get_device_capability = lambda: 10 if _orig_get_cc() >= 10 else _orig_get_cc()
     from flash_attn.cute import flash_attn_func
     HAS_FLASH_ATTN = True
 except ImportError:
