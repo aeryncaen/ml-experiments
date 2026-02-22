@@ -91,7 +91,7 @@ class HParams:
 
     # Composite embedding (byte-factored)
     composite_embed: bool = _env_bool("COMPOSITE_EMBED", False)
-    composite_token_ratio: int = _env_int("COMPOSITE_TOKEN_RATIO", 6)  # 1/N of dims_per_slot used for per-token (rest is shared)
+    composite_token_dims: int = _env_int("COMPOSITE_TOKEN_DIMS", 8)  # per-token dims per byte slot (rest is shared)
     composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
     composite_conv: bool = _env_bool("COMPOSITE_CONV", False)
@@ -1606,7 +1606,7 @@ class CompositeEmbedding(nn.Module):
     """Factored embedding: shared byte params + per-token params + optional LoRA adapter.
 
     Per byte slot: shared dims (from byte value) + per-token dims, derived from model_dim.
-    token_per_byte derived from COMPOSITE_TOKEN_RATIO; shared_per_byte = dims_per_slot - token_per_byte.
+    token_per_byte defaults to 8; shared_per_byte = dims_per_slot - token_per_byte.
     LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
     """
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
@@ -1668,11 +1668,9 @@ class CompositeEmbedding(nn.Module):
 def _make_embed():
     """Create token embedding — standard or composite (byte-factored)."""
     if HP.composite_embed:
-        dims_per_slot = HP.d_model // 16
-        token_per_byte = max(1, dims_per_slot // HP.composite_token_ratio)
         return CompositeEmbedding(
             HP.vocab_size, HP.d_model,
-            token_per_byte=token_per_byte,
+            token_per_byte=HP.composite_token_dims,
             use_lora=HP.composite_lora,
             lora_rank=HP.composite_lora_rank,
             use_conv=HP.composite_conv,
