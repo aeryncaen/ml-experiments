@@ -850,8 +850,8 @@ class MoEMLP(nn.Module):
         self.up_expert = nn.Parameter(torch.empty(n_experts, self.expert_hidden, d_model))
         self.down_expert = nn.Parameter(torch.empty(n_experts, d_model, self.expert_hidden))
 
-        # Router has E+1 outputs when bypass is on (last = null expert)
-        n_gate = n_experts + 1 if bypass else n_experts
+        # Router has E+K outputs when bypass is on (K null experts so top-k can go all-bypass)
+        n_gate = n_experts + top_k if bypass else n_experts
         self.router = nn.Linear(d_model, n_gate, bias=False)
 
         for p in [self.gate_expert, self.up_expert, self.down_expert]:
@@ -924,7 +924,7 @@ class MoEMLP(nn.Module):
         out.scatter_add_(0, flat_token.unsqueeze(-1).expand(-1, D), weighted)
 
         # Load-balancing auxiliary loss (over all gate outputs including bypass)
-        n_gate = E + 1 if self.bypass else E
+        n_gate = E + K if self.bypass else E
         probs = torch.softmax(gate_logits, dim=-1)              # (N, n_gate)
         oh_all = F.one_hot(top_idx.view(-1), n_gate).float()    # (N*K, n_gate)
         f = oh_all.sum(0) / N
