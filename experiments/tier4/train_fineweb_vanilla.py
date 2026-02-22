@@ -1598,16 +1598,14 @@ def _tie_weights(model: nn.Module):
 # ── Byte-attention MLP ───────────────────────────────────────────────────────
 
 class ByteAttentionMLP(nn.Module):
-    """MLP that runs multi-head QKV attention over 16 byte slots instead of SwiGLU.
+    """SwiGLU MLP with byte attention replacing element-wise gating.
 
-    Flow:
-      up_proj(d_model -> hidden)
-      reshape to (B*T, 16, desc_dim)
-      Q, K, V projections + RoPE over byte positions
-      acausal multi-head attention (n_byte_heads heads)
-      reshape to (B*T, hidden)
-      SiLU
-      down_proj(hidden -> d_model)
+    SwiGLU:       out = down_proj(SiLU(gate_proj(x)) * up_proj(x))
+    ByteAttn:     out = down_proj(SiLU(byte_attn(SiLU(gate_proj(x)), up_proj(x))))
+
+    gate_proj provides Q=K (Reformer-style), up_proj provides V.
+    Multi-head attention with RoPE over 16 byte slots, acausal.
+    Same three projections as SwiGLU, same param count.
     """
 
     def __init__(self, d_model: int, n_byte_heads: int):
@@ -1622,10 +1620,8 @@ class ByteAttentionMLP(nn.Module):
         assert self.desc_dim % n_byte_heads == 0
         self.byte_head_dim = self.desc_dim // n_byte_heads
 
-        self.up_proj = nn.Linear(d_model, hidden, bias=False)
-        self.q_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
-        self.k_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
-        self.v_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
+        self.gate_proj = nn.Linear(d_model, hidden, bias=False)  # → Q=K
+        self.up_proj = nn.Linear(d_model, hidden, bias=False)    # → V
         self.down_proj = nn.Linear(hidden, d_model, bias=False)
 
         # Precompute RoPE for byte positions (0-15)
@@ -1637,25 +1633,24 @@ class ByteAttentionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        h = self.up_proj(x)                                                         # (B, T, hidden)
-        h = F.silu(h)                                                               # pre-attention activation
-        h = h.view(B * T, self.max_bytes, self.desc_dim)                            # (B*T, 16, desc_dim)
 
-        q = self.q_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
-        k = self.k_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
-        v = self.v_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
+        # gate_proj → Q=K (with SiLU pre-act), up_proj → V
+        qk = F.silu(self.gate_proj(x))                                              # (B, T, hidden)
+        v = self.up_proj(x)                                                          # (B, T, hidden)
+
+        qk = qk.view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)  # (B*T, 16, H, D)
+        v = v.view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
 
         # RoPE over byte positions
-        q = apply_rotary(q, self.byte_cos, self.byte_sin)
-        k = apply_rotary(k, self.byte_cos, self.byte_sin)
+        qk = apply_rotary(qk, self.byte_cos, self.byte_sin)
 
-        # SDPA: (B*T, n_heads, 16, head_dim)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        out = out.transpose(1, 2).contiguous()                                      # (B*T, 16, n_heads, hd)
+        # SDPA: (B*T, n_heads, 16, head_dim), Q=K
+        qk, v = qk.transpose(1, 2), v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(qk, qk, v, is_causal=False)
+        out = out.transpose(1, 2).contiguous()                                       # (B*T, 16, H, D)
 
         out = out.reshape(B, T, self.hidden)
-        out = F.silu(out)                                                           # post-attention activation
+        out = F.silu(out)                                                            # post-attention activation
         return self.down_proj(out)
 
 
