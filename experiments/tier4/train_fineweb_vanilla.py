@@ -814,9 +814,10 @@ class MLP(nn.Module):
 class MoEMLP(nn.Module):
     """Top-k gated Mixture of Experts replacing a single MLP.
 
-    Scatter-gather dispatch: sort tokens by expert, run each expert as a
-    regular matmul on its chunk, scatter results back. Fused weight tensors
-    so each expert forward is a single mm per projection.
+    Fixed-capacity scatter-gather: assign each token-slot to its expert's
+    buffer (capacity = ceil(N*K/E)), run all experts as a single bmm with
+    batch=E, scatter results back. No GPU→CPU syncs, no dynamic shapes,
+    only processes ~N*K/E tokens per expert.
     """
 
     def __init__(self, d_model: int, n_experts: int, top_k: int):
@@ -843,54 +844,52 @@ class MoEMLP(nn.Module):
         B, T, D = x.shape
         x_flat = x.view(-1, D)  # (N, D)
         N = x_flat.shape[0]
+        E = self.n_experts
+        K = self.top_k
 
         # Routing
         gate_logits = self.router(x_flat)  # (N, E)
-        top_vals, top_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # (N, K)
+        top_vals, top_idx = torch.topk(gate_logits, K, dim=-1)  # (N, K)
         top_weights = torch.softmax(top_vals, dim=-1)  # (N, K)
 
         # Flatten to (N*K,) token-slot pairs
-        flat_expert = top_idx.view(-1)       # (N*K,) which expert per slot
-        flat_weight = top_weights.view(-1)   # (N*K,) routing weight per slot
-        flat_token = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)  # (N*K,) source token idx
+        flat_expert = top_idx.view(-1)      # (N*K,)
+        flat_weight = top_weights.view(-1)  # (N*K,)
+        flat_token = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
 
-        # Sort by expert for contiguous chunks
-        sort_idx = torch.argsort(flat_expert, stable=True)
-        sorted_expert = flat_expert[sort_idx]
-        sorted_token = flat_token[sort_idx]
-        sorted_weight = flat_weight[sort_idx]
+        # Compute position of each slot within its expert's group (vectorized)
+        one_hot = F.one_hot(flat_expert, E)  # (N*K, E)
+        cumpos = one_hot.cumsum(0)           # (N*K, E)
+        positions = torch.gather(cumpos, 1, flat_expert.unsqueeze(1)).squeeze(1) - 1  # (N*K,)
 
-        # Count tokens per expert for splitting
-        counts = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
-        counts.scatter_add_(0, sorted_expert, torch.ones_like(sorted_expert, dtype=torch.long))
-        splits = counts.tolist()
+        # Fixed capacity per expert — drop overflow
+        capacity = (N * K + E - 1) // E
+        valid = (positions < capacity).unsqueeze(-1)  # (N*K, 1)
+        positions = positions.clamp(max=capacity - 1)
 
-        # Gather inputs sorted by expert
-        sorted_input = x_flat[sorted_token]  # (N*K, D)
+        # Scatter inputs into (E, capacity, D) expert buffer
+        buffer_idx = (flat_expert * capacity + positions).unsqueeze(-1)  # (N*K, 1)
+        expert_input = torch.zeros(E * capacity, D, device=x.device, dtype=x.dtype)
+        expert_input.scatter_(0, buffer_idx.expand(-1, D), x_flat[flat_token])
+        expert_input = expert_input.view(E, capacity, D)
 
-        # Run each expert on its contiguous chunk
-        sorted_output = torch.empty_like(sorted_input)
-        offset = 0
-        for i, c in enumerate(splits):
-            if c == 0:
-                continue
-            inp = sorted_input[offset:offset + c]             # (c, D)
-            g = inp @ self.gate_proj[i].T                     # (c, hidden)
-            u = inp @ self.up_proj[i].T                       # (c, hidden)
-            sorted_output[offset:offset + c] = (F.silu(g) * u) @ self.down_proj[i].T  # (c, D)
-            offset += c
+        # Batched SwiGLU: bmm with batch=E
+        g = torch.bmm(expert_input, self.gate_proj.transpose(1, 2))  # (E, cap, hidden)
+        u = torch.bmm(expert_input, self.up_proj.transpose(1, 2))    # (E, cap, hidden)
+        expert_output = torch.bmm(F.silu(g) * u, self.down_proj.transpose(1, 2))  # (E, cap, D)
 
-        # Scatter back: weighted sum per token
+        # Gather outputs and scatter back to tokens
+        slot_output = expert_output.view(-1, D)[buffer_idx.squeeze(-1)]  # (N*K, D)
+        weighted = slot_output * flat_weight.unsqueeze(-1) * valid.float()
         out = torch.zeros_like(x_flat)
-        out.scatter_add_(0,
-            sorted_token.unsqueeze(-1).expand_as(sorted_output),
-            sorted_weight.unsqueeze(-1) * sorted_output)
+        out.scatter_add_(0, flat_token.unsqueeze(-1).expand(-1, D), weighted)
 
         # Load-balancing auxiliary loss
         probs = torch.softmax(gate_logits, dim=-1)  # (N, E)
-        f = counts.float() / N                       # fraction of slots per expert
-        P = probs.mean(0)                             # mean gate prob per expert
-        aux_loss = (f * P).sum() * self.n_experts
+        tokens_per_expert = one_hot.float().sum(0)   # (E,)
+        f = tokens_per_expert / N
+        P = probs.mean(0)
+        aux_loss = (f * P).sum() * E
 
         return out.view(B, T, D), aux_loss
 
