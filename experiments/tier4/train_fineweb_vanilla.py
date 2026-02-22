@@ -1889,14 +1889,15 @@ class DecoderHead(nn.Module):
 
 
 class StructuredLinearHead(nn.Module):
-    """Structured LM head with cross-attention over byte slots: (B,T,16,48) -> (B,T,V)."""
+    """Structured LM head with per-token query over byte slots: (B,T,16,48) -> (B,T,V)."""
 
     def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16):
         super().__init__()
         assert d_model % max_bytes == 0
         self.max_bytes = max_bytes
+        self.d_model = d_model
         self.dps = d_model // max_bytes
-        self.q_proj = nn.Linear(self.dps, self.dps, bias=False)
+        self.q_proj = nn.Linear(d_model, self.dps, bias=False)
         self.k_proj = nn.Linear(self.dps, self.dps, bias=False)
         self.v_proj = nn.Linear(self.dps, self.dps, bias=False)
         self.scale = self.dps ** -0.5
@@ -1904,10 +1905,11 @@ class StructuredLinearHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
+        if D != self.d_model:
+            raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
         slots = x.view(B, T, self.max_bytes, self.dps)
-        # Token-conditioned single-query cross-attention over the 16 byte slots.
-        q_seed = slots.mean(dim=2, keepdim=True)                         # (B, T, 1, dps)
-        q = self.q_proj(q_seed)                                           # (B, T, 1, dps)
+        # Per-token query from full hidden state (not per-output-token query bank).
+        q = self.q_proj(x).unsqueeze(2)                                   # (B, T, 1, dps)
         k = self.k_proj(slots)                                            # (B, T, 16, dps)
         v = self.v_proj(slots)                                            # (B, T, 16, dps)
         scores = torch.einsum('btqd,btsd->btqs', q, k) * self.scale      # (B, T, 1, 16)
