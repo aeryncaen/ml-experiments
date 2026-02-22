@@ -91,6 +91,7 @@ class HParams:
 
     # Composite embedding (byte-factored)
     composite_embed: bool = _env_bool("COMPOSITE_EMBED", False)
+    composite_token_dims: int = _env_int("COMPOSITE_TOKEN_DIMS", 8)  # per-token dims per byte slot (rest is shared)
     composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
 
@@ -1533,10 +1534,8 @@ class CompositeEmbedding(nn.Module):
     token_per_byte defaults to 8; shared_per_byte = dims_per_slot - token_per_byte.
     LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
     """
-    TOKEN_PER_BYTE = 8
-
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
-                 use_lora: bool = False, lora_rank: int = 16):
+                 token_per_byte: int = 8, use_lora: bool = False, lora_rank: int = 16):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
@@ -1546,7 +1545,7 @@ class CompositeEmbedding(nn.Module):
 
         assert model_dim % max_bytes == 0
         self.dims_per_slot = model_dim // max_bytes
-        self.token_per_byte = self.TOKEN_PER_BYTE
+        self.token_per_byte = token_per_byte
         self.shared_per_byte = self.dims_per_slot - self.token_per_byte
         assert self.shared_per_byte > 0, (
             f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({self.token_per_byte})")
@@ -1582,6 +1581,7 @@ def _make_embed():
     if HP.composite_embed:
         return CompositeEmbedding(
             HP.vocab_size, HP.d_model,
+            token_per_byte=HP.composite_token_dims,
             use_lora=HP.composite_lora,
             lora_rank=HP.composite_lora_rank,
         )
