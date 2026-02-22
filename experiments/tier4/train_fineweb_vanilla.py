@@ -98,6 +98,8 @@ class HParams:
 
     # Decoder head (ML-Decoder style cross-attention over byte slots)
     decoder_head: bool = _env_bool("DECODER_HEAD", False)
+    decoder_head_vocab_chunk: int = _env_int("DECODER_HEAD_VOCAB_CHUNK", 0)  # 0 = full vocab per token chunk (matches linear-head chunking style)
+    decoder_head_token_chunk: int = _env_int("DECODER_HEAD_TOKEN_CHUNK", 1024)
 
 
     # Byte-attention MLP
@@ -1759,13 +1761,14 @@ class DecoderHead(nn.Module):
     Reshapes hidden (B, T, d_model) → (B, T, 16, dps) byte slots, then uses
     per-vocab-token queries to cross-attend over the 16 positions.
     Logits produced via dot-product readout: (context * query).sum(-1).
-    Chunked over vocab to keep memory bounded.
+    For training, use streamed_cross_entropy() to avoid materializing (B, T, V, 16).
     """
     def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16):
         super().__init__()
         assert d_model % max_bytes == 0
         self.dps = d_model // max_bytes
         self.max_bytes = max_bytes
+        self.vocab_size = vocab_size
 
         self.queries = nn.Embedding(vocab_size, self.dps)
         self.k_proj = nn.Linear(self.dps, self.dps, bias=False)
@@ -1786,6 +1789,68 @@ class DecoderHead(nn.Module):
         # Fused readout: dot(attn-weighted v, q) without materializing (B,T,V,dps)
         v_dot_q = torch.einsum('btsd,vd->btvs', v, q)               # (B, T, V, 16)
         return (attn * v_dot_q).sum(dim=-1)                          # (B, T, V)
+
+    def streamed_cross_entropy(
+        self,
+        x: torch.Tensor,
+        targets: torch.Tensor,
+        vocab_chunk_size: int = 512,
+        token_chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """Compute CE loss without building full (B, T, V) or (B, T, V, 16) tensors.
+
+        Uses two-level chunking over flattened tokens and vocabulary classes, and
+        accumulates log-sum-exp in a numerically stable streaming form.
+        """
+        B, T, D = x.shape
+        if targets.shape != (B, T):
+            raise ValueError(f"targets shape {targets.shape} must match {(B, T)}")
+
+        slots = x.view(B, T, self.max_bytes, self.dps)              # (B, T, 16, dps)
+        k = self.k_proj(slots).reshape(B * T, self.max_bytes, self.dps)
+        v = self.v_proj(slots).reshape(B * T, self.max_bytes, self.dps)
+        t_flat = targets.reshape(B * T)
+        q_all = self.queries.weight                                  # (V, dps)
+
+        total_tokens = B * T
+        loss_sum = x.new_zeros((), dtype=torch.float32)
+
+        for tok_start in range(0, total_tokens, token_chunk_size):
+            tok_end = min(tok_start + token_chunk_size, total_tokens)
+            k_tok = k[tok_start:tok_end]                             # (N, 16, dps)
+            v_tok = v[tok_start:tok_end]                             # (N, 16, dps)
+            t_tok = t_flat[tok_start:tok_end]                        # (N,)
+            N = k_tok.shape[0]
+
+            max_logit = torch.full((N,), -float("inf"), device=x.device, dtype=torch.float32)
+            sum_exp = torch.zeros((N,), device=x.device, dtype=torch.float32)
+            target_logit = torch.zeros((N,), device=x.device, dtype=torch.float32)
+
+            for v_start in range(0, self.vocab_size, vocab_chunk_size):
+                v_end = min(v_start + vocab_chunk_size, self.vocab_size)
+                q_chunk = q_all[v_start:v_end]                       # (C, dps)
+
+                scores = torch.einsum('nsd,cd->ncs', k_tok, q_chunk) * self.scale
+                attn = scores.softmax(dim=-1)
+                v_dot_q = torch.einsum('nsd,cd->ncs', v_tok, q_chunk)
+                logits_chunk = (attn * v_dot_q).sum(dim=-1).float()  # (N, C)
+
+                chunk_max = logits_chunk.max(dim=1).values
+                new_max = torch.maximum(max_logit, chunk_max)
+                sum_exp = sum_exp * torch.exp(max_logit - new_max)
+                sum_exp = sum_exp + torch.exp(logits_chunk - new_max.unsqueeze(1)).sum(dim=1)
+                max_logit = new_max
+
+                local_idx = t_tok - v_start
+                in_chunk = (local_idx >= 0) & (local_idx < (v_end - v_start))
+                safe_idx = local_idx.clamp(0, (v_end - v_start) - 1)
+                gathered = logits_chunk.gather(1, safe_idx.unsqueeze(1)).squeeze(1)
+                target_logit = torch.where(in_chunk, gathered, target_logit)
+
+            log_denom = max_logit + torch.log(sum_exp)
+            loss_sum = loss_sum + (log_denom - target_logit).sum()
+
+        return loss_sum / total_tokens
 
 
 def _make_embed():
@@ -1902,6 +1967,15 @@ class GPTTransformer(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
         x = self.ln_f(x)
+        if targets is not None and isinstance(self.lm_head, DecoderHead):
+            vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
+            loss = self.lm_head.streamed_cross_entropy(
+                x,
+                targets,
+                vocab_chunk_size=vocab_chunk,
+                token_chunk_size=HP.decoder_head_token_chunk,
+            )
+            return None, loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -2405,6 +2479,15 @@ class GPTMoE(nn.Module):
             else:
                 x, _ = block(x)
         x = self.ln_f(x)
+        if targets is not None and isinstance(self.lm_head, DecoderHead):
+            vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
+            loss = self.lm_head.streamed_cross_entropy(
+                x,
+                targets,
+                vocab_chunk_size=vocab_chunk,
+                token_chunk_size=HP.decoder_head_token_chunk,
+            )
+            return None, loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
