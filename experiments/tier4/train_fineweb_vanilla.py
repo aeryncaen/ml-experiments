@@ -43,7 +43,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -86,6 +86,17 @@ class HParams:
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
+    # Retokenize >16-byte tokens on load (no need to preprocess .bin files)
+    retokenize: bool = _env_bool("RETOKENIZE", False)
+
+    # Composite embedding (byte-factored)
+    composite_embed: bool = _env_bool("COMPOSITE_EMBED", False)
+    composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
+    composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
+
+    # Byte-attention MLP
+    ba_n_byte_heads: int = _env_int("BA_N_BYTE_HEADS", 4)
+
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
     llada_subs: bool = _env_bool("LLADA_SUBS", True)
@@ -115,6 +126,58 @@ def print0(rank: int, s: str):
         print(s, flush=True)
 
 
+# Replacement map: token IDs whose byte sequences exceed 16 bytes.
+# Each maps to its BPE decomposition into tokens that are all ≤16 bytes.
+# Ported from modded-nanogpt/data/retokenize.go.
+_RETOK_MAP: dict[int, list[int]] = {
+    3880: [1783, 1783], 8864: [4181, 4181], 10052: [4770, 4770],
+    10097: [1783, 1783, 1783, 1783], 10221: [4841, 4841],
+    14827: [9364, 9364], 14950: [8184, 8184], 15171: [2424, 7992],
+    16529: [220, 1783, 1783, 1783, 1783], 17174: [8412, 8412],
+    19351: [1783, 650], 20368: [220, 1783, 1783], 20727: [555, 18789],
+    22369: [1783, 982], 23090: [9364, 9364, 9364, 9364],
+    23193: [4181, 4181, 4181, 4181], 23926: [4770, 4770, 4770, 4770],
+    27006: [15243, 15243], 27193: [4841, 4841, 4841, 4841],
+    27473: [5735, 20860], 27754: [4181, 2109], 28542: [16068, 16068],
+    28719: [18717, 1286], 29113: [14468, 14468], 29146: [15864, 15864],
+    29760: [15149, 28018], 29789: [16782, 5646], 30210: [29372, 18143],
+    30213: [30212, 10049], 30542: [8184, 8184, 8184, 8184],
+    30899: [21018, 30898], 30906: [30905, 21018, 30898],
+    30982: [18717, 378], 31576: [22615, 31573], 32799: [2095, 1634],
+    32941: [4841, 2602], 34400: [220, 1783], 35496: [9364] * 8,
+    36174: [36173, 35992], 36573: [3753, 19541], 36658: [796, 4770],
+    37389: [26825, 12100], 38093: [796, 4770, 4770, 4770, 4770],
+    39172: [17811, 17811], 39177: [7449, 39142], 39753: [39752, 10493],
+    39755: [39714, 39655], 39756: [24807, 31208], 39757: [17620, 29841],
+    40242: [39693, 40241], 40586: [6142, 1023], 40800: [11784, 453],
+    40887: [33131, 36387], 41380: [21353, 41215], 41436: [220, 1783, 650],
+    41906: [220, 8412, 8412], 42045: [11273, 16607], 43453: [15831, 42202],
+    43649: [37665, 41726], 43801: [1783, 1783, 1783, 982],
+    44436: [17038, 1056], 44713: [220, 4181], 45545: [45544, 42983],
+    45706: [22686, 22686], 46111: [796, 4770, 4770], 46674: [3753, 27781],
+    47232: [1783, 1783, 1783], 47757: [13352, 34718], 48667: [14318, 20860],
+    49129: [4181, 492], 49527: [20503, 20503], 49704: [27246, 27246],
+}
+
+
+def _retokenize(tokens: torch.Tensor) -> torch.Tensor:
+    """Replace >16-byte token IDs with their shorter decompositions."""
+    arr = tokens.numpy()
+    # Fast path: check if any replacements are needed
+    needs = set(_RETOK_MAP) & set(arr.tolist())
+    if not needs:
+        return tokens
+    # Build expanded sequence
+    out = []
+    for t in arr:
+        rep = _RETOK_MAP.get(int(t))
+        if rep is not None:
+            out.extend(rep)
+        else:
+            out.append(int(t))
+    return torch.tensor(out, dtype=torch.uint16).pin_memory()
+
+
 def _load_data_shard(file: Path) -> torch.Tensor:
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
     assert int(header[0]) == 20240520, "magic number mismatch in .bin"
@@ -125,6 +188,8 @@ def _load_data_shard(file: Path) -> torch.Tensor:
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "token count mismatch"
+    if HP.retokenize:
+        tokens = _retokenize(tokens)
     return tokens
 
 
@@ -1443,15 +1508,181 @@ def _run_blocks(blocks: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+# ── Composite (byte-factored) embedding ─────────────────────────────────────
+
+def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int = 256):
+    """Build a lookup table mapping each token ID to its byte sequence, padded to max_bytes."""
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    table = torch.full((vocab_size, max_bytes), pad_idx, dtype=torch.long)
+    for i in range(min(vocab_size, enc.n_vocab)):
+        try:
+            b = enc.decode_single_token_bytes(i)
+            if len(b) <= max_bytes:
+                for j, byte_val in enumerate(b):
+                    table[i, j] = byte_val
+        except Exception:
+            pass  # special tokens / gaps get all-pad
+    return table
+
+
+class CompositeEmbedding(nn.Module):
+    """Factored embedding: shared byte params + per-token params + optional LoRA adapter.
+
+    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
+    16 slots * 48 = 768 = model_dim
+    LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
+    """
+    SHARED_PER_BYTE = 40
+    TOKEN_PER_BYTE = 8
+
+    def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
+                 use_lora: bool = False, lora_rank: int = 16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.model_dim = model_dim
+        self.max_bytes = max_bytes
+        self.use_lora = use_lora
+        self.pad_idx = 256
+
+        self.dims_per_slot = model_dim // max_bytes
+        assert model_dim % max_bytes == 0
+        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
+
+        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)                    # 257 x 40
+        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # V x 128
+
+        if use_lora:
+            self.token_down = nn.Embedding(vocab_size, lora_rank)                    # V x rank
+            self.token_up = nn.Linear(lora_rank, model_dim, bias=False)              # rank x model_dim
+
+        self.register_buffer(
+            'token_bytes',
+            _build_token_byte_table(vocab_size, max_bytes, self.pad_idx),
+            persistent=False,
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        byte_seqs = self.token_bytes[token_ids]                                     # (..., 16)
+        shared = self.byte_embed(byte_seqs)                                         # (..., 16, 40)
+        per_tok = self.token_embed(token_ids)                                       # (..., 128)
+        per_tok = per_tok.view(*token_ids.shape, self.max_bytes, self.TOKEN_PER_BYTE)  # (..., 16, 8)
+        base = torch.cat([shared, per_tok], dim=-1)                                 # (..., 16, 48)
+        base = base.reshape(*token_ids.shape, self.model_dim)                       # (..., model_dim)
+        if self.use_lora:
+            adapter = self.token_up(self.token_down(token_ids))                     # (..., model_dim)
+            base = base + adapter
+        return base
+
+
+def _make_embed():
+    """Create token embedding — standard or composite (byte-factored)."""
+    if HP.composite_embed:
+        return CompositeEmbedding(
+            HP.vocab_size, HP.d_model,
+            use_lora=HP.composite_lora,
+            lora_rank=HP.composite_lora_rank,
+        )
+    return nn.Embedding(HP.vocab_size, HP.d_model)
+
+
+def _tie_weights(model: nn.Module):
+    """Tie lm_head to wte (standard) or skip + fix adapter init (composite)."""
+    if HP.composite_embed:
+        if HP.composite_lora:
+            nn.init.zeros_(model.wte.token_up.weight)
+    else:
+        model.lm_head.weight = model.wte.weight
+
+
+# ── Byte-attention MLP ───────────────────────────────────────────────────────
+
+class ByteAttentionMLP(nn.Module):
+    """MLP that runs multi-head QKV attention over 16 byte slots instead of SwiGLU.
+
+    Flow:
+      up_proj(d_model -> hidden)
+      reshape to (B*T, 16, desc_dim)
+      Q, K, V projections + RoPE over byte positions
+      acausal multi-head attention (n_byte_heads heads)
+      reshape to (B*T, hidden)
+      SiLU
+      down_proj(hidden -> d_model)
+    """
+
+    def __init__(self, d_model: int, n_byte_heads: int):
+        super().__init__()
+        hidden = int(d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        self.hidden = hidden
+        self.max_bytes = 16
+        assert hidden % self.max_bytes == 0
+        self.desc_dim = hidden // self.max_bytes
+        self.n_byte_heads = n_byte_heads
+        assert self.desc_dim % n_byte_heads == 0
+        self.byte_head_dim = self.desc_dim // n_byte_heads
+
+        self.up_proj = nn.Linear(d_model, hidden, bias=False)
+        self.q_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
+        self.k_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
+        self.v_proj = nn.Linear(self.desc_dim, self.desc_dim, bias=False)
+        self.down_proj = nn.Linear(hidden, d_model, bias=False)
+
+        # Precompute RoPE for byte positions (0-15)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.byte_head_dim, 2).float() / self.byte_head_dim))
+        positions = torch.arange(self.max_bytes).float()
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer('byte_cos', freqs.cos()[None, :, None, :], persistent=False)
+        self.register_buffer('byte_sin', freqs.sin()[None, :, None, :], persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        h = self.up_proj(x)                                                         # (B, T, hidden)
+        h = h.view(B * T, self.max_bytes, self.desc_dim)                            # (B*T, 16, desc_dim)
+
+        q = self.q_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
+        k = self.k_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
+        v = self.v_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
+
+        # RoPE over byte positions
+        q = apply_rotary(q, self.byte_cos, self.byte_sin)
+        k = apply_rotary(k, self.byte_cos, self.byte_sin)
+
+        # SDPA: (B*T, n_heads, 16, head_dim)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        out = out.transpose(1, 2).contiguous()                                      # (B*T, 16, n_heads, hd)
+
+        out = out.reshape(B, T, self.hidden)
+        out = F.silu(out)
+        return self.down_proj(out)
+
+
+class TransformerByteAttnBlock(nn.Module):
+    """Pre-norm block: sequence attention + byte-attention MLP."""
+
+    def __init__(self, d_model: int, n_head: int, n_byte_heads: int):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.attn = SelfAttention(d_model, n_head)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = ByteAttentionMLP(d_model, n_byte_heads)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
 class GPTTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1466,12 +1697,12 @@ class GPTTransformer(nn.Module):
 class GPTTransformerConv(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([TransformerMamba3Block(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1486,12 +1717,12 @@ class GPTTransformerConv(nn.Module):
 class GPTTransformerShift(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([TransformerShiftBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1506,12 +1737,12 @@ class GPTTransformerShift(nn.Module):
 class GPTGatedNeighbor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([GatedNeighborBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
         # Re-apply gate init after _init_weights (which overwrites it)
         for block in self.blocks:
             nn.init.zeros_(block.attn.gate_proj.weight)
@@ -1530,7 +1761,7 @@ class GPTGatedNeighbor(nn.Module):
 class GPTFusedGatedNeighbor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         inner = HP.fused_inner_dim if HP.fused_inner_dim > 0 else None
         paired_str = os.environ.get("PAIRED_HEAD_LAYERS", "0,2,5,9")
         paired_layers = set(int(x) for x in paired_str.split(",") if x.strip()) if paired_str.strip() else set()
@@ -1540,8 +1771,8 @@ class GPTFusedGatedNeighbor(nn.Module):
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
         # Re-apply gate init after _init_weights (which overwrites it)
         for block in self.blocks:
             nn.init.zeros_(block.neighbor_gate_proj.weight)
@@ -1565,7 +1796,7 @@ class GPTFusedGatedNeighbor(nn.Module):
 class GPTS6(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         modes = tuple(x.strip() for x in HP.s6_scan_state_modes.split(",") if x.strip())
         if len(modes) != 3:
             raise ValueError("S6_SCAN_STATE_MODES must have 3 comma-separated values")
@@ -1579,8 +1810,8 @@ class GPTS6(nn.Module):
         self.blocks = nn.ModuleList([USBBlock(cfg) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
@@ -1690,15 +1921,15 @@ class GPTFeatureAttn(nn.Module):
         post_act = HP.fa_post_act
         pre_act = HP.fa_pre_act
         qk_norm = HP.fa_qk_norm
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             TransformerFeatureAttnBlock(HP.d_model, HP.n_head, nf, act, post_act=post_act, pre_act=pre_act, qk_norm=qk_norm)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1726,15 +1957,15 @@ class GPTFusedSeqFeature(nn.Module):
         n_seq_heads = hidden // 64
         assert hidden % nf == 0, (
             f"hidden ({hidden}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             FusedSeqFeatureAttnBlock(HP.d_model, hidden, n_seq_heads, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1755,15 +1986,15 @@ class GPTThreeStage(nn.Module):
         act = HP.fa_activation
         assert HP.d_model % nf == 0, (
             f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             ThreeStageBlock(HP.d_model, HP.n_head, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1788,15 +2019,15 @@ class GPTQVO(nn.Module):
         act = HP.fa_activation
         assert HP.d_model % nf == 0, (
             f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             QVOBlock(HP.d_model, HP.n_head, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1823,15 +2054,15 @@ class GPTThreeStageFSA(nn.Module):
         act = HP.fa_activation
         assert HP.d_model % nf == 0, (
             f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             ThreeStageFSABlock(HP.d_model, HP.n_head, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1856,15 +2087,15 @@ class GPTDualQ(nn.Module):
         act = HP.fa_activation
         assert HP.d_model % nf == 0, (
             f"d_model ({HP.d_model}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             DualQBlock(HP.d_model, HP.n_head, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -1891,15 +2122,40 @@ class GPTFusedQKV(nn.Module):
         n_seq_heads = hidden // 64
         assert hidden % nf == 0, (
             f"hidden ({hidden}) not divisible by FA_N_FEATURES ({nf})")
-        self.wte = nn.Embedding(HP.vocab_size, HP.d_model)
+        self.wte = _make_embed()
         self.blocks = nn.ModuleList([
             FusedQKVBlock(HP.d_model, hidden, n_seq_heads, nf, act)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
         self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
         self.apply(_init_weights)
+        _tie_weights(self)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = _run_blocks(self.blocks, self.wte(idx))
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+
+class GPTByteAttn(nn.Module):
+    """GPT with byte-attention MLP — MLP replaced by multi-head attention over 16 byte slots."""
+
+    def __init__(self):
+        super().__init__()
+        self.wte = _make_embed()
+        self.blocks = nn.ModuleList([
+            TransformerByteAttnBlock(HP.d_model, HP.n_head, HP.ba_n_byte_heads)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = RMSNorm(HP.d_model)
+        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.apply(_init_weights)
+        _tie_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _run_blocks(self.blocks, self.wte(idx))
@@ -2021,6 +2277,8 @@ def build_model() -> nn.Module:
         return GPTULB1D()
     if HP.model_type == "ulb_2d":
         return GPTULB2D()
+    if HP.model_type == "byte_attn":
+        return GPTByteAttn()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
