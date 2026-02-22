@@ -814,8 +814,9 @@ class MLP(nn.Module):
 class MoEMLP(nn.Module):
     """Top-k gated Mixture of Experts replacing a single MLP.
 
-    All expert weights are fused into single (n_experts, ...) tensors so
-    dispatch is a batched matmul — no Python loop over experts.
+    Scatter-gather dispatch: sort tokens by expert, run each expert as a
+    regular matmul on its chunk, scatter results back. Fused weight tensors
+    so each expert forward is a single mm per projection.
     """
 
     def __init__(self, d_model: int, n_experts: int, top_k: int):
@@ -848,33 +849,47 @@ class MoEMLP(nn.Module):
         top_vals, top_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # (N, K)
         top_weights = torch.softmax(top_vals, dim=-1)  # (N, K)
 
-        # Flatten token-slot pairs: (N*K,)
-        flat_idx = top_idx.view(-1)  # (N*K,)
-        # Repeat input for each top-k slot: (N*K, D)
-        x_rep = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
+        # Flatten to (N*K,) token-slot pairs
+        flat_expert = top_idx.view(-1)       # (N*K,) which expert per slot
+        flat_weight = top_weights.view(-1)   # (N*K,) routing weight per slot
+        flat_token = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)  # (N*K,) source token idx
 
-        # Gather expert weights for selected experts: (N*K, hidden, D), etc.
-        gate_w = self.gate_proj[flat_idx]  # (N*K, hidden, D)
-        up_w = self.up_proj[flat_idx]      # (N*K, hidden, D)
-        down_w = self.down_proj[flat_idx]  # (N*K, D, hidden)
+        # Sort by expert for contiguous chunks
+        sort_idx = torch.argsort(flat_expert, stable=True)
+        sorted_expert = flat_expert[sort_idx]
+        sorted_token = flat_token[sort_idx]
+        sorted_weight = flat_weight[sort_idx]
 
-        # Batched SwiGLU: each token-slot gets its expert's MLP
-        h = torch.bmm(gate_w, x_rep.unsqueeze(-1)).squeeze(-1)  # (N*K, hidden)
-        u = torch.bmm(up_w, x_rep.unsqueeze(-1)).squeeze(-1)    # (N*K, hidden)
-        h = F.silu(h) * u                                        # (N*K, hidden)
-        expert_out = torch.bmm(down_w, h.unsqueeze(-1)).squeeze(-1)  # (N*K, D)
+        # Count tokens per expert for splitting
+        counts = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
+        counts.scatter_add_(0, sorted_expert, torch.ones_like(sorted_expert, dtype=torch.long))
+        splits = counts.tolist()
 
-        # Weighted sum across top-k slots per token
-        expert_out = expert_out.view(N, self.top_k, D)  # (N, K, D)
-        out = (top_weights.unsqueeze(-1) * expert_out).sum(dim=1)  # (N, D)
+        # Gather inputs sorted by expert
+        sorted_input = x_flat[sorted_token]  # (N*K, D)
 
-        # Load-balancing auxiliary loss (vectorized)
+        # Run each expert on its contiguous chunk
+        sorted_output = torch.empty_like(sorted_input)
+        offset = 0
+        for i, c in enumerate(splits):
+            if c == 0:
+                continue
+            inp = sorted_input[offset:offset + c]             # (c, D)
+            g = inp @ self.gate_proj[i].T                     # (c, hidden)
+            u = inp @ self.up_proj[i].T                       # (c, hidden)
+            sorted_output[offset:offset + c] = (F.silu(g) * u) @ self.down_proj[i].T  # (c, D)
+            offset += c
+
+        # Scatter back: weighted sum per token
+        out = torch.zeros_like(x_flat)
+        out.scatter_add_(0,
+            sorted_token.unsqueeze(-1).expand_as(sorted_output),
+            sorted_weight.unsqueeze(-1) * sorted_output)
+
+        # Load-balancing auxiliary loss
         probs = torch.softmax(gate_logits, dim=-1)  # (N, E)
-        # one-hot top-k assignments summed per expert
-        one_hot = torch.zeros(N, self.n_experts, device=x.device)
-        one_hot.scatter_add_(1, top_idx, torch.ones_like(top_idx, dtype=one_hot.dtype))
-        f = one_hot.sum(0) / N       # fraction of tokens per expert
-        P = probs.mean(0)             # mean gate prob per expert
+        f = counts.float() / N                       # fraction of slots per expert
+        P = probs.mean(0)                             # mean gate prob per expert
         aux_loss = (f * P).sum() * self.n_experts
 
         return out.view(B, T, D), aux_loss
