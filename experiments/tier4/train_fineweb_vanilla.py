@@ -1790,6 +1790,7 @@ class DecoderHead(nn.Module):
         v_dot_q = torch.einsum('btsd,vd->btvs', v, q)               # (B, T, V, 16)
         return (attn * v_dot_q).sum(dim=-1)                          # (B, T, V)
 
+    @torch._dynamo.disable()
     def streamed_cross_entropy(
         self,
         x: torch.Tensor,
