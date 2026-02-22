@@ -103,6 +103,7 @@ class HParams:
     n_experts: int = _env_int("N_EXPERTS", 8)
     top_k: int = _env_int("TOP_K", 2)
     moe_aux_weight: float = _env_float("MOE_AUX_WEIGHT", 0.01)
+    moe_bypass: bool = _env_bool("MOE_BYPASS", False)  # add a null expert that skips MLP
 
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
@@ -820,11 +821,12 @@ class MoEMLP(nn.Module):
     only processes ~N*K/E tokens per expert.
     """
 
-    def __init__(self, d_model: int, n_experts: int, top_k: int):
+    def __init__(self, d_model: int, n_experts: int, top_k: int, bypass: bool = False):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
         self.d_model = d_model
+        self.bypass = bypass
         hidden = int(d_model * 8 / 3)
         hidden = ((hidden + 255) // 256) * 256
         self.hidden = hidden
@@ -833,7 +835,9 @@ class MoEMLP(nn.Module):
         self.gate_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
         self.up_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
         self.down_proj = nn.Parameter(torch.empty(n_experts, d_model, hidden))
-        self.router = nn.Linear(d_model, n_experts, bias=False)
+        # Router has E+1 outputs when bypass is on (last = null expert)
+        n_gate = n_experts + 1 if bypass else n_experts
+        self.router = nn.Linear(d_model, n_gate, bias=False)
 
         # Init like nn.Linear
         for p in [self.gate_proj, self.up_proj, self.down_proj]:
@@ -853,22 +857,32 @@ class MoEMLP(nn.Module):
         top_weights = torch.softmax(top_vals, dim=-1)  # (N, K)
 
         # Flatten to (N*K,) token-slot pairs
-        flat_expert = top_idx.view(-1)      # (N*K,)
+        flat_expert = top_idx.view(-1)      # (N*K,) values in [0, E) or [0, E] with bypass
         flat_weight = top_weights.view(-1)  # (N*K,)
         flat_token = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
 
+        # Bypass: slots routed to expert E are null — mask them out
+        if self.bypass:
+            is_real = (flat_expert < E).unsqueeze(-1)  # (N*K, 1)
+            flat_expert_real = flat_expert.clamp(max=E - 1)  # safe index for buffer math
+        else:
+            is_real = None
+            flat_expert_real = flat_expert
+
         # Compute position of each slot within its expert's group (vectorized)
-        one_hot = F.one_hot(flat_expert, E)  # (N*K, E)
-        cumpos = one_hot.cumsum(0)           # (N*K, E)
-        positions = torch.gather(cumpos, 1, flat_expert.unsqueeze(1)).squeeze(1) - 1  # (N*K,)
+        one_hot = F.one_hot(flat_expert_real, E)  # (N*K, E)
+        cumpos = one_hot.cumsum(0)                # (N*K, E)
+        positions = torch.gather(cumpos, 1, flat_expert_real.unsqueeze(1)).squeeze(1) - 1
 
         # Fixed capacity per expert — drop overflow
         capacity = (N * K + E - 1) // E
         valid = (positions < capacity).unsqueeze(-1)  # (N*K, 1)
+        if is_real is not None:
+            valid = valid & is_real
         positions = positions.clamp(max=capacity - 1)
 
         # Scatter inputs into (E, capacity, D) expert buffer
-        buffer_idx = (flat_expert * capacity + positions).unsqueeze(-1)  # (N*K, 1)
+        buffer_idx = (flat_expert_real * capacity + positions).unsqueeze(-1)  # (N*K, 1)
         expert_input = torch.zeros(E * capacity, D, device=x.device, dtype=x.dtype)
         expert_input.scatter_(0, buffer_idx.expand(-1, D), x_flat[flat_token])
         expert_input = expert_input.view(E, capacity, D)
@@ -884,12 +898,13 @@ class MoEMLP(nn.Module):
         out = torch.zeros_like(x_flat)
         out.scatter_add_(0, flat_token.unsqueeze(-1).expand(-1, D), weighted)
 
-        # Load-balancing auxiliary loss
-        probs = torch.softmax(gate_logits, dim=-1)  # (N, E)
-        tokens_per_expert = one_hot.float().sum(0)   # (E,)
-        f = tokens_per_expert / N
+        # Load-balancing auxiliary loss (over all gate outputs including bypass)
+        n_gate = E + 1 if self.bypass else E
+        probs = torch.softmax(gate_logits, dim=-1)              # (N, n_gate)
+        oh_all = F.one_hot(top_idx.view(-1), n_gate).float()    # (N*K, n_gate)
+        f = oh_all.sum(0) / N
         P = probs.mean(0)
-        aux_loss = (f * P).sum() * E
+        aux_loss = (f * P).sum() * n_gate
 
         return out.view(B, T, D), aux_loss
 
@@ -897,12 +912,12 @@ class MoEMLP(nn.Module):
 class TransformerMoEBlock(nn.Module):
     """Pre-norm block: SelfAttention + MoEMLP. Returns (x, aux_loss)."""
 
-    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int):
+    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int, bypass: bool = False):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = MoEMLP(d_model, n_experts, top_k)
+        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass)
 
     def forward(self, x: torch.Tensor):
         with torch.autograd.profiler.record_function("moe/block_attn"):
@@ -2292,7 +2307,7 @@ class GPTMoE(nn.Module):
         super().__init__()
         self.wte = _make_embed()
         self.blocks = nn.ModuleList([
-            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k)
+            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
@@ -2507,7 +2522,7 @@ def main():
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
-        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight}"
+        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight} bypass={HP.moe_bypass}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
