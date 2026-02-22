@@ -104,6 +104,7 @@ class HParams:
     top_k: int = _env_int("TOP_K", 2)
     moe_aux_weight: float = _env_float("MOE_AUX_WEIGHT", 0.01)
     moe_bypass: bool = _env_bool("MOE_BYPASS", False)  # add a null expert that skips MLP
+    moe_shared: float = _env_float("MOE_SHARED", 0.5)  # fraction of hidden dim shared across experts (0=none)
 
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
@@ -821,7 +822,8 @@ class MoEMLP(nn.Module):
     only processes ~N*K/E tokens per expert.
     """
 
-    def __init__(self, d_model: int, n_experts: int, top_k: int, bypass: bool = False):
+    def __init__(self, d_model: int, n_experts: int, top_k: int,
+                 bypass: bool = False, shared_frac: float = 0.0):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
@@ -831,16 +833,28 @@ class MoEMLP(nn.Module):
         hidden = ((hidden + 255) // 256) * 256
         self.hidden = hidden
 
-        # Fused expert weights: (n_experts, out, in) for each projection
-        self.gate_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
-        self.up_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
-        self.down_proj = nn.Parameter(torch.empty(n_experts, d_model, hidden))
+        # Split hidden dim into shared (same for all experts) + per-expert
+        self.shared_hidden = int(hidden * shared_frac)
+        self.expert_hidden = hidden - self.shared_hidden
+
+        # Shared weights (broadcast to all experts in forward)
+        if self.shared_hidden > 0:
+            self.gate_shared = nn.Parameter(torch.empty(self.shared_hidden, d_model))
+            self.up_shared = nn.Parameter(torch.empty(self.shared_hidden, d_model))
+            self.down_shared = nn.Parameter(torch.empty(d_model, self.shared_hidden))
+            for p in [self.gate_shared, self.up_shared, self.down_shared]:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+
+        # Per-expert weights
+        self.gate_expert = nn.Parameter(torch.empty(n_experts, self.expert_hidden, d_model))
+        self.up_expert = nn.Parameter(torch.empty(n_experts, self.expert_hidden, d_model))
+        self.down_expert = nn.Parameter(torch.empty(n_experts, d_model, self.expert_hidden))
+
         # Router has E+1 outputs when bypass is on (last = null expert)
         n_gate = n_experts + 1 if bypass else n_experts
         self.router = nn.Linear(d_model, n_gate, bias=False)
 
-        # Init like nn.Linear
-        for p in [self.gate_proj, self.up_proj, self.down_proj]:
+        for p in [self.gate_expert, self.up_expert, self.down_expert]:
             nn.init.normal_(p, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor):
@@ -887,10 +901,21 @@ class MoEMLP(nn.Module):
         expert_input.scatter_(0, buffer_idx.expand(-1, D), x_flat[flat_token])
         expert_input = expert_input.view(E, capacity, D)
 
+        # Build full weight tensors: cat shared (broadcast) + per-expert
+        if self.shared_hidden > 0:
+            sh = self.gate_shared.unsqueeze(0).expand(E, -1, -1)
+            gate_w = torch.cat([sh, self.gate_expert], dim=1)                        # (E, hidden, D)
+            sh = self.up_shared.unsqueeze(0).expand(E, -1, -1)
+            up_w = torch.cat([sh, self.up_expert], dim=1)                            # (E, hidden, D)
+            sh = self.down_shared.unsqueeze(0).expand(E, -1, -1)
+            down_w = torch.cat([sh, self.down_expert], dim=2)                        # (E, D, hidden)
+        else:
+            gate_w, up_w, down_w = self.gate_expert, self.up_expert, self.down_expert
+
         # Batched SwiGLU: bmm with batch=E
-        g = torch.bmm(expert_input, self.gate_proj.transpose(1, 2))  # (E, cap, hidden)
-        u = torch.bmm(expert_input, self.up_proj.transpose(1, 2))    # (E, cap, hidden)
-        expert_output = torch.bmm(F.silu(g) * u, self.down_proj.transpose(1, 2))  # (E, cap, D)
+        g = torch.bmm(expert_input, gate_w.transpose(1, 2))   # (E, cap, hidden)
+        u = torch.bmm(expert_input, up_w.transpose(1, 2))     # (E, cap, hidden)
+        expert_output = torch.bmm(F.silu(g) * u, down_w.transpose(1, 2))  # (E, cap, D)
 
         # Gather outputs and scatter back to tokens
         slot_output = expert_output.view(-1, D)[buffer_idx.squeeze(-1)]  # (N*K, D)
@@ -912,12 +937,13 @@ class MoEMLP(nn.Module):
 class TransformerMoEBlock(nn.Module):
     """Pre-norm block: SelfAttention + MoEMLP. Returns (x, aux_loss)."""
 
-    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int, bypass: bool = False):
+    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int,
+                 bypass: bool = False, shared_frac: float = 0.0):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass)
+        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass, shared_frac=shared_frac)
 
     def forward(self, x: torch.Tensor):
         with torch.autograd.profiler.record_function("moe/block_attn"):
@@ -2307,7 +2333,7 @@ class GPTMoE(nn.Module):
         super().__init__()
         self.wte = _make_embed()
         self.blocks = nn.ModuleList([
-            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass)
+            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass, shared_frac=HP.moe_shared)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
@@ -2522,7 +2548,7 @@ def main():
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
-        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight} bypass={HP.moe_bypass}"
+        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight} bypass={HP.moe_bypass} shared={HP.moe_shared}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
