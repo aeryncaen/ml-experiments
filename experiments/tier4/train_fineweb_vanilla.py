@@ -98,9 +98,11 @@ class HParams:
 
     # Decoder head (ML-Decoder style cross-attention over byte slots)
     decoder_head: bool = _env_bool("DECODER_HEAD", False)
-    lm_head_type: str = os.environ.get("LM_HEAD_TYPE", "")  # "" = backward-compatible (DECODER_HEAD), else linear|decoder|linear48
+    lm_head_type: str = os.environ.get("LM_HEAD_TYPE", "")  # "" = backward-compatible (DECODER_HEAD), else linear|decoder|linear48|pit
     decoder_head_vocab_chunk: int = _env_int("DECODER_HEAD_VOCAB_CHUNK", 0)  # 0 = full vocab per token chunk (matches linear-head chunking style)
     decoder_head_token_chunk: int = _env_int("DECODER_HEAD_TOKEN_CHUNK", 1024)
+    pit_orth_init: bool = _env_bool("PIT_ORTH_INIT", True)
+    pit_eps: float = _env_float("PIT_EPS", 1e-6)
 
 
     # Byte-attention MLP
@@ -1924,6 +1926,196 @@ class StructuredLinearHead(nn.Module):
         return base_logits + bank_logits
 
 
+class PITTokenInterface(nn.Module):
+    """Pseudo-Inverse Tying interface: E=Z T^{-1}, W_out=T Z^T."""
+
+    def __init__(self, vocab_size: int, d_model: int, eps: float = 1e-6, orth_init: bool = True):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.eps = eps
+
+        self.memory = nn.Parameter(torch.empty(vocab_size, d_model))         # Z
+        self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))          # unconstrained L
+
+        self.reset_parameters(orth_init=orth_init)
+
+    def reset_parameters(self, orth_init: bool = True):
+        with torch.no_grad():
+            if orth_init:
+                q, _ = torch.linalg.qr(torch.randn(self.vocab_size, self.d_model), mode="reduced")
+                self.memory.copy_(q)
+            else:
+                nn.init.normal_(self.memory, mean=0.0, std=0.02)
+
+            self.chol_raw.zero_()
+            # softplus^{-1}(1.0): initialize T near identity.
+            diag_init = math.log(math.expm1(1.0))
+            self.chol_raw.diagonal().fill_(diag_init)
+
+    def _chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        raw = torch.tril(self.chol_raw.to(device=device, dtype=dtype))
+        raw_diag = torch.diagonal(raw)
+        pos_diag = F.softplus(raw_diag) + self.eps
+        return raw - torch.diag_embed(raw_diag) + torch.diag_embed(pos_diag)
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # E = Z T^{-1}; do right-multiply by T^{-1} via stable Cholesky solves.
+        z = F.embedding(token_ids, self.memory)                                   # (..., d)
+        flat = z.reshape(-1, self.d_model)
+        L32 = self._chol_factor(torch.float32, z.device)
+        x_t = torch.cholesky_solve(flat.to(torch.float32).T, L32)                 # (d, N)
+        x = x_t.T.reshape_as(z)
+        return x.to(dtype=z.dtype)
+
+    def project(self, hidden: torch.Tensor) -> torch.Tensor:
+        # W_out = T Z^T, with T=LL^T.
+        B, T, D = hidden.shape
+        if D != self.d_model:
+            raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
+
+        L = self._chol_factor(hidden.dtype, hidden.device)
+        g = hidden.reshape(-1, D) @ L
+        g = g @ L.transpose(0, 1)
+        logits = F.linear(g, self.memory.to(dtype=g.dtype))
+        return logits.view(B, T, self.vocab_size)
+
+
+class PITEmbedding(nn.Module):
+    def __init__(self, interface: PITTokenInterface):
+        super().__init__()
+        self.interface = interface
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.interface.embed(token_ids)
+
+
+class PITHead(nn.Module):
+    def __init__(self, interface: PITTokenInterface):
+        super().__init__()
+        self.interface = interface
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.interface.project(hidden)
+
+
+class CompositePITTokenInterface(nn.Module):
+    """Composite PIT: enforce PIT on byte-shared subspace, keep token subspace learned."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        max_bytes: int = 16,
+        token_per_byte: int = 8,
+        eps: float = 1e-6,
+        orth_init: bool = True,
+    ):
+        super().__init__()
+        assert d_model % max_bytes == 0
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_bytes = max_bytes
+        self.dims_per_slot = d_model // max_bytes
+        self.token_per_byte = token_per_byte
+        self.shared_per_byte = self.dims_per_slot - token_per_byte
+        if self.shared_per_byte <= 0:
+            raise ValueError(
+                f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({token_per_byte})"
+            )
+        self.eps = eps
+
+        self.byte_memory = nn.Parameter(torch.empty(257, self.shared_per_byte))
+        self.token_embed = nn.Embedding(vocab_size, max_bytes * token_per_byte)
+        self.byte_chol_raw = nn.Parameter(torch.zeros(self.shared_per_byte, self.shared_per_byte))
+        self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
+
+        self.pad_idx = 256
+        self.register_buffer(
+            'token_bytes',
+            _build_token_byte_table(vocab_size, max_bytes, self.pad_idx),
+            persistent=False,
+        )
+
+        self.reset_parameters(orth_init=orth_init)
+
+    def reset_parameters(self, orth_init: bool = True):
+        with torch.no_grad():
+            if orth_init:
+                q, _ = torch.linalg.qr(torch.randn(257, self.shared_per_byte), mode="reduced")
+                self.byte_memory.copy_(q)
+            else:
+                nn.init.normal_(self.byte_memory, mean=0.0, std=0.02)
+
+            nn.init.normal_(self.token_embed.weight, mean=0.0, std=0.02)
+            self.byte_chol_raw.zero_()
+            diag_init = math.log(math.expm1(1.0))
+            self.byte_chol_raw.diagonal().fill_(diag_init)
+
+    def _byte_chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        raw = torch.tril(self.byte_chol_raw.to(device=device, dtype=dtype))
+        raw_diag = torch.diagonal(raw)
+        pos_diag = F.softplus(raw_diag) + self.eps
+        return raw - torch.diag_embed(raw_diag) + torch.diag_embed(pos_diag)
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        byte_ids = self.token_bytes[token_ids]                                       # (..., 16)
+        z_shared = F.embedding(byte_ids, self.byte_memory)                           # (..., 16, shared)
+        flat = z_shared.reshape(-1, self.shared_per_byte)
+        L32 = self._byte_chol_factor(torch.float32, z_shared.device)
+        x_t = torch.cholesky_solve(flat.to(torch.float32).T, L32)
+        x_shared = x_t.T.reshape_as(z_shared).to(dtype=z_shared.dtype)
+
+        tok = self.token_embed(token_ids)
+        tok = tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)        # (..., 16, token)
+
+        out = torch.cat([x_shared, tok], dim=-1)
+        return out.reshape(*token_ids.shape, self.d_model)
+
+    def project(self, hidden: torch.Tensor) -> torch.Tensor:
+        B, T, D = hidden.shape
+        if D != self.d_model:
+            raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
+
+        slots = hidden.view(B, T, self.max_bytes, self.dims_per_slot)
+        h_shared = slots[..., :self.shared_per_byte]
+        h_tok = slots[..., self.shared_per_byte:]
+
+        L = self._byte_chol_factor(hidden.dtype, hidden.device)
+        g_shared = torch.matmul(h_shared, L)
+        g_shared = torch.matmul(g_shared, L.transpose(0, 1))                         # (B, T, 16, shared)
+
+        token_shared = F.embedding(self.token_bytes, self.byte_memory)               # (V, 16, shared)
+        token_shared = token_shared.to(dtype=g_shared.dtype)
+        logits_shared = torch.einsum('btsd,vsd->btv', g_shared, token_shared)
+
+        h_tok_flat = h_tok.reshape(B, T, self.max_bytes * self.token_per_byte)
+        logits_token = F.linear(
+            h_tok_flat,
+            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
+            self.token_out_bias,
+        )
+        return logits_shared + logits_token
+
+
+class CompositePITEmbedding(nn.Module):
+    def __init__(self, interface: CompositePITTokenInterface):
+        super().__init__()
+        self.interface = interface
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.interface.embed(token_ids)
+
+
+class CompositePITHead(nn.Module):
+    def __init__(self, interface: CompositePITTokenInterface):
+        super().__init__()
+        self.interface = interface
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.interface.project(hidden)
+
+
 def _resolved_head_type() -> str:
     head_type = HP.lm_head_type.strip().lower()
     if not head_type:
@@ -1951,14 +2143,43 @@ def _make_head():
         return DecoderHead(HP.vocab_size, HP.d_model)
     if head_type == "linear48":
         return StructuredLinearHead(HP.vocab_size, HP.d_model)
+    if head_type == "pit":
+        raise ValueError("LM_HEAD_TYPE=pit requires paired embed/head construction")
     if head_type == "linear":
         return nn.Linear(HP.d_model, HP.vocab_size, bias=False)
     raise ValueError(f"Unknown LM_HEAD_TYPE={head_type}")
 
 
+def _make_embed_head_pair():
+    """Create embedding + head pair, including coupled PIT interface."""
+    head_type = _resolved_head_type()
+    if head_type == "pit":
+        if HP.composite_embed:
+            if HP.composite_lora or HP.composite_conv:
+                raise ValueError("LM_HEAD_TYPE=pit with COMPOSITE_EMBED does not support COMPOSITE_LORA/COMPOSITE_CONV")
+            interface = CompositePITTokenInterface(
+                HP.vocab_size,
+                HP.d_model,
+                max_bytes=16,
+                token_per_byte=HP.composite_token_dims,
+                eps=HP.pit_eps,
+                orth_init=HP.pit_orth_init,
+            )
+            return CompositePITEmbedding(interface), CompositePITHead(interface)
+
+        interface = PITTokenInterface(
+            HP.vocab_size,
+            HP.d_model,
+            eps=HP.pit_eps,
+            orth_init=HP.pit_orth_init,
+        )
+        return PITEmbedding(interface), PITHead(interface)
+    return _make_embed(), _make_head()
+
+
 def _tie_weights(model: nn.Module):
     """Post-init fixups: zero-init LoRA adapter if composite embedding is active."""
-    if HP.composite_embed and HP.composite_lora:
+    if HP.composite_embed and HP.composite_lora and hasattr(model.wte, "token_up"):
         nn.init.zeros_(model.wte.token_up.weight)
 
 
@@ -2040,10 +2261,9 @@ class TransformerByteAttnBlock(nn.Module):
 class GPTTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.wte = _make_embed()
+        self.wte, self.lm_head = _make_embed_head_pair()
         self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
-        self.lm_head = _make_head()
         self.apply(_init_weights)
         _tie_weights(self)
 
@@ -2544,13 +2764,12 @@ class GPTMoE(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.wte = _make_embed()
+        self.wte, self.lm_head = _make_embed_head_pair()
         self.blocks = nn.ModuleList([
             TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass, shared_frac=HP.moe_shared, bias_lr=HP.moe_bias_lr)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
-        self.lm_head = _make_head()
         self.apply(_init_weights)
         _tie_weights(self)
 
@@ -2766,12 +2985,13 @@ def main():
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
+    _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
     _eff_bs = HP.batch_size * HP.grad_accum
     _tok_per_step = _eff_bs * HP.seq_len
-    print0(rank, f"model_type={HP.model_type} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
+    print0(rank, f"model_type={HP.model_type} lm_head={_head} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
     print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,}")
     if HP.llada:
         _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
