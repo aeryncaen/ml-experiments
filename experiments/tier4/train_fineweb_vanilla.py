@@ -1638,6 +1638,7 @@ class ByteAttentionMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         h = self.up_proj(x)                                                         # (B, T, hidden)
+        h = F.silu(h)                                                               # pre-attention activation
         h = h.view(B * T, self.max_bytes, self.desc_dim)                            # (B*T, 16, desc_dim)
 
         q = self.q_proj(h).view(B * T, self.max_bytes, self.n_byte_heads, self.byte_head_dim)
@@ -1654,7 +1655,7 @@ class ByteAttentionMLP(nn.Module):
         out = out.transpose(1, 2).contiguous()                                      # (B*T, 16, n_heads, hd)
 
         out = out.reshape(B, T, self.hidden)
-        out = F.silu(out)
+        out = F.silu(out)                                                           # post-attention activation
         return self.down_proj(out)
 
 
