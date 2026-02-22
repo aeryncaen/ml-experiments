@@ -2914,9 +2914,25 @@ def build_model() -> nn.Module:
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
+def _llada_apply_head_override(backbone: nn.Module) -> nn.Module:
+    """For LLaDA, allow any backbone to use the configured LM head type."""
+    if HP.model_type in ("transformer", "moe"):
+        # These already route through _make_embed_head_pair().
+        return backbone
+
+    wte, lm_head = _make_embed_head_pair()
+    wte.apply(_init_weights)
+    lm_head.apply(_init_weights)
+    backbone.wte = wte
+    backbone.lm_head = lm_head
+    _tie_weights(backbone)
+    return backbone
+
+
 def build_model_maybe_llada() -> nn.Module:
     backbone = build_model()
     if HP.llada:
+        backbone = _llada_apply_head_override(backbone)
         return LLaDAWrapper(backbone)
     return backbone
 
