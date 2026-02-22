@@ -96,6 +96,10 @@ class HParams:
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
     composite_conv: bool = _env_bool("COMPOSITE_CONV", False)
 
+    # Decoder head (ML-Decoder style cross-attention over byte slots)
+    decoder_head: bool = _env_bool("DECODER_HEAD", False)
+    decoder_head_chunk: int = _env_int("DECODER_HEAD_CHUNK", 256)
+
     # Byte-attention MLP
     ba_n_byte_heads: int = _env_int("BA_N_BYTE_HEADS", 4)
 
@@ -1749,6 +1753,50 @@ class CompositeEmbedding(nn.Module):
         return base
 
 
+class DecoderHead(nn.Module):
+    """ML-Decoder style cross-attention head over byte-slot features.
+
+    Reshapes hidden (B, T, d_model) → (B, T, 16, dps) byte slots, then uses
+    per-vocab-token queries to cross-attend over the 16 positions.
+    Logits produced via dot-product readout: (context * query).sum(-1).
+    Chunked over vocab to keep memory bounded.
+    """
+    def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16,
+                 chunk_size: int = 256):
+        super().__init__()
+        assert d_model % max_bytes == 0
+        self.dps = d_model // max_bytes
+        self.max_bytes = max_bytes
+        self.chunk_size = chunk_size
+        self.vocab_size = vocab_size
+
+        self.queries = nn.Embedding(vocab_size, self.dps)
+        self.k_proj = nn.Linear(self.dps, self.dps, bias=False)
+        self.v_proj = nn.Linear(self.dps, self.dps, bias=False)
+        self.scale = self.dps ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        slots = x.view(B, T, self.max_bytes, self.dps)         # (B, T, 16, dps)
+        k = self.k_proj(slots)                                  # (B, T, 16, dps)
+        v = self.v_proj(slots)                                  # (B, T, 16, dps)
+
+        all_q = self.queries.weight                             # (V, dps)
+        logits_chunks = []
+        for i in range(0, self.vocab_size, self.chunk_size):
+            q_chunk = all_q[i : i + self.chunk_size]            # (C, dps)
+            # scores: (B, T, C, 16)
+            scores = torch.einsum('btsd,cd->btcs', k, q_chunk) * self.scale
+            attn = scores.softmax(dim=-1)                       # (B, T, C, 16)
+            # context: (B, T, C, dps)
+            context = torch.einsum('btcs,btsd->btcd', attn, v)
+            # dot-product readout: (B, T, C)
+            chunk_logits = (context * q_chunk).sum(dim=-1)
+            logits_chunks.append(chunk_logits)
+
+        return torch.cat(logits_chunks, dim=2)                  # (B, T, V)
+
+
 def _make_embed():
     """Create token embedding — standard or composite (byte-factored)."""
     if HP.composite_embed:
@@ -1760,6 +1808,13 @@ def _make_embed():
             use_conv=HP.composite_conv,
         )
     return nn.Embedding(HP.vocab_size, HP.d_model)
+
+
+def _make_head():
+    """Create LM head — standard linear or DecoderHead (cross-attention over byte slots)."""
+    if HP.decoder_head:
+        return DecoderHead(HP.vocab_size, HP.d_model, chunk_size=HP.decoder_head_chunk)
+    return nn.Linear(HP.d_model, HP.vocab_size, bias=False)
 
 
 def _tie_weights(model: nn.Module):
@@ -1849,7 +1904,7 @@ class GPTTransformer(nn.Module):
         self.wte = _make_embed()
         self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
         self.ln_f = RMSNorm(HP.d_model)
-        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head = _make_head()
         self.apply(_init_weights)
         _tie_weights(self)
 
@@ -2347,7 +2402,7 @@ class GPTMoE(nn.Module):
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
-        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+        self.lm_head = _make_head()
         self.apply(_init_weights)
         _tie_weights(self)
 
