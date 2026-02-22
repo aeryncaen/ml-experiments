@@ -1561,9 +1561,9 @@ class CompositeEmbedding(nn.Module):
             self.token_up = nn.Linear(lora_rank, model_dim, bias=False)
 
         if use_conv:
-            # Cross-byte conv: kernel=3, depthwise over byte positions, padded to preserve length
+            # Cross-byte conv: kernel=3 over byte positions, mixes features across adjacent bytes
             self.byte_conv = nn.Conv1d(self.dims_per_slot, self.dims_per_slot, kernel_size=3,
-                                       padding=1, groups=self.dims_per_slot, bias=False)
+                                       padding=1, bias=False)
 
         self.register_buffer(
             'token_bytes',
