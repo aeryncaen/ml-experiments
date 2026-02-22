@@ -1587,12 +1587,9 @@ def _make_embed():
 
 
 def _tie_weights(model: nn.Module):
-    """Tie lm_head to wte (standard) or skip + fix adapter init (composite)."""
-    if HP.composite_embed:
-        if HP.composite_lora:
-            nn.init.zeros_(model.wte.token_up.weight)
-    else:
-        model.lm_head.weight = model.wte.weight
+    """Post-init fixups: zero-init LoRA adapter if composite embedding is active."""
+    if HP.composite_embed and HP.composite_lora:
+        nn.init.zeros_(model.wte.token_up.weight)
 
 
 # ── Byte-attention MLP ───────────────────────────────────────────────────────
