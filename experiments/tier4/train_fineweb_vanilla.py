@@ -95,6 +95,7 @@ class HParams:
     composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
     composite_conv: bool = _env_bool("COMPOSITE_CONV", False)
+    composite_token_suffix: bool = _env_bool("COMPOSITE_TOKEN_SUFFIX", False)  # group all token dims at end instead of interleaved
 
     # Byte-attention MLP
     ba_n_byte_heads: int = _env_int("BA_N_BYTE_HEADS", 4)
@@ -1611,13 +1612,14 @@ class CompositeEmbedding(nn.Module):
     """
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
                  token_per_byte: int = 8, use_lora: bool = False, lora_rank: int = 16,
-                 use_conv: bool = False):
+                 use_conv: bool = False, token_suffix: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.max_bytes = max_bytes
         self.use_lora = use_lora
         self.use_conv = use_conv
+        self.token_suffix = token_suffix
         self.pad_idx = 256
 
         assert model_dim % max_bytes == 0
@@ -1650,6 +1652,15 @@ class CompositeEmbedding(nn.Module):
         shared = self.byte_embed(byte_seqs)                                            # (..., 16, shared)
         per_tok = self.token_embed(token_ids)                                          # (..., 16*tpb)
         per_tok = per_tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)  # (..., 16, tpb)
+        if self.token_suffix:
+            # [shared_0..shared_15, tok_0..tok_15]
+            shared = shared.reshape(*token_ids.shape, -1)                                # (..., 16*shared)
+            per_tok = per_tok.reshape(*token_ids.shape, -1)                              # (..., 16*tpb)
+            base = torch.cat([shared, per_tok], dim=-1)                                  # (..., model_dim)
+            if self.use_lora:
+                adapter = self.token_up(self.token_down(token_ids))
+                base = base + adapter
+            return base
         base = torch.cat([shared, per_tok], dim=-1)                                    # (..., 16, dps)
         if self.use_conv:
             # Conv over byte positions: (..., 16, dps) -> transpose -> conv1d -> transpose
@@ -1676,6 +1687,7 @@ def _make_embed():
             use_lora=HP.composite_lora,
             lora_rank=HP.composite_lora_rank,
             use_conv=HP.composite_conv,
+            token_suffix=HP.composite_token_suffix,
         )
     return nn.Embedding(HP.vocab_size, HP.d_model)
 
