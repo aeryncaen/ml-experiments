@@ -1529,11 +1529,10 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 class CompositeEmbedding(nn.Module):
     """Factored embedding: shared byte params + per-token params + optional LoRA adapter.
 
-    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
-    16 slots * 48 = 768 = model_dim
+    Per byte slot: shared dims (from byte value) + per-token dims, derived from model_dim.
+    token_per_byte defaults to 8; shared_per_byte = dims_per_slot - token_per_byte.
     LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
     """
-    SHARED_PER_BYTE = 40
     TOKEN_PER_BYTE = 8
 
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
@@ -1545,16 +1544,19 @@ class CompositeEmbedding(nn.Module):
         self.use_lora = use_lora
         self.pad_idx = 256
 
-        self.dims_per_slot = model_dim // max_bytes
         assert model_dim % max_bytes == 0
-        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
+        self.dims_per_slot = model_dim // max_bytes
+        self.token_per_byte = self.TOKEN_PER_BYTE
+        self.shared_per_byte = self.dims_per_slot - self.token_per_byte
+        assert self.shared_per_byte > 0, (
+            f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({self.token_per_byte})")
 
-        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)                    # 257 x 40
-        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # V x 128
+        self.byte_embed = nn.Embedding(257, self.shared_per_byte)
+        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.token_per_byte)
 
         if use_lora:
-            self.token_down = nn.Embedding(vocab_size, lora_rank)                    # V x rank
-            self.token_up = nn.Linear(lora_rank, model_dim, bias=False)              # rank x model_dim
+            self.token_down = nn.Embedding(vocab_size, lora_rank)
+            self.token_up = nn.Linear(lora_rank, model_dim, bias=False)
 
         self.register_buffer(
             'token_bytes',
@@ -1563,14 +1565,14 @@ class CompositeEmbedding(nn.Module):
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        byte_seqs = self.token_bytes[token_ids]                                     # (..., 16)
-        shared = self.byte_embed(byte_seqs)                                         # (..., 16, 40)
-        per_tok = self.token_embed(token_ids)                                       # (..., 128)
-        per_tok = per_tok.view(*token_ids.shape, self.max_bytes, self.TOKEN_PER_BYTE)  # (..., 16, 8)
-        base = torch.cat([shared, per_tok], dim=-1)                                 # (..., 16, 48)
-        base = base.reshape(*token_ids.shape, self.model_dim)                       # (..., model_dim)
+        byte_seqs = self.token_bytes[token_ids]                                        # (..., 16)
+        shared = self.byte_embed(byte_seqs)                                            # (..., 16, shared)
+        per_tok = self.token_embed(token_ids)                                          # (..., 16*tpb)
+        per_tok = per_tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)  # (..., 16, tpb)
+        base = torch.cat([shared, per_tok], dim=-1)                                    # (..., 16, dps)
+        base = base.reshape(*token_ids.shape, self.model_dim)                          # (..., model_dim)
         if self.use_lora:
-            adapter = self.token_up(self.token_down(token_ids))                     # (..., model_dim)
+            adapter = self.token_up(self.token_down(token_ids))
             base = base + adapter
         return base
 
