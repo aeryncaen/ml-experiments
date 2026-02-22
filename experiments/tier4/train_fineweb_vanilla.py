@@ -1901,6 +1901,8 @@ class StructuredLinearHead(nn.Module):
         self.k_proj = nn.Linear(self.dps, self.dps, bias=False)
         self.v_proj = nn.Linear(self.dps, self.dps, bias=False)
         self.scale = self.dps ** -0.5
+        # Base readout from pooled slot state.
+        self.proj = nn.Linear(self.dps, vocab_size, bias=False)
         # Explicit vocab query bank (one learned 48-d query per token id).
         self.query_bank = nn.Embedding(vocab_size, self.dps)
         self.out_bias = nn.Parameter(torch.zeros(vocab_size))
@@ -1917,7 +1919,9 @@ class StructuredLinearHead(nn.Module):
         scores = torch.einsum('btqd,btsd->btqs', q, k) * self.scale      # (B, T, 1, 16)
         attn = scores.softmax(dim=-1)
         pooled = torch.einsum('btqs,btsd->btqd', attn, v).squeeze(2)      # (B, T, dps)
-        return F.linear(pooled, self.query_bank.weight, self.out_bias)
+        base_logits = self.proj(pooled)
+        bank_logits = F.linear(q.squeeze(2), self.query_bank.weight, self.out_bias)
+        return base_logits + bank_logits
 
 
 def _resolved_head_type() -> str:
