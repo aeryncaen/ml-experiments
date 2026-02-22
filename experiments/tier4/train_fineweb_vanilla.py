@@ -98,7 +98,7 @@ class HParams:
 
     # Decoder head (ML-Decoder style cross-attention over byte slots)
     decoder_head: bool = _env_bool("DECODER_HEAD", False)
-    decoder_head_chunk: int = _env_int("DECODER_HEAD_CHUNK", 256)
+
 
     # Byte-attention MLP
     ba_n_byte_heads: int = _env_int("BA_N_BYTE_HEADS", 4)
@@ -1761,14 +1761,11 @@ class DecoderHead(nn.Module):
     Logits produced via dot-product readout: (context * query).sum(-1).
     Chunked over vocab to keep memory bounded.
     """
-    def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16,
-                 chunk_size: int = 256):
+    def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16):
         super().__init__()
         assert d_model % max_bytes == 0
         self.dps = d_model // max_bytes
         self.max_bytes = max_bytes
-        self.chunk_size = chunk_size
-        self.vocab_size = vocab_size
 
         self.queries = nn.Embedding(vocab_size, self.dps)
         self.k_proj = nn.Linear(self.dps, self.dps, bias=False)
@@ -1777,24 +1774,18 @@ class DecoderHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        slots = x.view(B, T, self.max_bytes, self.dps)         # (B, T, 16, dps)
-        k = self.k_proj(slots)                                  # (B, T, 16, dps)
-        v = self.v_proj(slots)                                  # (B, T, 16, dps)
+        slots = x.view(B, T, self.max_bytes, self.dps)              # (B, T, 16, dps)
+        k = self.k_proj(slots)                                       # (B, T, 16, dps)
+        v = self.v_proj(slots)                                       # (B, T, 16, dps)
+        q = self.queries.weight                                      # (V, dps)
 
-        all_q = self.queries.weight                             # (V, dps)
-        logits_chunks = []
-        for i in range(0, self.vocab_size, self.chunk_size):
-            q_chunk = all_q[i : i + self.chunk_size]            # (C, dps)
-            # scores: (B, T, C, 16)
-            scores = torch.einsum('btsd,cd->btcs', k, q_chunk) * self.scale
-            attn = scores.softmax(dim=-1)                       # (B, T, C, 16)
-            # context: (B, T, C, dps)
-            context = torch.einsum('btcs,btsd->btcd', attn, v)
-            # dot-product readout: (B, T, C)
-            chunk_logits = (context * q_chunk).sum(dim=-1)
-            logits_chunks.append(chunk_logits)
+        # Cross-attention: each vocab query attends over 16 byte positions
+        scores = torch.einsum('btsd,vd->btvs', k, q) * self.scale   # (B, T, V, 16)
+        attn = scores.softmax(dim=-1)                                # (B, T, V, 16)
 
-        return torch.cat(logits_chunks, dim=2)                  # (B, T, V)
+        # Fused readout: dot(attn-weighted v, q) without materializing (B,T,V,dps)
+        v_dot_q = torch.einsum('btsd,vd->btvs', v, q)               # (B, T, V, 16)
+        return (attn * v_dot_q).sum(dim=-1)                          # (B, T, V)
 
 
 def _make_embed():
@@ -1813,7 +1804,7 @@ def _make_embed():
 def _make_head():
     """Create LM head — standard linear or DecoderHead (cross-attention over byte slots)."""
     if HP.decoder_head:
-        return DecoderHead(HP.vocab_size, HP.d_model, chunk_size=HP.decoder_head_chunk)
+        return DecoderHead(HP.vocab_size, HP.d_model)
     return nn.Linear(HP.d_model, HP.vocab_size, bias=False)
 
 
