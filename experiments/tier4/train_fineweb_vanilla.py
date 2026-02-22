@@ -102,7 +102,7 @@ class HParams:
     # MoE (Mixture of Experts)
     n_experts: int = _env_int("N_EXPERTS", 8)
     top_k: int = _env_int("TOP_K", 2)
-    moe_aux_weight: float = _env_float("MOE_AUX_WEIGHT", 0.01)
+
     moe_bypass: bool = _env_bool("MOE_BYPASS", False)  # add a null expert that skips MLP
     moe_shared: float = _env_float("MOE_SHARED", 0.5)  # fraction of hidden dim shared across experts (0=none)
 
@@ -923,15 +923,7 @@ class MoEMLP(nn.Module):
         out = torch.zeros_like(x_flat)
         out.scatter_add_(0, flat_token.unsqueeze(-1).expand(-1, D), weighted)
 
-        # Load-balancing auxiliary loss (over all gate outputs including bypass)
-        n_gate = E + K if self.bypass else E
-        probs = torch.softmax(gate_logits, dim=-1)              # (N, n_gate)
-        oh_all = F.one_hot(top_idx.view(-1), n_gate).float()    # (N*K, n_gate)
-        f = oh_all.sum(0) / N
-        P = probs.mean(0)
-        aux_loss = (f * P).sum() * n_gate
-
-        return out.view(B, T, D), aux_loss
+        return out.view(B, T, D), torch.tensor(0.0, device=x.device)
 
 
 class TransformerMoEBlock(nn.Module):
@@ -2343,21 +2335,16 @@ class GPTMoE(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
-        total_aux_loss = 0.0
         for block in self.blocks:
             if HP.grad_ckpt and x.requires_grad:
-                x, aux = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                x, _ = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
-                x, aux = block(x)
-            total_aux_loss = total_aux_loss + aux
+                x, _ = block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            ce_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            loss = ce_loss + HP.moe_aux_weight * total_aux_loss
-        # Store for logging (not part of graph — detach)
-        self._last_aux_loss = total_aux_loss.detach() if torch.is_tensor(total_aux_loss) else total_aux_loss
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
 
@@ -2548,7 +2535,7 @@ def main():
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
-        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight} bypass={HP.moe_bypass} shared={HP.moe_shared}"
+        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
@@ -2643,15 +2630,7 @@ def main():
             if world_size > 1:
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
-            _aux_str = ""
-            if HP.model_type == "moe":
-                _raw = model.module if world_size > 1 else model
-                # unwrap compiled model
-                _raw = getattr(_raw, "_orig_mod", _raw)
-                _aux_val = getattr(_raw, "_last_aux_loss", 0.0)
-                _aux_val = float(_aux_val) if torch.is_tensor(_aux_val) else float(_aux_val)
-                _aux_str = f" | aux_loss {_aux_val:.5f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_aux_str} | lr {lr:.3e} | sec/step {dt:.3f}")
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f} | lr {lr:.3e} | sec/step {dt:.3f}")
 
         if profiler is not None:
             profiler.step()
