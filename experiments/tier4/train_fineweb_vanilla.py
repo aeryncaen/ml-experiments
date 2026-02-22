@@ -102,6 +102,7 @@ class HParams:
     # MoE (Mixture of Experts)
     n_experts: int = _env_int("N_EXPERTS", 8)
     top_k: int = _env_int("TOP_K", 2)
+    moe_bias_lr: float = _env_float("MOE_BIAS_LR", 0.001)  # loss-free balancing bias update rate
 
     moe_bypass: bool = _env_bool("MOE_BYPASS", False)  # add a null expert that skips MLP
     moe_shared: float = _env_float("MOE_SHARED", 0.5)  # fraction of hidden dim shared across experts (0=none)
@@ -823,12 +824,14 @@ class MoEMLP(nn.Module):
     """
 
     def __init__(self, d_model: int, n_experts: int, top_k: int,
-                 bypass: bool = False, shared_frac: float = 0.0):
+                 bypass: bool = False, shared_frac: float = 0.0,
+                 bias_lr: float = 0.001):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
         self.d_model = d_model
         self.bypass = bypass
+        self.bias_lr = bias_lr
         hidden = int(d_model * 8 / 3)
         hidden = ((hidden + 255) // 256) * 256
         self.hidden = hidden
@@ -854,6 +857,9 @@ class MoEMLP(nn.Module):
         n_gate = n_experts + top_k if bypass else n_experts
         self.router = nn.Linear(d_model, n_gate, bias=False)
 
+        # Loss-free balancing: gradient-isolated per-expert bias
+        self.register_buffer('expert_bias', torch.zeros(n_gate))
+
         for p in [self.gate_expert, self.up_expert, self.down_expert]:
             nn.init.normal_(p, mean=0.0, std=0.02)
 
@@ -865,10 +871,22 @@ class MoEMLP(nn.Module):
         E = self.n_experts
         K = self.top_k
 
-        # Routing
-        gate_logits = self.router(x_flat)  # (N, E)
-        top_vals, top_idx = torch.topk(gate_logits, K, dim=-1)  # (N, K)
-        top_weights = torch.softmax(top_vals, dim=-1)  # (N, K)
+        # Routing: biased logits for selection, unbiased for weights
+        gate_logits = self.router(x_flat)  # (N, n_gate)
+        biased_logits = gate_logits + self.expert_bias  # gradient-isolated bias
+        _, top_idx = torch.topk(biased_logits, K, dim=-1)  # (N, K) — selection from biased
+        top_vals = torch.gather(gate_logits, 1, top_idx)   # (N, K) — weights from unbiased
+        top_weights = torch.softmax(top_vals, dim=-1)       # (N, K)
+
+        # Update bias (loss-free balancing, no grad)
+        if self.training:
+            with torch.no_grad():
+                n_gate = gate_logits.shape[1]
+                counts = torch.zeros(n_gate, device=x.device)
+                counts.scatter_add_(0, top_idx.view(-1),
+                                    torch.ones(N * K, device=x.device))
+                target = N * K / n_gate
+                self.expert_bias += self.bias_lr * torch.sign(target - counts)
 
         # Flatten to (N*K,) token-slot pairs
         flat_expert = top_idx.view(-1)      # (N*K,) values in [0, E) or [0, E] with bypass
@@ -930,12 +948,12 @@ class TransformerMoEBlock(nn.Module):
     """Pre-norm block: SelfAttention + MoEMLP. Returns (x, aux_loss)."""
 
     def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int,
-                 bypass: bool = False, shared_frac: float = 0.0):
+                 bypass: bool = False, shared_frac: float = 0.0, bias_lr: float = 0.001):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass, shared_frac=shared_frac)
+        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass, shared_frac=shared_frac, bias_lr=bias_lr)
 
     def forward(self, x: torch.Tensor):
         with torch.autograd.profiler.record_function("moe/block_attn"):
@@ -2325,7 +2343,7 @@ class GPTMoE(nn.Module):
         super().__init__()
         self.wte = _make_embed()
         self.blocks = nn.ModuleList([
-            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass, shared_frac=HP.moe_shared)
+            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k, bypass=HP.moe_bypass, shared_frac=HP.moe_shared, bias_lr=HP.moe_bias_lr)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = RMSNorm(HP.d_model)
@@ -2535,7 +2553,7 @@ def main():
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
-        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared}"
+        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
