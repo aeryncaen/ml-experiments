@@ -1811,9 +1811,32 @@ class DecoderHead(nn.Module):
         v = self.v_proj(slots).reshape(B * T, self.max_bytes, self.dps)
         t_flat = targets.reshape(B * T)
         q_all = self.queries.weight                                  # (V, dps)
+        q_all_t = q_all.t().contiguous()                             # (dps, V)
+
+        if token_chunk_size <= 0:
+            token_chunk_size = 1024
+        if vocab_chunk_size <= 0:
+            vocab_chunk_size = self.vocab_size
 
         total_tokens = B * T
         loss_sum = x.new_zeros((), dtype=torch.float32)
+
+        # Fast path: one vocab block per token chunk (matches linear-head style)
+        if vocab_chunk_size >= self.vocab_size:
+            for tok_start in range(0, total_tokens, token_chunk_size):
+                tok_end = min(tok_start + token_chunk_size, total_tokens)
+                k_tok = k[tok_start:tok_end]                             # (N, 16, dps)
+                v_tok = v[tok_start:tok_end]                             # (N, 16, dps)
+                t_tok = t_flat[tok_start:tok_end]                        # (N,)
+
+                # Keep layout (N, 16, V): softmax over byte-slot axis (16)
+                scores = torch.matmul(k_tok, q_all_t) * self.scale       # (N, 16, V)
+                attn = scores.softmax(dim=1)
+                v_dot_q = torch.matmul(v_tok, q_all_t)                   # (N, 16, V)
+                logits = (attn * v_dot_q).sum(dim=1)                     # (N, V)
+                loss_sum = loss_sum + F.cross_entropy(logits, t_tok, reduction="sum").float()
+
+            return loss_sum / total_tokens
 
         for tok_start in range(0, total_tokens, token_chunk_size):
             tok_end = min(tok_start + token_chunk_size, total_tokens)
@@ -1828,12 +1851,13 @@ class DecoderHead(nn.Module):
 
             for v_start in range(0, self.vocab_size, vocab_chunk_size):
                 v_end = min(v_start + vocab_chunk_size, self.vocab_size)
-                q_chunk = q_all[v_start:v_end]                       # (C, dps)
+                q_chunk_t = q_all_t[:, v_start:v_end]                # (dps, C)
 
-                scores = torch.einsum('nsd,cd->ncs', k_tok, q_chunk) * self.scale
-                attn = scores.softmax(dim=-1)
-                v_dot_q = torch.einsum('nsd,cd->ncs', v_tok, q_chunk)
-                logits_chunk = (attn * v_dot_q).sum(dim=-1).float()  # (N, C)
+                # Compute in (N, 16, C) layout; softmax over slot axis.
+                scores = torch.matmul(k_tok, q_chunk_t) * self.scale
+                attn = scores.softmax(dim=1)
+                v_dot_q = torch.matmul(v_tok, q_chunk_t)
+                logits_chunk = (attn * v_dot_q).sum(dim=1).float()   # (N, C)
 
                 chunk_max = logits_chunk.max(dim=1).values
                 new_max = torch.maximum(max_logit, chunk_max)
