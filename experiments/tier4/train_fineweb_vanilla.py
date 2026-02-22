@@ -98,6 +98,7 @@ class HParams:
 
     # Decoder head (ML-Decoder style cross-attention over byte slots)
     decoder_head: bool = _env_bool("DECODER_HEAD", False)
+    lm_head_type: str = os.environ.get("LM_HEAD_TYPE", "")  # "" = backward-compatible (DECODER_HEAD), else linear|decoder|linear48
     decoder_head_vocab_chunk: int = _env_int("DECODER_HEAD_VOCAB_CHUNK", 0)  # 0 = full vocab per token chunk (matches linear-head chunking style)
     decoder_head_token_chunk: int = _env_int("DECODER_HEAD_TOKEN_CHUNK", 1024)
 
@@ -1821,21 +1822,30 @@ class DecoderHead(nn.Module):
 
         total_tokens = B * T
         loss_sum = x.new_zeros((), dtype=torch.float32)
+        use_ckpt = self.training and x.requires_grad
 
         # Fast path: one vocab block per token chunk (matches linear-head style)
         if vocab_chunk_size >= self.vocab_size:
-            for tok_start in range(0, total_tokens, token_chunk_size):
-                tok_end = min(tok_start + token_chunk_size, total_tokens)
-                k_tok = k[tok_start:tok_end]                             # (N, 16, dps)
-                v_tok = v[tok_start:tok_end]                             # (N, 16, dps)
-                t_tok = t_flat[tok_start:tok_end]                        # (N,)
-
+            def _fast_chunk_loss(k_tok: torch.Tensor, v_tok: torch.Tensor, t_tok: torch.Tensor) -> torch.Tensor:
                 # Keep layout (N, 16, V): softmax over byte-slot axis (16)
                 scores = torch.matmul(k_tok, q_all_t) * self.scale       # (N, 16, V)
                 attn = scores.softmax(dim=1)
                 v_dot_q = torch.matmul(v_tok, q_all_t)                   # (N, 16, V)
                 logits = (attn * v_dot_q).sum(dim=1)                     # (N, V)
-                loss_sum = loss_sum + F.cross_entropy(logits, t_tok, reduction="sum").float()
+                return F.cross_entropy(logits, t_tok, reduction="sum")
+
+            for tok_start in range(0, total_tokens, token_chunk_size):
+                tok_end = min(tok_start + token_chunk_size, total_tokens)
+                k_tok = k[tok_start:tok_end]                             # (N, 16, dps)
+                v_tok = v[tok_start:tok_end]                             # (N, 16, dps)
+                t_tok = t_flat[tok_start:tok_end]                        # (N,)
+                if use_ckpt:
+                    chunk_loss = torch.utils.checkpoint.checkpoint(
+                        _fast_chunk_loss, k_tok, v_tok, t_tok, use_reentrant=False
+                    )
+                else:
+                    chunk_loss = _fast_chunk_loss(k_tok, v_tok, t_tok)
+                loss_sum = loss_sum + chunk_loss.float()
 
             return loss_sum / total_tokens
 
@@ -1878,6 +1888,32 @@ class DecoderHead(nn.Module):
         return loss_sum / total_tokens
 
 
+class StructuredLinearHead(nn.Module):
+    """Linear LM head in byte-slot space: (B,T,16,48) -> (B,T,V)."""
+
+    def __init__(self, vocab_size: int, d_model: int, max_bytes: int = 16):
+        super().__init__()
+        assert d_model % max_bytes == 0
+        self.max_bytes = max_bytes
+        self.dps = d_model // max_bytes
+        self.slot_logits = nn.Parameter(torch.zeros(max_bytes))
+        self.proj = nn.Linear(self.dps, vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        slots = x.view(B, T, self.max_bytes, self.dps)
+        slot_mix = torch.softmax(self.slot_logits, dim=0).to(dtype=slots.dtype)
+        pooled = (slots * slot_mix.view(1, 1, self.max_bytes, 1)).sum(dim=2)
+        return self.proj(pooled)
+
+
+def _resolved_head_type() -> str:
+    head_type = HP.lm_head_type.strip().lower()
+    if not head_type:
+        return "decoder" if HP.decoder_head else "linear"
+    return head_type
+
+
 def _make_embed():
     """Create token embedding — standard or composite (byte-factored)."""
     if HP.composite_embed:
@@ -1893,9 +1929,14 @@ def _make_embed():
 
 def _make_head():
     """Create LM head — standard linear or DecoderHead (cross-attention over byte slots)."""
-    if HP.decoder_head:
+    head_type = _resolved_head_type()
+    if head_type == "decoder":
         return DecoderHead(HP.vocab_size, HP.d_model)
-    return nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+    if head_type == "linear48":
+        return StructuredLinearHead(HP.vocab_size, HP.d_model)
+    if head_type == "linear":
+        return nn.Linear(HP.d_model, HP.vocab_size, bias=False)
+    raise ValueError(f"Unknown LM_HEAD_TYPE={head_type}")
 
 
 def _tie_weights(model: nn.Module):
