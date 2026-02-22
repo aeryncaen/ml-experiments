@@ -43,7 +43,7 @@ class HParams:
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn | moe
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn
     vocab_size: int = 50304
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -91,18 +91,13 @@ class HParams:
 
     # Composite embedding (byte-factored)
     composite_embed: bool = _env_bool("COMPOSITE_EMBED", False)
-    composite_token_ratio: int = _env_int("COMPOSITE_TOKEN_RATIO", 6)  # 1/N of dims_per_slot used for per-token (rest is shared)
+    composite_token_dims: int = _env_int("COMPOSITE_TOKEN_DIMS", 8)  # per-token dims per byte slot (rest is shared)
     composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
     composite_conv: bool = _env_bool("COMPOSITE_CONV", False)
 
     # Byte-attention MLP
     ba_n_byte_heads: int = _env_int("BA_N_BYTE_HEADS", 4)
-
-    # MoE (Mixture of Experts)
-    n_experts: int = _env_int("N_EXPERTS", 8)
-    top_k: int = _env_int("TOP_K", 2)
-    moe_aux_weight: float = _env_float("MOE_AUX_WEIGHT", 0.01)
 
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
@@ -809,75 +804,6 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("tf/mlp"):
             return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class MoEMLP(nn.Module):
-    """Top-k gated Mixture of Experts replacing a single MLP."""
-
-    def __init__(self, d_model: int, n_experts: int, top_k: int):
-        super().__init__()
-        self.n_experts = n_experts
-        self.top_k = top_k
-        self.experts = nn.ModuleList([MLP(d_model) for _ in range(n_experts)])
-        self.gate = nn.Linear(d_model, n_experts, bias=False)
-
-    def forward(self, x: torch.Tensor):
-        """Returns (output, aux_loss)."""
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)  # (B*T, D)
-        N = x_flat.shape[0]
-
-        # Gate logits and routing
-        gate_logits = self.gate(x_flat)  # (N, n_experts)
-        top_vals, top_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # (N, top_k)
-        top_weights = torch.softmax(top_vals, dim=-1)  # (N, top_k)
-
-        # Dispatch tokens to experts and weighted sum
-        out = torch.zeros_like(x_flat)
-        for i, expert in enumerate(self.experts):
-            # Mask: which (token, slot) pairs route to expert i
-            mask = (top_idx == i)  # (N, top_k)
-            token_mask = mask.any(dim=-1)  # (N,)
-            if not token_mask.any():
-                continue
-            # Gather weights for this expert (sum across slots that picked it)
-            weights = (top_weights * mask.float()).sum(dim=-1)  # (N,)
-            expert_input = x_flat[token_mask]
-            expert_output = expert(expert_input)
-            out[token_mask] += weights[token_mask].unsqueeze(-1) * expert_output
-
-        # Load-balancing auxiliary loss
-        # fraction of tokens routed to each expert
-        probs = torch.softmax(gate_logits, dim=-1)  # (N, n_experts)
-        # f_i = fraction of tokens where expert i is in top-k
-        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-        for k in range(self.top_k):
-            tokens_per_expert.scatter_add_(0, top_idx[:, k], torch.ones(N, device=x.device))
-        f = tokens_per_expert / N  # (n_experts,)
-        # P_i = mean gate probability for expert i
-        P = probs.mean(dim=0)  # (n_experts,)
-        aux_loss = (f * P).sum() * self.n_experts
-
-        return out.view(B, T, D), aux_loss
-
-
-class TransformerMoEBlock(nn.Module):
-    """Pre-norm block: SelfAttention + MoEMLP. Returns (x, aux_loss)."""
-
-    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int):
-        super().__init__()
-        self.ln1 = RMSNorm(d_model)
-        self.attn = SelfAttention(d_model, n_head)
-        self.ln2 = RMSNorm(d_model)
-        self.mlp = MoEMLP(d_model, n_experts, top_k)
-
-    def forward(self, x: torch.Tensor):
-        with torch.autograd.profiler.record_function("moe/block_attn"):
-            x = x + self.attn(self.ln1(x))
-        with torch.autograd.profiler.record_function("moe/block_mlp"):
-            mlp_out, aux_loss = self.mlp(self.ln2(x))
-            x = x + mlp_out
-        return x, aux_loss
 
 
 class FeatureAttentionMLP(nn.Module):
@@ -1606,7 +1532,7 @@ class CompositeEmbedding(nn.Module):
     """Factored embedding: shared byte params + per-token params + optional LoRA adapter.
 
     Per byte slot: shared dims (from byte value) + per-token dims, derived from model_dim.
-    token_per_byte derived from COMPOSITE_TOKEN_RATIO; shared_per_byte = dims_per_slot - token_per_byte.
+    token_per_byte defaults to 8; shared_per_byte = dims_per_slot - token_per_byte.
     LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
     """
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
@@ -1668,11 +1594,9 @@ class CompositeEmbedding(nn.Module):
 def _make_embed():
     """Create token embedding — standard or composite (byte-factored)."""
     if HP.composite_embed:
-        dims_per_slot = HP.d_model // 16
-        token_per_byte = max(1, dims_per_slot // HP.composite_token_ratio)
         return CompositeEmbedding(
             HP.vocab_size, HP.d_model,
-            token_per_byte=token_per_byte,
+            token_per_byte=HP.composite_token_dims,
             use_lora=HP.composite_lora,
             lora_rank=HP.composite_lora_rank,
             use_conv=HP.composite_conv,
@@ -2254,41 +2178,6 @@ class GPTByteAttn(nn.Module):
         return logits, loss
 
 
-class GPTMoE(nn.Module):
-    """GPT with Mixture of Experts MLP — each layer uses top-k gated MoE."""
-
-    def __init__(self):
-        super().__init__()
-        self.wte = _make_embed()
-        self.blocks = nn.ModuleList([
-            TransformerMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k)
-            for _ in range(HP.n_layer)
-        ])
-        self.ln_f = RMSNorm(HP.d_model)
-        self.lm_head = nn.Linear(HP.d_model, HP.vocab_size, bias=False)
-        self.apply(_init_weights)
-        _tie_weights(self)
-
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.wte(idx)
-        total_aux_loss = 0.0
-        for block in self.blocks:
-            if HP.grad_ckpt and x.requires_grad:
-                x, aux = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-            else:
-                x, aux = block(x)
-            total_aux_loss = total_aux_loss + aux
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        loss = None
-        if targets is not None:
-            ce_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            loss = ce_loss + HP.moe_aux_weight * total_aux_loss
-        # Store for logging (not part of graph — detach)
-        self._last_aux_loss = total_aux_loss.detach() if torch.is_tensor(total_aux_loss) else total_aux_loss
-        return logits, loss
-
-
 # ── LLaDA wrapper ───────────────────────────────────────────────────────────
 
 class LLaDAWrapper(nn.Module):
@@ -2401,8 +2290,6 @@ def build_model() -> nn.Module:
         return GPTULB2D()
     if HP.model_type == "byte_attn":
         return GPTByteAttn()
-    if HP.model_type == "moe":
-        return GPTMoE()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
@@ -2475,8 +2362,6 @@ def main():
     if HP.model_type == "feat_attn":
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
-    if HP.model_type == "moe":
-        _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} moe_aux_weight={HP.moe_aux_weight}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
@@ -2571,15 +2456,7 @@ def main():
             if world_size > 1:
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
-            _aux_str = ""
-            if HP.model_type == "moe":
-                _raw = model.module if world_size > 1 else model
-                # unwrap compiled model
-                _raw = getattr(_raw, "_orig_mod", _raw)
-                _aux_val = getattr(_raw, "_last_aux_loss", 0.0)
-                _aux_val = float(_aux_val) if torch.is_tensor(_aux_val) else float(_aux_val)
-                _aux_str = f" | aux_loss {_aux_val:.5f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_aux_str} | lr {lr:.3e} | sec/step {dt:.3f}")
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f} | lr {lr:.3e} | sec/step {dt:.3f}")
 
         if profiler is not None:
             profiler.step()
