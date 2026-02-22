@@ -812,50 +812,69 @@ class MLP(nn.Module):
 
 
 class MoEMLP(nn.Module):
-    """Top-k gated Mixture of Experts replacing a single MLP."""
+    """Top-k gated Mixture of Experts replacing a single MLP.
+
+    All expert weights are fused into single (n_experts, ...) tensors so
+    dispatch is a batched matmul — no Python loop over experts.
+    """
 
     def __init__(self, d_model: int, n_experts: int, top_k: int):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
-        self.experts = nn.ModuleList([MLP(d_model) for _ in range(n_experts)])
-        self.gate = nn.Linear(d_model, n_experts, bias=False)
+        self.d_model = d_model
+        hidden = int(d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        self.hidden = hidden
+
+        # Fused expert weights: (n_experts, out, in) for each projection
+        self.gate_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
+        self.up_proj = nn.Parameter(torch.empty(n_experts, hidden, d_model))
+        self.down_proj = nn.Parameter(torch.empty(n_experts, d_model, hidden))
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+
+        # Init like nn.Linear
+        for p in [self.gate_proj, self.up_proj, self.down_proj]:
+            nn.init.normal_(p, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor):
         """Returns (output, aux_loss)."""
         B, T, D = x.shape
-        x_flat = x.view(-1, D)  # (B*T, D)
+        x_flat = x.view(-1, D)  # (N, D)
         N = x_flat.shape[0]
 
-        # Gate logits and routing
-        gate_logits = self.gate(x_flat)  # (N, n_experts)
-        top_vals, top_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # (N, top_k)
-        top_weights = torch.softmax(top_vals, dim=-1)  # (N, top_k)
+        # Routing
+        gate_logits = self.router(x_flat)  # (N, E)
+        top_vals, top_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # (N, K)
+        top_weights = torch.softmax(top_vals, dim=-1)  # (N, K)
 
-        # Dispatch tokens to experts and weighted sum
-        out = torch.zeros_like(x_flat)
-        for i, expert in enumerate(self.experts):
-            # Mask: which (token, slot) pairs route to expert i
-            mask = (top_idx == i)  # (N, top_k)
-            token_mask = mask.any(dim=-1)  # (N,)
-            if not token_mask.any():
-                continue
-            # Gather weights for this expert (sum across slots that picked it)
-            weights = (top_weights * mask.float()).sum(dim=-1)  # (N,)
-            expert_input = x_flat[token_mask]
-            expert_output = expert(expert_input)
-            out[token_mask] += weights[token_mask].unsqueeze(-1) * expert_output
+        # Flatten token-slot pairs: (N*K,)
+        flat_idx = top_idx.view(-1)  # (N*K,)
+        # Repeat input for each top-k slot: (N*K, D)
+        x_rep = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
 
-        # Load-balancing auxiliary loss
-        # fraction of tokens routed to each expert
-        probs = torch.softmax(gate_logits, dim=-1)  # (N, n_experts)
-        # f_i = fraction of tokens where expert i is in top-k
-        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-        for k in range(self.top_k):
-            tokens_per_expert.scatter_add_(0, top_idx[:, k], torch.ones(N, device=x.device))
-        f = tokens_per_expert / N  # (n_experts,)
-        # P_i = mean gate probability for expert i
-        P = probs.mean(dim=0)  # (n_experts,)
+        # Gather expert weights for selected experts: (N*K, hidden, D), etc.
+        gate_w = self.gate_proj[flat_idx]  # (N*K, hidden, D)
+        up_w = self.up_proj[flat_idx]      # (N*K, hidden, D)
+        down_w = self.down_proj[flat_idx]  # (N*K, D, hidden)
+
+        # Batched SwiGLU: each token-slot gets its expert's MLP
+        h = torch.bmm(gate_w, x_rep.unsqueeze(-1)).squeeze(-1)  # (N*K, hidden)
+        u = torch.bmm(up_w, x_rep.unsqueeze(-1)).squeeze(-1)    # (N*K, hidden)
+        h = F.silu(h) * u                                        # (N*K, hidden)
+        expert_out = torch.bmm(down_w, h.unsqueeze(-1)).squeeze(-1)  # (N*K, D)
+
+        # Weighted sum across top-k slots per token
+        expert_out = expert_out.view(N, self.top_k, D)  # (N, K, D)
+        out = (top_weights.unsqueeze(-1) * expert_out).sum(dim=1)  # (N, D)
+
+        # Load-balancing auxiliary loss (vectorized)
+        probs = torch.softmax(gate_logits, dim=-1)  # (N, E)
+        # one-hot top-k assignments summed per expert
+        one_hot = torch.zeros(N, self.n_experts, device=x.device)
+        one_hot.scatter_add_(1, top_idx, torch.ones_like(top_idx, dtype=one_hot.dtype))
+        f = one_hot.sum(0) / N       # fraction of tokens per expert
+        P = probs.mean(0)             # mean gate prob per expert
         aux_loss = (f * P).sum() * self.n_experts
 
         return out.view(B, T, D), aux_loss
