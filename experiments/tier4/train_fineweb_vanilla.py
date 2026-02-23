@@ -119,6 +119,7 @@ class HParams:
     decoder_head_token_chunk: int = _env_int("DECODER_HEAD_TOKEN_CHUNK", 1024)
     pit_orth_init: bool = _env_bool("PIT_ORTH_INIT", True)
     pit_eps: float = _env_float("PIT_EPS", 1e-6)
+    pit_min_diag: float = _env_float("PIT_MIN_DIAG", 1e-3)
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
@@ -1993,14 +1994,19 @@ class StructuredLinearHead(nn.Module):
 class PITTokenInterface(nn.Module):
     """Pseudo-Inverse Tying interface: E=Z T^{-1}, W_out=T Z^T."""
 
-    def __init__(self, vocab_size: int, d_model: int, eps: float = 1e-6, orth_init: bool = True):
+    def __init__(self, vocab_size: int, d_model: int,
+                 eps: float = 1e-6, min_diag: float = 1e-3,
+                 orth_init: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.eps = eps
+        self.min_diag = max(min_diag, eps)
 
         self.memory = nn.Parameter(torch.empty(vocab_size, d_model))         # Z
         self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))          # unconstrained L
+        self.embed_norm = RMSNorm(d_model)
+        self.project_norm = RMSNorm(d_model)
 
         self.reset_parameters(orth_init=orth_init)
 
@@ -2020,7 +2026,7 @@ class PITTokenInterface(nn.Module):
     def _chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         raw = torch.tril(self.chol_raw.to(device=device, dtype=dtype))
         raw_diag = torch.diagonal(raw)
-        pos_diag = F.softplus(raw_diag) + self.eps
+        pos_diag = (F.softplus(raw_diag) + self.eps).clamp_min(self.min_diag)
         return raw - torch.diag_embed(raw_diag) + torch.diag_embed(pos_diag)
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -2030,7 +2036,7 @@ class PITTokenInterface(nn.Module):
         L32 = self._chol_factor(torch.float32, z.device)
         x_t = torch.cholesky_solve(flat.to(torch.float32).T, L32)                 # (d, N)
         x = x_t.T.reshape_as(z)
-        return x.to(dtype=z.dtype)
+        return self.embed_norm(x.to(dtype=z.dtype))
 
     def project(self, hidden: torch.Tensor) -> torch.Tensor:
         # W_out = T Z^T, with T=LL^T.
@@ -2038,10 +2044,12 @@ class PITTokenInterface(nn.Module):
         if D != self.d_model:
             raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
 
+        hidden = self.project_norm(hidden)
         L = self._chol_factor(hidden.dtype, hidden.device)
         g = hidden.reshape(-1, D) @ L
         g = g @ L.transpose(0, 1)
-        logits = F.linear(g, self.memory.to(dtype=g.dtype))
+        mem = F.rms_norm(self.memory.to(dtype=g.dtype), (self.d_model,), None, 1e-5)
+        logits = F.linear(g, mem)
         return logits.view(B, T, self.vocab_size)
 
 
@@ -2073,6 +2081,7 @@ class CompositePITTokenInterface(nn.Module):
         max_bytes: int = 16,
         token_per_byte: int = 8,
         eps: float = 1e-6,
+        min_diag: float = 1e-3,
         orth_init: bool = True,
     ):
         super().__init__()
@@ -2088,11 +2097,15 @@ class CompositePITTokenInterface(nn.Module):
                 f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({token_per_byte})"
             )
         self.eps = eps
+        self.min_diag = max(min_diag, eps)
 
         self.byte_memory = nn.Parameter(torch.empty(257, self.shared_per_byte))
         self.token_embed = nn.Embedding(vocab_size, max_bytes * token_per_byte)
         self.byte_chol_raw = nn.Parameter(torch.zeros(self.shared_per_byte, self.shared_per_byte))
         self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
+        self.shared_norm = RMSNorm(self.shared_per_byte)
+        self.token_norm = RMSNorm(self.max_bytes * self.token_per_byte)
+        self.embed_out_norm = RMSNorm(self.d_model)
 
         self.pad_idx = 256
         self.register_buffer(
@@ -2119,7 +2132,7 @@ class CompositePITTokenInterface(nn.Module):
     def _byte_chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         raw = torch.tril(self.byte_chol_raw.to(device=device, dtype=dtype))
         raw_diag = torch.diagonal(raw)
-        pos_diag = F.softplus(raw_diag) + self.eps
+        pos_diag = (F.softplus(raw_diag) + self.eps).clamp_min(self.min_diag)
         return raw - torch.diag_embed(raw_diag) + torch.diag_embed(pos_diag)
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -2129,12 +2142,15 @@ class CompositePITTokenInterface(nn.Module):
         L32 = self._byte_chol_factor(torch.float32, z_shared.device)
         x_t = torch.cholesky_solve(flat.to(torch.float32).T, L32)
         x_shared = x_t.T.reshape_as(z_shared).to(dtype=z_shared.dtype)
+        x_shared = self.shared_norm(x_shared)
 
         tok = self.token_embed(token_ids)
         tok = tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)        # (..., 16, token)
+        tok = F.rms_norm(tok, (tok.shape[-1],), None, 1e-5)
 
         out = torch.cat([x_shared, tok], dim=-1)
-        return out.reshape(*token_ids.shape, self.d_model)
+        out = out.reshape(*token_ids.shape, self.d_model)
+        return self.embed_out_norm(out)
 
     def project(self, hidden: torch.Tensor) -> torch.Tensor:
         B, T, D = hidden.shape
@@ -2142,7 +2158,7 @@ class CompositePITTokenInterface(nn.Module):
             raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
 
         slots = hidden.view(B, T, self.max_bytes, self.dims_per_slot)
-        h_shared = slots[..., :self.shared_per_byte]
+        h_shared = self.shared_norm(slots[..., :self.shared_per_byte])
         h_tok = slots[..., self.shared_per_byte:]
 
         L = self._byte_chol_factor(hidden.dtype, hidden.device)
@@ -2151,12 +2167,20 @@ class CompositePITTokenInterface(nn.Module):
 
         token_shared = F.embedding(self.token_bytes, self.byte_memory)               # (V, 16, shared)
         token_shared = token_shared.to(dtype=g_shared.dtype)
+        token_shared = F.rms_norm(token_shared, (token_shared.shape[-1],), None, 1e-5)
         logits_shared = torch.einsum('btsd,vsd->btv', g_shared, token_shared)
 
         h_tok_flat = h_tok.reshape(B, T, self.max_bytes * self.token_per_byte)
+        h_tok_flat = self.token_norm(h_tok_flat)
+        token_w = F.rms_norm(
+            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
+            (self.token_embed.weight.shape[-1],),
+            None,
+            1e-5,
+        )
         logits_token = F.linear(
             h_tok_flat,
-            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
+            token_w,
             self.token_out_bias,
         )
         return logits_shared + logits_token
@@ -2440,6 +2464,7 @@ def _make_embed_head_pair():
                 max_bytes=16,
                 token_per_byte=HP.composite_token_dims,
                 eps=HP.pit_eps,
+                min_diag=HP.pit_min_diag,
                 orth_init=HP.pit_orth_init,
             )
             if head_type == "bucketed_pit":
@@ -2454,6 +2479,7 @@ def _make_embed_head_pair():
             HP.vocab_size,
             HP.d_model,
             eps=HP.pit_eps,
+            min_diag=HP.pit_min_diag,
             orth_init=HP.pit_orth_init,
         )
         return PITEmbedding(interface), PITHead(interface)
@@ -3318,7 +3344,9 @@ def main():
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     if _head == "bucketed_pit":
-        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
+        _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag} pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
+    elif _head == "pit":
+        _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
