@@ -106,12 +106,6 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
-    pit_bucket_mode: str = os.environ.get("PIT_BUCKET_MODE", "hash")  # semantic | first_byte | hash
-    pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_labels.npy"))
-    pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_centers.npy"))
-    pit_n_routers: int = _env_int("PIT_N_ROUTERS", 4)       # number of expert routers
-    pit_meta_top_k: int = _env_int("PIT_META_TOP_K", 2)     # how many expert routers to activate
-    pit_meta_bias_lr: float = _env_float("PIT_META_BIAS_LR", 0.001)  # loss-free balancing update rate
 
 
     # Byte-attention MLP
@@ -2136,11 +2130,7 @@ class BucketedCompositePITHead(nn.Module):
 
     def __init__(self, interface: CompositePITTokenInterface,
                  n_buckets: int = 64, top_k: int = 8,
-                 router_aux_weight: float = 0.01,
-                 bucket_labels: torch.Tensor | None = None,
-                 bucket_centers: torch.Tensor | None = None,
-                 n_routers: int = 4, meta_top_k: int = 2,
-                 meta_bias_lr: float = 0.001):
+                 router_aux_weight: float = 0.01):
         super().__init__()
         self.interface = interface
         self.top_k = top_k
@@ -2149,21 +2139,9 @@ class BucketedCompositePITHead(nn.Module):
         V = interface.vocab_size
         d_model = interface.d_model
 
-        # ── Bucket assignment ──
-        if bucket_labels is not None:
-            # Maximally-dissimilar (anti-clustered) buckets — labels may cover fewer tokens than V
-            n_labeled = len(bucket_labels)
-            n_buckets = int(bucket_labels.max().item()) + 1
-            if n_labeled < V:
-                # Assign unlabeled tokens (padding/unused) round-robin
-                extra = torch.arange(V - n_labeled, dtype=torch.long) % n_buckets
-                bucket_ids = torch.cat([bucket_labels.long(), extra])
-            else:
-                bucket_ids = bucket_labels[:V].long()
-        else:
-            # Fallback: hash routing
-            ids = torch.arange(V, dtype=torch.long)
-            bucket_ids = ((ids * 2654435761) % (2**32)) % n_buckets
+        # ── Bucket assignment: Knuth multiplicative hash ──
+        ids = torch.arange(V, dtype=torch.long)
+        bucket_ids = ((ids * 2654435761) % (2**32)) % n_buckets
 
         self.n_buckets = n_buckets
         self.register_buffer('token_to_bucket', bucket_ids)
@@ -2190,57 +2168,15 @@ class BucketedCompositePITHead(nn.Module):
         self.max_bucket_size = max_bs
         self._bucket_sizes_list = sizes.tolist()  # plain Python list, no .item() graph breaks
 
-        # ── Expert routers: pool of full SwiGLU MLPs ──
-        self.n_routers = n_routers
-        self.meta_top_k = meta_top_k
-        self.meta_bias_lr = meta_bias_lr
+        # ── Router: single SwiGLU MLP ──
         router_hidden = ((int(d_model * 8 / 3) + 255) // 256) * 256
-
-        # Meta-router: linear gate to select which expert routers to use
-        self.meta_router = nn.Linear(d_model, n_routers, bias=False)
-        self.register_buffer('meta_bias', torch.zeros(n_routers))
-
-        # Expert routers: each is a full SwiGLU MLP → n_buckets logits
-        self.router_gates = nn.ModuleList([nn.Linear(d_model, router_hidden, bias=False) for _ in range(n_routers)])
-        self.router_ups = nn.ModuleList([nn.Linear(d_model, router_hidden, bias=False) for _ in range(n_routers)])
-        self.router_downs = nn.ModuleList([nn.Linear(router_hidden, n_buckets, bias=False) for _ in range(n_routers)])
-
-    def _meta_route(self, hidden: torch.Tensor) -> list[int]:
-        """Meta-router: select which expert routers to activate. Returns list of router indices."""
-        # hidden: (B, T, D) — pool over sequence for meta-routing decision
-        h_pool = hidden.mean(dim=(0, 1))  # (D,)
-        gate_logits = self.meta_router(h_pool)  # (n_routers,)
-        biased_logits = gate_logits + self.meta_bias
-        _, top_idx = biased_logits.topk(self.meta_top_k)
-        selected = top_idx.tolist()
-
-        # Loss-free balancing: update bias based on selection counts
-        if self.training:
-            with torch.no_grad():
-                counts = torch.zeros(self.n_routers, device=hidden.device)
-                counts[top_idx] = 1.0
-                target = self.meta_top_k / self.n_routers
-                self.meta_bias += self.meta_bias_lr * torch.sign(torch.full_like(counts, target) - counts)
-
-        return selected
-
-    def _expert_route(self, hidden: torch.Tensor, router_idx: int) -> torch.Tensor:
-        """Run one expert router. Returns (B, T, n_buckets) logits."""
-        return self.router_downs[router_idx](
-            F.silu(self.router_gates[router_idx](hidden)) * self.router_ups[router_idx](hidden)
-        )
+        self.router_gate = nn.Linear(d_model, router_hidden, bias=False)
+        self.router_up = nn.Linear(d_model, router_hidden, bias=False)
+        self.router_down = nn.Linear(router_hidden, n_buckets, bias=False)
 
     def _route(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Combined routing: meta-router selects expert routers, sum their bucket logits.
-
-        Returns (B, T, n_buckets) bucket logits (summed/stacked from active expert routers).
-        """
-        selected = self._meta_route(hidden)
-        combined = torch.zeros(hidden.shape[0], hidden.shape[1], self.n_buckets,
-                               device=hidden.device, dtype=hidden.dtype)
-        for r in selected:
-            combined += self._expert_route(hidden, r)
-        return combined
+        """SwiGLU router: returns (B, T, n_buckets) bucket logits."""
+        return self.router_down(F.silu(self.router_gate(hidden)) * self.router_up(hidden))
 
     def _prepare_hidden(self, hidden: torch.Tensor):
         """Split hidden into shared/private, apply T to shared subspace."""
@@ -2427,30 +2363,11 @@ def _make_embed_head_pair():
                 orth_init=HP.pit_orth_init,
             )
             if head_type == "bucketed_pit":
-                bucket_labels = None
-                bucket_centers = None
-                if HP.pit_bucket_mode == "first_byte":
-                    byte_table = _build_token_byte_table(HP.vocab_size, 16, 256)
-                    first_bytes = byte_table[:, 0].clone()
-                    first_bytes[first_bytes == 256] = 0  # all-pad tokens → bucket 0
-                    bucket_labels = first_bytes
-                elif HP.pit_bucket_mode == "semantic":
-                    if HP.pit_bucket_labels and os.path.isfile(HP.pit_bucket_labels):
-                        import numpy as np
-                        bucket_labels = torch.from_numpy(np.load(HP.pit_bucket_labels))
-                        if HP.pit_bucket_centers and os.path.isfile(HP.pit_bucket_centers):
-                            bucket_centers = torch.from_numpy(np.load(HP.pit_bucket_centers))
-                # else: hash (bucket_labels stays None)
                 return (CompositePITEmbedding(interface),
                         BucketedCompositePITHead(interface,
                                                   n_buckets=HP.pit_n_buckets,
                                                   top_k=HP.pit_top_k,
-                                                  router_aux_weight=HP.pit_router_aux_weight,
-                                                  bucket_labels=bucket_labels,
-                                                  bucket_centers=bucket_centers,
-                                                  n_routers=HP.pit_n_routers,
-                                                  meta_top_k=HP.pit_meta_top_k,
-                                                  meta_bias_lr=HP.pit_meta_bias_lr))
+                                                  router_aux_weight=HP.pit_router_aux_weight))
             return CompositePITEmbedding(interface), CompositePITHead(interface)
 
         interface = PITTokenInterface(
@@ -3311,8 +3228,7 @@ def main():
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     if _head == "bucketed_pit":
-        _routing = HP.pit_bucket_mode
-        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={_routing} n_routers={HP.pit_n_routers} meta_top_k={HP.pit_meta_top_k} meta_bias_lr={HP.pit_meta_bias_lr}"
+        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
