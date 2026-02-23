@@ -1252,6 +1252,13 @@ class BaselineTransformer(nn.Module):
         logits = F.linear(x, self.embed.weight, self.head_bias)
         return logits
 
+    def init_cache(self):
+        return None
+
+    def forward_with_cache(self, input_ids, position_ids=None, cache=None, use_cache=True, mask=None, sparse_mask=None):
+        logits = self.forward(input_ids, position_ids=position_ids, mask=mask, sparse_mask=sparse_mask)
+        return logits, cache
+
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
 

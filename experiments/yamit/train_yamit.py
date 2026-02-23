@@ -37,7 +37,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from yamit.model import YAMIT, MODEL_S, MODEL_P, BaselineTransformer
-from yamit.refusion import forward_process, refusion_loss
+from yamit.refusion import forward_process, refusion_loss, ForwardProcessOutput
 from yamit.sampler import generate_refusion, ReFusionSamplerConfig
 from yamit.training import (
     ShardedTokenDataset,
@@ -185,10 +185,10 @@ def evaluate_yamit(
     for batch in val_loader:
         if n_batches >= max_batches:
             break
-        input_ids = batch["input_ids"].to(device)
+        input_ids = batch["input_ids"]  # keep on CPU for forward_process
         attention_mask = torch.ones_like(input_ids)
 
-        # ReFusion forward process.
+        # ReFusion forward process (CPU).
         fp = forward_process(
             input_ids,
             attention_mask,
@@ -197,10 +197,17 @@ def evaluate_yamit(
         )
 
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits = model(fp.input_ids, position_ids=fp.position_ids)
+            logits = model(
+                fp.input_ids.to(device),
+                position_ids=fp.position_ids.to(device),
+            )
 
         loss, ar, mdm = refusion_loss(
-            logits, fp.labels, fp.masked_indices, fp.p_masks, fp.answer_lengths
+            logits,
+            fp.labels.to(device),
+            fp.masked_indices.to(device),
+            fp.p_masks.to(device),
+            fp.answer_lengths.to(device),
         )
 
         total_loss += loss.item()
@@ -547,15 +554,24 @@ def train(args):
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"]  # keep on CPU for forward_process
         attention_mask = torch.ones_like(input_ids)
 
-        # ── ReFusion forward process ──
+        # ── ReFusion forward process (CPU — avoids GPU→CPU sync) ──
         fp = forward_process(
             input_ids,
             attention_mask,
             mask_token_id=mask_token_id,
             boundary_token_id=cfg.eos_token_id,
+        )
+        # Move to GPU after forward_process is done.
+        fp = ForwardProcessOutput(
+            input_ids=fp.input_ids.to(device, non_blocking=True),
+            labels=fp.labels.to(device, non_blocking=True),
+            masked_indices=fp.masked_indices.to(device, non_blocking=True),
+            p_masks=fp.p_masks.to(device, non_blocking=True),
+            answer_lengths=fp.answer_lengths.to(device, non_blocking=True),
+            position_ids=fp.position_ids.to(device, non_blocking=True),
         )
 
         # ── LR step ──

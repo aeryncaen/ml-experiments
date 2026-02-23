@@ -165,8 +165,9 @@ def forward_process(
         unmasked_indices = [s for s, m in enumerate(slot_mask) if not m]
         masked_indices_list = [s for s, m in enumerate(slot_mask) if m]
 
-        # ── shuffle unmasked (AR) slots ──
-        random.shuffle(unmasked_indices)
+        # AR slots stay in original order for pretraining.
+        # (Shuffling is only appropriate for SFT where a prompt provides
+        # coherent context; from-scratch training needs sequential AR.)
 
         # ── build rearranged answer ──
         final_ids: list[int] = []
