@@ -104,13 +104,13 @@ class HParams:
     pit_orth_init: bool = _env_bool("PIT_ORTH_INIT", True)
     pit_eps: float = _env_float("PIT_EPS", 1e-6)
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
-    pit_top_k: int = _env_int("PIT_TOP_K", 4)
+    pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
     pit_bucket_mode: str = os.environ.get("PIT_BUCKET_MODE", "hash")  # semantic | first_byte | hash
     pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_labels.npy"))
     pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_centers.npy"))
     pit_n_routers: int = _env_int("PIT_N_ROUTERS", 4)       # number of expert routers
-    pit_meta_top_k: int = _env_int("PIT_META_TOP_K", 4)     # how many expert routers to activate
+    pit_meta_top_k: int = _env_int("PIT_META_TOP_K", 2)     # how many expert routers to activate
     pit_meta_bias_lr: float = _env_float("PIT_META_BIAS_LR", 0.001)  # loss-free balancing update rate
 
 
@@ -2126,13 +2126,12 @@ class CompositePITHead(nn.Module):
 
 
 class BucketedCompositePITHead(nn.Module):
-    """Composite-PIT head with Borda-count RCV bucket routing.
+    """Composite-PIT head with hash-routed sub-heads.
 
-    Splits vocab into n_buckets. A meta-router (loss-free balanced) selects
-    expert routers from a pool. Each expert router ranks its top-k buckets.
-    Borda count across selected routers elects 1 winning bucket per position.
-    Training uses teacher-forced routing (target bucket) for token CE loss,
-    plus bucket CE on the Borda scores. Inference scores only the winning bucket.
+    Splits vocab into n_buckets via hash. A SwiGLU router selects top_k
+    buckets per position. Training uses teacher-forced routing (target
+    bucket always active) with streaming CE + router aux loss.
+    Inference only computes top_k bucket logits.
     """
 
     def __init__(self, interface: CompositePITTokenInterface,
@@ -2232,26 +2231,16 @@ class BucketedCompositePITHead(nn.Module):
         )
 
     def _route(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Borda-count RCV: meta-router selects expert routers, each ranks top-k buckets.
+        """Combined routing: meta-router selects expert routers, sum their bucket logits.
 
-        Each router's top-k buckets get Borda points (k for 1st, k-1 for 2nd, ..., 1 for kth).
-        Points are weighted by the router's softmax score for differentiability.
-        Scores are summed across routers. Returns (B, T, n_buckets) Borda scores.
+        Returns (B, T, n_buckets) bucket logits (summed/stacked from active expert routers).
         """
         selected = self._meta_route(hidden)
-        B, T, D = hidden.shape
-        borda = torch.zeros(B, T, self.n_buckets, device=hidden.device, dtype=hidden.dtype)
-        k = self.top_k  # ballot size per router
-        # Borda points: [k, k-1, ..., 1] for ranks [1st, 2nd, ..., kth]
-        points = torch.arange(k, 0, -1, device=hidden.device, dtype=hidden.dtype)  # (k,)
+        combined = torch.zeros(hidden.shape[0], hidden.shape[1], self.n_buckets,
+                               device=hidden.device, dtype=hidden.dtype)
         for r in selected:
-            logits = self._expert_route(hidden, r)  # (B, T, n_buckets)
-            top_vals, top_idx = logits.topk(k, dim=-1)  # (B, T, k)
-            # Weight Borda points by softmax of the top-k logits for differentiability
-            weights = F.softmax(top_vals, dim=-1)  # (B, T, k)
-            weighted_points = weights * points.unsqueeze(0).unsqueeze(0)  # (B, T, k)
-            borda.scatter_add_(-1, top_idx, weighted_points)
-        return borda
+            combined += self._expert_route(hidden, r)
+        return combined
 
     def _prepare_hidden(self, hidden: torch.Tensor):
         """Split hidden into shared/private, apply T to shared subspace."""
@@ -2285,24 +2274,21 @@ class BucketedCompositePITHead(nn.Module):
         return logits_shared + logits_tok
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Inference: Borda RCV elects 1 winning bucket per position, score only that."""
+        """Inference: top-k bucket logits only, rest -inf."""
         B, T, D = hidden.shape
-        N = B * T
         g_shared, h_tok_flat = self._prepare_hidden(hidden)
-        borda_scores = self._route(hidden)  # (B, T, n_buckets)
-        winner = borda_scores.reshape(N, -1).argmax(dim=-1)  # (N,)
+        router_logits = self._route(hidden)
+        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)
+        active = top_k_idx.unique()
 
-        g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
-        h_flat = h_tok_flat.reshape(N, -1)
-        logits = torch.full((N, self.interface.vocab_size), float('-inf'),
+        logits = torch.full((B, T, self.interface.vocab_size), float('-inf'),
                             device=hidden.device, dtype=hidden.dtype)
-        for b in winner.unique().tolist():
-            mask = (winner == b)
+        for b_idx in active:
+            b = b_idx.item()
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
-            bl = self._bucket_logits(g_flat[mask], h_flat[mask], b)
-            logits[mask.unsqueeze(-1).expand(-1, bs).clone(), members.unsqueeze(0).expand(mask.sum(), -1)] = bl
-        return logits.view(B, T, -1)
+            logits[:, :, members] = self._bucket_logits(g_shared, h_tok_flat, b)
+        return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
         """2-level hierarchical softmax: P(token) = P(bucket|h) * P(token|bucket,h).
@@ -2359,24 +2345,34 @@ class BucketedCompositePITHead(nn.Module):
         token_loss = token_loss_sum / N
         total_loss = bucket_loss + token_loss
 
-        # ── Accuracy: RCV winner bucket, argmax within it ──
+        # ── Accuracy: argmax across router's top-k buckets (matches inference) ──
         with torch.no_grad():
-            borda_flat = router_logits.reshape(N, -1)
-            winner = borda_flat.argmax(dim=-1)  # (N,) — Borda winner per position
-            pred_global = torch.zeros(N, device=hidden.device, dtype=torch.long)
-            for b in winner.unique().tolist():
-                mask = (winner == b)
+            router_flat = router_logits.reshape(N, -1)
+            _, top_k_idx = router_flat.topk(self.top_k, dim=-1)  # (N, top_k)
+            active_buckets = top_k_idx.unique().tolist()
+            best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
+            best_score = torch.full((N,), float('-inf'), device=hidden.device)
+            iface = self.interface
+            for b in active_buckets:
                 bs = self._bucket_sizes_list[b]
                 members = self.bucket_members[b, :bs]
-                iface = self.interface
+                # Only score positions whose router selected this bucket
+                in_topk = (top_k_idx == b).any(dim=-1)  # (N,)
+                if not in_topk.any():
+                    continue
                 patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
                 patterns = patterns.to(dtype=g_flat.dtype)
-                bl_shared = torch.einsum('nsd,vsd->nv', g_flat[mask], patterns)
+                bl_shared = torch.einsum('nsd,vsd->nv', g_flat[in_topk], patterns)
                 embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
-                bl_tok = F.linear(h_tok_2d[mask], embeds, iface.token_out_bias[members])
-                local_pred = (bl_shared + bl_tok).float().argmax(dim=-1)
-                pred_global[mask] = members[local_pred]
-            token_acc = (pred_global == target_flat).float().mean()
+                bl_tok = F.linear(h_tok_2d[in_topk], embeds, iface.token_out_bias[members])
+                bl = (bl_shared + bl_tok).float()  # (n, bs)
+                top_val, top_idx = bl.max(dim=-1)
+                improved = top_val > best_score[in_topk]
+                idx_into_n = in_topk.nonzero(as_tuple=True)[0]
+                update_mask = improved
+                best_score[idx_into_n[update_mask]] = top_val[update_mask]
+                best_token[idx_into_n[update_mask]] = members[top_idx[update_mask]]
+            token_acc = (best_token == target_flat).float().mean()
 
         return total_loss, bucket_loss, token_loss, token_acc
 
