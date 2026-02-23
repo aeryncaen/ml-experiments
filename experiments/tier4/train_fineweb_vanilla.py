@@ -3352,7 +3352,7 @@ def main():
             dt = (time.time() - t0) / max(1, step + 1)
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
-                _train_acc_str = f" | train_acc {raw_model._last_acc:.4f}"
+                _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
             print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | sec/step {dt:.3f}")
 
         if profiler is not None:
