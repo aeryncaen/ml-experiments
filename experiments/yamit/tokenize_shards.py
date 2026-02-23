@@ -58,12 +58,6 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--val-fraction", type=float, default=0.005)
     parser.add_argument("--go-bin", default="go", help="Go binary (default: go)")
-    parser.add_argument(
-        "--engine",
-        choices=["auto", "go", "python"],
-        default="auto",
-        help="Tokenizer engine: go, python, or auto fallback",
-    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -73,7 +67,8 @@ def main() -> None:
     output_dir = _resolve(repo_root, args.output)
     artifacts_dir = _resolve_artifacts(repo_root, args.artifacts_dir)
 
-    tok_json = artifacts_dir / "tokenizer.json"
+    tok_go_json = artifacts_dir / "tokenizer_go.json"
+    tok_json = tok_go_json if tok_go_json.exists() else (artifacts_dir / "tokenizer.json")
     surgery_map = artifacts_dir / "surgery_map.json"
     id_remap = artifacts_dir / "id_remap.json"
 
@@ -103,7 +98,7 @@ def main() -> None:
             msg.append("Pass --input with the correct path.")
             raise SystemExit("\n".join(msg))
 
-    go_cmd = [
+    cmd = [
         args.go_bin,
         "run",
         ".",
@@ -123,41 +118,7 @@ def main() -> None:
         str(args.val_fraction),
     ]
 
-    py_fallback = repo_root / "experiments/yamit/tokenizer/tokenize_python.py"
-    py_cmd = [
-        "python",
-        str(py_fallback),
-        "--tokenizer",
-        str(tok_json),
-        "--surgery-map",
-        str(surgery_map),
-        "--id-remap",
-        str(id_remap),
-        "--input",
-        str(input_dir),
-        "--output",
-        str(output_dir),
-        "--workers",
-        str(args.workers),
-        "--val-fraction",
-        str(args.val_fraction),
-    ]
-
-    if args.engine == "python":
-        subprocess.run(py_cmd, cwd=repo_root, check=True)
-        return
-
-    if args.engine == "go":
-        subprocess.run(go_cmd, cwd=tokenizer_dir, check=True)
-        return
-
-    # auto: try Go first, fallback to Python if it fails.
-    try:
-        subprocess.run(go_cmd, cwd=tokenizer_dir, check=True)
-        return
-    except subprocess.CalledProcessError:
-        print("[tokenize_shards] Go tokenizer failed; falling back to Python engine...")
-        subprocess.run(py_cmd, cwd=repo_root, check=True)
+    subprocess.run(cmd, cwd=tokenizer_dir, check=True)
 
 
 if __name__ == "__main__":
