@@ -102,6 +102,15 @@ class HParams:
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
+    # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
+    ngpt: bool = _env_bool("NGPT", False)
+    ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.05)   # eigen LR init (paper: ~1/n_layers)
+    ngpt_alpha_scale: float = _env_float("NGPT_ALPHA_SCALE", 0.0)  # 0 = auto -> 1/sqrt(d_model)
+    ngpt_sqk_init: float = _env_float("NGPT_SQK_INIT", 1.0)       # QK scaling init
+    ngpt_su_init: float = _env_float("NGPT_SU_INIT", 1.0)         # MLP u scaling init
+    ngpt_sv_init: float = _env_float("NGPT_SV_INIT", 1.0)         # MLP v scaling init
+    ngpt_sz_init: float = _env_float("NGPT_SZ_INIT", 1.0)         # logit scaling init
+
     # Retokenize >16-byte tokens on load (no need to preprocess .bin files)
     retokenize: bool = _env_bool("RETOKENIZE", False)
 
@@ -1102,6 +1111,162 @@ class TransformerBlock(nn.Module):
         with torch.autograd.profiler.record_function("tf/block_mlp"):
             x = x + self.mlp(self.ln2(x))
         return x
+
+
+# ── nGPT: Normalized Transformer on the Hypersphere ─────────────────────────
+
+def _unit_norm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Normalize to unit norm along dim. No learnable scale (unlike RMSNorm)."""
+    return F.normalize(x, p=2, dim=dim, eps=1e-8)
+
+
+def _ngpt_scale_param(shape, init_val: float, scale_val: float) -> nn.Parameter:
+    """Create a scaling parameter with the nGPT init/scale trick.
+
+    The parameter is stored as `scale_val` but during forward we multiply by
+    `init_val / scale_val` so the actual value starts at init_val while Adam
+    sees a parameter of magnitude scale_val (controlling effective LR).
+    """
+    p = nn.Parameter(torch.full(shape, scale_val))
+    p._ngpt_init = init_val  # type: ignore[attr-defined]
+    p._ngpt_scale = scale_val  # type: ignore[attr-defined]
+    p._no_weight_decay = True  # type: ignore[attr-defined]
+    return p
+
+
+def _ngpt_actual(p: nn.Parameter) -> torch.Tensor:
+    """Recover actual value: param * (init / scale)."""
+    return p * (p._ngpt_init / p._ngpt_scale)  # type: ignore[attr-defined]
+
+
+class NGPTSelfAttention(nn.Module):
+    """Self-attention for nGPT: QK normalization + s_qk scaling, sqrt(dk) softmax scale."""
+
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = Rotary(self.head_dim)
+
+        # QK scaling: shared per head, one scalar per head_dim element
+        s_scale = 1.0 / math.sqrt(d_model)
+        self.s_qk = _ngpt_scale_param((self.head_dim,), HP.ngpt_sqk_init, s_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        q = self.q(x).view(b, t, self.n_head, self.head_dim)
+        k = self.k(x).view(b, t, self.n_head, self.head_dim)
+        v = self.v(x).view(b, t, self.n_head, self.head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        # nGPT: normalize q,k then apply learned scaling
+        s_qk = _ngpt_actual(self.s_qk)
+        q = _unit_norm(q, dim=-1) * s_qk
+        k = _unit_norm(k, dim=-1) * s_qk
+
+        # nGPT: softmax scale is sqrt(dk) instead of 1/sqrt(dk) because q,k are normalized
+        # and s_qk absorbs the scaling. But flash_attn applies its own 1/sqrt(dk) internally,
+        # so we pre-scale q by dk to cancel it: q * dk * (1/sqrt(dk)) = q * sqrt(dk).
+        if HAS_FLASH_ATTN:
+            q = q * self.head_dim  # flash_attn will divide by sqrt(dk)
+            y = flash_attn_func(q, k, v, causal=HP.is_causal)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            # Manual: scale_factor = sqrt(dk) -> pass scale = 1/sqrt(dk) * dk = sqrt(dk)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal,
+                                               scale=math.sqrt(self.head_dim))
+            y = y.transpose(1, 2)
+        y = y.contiguous().view(b, t, c)
+        return self.proj(y)
+
+
+class NGPTMLP(nn.Module):
+    """SwiGLU MLP for nGPT: s_u, s_v scaling on intermediates."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        hidden = int(d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        self.gate_proj = nn.Linear(d_model, hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, d_model, bias=False)
+
+        # Scaling factors for intermediate states
+        self.s_u = _ngpt_scale_param((hidden,), HP.ngpt_su_init, 1.0)
+        self.s_v = _ngpt_scale_param((hidden,), HP.ngpt_sv_init, 1.0)
+        self._sqrt_d = math.sqrt(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("ngpt/mlp"):
+            u = self.up_proj(x) * _ngpt_actual(self.s_u)
+            v = self.gate_proj(x) * _ngpt_actual(self.s_v) * self._sqrt_d
+            return self.down_proj(F.silu(v) * u)
+
+
+class NGPTBlock(nn.Module):
+    """nGPT transformer block: LERP updates with eigen learning rates on the hypersphere.
+
+    h = Norm(h + alpha_A * (Norm(attn(h)) - h))
+    h = Norm(h + alpha_M * (Norm(mlp(h)) - h))
+    No RMSNorm layers. Hidden state stays unit-norm throughout.
+    """
+
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        self.attn = NGPTSelfAttention(d_model, n_head)
+        self.mlp = NGPTMLP(d_model)
+
+        # Eigen learning rates (per embedding dimension)
+        alpha_scale = HP.ngpt_alpha_scale if HP.ngpt_alpha_scale > 0 else 1.0 / math.sqrt(d_model)
+        self.alpha_attn = _ngpt_scale_param((d_model,), HP.ngpt_alpha_init, alpha_scale)
+        self.alpha_mlp = _ngpt_scale_param((d_model,), HP.ngpt_alpha_init, alpha_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("ngpt/block_attn"):
+            h_a = _unit_norm(self.attn(x))
+            alpha_a = _ngpt_actual(self.alpha_attn).abs()
+            x = _unit_norm(x + alpha_a * (h_a - x))
+        with torch.autograd.profiler.record_function("ngpt/block_mlp"):
+            h_m = _unit_norm(self.mlp(x))
+            alpha_m = _ngpt_actual(self.alpha_mlp).abs()
+            x = _unit_norm(x + alpha_m * (h_m - x))
+        return x
+
+
+def _ngpt_normalize_weights(model: nn.Module):
+    """Post-optimizer-step: normalize all weight matrices along embedding dim.
+
+    nn.Linear weight is (out, in) — normalize along dim=1 (input/embedding dim).
+    nn.Embedding weight is (vocab, dim) — normalize along dim=1 (embedding dim).
+    This keeps all dot products interpretable as cosine similarities.
+    """
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
+            elif isinstance(m, nn.Embedding):
+                m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
+
+
+def _ngpt_normalize_pit_memory(model: nn.Module):
+    """Post-optimizer-step: normalize PIT bare Parameter memories to unit norm.
+
+    nn.Embedding weights are already handled by _ngpt_normalize_weights.
+    This catches bare nn.Parameter tensors like memory and byte_memory.
+    """
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, PITTokenInterface):
+                m.memory.div_(m.memory.norm(dim=1, keepdim=True).clamp(min=1e-8))
+            elif isinstance(m, CompositePITTokenInterface):
+                m.byte_memory.div_(m.byte_memory.norm(dim=1, keepdim=True).clamp(min=1e-8))
 
 
 class TransformerFeatureAttnBlock(nn.Module):
@@ -2559,13 +2724,27 @@ class GPTTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte, self.lm_head = _make_embed_head_pair()
-        self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
-        self.ln_f = RMSNorm(HP.d_model)
+        if HP.ngpt:
+            self.blocks = nn.ModuleList([NGPTBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+            self.ln_f = nn.Identity()  # nGPT: hidden state is already unit-norm
+            # Logit scaling: per-vocab learnable temperature
+            s_z_scale = 1.0 / math.sqrt(HP.d_model)
+            self.s_z = _ngpt_scale_param((HP.vocab_size,), HP.ngpt_sz_init, s_z_scale)
+        else:
+            self.blocks = nn.ModuleList([TransformerBlock(HP.d_model, HP.n_head) for _ in range(HP.n_layer)])
+            self.ln_f = RMSNorm(HP.d_model)
+            self.s_z = None
         self.apply(_init_weights)
         _tie_weights(self)
+        # nGPT: normalize all weights after init
+        if HP.ngpt:
+            _ngpt_normalize_weights(self)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = _run_blocks(self.blocks, self.wte(idx))
+        x = self.wte(idx)
+        if HP.ngpt:
+            x = _unit_norm(x)  # project onto hypersphere before entering nGPT blocks
+        x = _run_blocks(self.blocks, x)
         x = self.ln_f(x)
         if targets is not None and isinstance(self.lm_head, DecoderHead):
             vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
@@ -2582,6 +2761,8 @@ class GPTTransformer(nn.Module):
             self._last_acc = acc
             return None, total_loss
         logits = self.lm_head(x)
+        if self.s_z is not None:
+            logits = logits * _ngpt_actual(self.s_z)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
@@ -3247,8 +3428,8 @@ def build_model_maybe_llada() -> nn.Module:
 
 
 def lr_for_step(step: int) -> float:
-    warmup_steps = int(HP.train_steps * HP.warmup_frac)
-    # Warmup phase (same for all schedules)
+    warmup_steps = 0 if HP.ngpt else int(HP.train_steps * HP.warmup_frac)
+    # Warmup phase (same for all schedules; nGPT skips warmup)
     if step < warmup_steps:
         return HP.lr * (step + 1) / max(1, warmup_steps)
 
@@ -3335,6 +3516,8 @@ def main():
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag} pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
     elif _head == "pit":
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag}"
+    if HP.ngpt:
+        _extra += f" ngpt=True alpha_init={HP.ngpt_alpha_init}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
@@ -3363,9 +3546,10 @@ def main():
             no_decay_params.append(p)
         else:
             decay_params.append(p)
-    print0(rank, f"optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params")
+    _wd = 0.0 if HP.ngpt else HP.weight_decay
+    print0(rank, f"optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params (wd={_wd})")
     param_groups = [
-        {"params": decay_params, "weight_decay": HP.weight_decay},
+        {"params": decay_params, "weight_decay": _wd},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
@@ -3425,6 +3609,9 @@ def main():
         if HP.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(decay_params + no_decay_params, HP.grad_clip)
         optimizer.step()
+        if HP.ngpt:
+            _ngpt_normalize_weights(raw_model)
+            _ngpt_normalize_pit_memory(raw_model)
 
         if step % 20 == 0:
             loss_t = loss.detach() * HP.grad_accum
