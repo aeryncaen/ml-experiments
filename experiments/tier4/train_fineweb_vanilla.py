@@ -106,8 +106,8 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
-    pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", "")  # path to .npy with per-token cluster labels
-    pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", "")  # path to .npy with cluster centers (for router init)
+    pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_labels.npy"))
+    pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_centers.npy"))
 
 
     # Byte-attention MLP
@@ -2367,10 +2367,10 @@ def _make_embed_head_pair():
             if head_type == "bucketed_pit":
                 bucket_labels = None
                 bucket_centers = None
-                if HP.pit_bucket_labels:
+                if HP.pit_bucket_labels and os.path.isfile(HP.pit_bucket_labels):
                     import numpy as np
                     bucket_labels = torch.from_numpy(np.load(HP.pit_bucket_labels))
-                    if HP.pit_bucket_centers:
+                    if HP.pit_bucket_centers and os.path.isfile(HP.pit_bucket_centers):
                         bucket_centers = torch.from_numpy(np.load(HP.pit_bucket_centers))
                 return (CompositePITEmbedding(interface),
                         BucketedCompositePITHead(interface,
