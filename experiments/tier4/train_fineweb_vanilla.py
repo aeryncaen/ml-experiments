@@ -106,6 +106,8 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
+    pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", "")  # path to .npy with per-token cluster labels
+    pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", "")  # path to .npy with cluster centers (for router init)
 
 
     # Byte-attention MLP
@@ -2130,19 +2132,34 @@ class BucketedCompositePITHead(nn.Module):
 
     def __init__(self, interface: CompositePITTokenInterface,
                  n_buckets: int = 64, top_k: int = 8,
-                 router_aux_weight: float = 0.01):
+                 router_aux_weight: float = 0.01,
+                 bucket_labels: torch.Tensor | None = None,
+                 bucket_centers: torch.Tensor | None = None):
         super().__init__()
         self.interface = interface
-        self.n_buckets = n_buckets
         self.top_k = top_k
         self.router_aux_weight = router_aux_weight
 
         V = interface.vocab_size
         d_model = interface.d_model
 
-        # ── Hash routing ──
-        ids = torch.arange(V, dtype=torch.long)
-        bucket_ids = ((ids * 2654435761) % (2**32)) % n_buckets
+        # ── Bucket assignment ──
+        if bucket_labels is not None:
+            # Semantic clustering — labels may cover fewer tokens than V
+            n_labeled = len(bucket_labels)
+            n_buckets = int(bucket_labels.max().item()) + 1
+            if n_labeled < V:
+                # Assign unlabeled tokens (padding/unused) round-robin
+                extra = torch.arange(V - n_labeled, dtype=torch.long) % n_buckets
+                bucket_ids = torch.cat([bucket_labels.long(), extra])
+            else:
+                bucket_ids = bucket_labels[:V].long()
+        else:
+            # Fallback: hash routing
+            ids = torch.arange(V, dtype=torch.long)
+            bucket_ids = ((ids * 2654435761) % (2**32)) % n_buckets
+
+        self.n_buckets = n_buckets
         self.register_buffer('token_to_bucket', bucket_ids)
 
         # Build padded bucket membership table
@@ -2171,6 +2188,22 @@ class BucketedCompositePITHead(nn.Module):
         self.router_gate = nn.Linear(d_model, router_hidden, bias=False)
         self.router_up = nn.Linear(d_model, router_hidden, bias=False)
         self.router_down = nn.Linear(router_hidden, n_buckets, bias=False)
+
+        # Init router from cluster centers if available
+        if bucket_centers is not None:
+            with torch.no_grad():
+                # Project centers through the router to set a good init:
+                # router_down should map router_hidden -> n_buckets such that
+                # hidden states near center_k produce high logit for bucket k.
+                # We init router_down.weight rows as normalized centers projected
+                # through a pseudo-inverse of the gate/up path.
+                # Simple approach: init router_down to align with centers directly.
+                c = bucket_centers.float()  # (K, d_model)
+                c = c / (c.norm(dim=-1, keepdim=True) + 1e-8)
+                # Truncate or pad to match router_hidden
+                if d_model >= router_hidden:
+                    self.router_down.weight.copy_(c[:, :router_hidden].to(self.router_down.weight.dtype))
+                # This is approximate but gives the router a head start
 
     def _route(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.router_down(F.silu(self.router_gate(hidden)) * self.router_up(hidden))
@@ -2332,11 +2365,20 @@ def _make_embed_head_pair():
                 orth_init=HP.pit_orth_init,
             )
             if head_type == "bucketed_pit":
+                bucket_labels = None
+                bucket_centers = None
+                if HP.pit_bucket_labels:
+                    import numpy as np
+                    bucket_labels = torch.from_numpy(np.load(HP.pit_bucket_labels))
+                    if HP.pit_bucket_centers:
+                        bucket_centers = torch.from_numpy(np.load(HP.pit_bucket_centers))
                 return (CompositePITEmbedding(interface),
                         BucketedCompositePITHead(interface,
                                                   n_buckets=HP.pit_n_buckets,
                                                   top_k=HP.pit_top_k,
-                                                  router_aux_weight=HP.pit_router_aux_weight))
+                                                  router_aux_weight=HP.pit_router_aux_weight,
+                                                  bucket_labels=bucket_labels,
+                                                  bucket_centers=bucket_centers))
             return CompositePITEmbedding(interface), CompositePITHead(interface)
 
         interface = PITTokenInterface(
@@ -3190,7 +3232,8 @@ def main():
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     if _head == "bucketed_pit":
-        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
+        _routing = "semantic" if HP.pit_bucket_labels else "hash"
+        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={_routing}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
