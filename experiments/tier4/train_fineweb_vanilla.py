@@ -2285,7 +2285,6 @@ class BucketedCompositePITHead(nn.Module):
         g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
         h_tok_2d = h_tok_flat.reshape(N, -1)
         token_loss_sum = torch.zeros(1, device=hidden.device, dtype=torch.float32)
-        correct = torch.zeros(1, device=hidden.device, dtype=torch.long)
 
         for b in range(self.n_buckets):
             in_bucket = (target_buckets == b)
@@ -2311,13 +2310,32 @@ class BucketedCompositePITHead(nn.Module):
             bl = (bl_shared + bl_tok).float()  # (n_b, bs)
             token_loss_sum += F.cross_entropy(bl, local_idx, reduction='sum')
 
-            # Accuracy: map within-bucket argmax back to global token ID
-            pred_local = bl.detach().argmax(dim=-1)  # (n_b,)
-            correct += (pred_local == local_idx).sum()
-
         token_loss = token_loss_sum / N
-        token_acc = correct.float() / N
         total_loss = bucket_loss + token_loss
+
+        # ── Accuracy: full joint argmax over P(bucket)*P(token|bucket) ──
+        # Compute log P(bucket) + log P(token|bucket) for every token, take global argmax.
+        with torch.no_grad():
+            log_p_bucket = F.log_softmax(router_logits.reshape(N, -1).float(), dim=-1)  # (N, K)
+            best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
+            best_score = torch.full((N,), float('-inf'), device=hidden.device)
+            iface = self.interface
+            for b in range(self.n_buckets):
+                bs = self._bucket_sizes_list[b]
+                members = self.bucket_members[b, :bs]
+                patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
+                patterns = patterns.to(dtype=g_flat.dtype)
+                bl_shared = torch.einsum('nsd,vsd->nv', g_flat, patterns)
+                embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
+                bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
+                log_p_tok = F.log_softmax((bl_shared + bl_tok).float(), dim=-1)  # (N, bs)
+                joint = log_p_bucket[:, b].unsqueeze(1) + log_p_tok               # (N, bs)
+                top_val, top_idx = joint.max(dim=-1)
+                improved = top_val > best_score
+                best_score = torch.where(improved, top_val, best_score)
+                best_token = torch.where(improved, members[top_idx], best_token)
+            token_acc = (best_token == target_flat).float().mean()
+
         return total_loss, bucket_loss, token_loss, token_acc
 
 
