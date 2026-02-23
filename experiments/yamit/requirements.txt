@@ -1,0 +1,4 @@
+# Python dependencies for YAMIT training pipeline
+torch>=2.2.0
+numpy>=1.24.0
+datasets>=2.18.0    # HuggingFace datasets for download script
