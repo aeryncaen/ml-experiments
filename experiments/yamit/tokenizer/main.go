@@ -148,6 +148,11 @@ type jsonlRecord struct {
 
 const fastPathVerifyDocs = 8
 
+type addedTokenEntry struct {
+	content string
+	id      int
+}
+
 type fastEncoder struct {
 	model        *bpe.BPE
 	splitPattern normalizer.Pattern
@@ -155,6 +160,7 @@ type fastEncoder struct {
 	byteChar     [256]string
 	normalizeNFC bool
 	verifyBudget int
+	addedTokens  []addedTokenEntry // sorted longest-first
 }
 
 func buildFastEncoder(tk *tokenizer.Tokenizer) (*fastEncoder, string) {
@@ -202,12 +208,27 @@ func buildFastEncoder(tk *tokenizer.Tokenizer) (*fastEncoder, string) {
 		}
 	}
 
+	// Collect added tokens for splitting before BPE.
+	addedVocab := tk.GetAddedVocab()
+	entries := make([]addedTokenEntry, 0, len(addedVocab))
+	for content, id := range addedVocab {
+		entries = append(entries, addedTokenEntry{content, id})
+	}
+	// Sort longest-first for greedy matching.
+	sort.Slice(entries, func(i, j int) bool {
+		if len(entries[i].content) != len(entries[j].content) {
+			return len(entries[i].content) > len(entries[j].content)
+		}
+		return entries[i].content < entries[j].content
+	})
+
 	fe := &fastEncoder{
 		model:        model,
 		splitPattern: split.Pattern,
 		byteLevel:    bl,
 		normalizeNFC: normalizeNFC,
 		verifyBudget: fastPathVerifyDocs,
+		addedTokens:  entries,
 	}
 	for i := 0; i < 256; i++ {
 		fe.byteChar[i] = pretokenizer.BytesChar[byte(i)]
@@ -228,22 +249,18 @@ func (f *fastEncoder) byteLevelMap(s string) string {
 	return b.String()
 }
 
-func (f *fastEncoder) encodeIntoIDs(text string, dst []int) ([]int, bool, error) {
-	normText := text
-	if f.normalizeNFC {
-		normText = norm.NFC.String(text)
-	}
-
-	matches := f.splitPattern.FindMatches(normText)
-	dst = dst[:0]
+// encodeBPESegment runs the regex-split + byte-level-map + BPE pipeline on
+// a segment of text that is known to contain no added tokens.
+func (f *fastEncoder) encodeBPESegment(segment string, dst []int) []int {
+	matches := f.splitPattern.FindMatches(segment)
 	for _, m := range matches {
 		start := m.Offsets[0]
 		end := m.Offsets[1]
-		if start < 0 || end > len(normText) || start >= end {
+		if start < 0 || end > len(segment) || start >= end {
 			continue
 		}
 
-		piece := normText[start:end]
+		piece := segment[start:end]
 		if f.byteLevel.AddPrefixSpace && !strings.HasPrefix(piece, " ") {
 			piece = " " + piece
 		}
@@ -253,6 +270,49 @@ func (f *fastEncoder) encodeIntoIDs(text string, dst []int) ([]int, bool, error)
 		for _, tok := range toks {
 			dst = append(dst, tok.Id)
 		}
+	}
+	return dst
+}
+
+func (f *fastEncoder) encodeIntoIDs(text string, dst []int) ([]int, bool, error) {
+	normText := text
+	if f.normalizeNFC {
+		normText = norm.NFC.String(text)
+	}
+
+	dst = dst[:0]
+
+	if len(f.addedTokens) == 0 {
+		dst = f.encodeBPESegment(normText, dst)
+		return dst, true, nil
+	}
+
+	// Split text around added tokens, greedy longest-match scan.
+	remaining := normText
+	for len(remaining) > 0 {
+		bestIdx := -1
+		bestPos := -1
+		for i, at := range f.addedTokens {
+			pos := strings.Index(remaining, at.content)
+			if pos != -1 && (bestPos == -1 || pos < bestPos) {
+				bestPos = pos
+				bestIdx = i
+				break // sorted longest-first, first hit at this pos is best
+			}
+		}
+		if bestIdx == -1 {
+			// No more added tokens — BPE-encode the rest.
+			dst = f.encodeBPESegment(remaining, dst)
+			break
+		}
+
+		// BPE-encode the text before the added token.
+		if bestPos > 0 {
+			dst = f.encodeBPESegment(remaining[:bestPos], dst)
+		}
+		// Emit the added token ID directly.
+		dst = append(dst, f.addedTokens[bestIdx].id)
+		remaining = remaining[bestPos+len(f.addedTokens[bestIdx].content):]
 	}
 
 	return dst, true, nil

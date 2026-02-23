@@ -1,7 +1,7 @@
 github.com/aeryncaen/regexp2 v0.0.0-20260223063553-3a989801f37f h1:LOvIjoLvjbLEH9ZN30DdDQuH8rxmb+XXdOrOpZn7yME=
 github.com/aeryncaen/regexp2 v0.0.0-20260223063553-3a989801f37f/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
-github.com/aeryncaen/tokenizer v0.0.0-20260223074333-36a1f5bada00 h1:4iwQ4Rnuq3YC0FAqhNcccavDATvifepDcP++dACLAZw=
-github.com/aeryncaen/tokenizer v0.0.0-20260223074333-36a1f5bada00/go.mod h1:hQhQ00zsLzgpQhFixDgUcux7u6y3HniRIetM3mpGjyk=
+github.com/aeryncaen/tokenizer v0.0.0-20260223110315-2f03327a22c4 h1:EE5qiVbfyr2FipAkeauC6f14lOTFY25WoV3VGg0Jdok=
+github.com/aeryncaen/tokenizer v0.0.0-20260223110315-2f03327a22c4/go.mod h1:hQhQ00zsLzgpQhFixDgUcux7u6y3HniRIetM3mpGjyk=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

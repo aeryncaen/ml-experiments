@@ -8,7 +8,7 @@ require (
 	golang.org/x/text v0.25.0
 )
 
-replace github.com/sugarme/tokenizer => github.com/aeryncaen/tokenizer v0.0.0-20260223074333-36a1f5bada00
+replace github.com/sugarme/tokenizer => github.com/aeryncaen/tokenizer v0.0.0-20260223110315-2f03327a22c4
 
 replace github.com/dlclark/regexp2 => github.com/aeryncaen/regexp2 v0.0.0-20260223063553-3a989801f37f
 
