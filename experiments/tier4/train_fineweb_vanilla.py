@@ -2467,8 +2467,13 @@ class GPTTransformer(nn.Module):
             )
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
-            return None, total_loss
+            if self.training:
+                total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+                return None, total_loss
+            # Eval: full-vocab CE so val loss is comparable to other heads
+            logits = self.lm_head.interface.project(x)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            return None, loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -2981,8 +2986,12 @@ class GPTMoE(nn.Module):
             )
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
-            return None, total_loss
+            if self.training:
+                total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+                return None, total_loss
+            logits = self.lm_head.interface.project(x)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            return None, loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
