@@ -106,6 +106,7 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
+    pit_router_n_neg: int = _env_int("PIT_ROUTER_N_NEG", 10)  # negative samples for sigmoid router loss
 
 
     # Byte-attention MLP
@@ -2122,19 +2123,21 @@ class CompositePITHead(nn.Module):
 class BucketedCompositePITHead(nn.Module):
     """Composite-PIT head with hash-routed sub-heads.
 
-    Splits vocab into n_buckets via hash. A SwiGLU router selects top_k
-    buckets per position. Training uses teacher-forced routing (target
-    bucket always active) with streaming CE + router aux loss.
-    Inference only computes top_k bucket logits.
+    Splits vocab into n_buckets via hash. A SwiGLU router scores buckets
+    with sigmoid activation (independent per-bucket scores). Training uses
+    sigmoid BCE with negative sampling for the router, plus within-bucket
+    softmax CE for token prediction. Inference scores top_k buckets.
     """
 
     def __init__(self, interface: CompositePITTokenInterface,
                  n_buckets: int = 64, top_k: int = 8,
-                 router_aux_weight: float = 0.01):
+                 router_aux_weight: float = 0.01,
+                 router_n_neg: int = 10):
         super().__init__()
         self.interface = interface
         self.top_k = top_k
         self.router_aux_weight = router_aux_weight
+        self.router_n_neg = router_n_neg
 
         V = interface.vocab_size
         d_model = interface.d_model
@@ -2227,11 +2230,11 @@ class BucketedCompositePITHead(nn.Module):
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
-        """2-level hierarchical softmax: P(token) = P(bucket|h) * P(token|bucket,h).
+        """Hierarchical loss: sigmoid router + within-bucket softmax CE.
 
-        Level 1: router softmax over K buckets → CE against target bucket.
+        Level 1: sigmoid BCE on router logits — target bucket is positive,
+                 n_neg random buckets are negative. Independent per-bucket scores.
         Level 2: within-bucket softmax → CE against target token in its bucket.
-        Total loss = bucket_loss + token_loss. Exact, no approximation.
 
         Returns (total_loss, bucket_loss, token_loss, token_acc).
         """
@@ -2239,13 +2242,24 @@ class BucketedCompositePITHead(nn.Module):
         N = B * T
         g_shared, h_tok_flat = self._prepare_hidden(hidden)
 
-        # ── Level 1: bucket prediction ──
+        # ── Level 1: sigmoid router with negative sampling ──
         router_logits = self._route(hidden)  # (B, T, K)
         target_flat = targets.reshape(N)
         target_buckets = self.token_to_bucket[target_flat]
         target_local = self.token_in_bucket_idx[target_flat]
 
-        bucket_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
+        router_flat = router_logits.reshape(N, -1)  # (N, K)
+        # Positive: target bucket logit for each position
+        pos_logits = router_flat.gather(1, target_buckets.unsqueeze(1))  # (N, 1)
+        # Negative: sample n_neg random buckets != target per position
+        n_neg = self.router_n_neg
+        # Sample uniform random bucket indices, reject target via modular shift
+        neg_idx = torch.randint(0, self.n_buckets - 1, (N, n_neg), device=hidden.device)
+        # Shift indices >= target_bucket up by 1 to avoid sampling the target
+        neg_idx = neg_idx + (neg_idx >= target_buckets.unsqueeze(1)).long()
+        neg_logits = router_flat.gather(1, neg_idx)  # (N, n_neg)
+        # BCE: -log(sigmoid(pos)) - sum(log(1 - sigmoid(neg)))
+        bucket_loss = (-F.logsigmoid(pos_logits).sum() - F.logsigmoid(-neg_logits).sum()) / N
 
         # ── Level 2: within-bucket token prediction ──
         # Only need to compute logits for the target bucket of each position.
@@ -2367,7 +2381,8 @@ def _make_embed_head_pair():
                         BucketedCompositePITHead(interface,
                                                   n_buckets=HP.pit_n_buckets,
                                                   top_k=HP.pit_top_k,
-                                                  router_aux_weight=HP.pit_router_aux_weight))
+                                                  router_aux_weight=HP.pit_router_aux_weight,
+                                                  router_n_neg=HP.pit_router_n_neg))
             return CompositePITEmbedding(interface), CompositePITHead(interface)
 
         interface = PITTokenInterface(
@@ -3228,7 +3243,7 @@ def main():
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     if _head == "bucketed_pit":
-        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
+        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} router_n_neg={HP.pit_router_n_neg}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
