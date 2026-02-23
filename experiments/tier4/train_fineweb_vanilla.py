@@ -76,11 +76,11 @@ class HParams:
     val_steps: int = _env_int("VAL_STEPS", 32)
     val_every: int = _env_int("VAL_EVERY", 100)
     lr: float = _env_float("LR", 3e-4)
-    warmup_steps: int = _env_int("WARMUP_STEPS", 200)
+    warmup_steps: int = _env_int("WARMUP_STEPS", 2000)
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
-    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.33)  # fraction of steps for decay phase
+    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of steps for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
