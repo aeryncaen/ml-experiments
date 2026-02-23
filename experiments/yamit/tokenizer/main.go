@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,31 @@ const maxBytesPerToken = 16
 // maxBytesPerToken to their byte-level fallback token sequences.
 type surgeryTable struct {
 	remap map[int][]int // long_token_id → []byte_token_id
+}
+
+func loadSurgeryTable(path string) (*surgeryTable, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read surgery map: %w", err)
+	}
+
+	var raw map[string][]int
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("parse surgery map json: %w", err)
+	}
+
+	remap := make(map[int][]int, len(raw))
+	for k, v := range raw {
+		oldID, err := strconv.Atoi(k)
+		if err != nil {
+			return nil, fmt.Errorf("invalid surgery key %q: %w", k, err)
+		}
+		remap[oldID] = v
+	}
+	return &surgeryTable{remap: remap}, nil
 }
 
 // buildSurgeryTable examines every token in the vocabulary. Tokens whose
@@ -276,9 +302,50 @@ type tokenizeResult struct {
 	err        error
 }
 
+func loadIDRemap(path string) (map[int]int, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read id remap: %w", err)
+	}
+
+	var raw map[string]int
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("parse id remap json: %w", err)
+	}
+
+	out := make(map[int]int, len(raw))
+	for k, v := range raw {
+		oldID, err := strconv.Atoi(k)
+		if err != nil {
+			return nil, fmt.Errorf("invalid id remap key %q: %w", k, err)
+		}
+		out[oldID] = v
+	}
+	return out, nil
+}
+
+func applyIDRemap(ids []int, remap map[int]int) ([]int, error) {
+	if remap == nil {
+		return ids, nil
+	}
+	out := make([]int, len(ids))
+	for i, id := range ids {
+		newID, ok := remap[id]
+		if !ok {
+			return nil, fmt.Errorf("missing remap for token id %d", id)
+		}
+		out[i] = newID
+	}
+	return out, nil
+}
+
 func tokenizeWorker(
 	tk *tokenizer.Tokenizer,
 	surgery *surgeryTable,
+	idRemap map[int]int,
 	jobs <-chan string,
 	results chan<- tokenizeResult,
 ) {
@@ -291,6 +358,7 @@ func tokenizeWorker(
 
 		allIDs := make([][]int, 0, len(texts))
 		totalTokens := 0
+		var fileErr error
 
 		for _, text := range texts {
 			enc, err := tk.EncodeSingle(text)
@@ -300,8 +368,18 @@ func tokenizeWorker(
 			}
 			ids := enc.Ids
 			ids = surgery.apply(ids)
+			ids, err = applyIDRemap(ids, idRemap)
+			if err != nil {
+				fileErr = err
+				break
+			}
 			allIDs = append(allIDs, ids)
 			totalTokens += len(ids)
+		}
+
+		if fileErr != nil {
+			results <- tokenizeResult{inputPath: path, err: fileErr}
+			continue
 		}
 
 		base := filepath.Base(path)
@@ -321,6 +399,8 @@ func tokenizeWorker(
 
 func main() {
 	tokenizerPath := flag.String("tokenizer", "", "Path to tokenizer.json")
+	surgeryMapPath := flag.String("surgery-map", "", "Optional path to surgery_map.json")
+	idRemapPath := flag.String("id-remap", "", "Optional path to id_remap.json (old tokenizer IDs -> model IDs)")
 	inputDir := flag.String("input", "", "Input directory with JSONL shards (searched recursively)")
 	outputDir := flag.String("output", "", "Output directory for .bin/.idx shards")
 	workers := flag.Int("workers", 0, "Number of worker goroutines (default: NumCPU)")
@@ -345,10 +425,28 @@ func main() {
 	}
 	log.Printf("Vocabulary size: %d", tk.GetVocabSize(true))
 
-	// Build surgery table.
-	surgery, err := buildSurgeryTable(tk)
+	// Surgery table: prefer artifact file when provided.
+	surgery, err := loadSurgeryTable(*surgeryMapPath)
 	if err != nil {
-		log.Fatalf("Failed to build surgery table: %v", err)
+		log.Fatalf("Failed to load surgery map: %v", err)
+	}
+	if surgery == nil {
+		surgery, err = buildSurgeryTable(tk)
+		if err != nil {
+			log.Fatalf("Failed to build surgery table: %v", err)
+		}
+		log.Printf("Built surgery table from tokenizer vocab: %d entries", len(surgery.remap))
+	} else {
+		log.Printf("Loaded surgery map: %d entries", len(surgery.remap))
+	}
+
+	// Optional ID remap for pruned composite vocab.
+	idRemap, err := loadIDRemap(*idRemapPath)
+	if err != nil {
+		log.Fatalf("Failed to load id remap: %v", err)
+	}
+	if idRemap != nil {
+		log.Printf("Loaded ID remap: %d entries", len(idRemap))
 	}
 
 	// Find all JSONL files.
@@ -405,7 +503,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tokenizeWorker(tk, surgery, jobs, results)
+			tokenizeWorker(tk, surgery, idRemap, jobs, results)
 		}()
 	}
 

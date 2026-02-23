@@ -5,8 +5,9 @@ This script prepares the artifacts required by YAMIT composite embeddings:
 
 1) `tokenizer.json` copy from a base HF tokenizer
 2) `surgery_map.json` mapping long tokens (> max_bytes) to byte-token ID sequences
-3) `token_bytes.pt` table of shape [final_vocab_size, max_bytes]
-4) `artifact_meta.json` with vocab/special-token metadata
+3) `id_remap.json` mapping base token IDs -> pruned token IDs
+4) `token_bytes.pt` table of shape [final_vocab_size, max_bytes]
+5) `artifact_meta.json` with vocab/special-token metadata
 
 Notes:
 - YAMIT does not require rewriting BPE merges. Long tokens are handled by
@@ -153,6 +154,7 @@ def build_artifacts(
     pad_byte_id: int,
     vocab_multiple: int,
     add_special_tokens: List[str],
+    prune_long_tokens: bool,
 ) -> Dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -204,41 +206,81 @@ def build_artifacts(
         for i, b in enumerate(raw):
             base_token_bytes[token_id, i] = b
 
-    # Special token ID mapping (new IDs if token not in base vocab).
-    special_token_ids: Dict[str, int] = {}
-    next_id = base_vocab_size
+    # Build old->new ID remap.
+    # - If prune_long_tokens=True: remove >max_bytes tokens from model ID space.
+    # - Else: identity remap for base vocab.
+    old_to_new: Dict[int, int] = {}
+    new_to_old: Dict[int, int] = {}
 
+    if prune_long_tokens:
+        for new_id, old_id in enumerate(keep_token_ids):
+            old_to_new[old_id] = new_id
+            new_to_old[new_id] = old_id
+        next_id = len(keep_token_ids)
+    else:
+        for old_id in range(base_vocab_size):
+            old_to_new[old_id] = old_id
+            new_to_old[old_id] = old_id
+        next_id = base_vocab_size
+
+    # Special token ID mapping (new IDs if token not in kept/base vocab).
+    special_token_ids: Dict[str, int] = {}
     for tok in add_special_tokens:
         if not tok:
             continue
         existing = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(existing, int) and 0 <= existing < base_vocab_size:
-            special_token_ids[tok] = existing
+        if isinstance(existing, int) and existing in old_to_new:
+            special_token_ids[tok] = old_to_new[existing]
         else:
             special_token_ids[tok] = next_id
             next_id += 1
 
-    unpadded_vocab_size = max(base_vocab_size, next_id)
+    unpadded_vocab_size = next_id
     final_vocab_size = _round_up_to_multiple(unpadded_vocab_size, vocab_multiple)
 
     token_bytes = torch.full((final_vocab_size, max_bytes), pad_byte_id, dtype=torch.long)
-    token_bytes[:base_vocab_size] = base_token_bytes
+
+    # Copy base bytes through remap.
+    for old_id, new_id in old_to_new.items():
+        token_bytes[new_id] = base_token_bytes[old_id]
 
     # Fill bytes for newly added specials if they were assigned new IDs.
     for tok, tok_id in special_token_ids.items():
-        if tok_id < base_vocab_size:
+        if tok_id in new_to_old:
             continue
         raw = tok.encode("utf-8")
         if len(raw) <= max_bytes:
             for i, b in enumerate(raw):
                 token_bytes[tok_id, i] = b
 
+    # Remap surgery targets to pruned/new IDs.
+    remapped_surgery_map: Dict[int, List[int]] = {}
+    for old_long_id, seq_old in surgery_map.items():
+        if old_long_id in old_to_new:
+            # Long tokens are expected removed in prune mode, but allow if not pruned.
+            src_id = old_to_new[old_long_id]
+        else:
+            src_id = old_long_id
+
+        seq_new: List[int] = []
+        for old_id in seq_old:
+            if old_id not in old_to_new:
+                raise RuntimeError(
+                    f"Surgery target token {old_id} is missing from old_to_new remap"
+                )
+            seq_new.append(old_to_new[old_id])
+        remapped_surgery_map[src_id] = seq_new
+
     # Export artifacts.
-    surgery_map_json = {str(k): v for k, v in sorted(surgery_map.items())}
+    surgery_map_json = {str(k): v for k, v in sorted(remapped_surgery_map.items())}
 
     surgery_path = output_dir / "surgery_map.json"
     with open(surgery_path, "w") as f:
         json.dump(surgery_map_json, f, indent=2)
+
+    id_remap_path = output_dir / "id_remap.json"
+    with open(id_remap_path, "w") as f:
+        json.dump({str(k): v for k, v in sorted(old_to_new.items())}, f, indent=2)
 
     token_bytes_pt = output_dir / "token_bytes.pt"
     torch.save(token_bytes, token_bytes_pt)
@@ -254,6 +296,7 @@ def build_artifacts(
             {
                 "keep_token_ids": keep_token_ids,
                 "long_token_ids": long_token_ids,
+                "old_to_new_count": len(old_to_new),
             },
             f,
         )
@@ -264,9 +307,11 @@ def build_artifacts(
         "max_bytes": max_bytes,
         "pad_byte_id": pad_byte_id,
         "base_vocab_size": base_vocab_size,
+        "pruned_vocab_size": len(old_to_new),
         "final_vocab_size": final_vocab_size,
         "unpadded_vocab_size": unpadded_vocab_size,
         "vocab_multiple": vocab_multiple,
+        "prune_long_tokens": prune_long_tokens,
         "long_token_count": len(long_token_ids),
         "byte_token_count": len(byte_to_id),
         "special_token_ids": special_token_ids,
@@ -277,8 +322,32 @@ def build_artifacts(
             "pad": tokenizer.pad_token,
             "unk": tokenizer.unk_token,
         },
+        "resolved_special_ids": {
+            "mask": special_token_ids.get("<|mask|>", None),
+            "bos": (
+                old_to_new[tokenizer.bos_token_id]
+                if getattr(tokenizer, "bos_token_id", None) in old_to_new
+                else None
+            ),
+            "eos": (
+                old_to_new[tokenizer.eos_token_id]
+                if getattr(tokenizer, "eos_token_id", None) in old_to_new
+                else None
+            ),
+            "pad": (
+                old_to_new[tokenizer.pad_token_id]
+                if getattr(tokenizer, "pad_token_id", None) in old_to_new
+                else None
+            ),
+            "unk": (
+                old_to_new[tokenizer.unk_token_id]
+                if getattr(tokenizer, "unk_token_id", None) in old_to_new
+                else None
+            ),
+        },
         "artifacts": {
             "surgery_map": surgery_path.name,
+            "id_remap": id_remap_path.name,
             "token_bytes_pt": token_bytes_pt.name,
             "token_bytes_npy": token_bytes_npy.name,
             "pruned_vocab": pruned_vocab_path.name,
@@ -330,6 +399,11 @@ def parse_args() -> argparse.Namespace:
         default=["<|mask|>"],
         help="Extra special token to reserve in final vocab (repeatable)",
     )
+    p.add_argument(
+        "--no-prune-long-tokens",
+        action="store_true",
+        help="Disable long-token pruning (keeps base token ID space)",
+    )
     return p.parse_args()
 
 
@@ -345,14 +419,17 @@ def main() -> None:
         pad_byte_id=args.pad_byte_id,
         vocab_multiple=args.vocab_multiple,
         add_special_tokens=extra_specials,
+        prune_long_tokens=not args.no_prune_long_tokens,
     )
 
     print("\nComposite tokenizer artifacts written:")
     print(f"  output_dir       : {output_dir}")
     print(f"  base_vocab_size  : {meta['base_vocab_size']:,}")
+    print(f"  pruned_vocab_size: {meta['pruned_vocab_size']:,}")
     print(f"  final_vocab_size : {meta['final_vocab_size']:,}")
     print(f"  long_token_count : {meta['long_token_count']:,}")
     print(f"  surgery_map      : {meta['artifacts']['surgery_map']}")
+    print(f"  id_remap         : {meta['artifacts']['id_remap']}")
     print(f"  token_bytes      : {meta['artifacts']['token_bytes_pt']}")
 
 
