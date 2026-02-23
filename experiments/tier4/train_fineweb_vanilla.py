@@ -2226,11 +2226,12 @@ class BucketedCompositePITHead(nn.Module):
         return F.softmax(logits, dim=-1) + self.silu2_gate_token * self._silu2(logits)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Inference: top-k bucket logits only, rest -inf."""
+        """Inference: top-k bucket logits, scaled by router confidence."""
         B, T, D = hidden.shape
         g_shared, h_tok_flat = self._prepare_hidden(hidden)
         router_logits = self._route(hidden)
-        _, top_k_idx = self._corrected_bucket_scores(router_logits).topk(self.top_k, dim=-1)
+        bucket_scores = self._corrected_bucket_scores(router_logits)  # (B, T, K)
+        _, top_k_idx = bucket_scores.topk(self.top_k, dim=-1)
         active = top_k_idx.unique()
 
         logits = torch.full((B, T, self.interface.vocab_size), float('-inf'),
@@ -2239,8 +2240,9 @@ class BucketedCompositePITHead(nn.Module):
             b = b_idx.item()
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
-            bl = self._bucket_logits(g_shared, h_tok_flat, b)
-            logits[:, :, members] = self._corrected_token_scores(bl)
+            confidence = bucket_scores[:, :, b].unsqueeze(-1)  # (B, T, 1)
+            bl = self._corrected_token_scores(self._bucket_logits(g_shared, h_tok_flat, b))
+            logits[:, :, members] = bl * confidence
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
@@ -2300,8 +2302,8 @@ class BucketedCompositePITHead(nn.Module):
 
         # ── Accuracy: argmax across router's top-k buckets (matches inference) ──
         with torch.no_grad():
-            routing_scores = self._corrected_bucket_scores(router_logits).reshape(N, -1)
-            _, top_k_idx = routing_scores.topk(self.top_k, dim=-1)  # (N, top_k)
+            bucket_scores = self._corrected_bucket_scores(router_logits).reshape(N, -1)
+            _, top_k_idx = bucket_scores.topk(self.top_k, dim=-1)  # (N, top_k)
             active_buckets = top_k_idx.unique().tolist()
             best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
             best_score = torch.full((N,), float('-inf'), device=hidden.device)
@@ -2309,16 +2311,16 @@ class BucketedCompositePITHead(nn.Module):
             for b in active_buckets:
                 bs = self._bucket_sizes_list[b]
                 members = self.bucket_members[b, :bs]
-                # Only score positions whose router selected this bucket
                 in_topk = (top_k_idx == b).any(dim=-1)  # (N,)
                 if not in_topk.any():
                     continue
+                confidence = bucket_scores[in_topk, b].unsqueeze(-1)  # (n, 1)
                 patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
                 patterns = patterns.to(dtype=g_flat.dtype)
                 bl_shared = torch.einsum('nsd,vsd->nv', g_flat[in_topk], patterns)
                 embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
                 bl_tok = F.linear(h_tok_2d[in_topk], embeds, iface.token_out_bias[members])
-                bl = self._corrected_token_scores((bl_shared + bl_tok).float())  # (n, bs)
+                bl = self._corrected_token_scores((bl_shared + bl_tok).float()) * confidence
                 top_val, top_idx = bl.max(dim=-1)
                 improved = top_val > best_score[in_topk]
                 idx_into_n = in_topk.nonzero(as_tuple=True)[0]
