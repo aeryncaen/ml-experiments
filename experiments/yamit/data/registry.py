@@ -449,14 +449,11 @@ DATASETS: list[Dataset] = [
     # =========================================================================
     # CODE — GitHub auxiliary (all stages)
     # =========================================================================
-    Dataset(
-        name="pull-requests",
-        hf_path="HuggingFaceTB/issues-kaggle-notebooks",
-        hf_subset="pull-requests",
-        text_column="text",
-        category=Category.CODE,
-        stage_weights={1: 0.006, 2: 0.0114, 3: 0.005},
-    ),
+    # NOTE: pull-requests and jupyter-scripts were internal HuggingFace
+    # datasets used for SmolLM3 training but not publicly released.
+    # Their weights are redistributed to github-issues and kaggle.
+    # Original weights: pull-requests {1: 0.006, 2: 0.0114, 3: 0.005},
+    #                   jupyter-scripts {1: 0.0055, 2: 0.01, 3: 0.012}
     Dataset(
         name="kaggle",
         hf_path="HuggingFaceTB/issues-kaggle-notebooks",
@@ -466,17 +463,9 @@ DATASETS: list[Dataset] = [
         stage_weights={1: 0.0005, 2: 0.0005, 3: 0.0006},
     ),
     Dataset(
-        name="jupyter-scripts",
-        hf_path="HuggingFaceTB/issues-kaggle-notebooks",
-        hf_subset="jupyter-scripts",
-        text_column="text",
-        category=Category.CODE,
-        stage_weights={1: 0.0055, 2: 0.01, 3: 0.012},
-    ),
-    Dataset(
         name="github-issues",
         hf_path="HuggingFaceTB/issues-kaggle-notebooks",
-        hf_subset="github-issues",
+        hf_subset="issues",
         text_column="text",
         category=Category.CODE,
         stage_weights={1: 0.0032, 2: 0.004, 3: 0.004},
