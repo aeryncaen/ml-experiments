@@ -300,6 +300,7 @@ type tokenizeResult struct {
 	isVal      bool
 	tokenCount int
 	docCount   int
+	elapsed    time.Duration
 	err        error
 }
 
@@ -467,7 +468,9 @@ func tokenizeWorker(
 			continue
 		}
 
+		t0 := time.Now()
 		docs, tokens, err := tokenizeJSONLToShard(job.inputPath, job.outputPath, tk, fast)
+		dt := time.Since(t0)
 		results <- tokenizeResult{
 			inputPath:  job.inputPath,
 			relPath:    job.relPath,
@@ -475,6 +478,7 @@ func tokenizeWorker(
 			isVal:      job.isVal,
 			tokenCount: tokens,
 			docCount:   docs,
+			elapsed:    dt,
 			err:        err,
 		}
 	}
@@ -648,6 +652,7 @@ func main() {
 	var totalDocs uint64
 	var trainTokens, valTokens uint64
 	var errorCount int
+	shardsCompleted := 0
 
 	for result := range results {
 		if result.err != nil {
@@ -662,13 +667,28 @@ func main() {
 		} else {
 			trainTokens += uint64(result.tokenCount)
 		}
+		shardsCompleted++
 
 		split := "train"
 		if result.isVal {
 			split = "val  "
 		}
-		log.Printf("[%s] %s — %d docs, %d tokens",
-			split, result.relPath, result.docCount, result.tokenCount)
+
+		// Per-shard speed.
+		shardTokSec := float64(0)
+		if result.elapsed > 0 {
+			shardTokSec = float64(result.tokenCount) / result.elapsed.Seconds()
+		}
+		// Aggregate speed.
+		wallElapsed := time.Since(startTime).Seconds()
+		aggTokSec := float64(0)
+		if wallElapsed > 0 {
+			aggTokSec = float64(totalTokens) / wallElapsed
+		}
+		log.Printf("[%s] %s — %d docs, %dk tok, %.1fM tok/s (agg %.1fM tok/s, %d/%d shards)",
+			split, result.relPath, result.docCount,
+			result.tokenCount/1000, shardTokSec/1e6,
+			aggTokSec/1e6, shardsCompleted, len(jsonlFiles))
 	}
 
 	elapsed := time.Since(startTime)
