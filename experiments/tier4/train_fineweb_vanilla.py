@@ -98,11 +98,14 @@ class HParams:
 
     # Decoder head (ML-Decoder style cross-attention over byte slots)
     decoder_head: bool = _env_bool("DECODER_HEAD", False)
-    lm_head_type: str = os.environ.get("LM_HEAD_TYPE", "")  # "" = backward-compatible (DECODER_HEAD), else linear|decoder|linear48|pit
+    lm_head_type: str = os.environ.get("LM_HEAD_TYPE", "")  # "" = backward-compatible (DECODER_HEAD), else linear|decoder|linear48|pit|bucketed_pit
     decoder_head_vocab_chunk: int = _env_int("DECODER_HEAD_VOCAB_CHUNK", 0)  # 0 = full vocab per token chunk (matches linear-head chunking style)
     decoder_head_token_chunk: int = _env_int("DECODER_HEAD_TOKEN_CHUNK", 1024)
     pit_orth_init: bool = _env_bool("PIT_ORTH_INIT", True)
     pit_eps: float = _env_float("PIT_EPS", 1e-6)
+    pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
+    pit_top_k: int = _env_int("PIT_TOP_K", 8)
+    pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
 
 
     # Byte-attention MLP
@@ -2116,6 +2119,184 @@ class CompositePITHead(nn.Module):
         return self.interface.project(hidden)
 
 
+class BucketedCompositePITHead(nn.Module):
+    """Composite-PIT head with hash-routed sub-heads.
+
+    Splits vocab into n_buckets via hash. A SwiGLU router selects top_k
+    buckets per position. Training uses teacher-forced routing (target
+    bucket always active) with streaming CE + router aux loss.
+    Inference only computes top_k bucket logits.
+    """
+
+    def __init__(self, interface: CompositePITTokenInterface,
+                 n_buckets: int = 64, top_k: int = 8,
+                 router_aux_weight: float = 0.01):
+        super().__init__()
+        self.interface = interface
+        self.n_buckets = n_buckets
+        self.top_k = top_k
+        self.router_aux_weight = router_aux_weight
+
+        V = interface.vocab_size
+        d_model = interface.d_model
+
+        # ── Hash routing ──
+        ids = torch.arange(V, dtype=torch.long)
+        bucket_ids = ((ids * 2654435761) % (2**32)) % n_buckets
+        self.register_buffer('token_to_bucket', bucket_ids)
+
+        # Build padded bucket membership table
+        bucket_lists: list[torch.Tensor] = []
+        for b in range(n_buckets):
+            bucket_lists.append((bucket_ids == b).nonzero(as_tuple=True)[0])
+
+        max_bs = max(len(bl) for bl in bucket_lists)
+        members = torch.zeros(n_buckets, max_bs, dtype=torch.long)
+        sizes = torch.zeros(n_buckets, dtype=torch.long)
+        tok_in_bucket = torch.zeros(V, dtype=torch.long)
+
+        for b in range(n_buckets):
+            sz = len(bucket_lists[b])
+            sizes[b] = sz
+            members[b, :sz] = bucket_lists[b]
+            tok_in_bucket[bucket_lists[b]] = torch.arange(sz)
+
+        self.register_buffer('bucket_members', members)       # (K, max_bs)
+        self.register_buffer('bucket_sizes', sizes)            # (K,)
+        self.register_buffer('token_in_bucket_idx', tok_in_bucket)  # (V,)
+        self.max_bucket_size = max_bs
+
+        # ── SwiGLU Router ──
+        router_hidden = d_model // 4
+        self.router_gate = nn.Linear(d_model, router_hidden, bias=False)
+        self.router_up = nn.Linear(d_model, router_hidden, bias=False)
+        self.router_down = nn.Linear(router_hidden, n_buckets, bias=False)
+
+    def _route(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.router_down(F.silu(self.router_gate(hidden)) * self.router_up(hidden))
+
+    def _prepare_hidden(self, hidden: torch.Tensor):
+        """Split hidden into shared/private, apply T to shared subspace."""
+        iface = self.interface
+        B, T, D = hidden.shape
+        slots = hidden.view(B, T, iface.max_bytes, iface.dims_per_slot)
+        h_shared = slots[..., :iface.shared_per_byte]
+        h_tok = slots[..., iface.shared_per_byte:]
+
+        L = iface._byte_chol_factor(hidden.dtype, hidden.device)
+        g_shared = torch.matmul(h_shared, L)
+        g_shared = torch.matmul(g_shared, L.transpose(0, 1))
+
+        h_tok_flat = h_tok.reshape(B, T, iface.max_bytes * iface.token_per_byte)
+        return g_shared, h_tok_flat
+
+    def _bucket_logits(self, g_shared: torch.Tensor, h_tok_flat: torch.Tensor,
+                       bucket_idx: int) -> torch.Tensor:
+        """Compute PIT logits for one bucket. Returns (*, bucket_size)."""
+        iface = self.interface
+        bs = self.bucket_sizes[bucket_idx]
+        members = self.bucket_members[bucket_idx, :bs]
+
+        patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
+        patterns = patterns.to(dtype=g_shared.dtype)
+        logits_shared = torch.einsum('...sd,vsd->...v', g_shared, patterns)
+
+        embeds = iface.token_embed.weight[members].to(dtype=h_tok_flat.dtype)
+        logits_tok = F.linear(h_tok_flat, embeds, iface.token_out_bias[members])
+
+        return logits_shared + logits_tok
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Inference: top-k bucket logits only, rest -inf."""
+        B, T, D = hidden.shape
+        g_shared, h_tok_flat = self._prepare_hidden(hidden)
+        router_logits = self._route(hidden)
+        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)
+        active = top_k_idx.unique()
+
+        logits = torch.full((B, T, self.interface.vocab_size), float('-inf'),
+                            device=hidden.device, dtype=hidden.dtype)
+        for b_idx in active:
+            b = b_idx.item()
+            bs = self.bucket_sizes[b]
+            members = self.bucket_members[b, :bs]
+            logits[:, :, members] = self._bucket_logits(g_shared, h_tok_flat, b)
+        return logits
+
+    def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
+        """Training: streaming CE with teacher-forced routing + aux loss.
+
+        Returns (total_loss, ce_loss, router_loss).
+        """
+        B, T, D = hidden.shape
+        N = B * T
+        g_shared, h_tok_flat = self._prepare_hidden(hidden)
+        g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
+        h_tok_2d = h_tok_flat.reshape(N, -1)
+
+        # Router
+        router_logits = self._route(hidden)
+        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)  # (B, T, k)
+
+        target_flat = targets.reshape(N)
+        target_buckets = self.token_to_bucket[target_flat]
+        target_local = self.token_in_bucket_idx[target_flat]
+
+        # Aux loss: router should predict target bucket
+        router_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
+
+        # Per-position active mask
+        active_mask = torch.zeros(B, T, self.n_buckets, dtype=torch.bool, device=hidden.device)
+        active_mask.scatter_(-1, top_k_idx, True)
+        active_mask.scatter_(-1, target_buckets.reshape(B, T, 1), True)
+        active_flat = active_mask.reshape(N, -1)
+
+        # Streaming log-sum-exp (fp32)
+        max_val = torch.full((N,), -1e30, device=hidden.device, dtype=torch.float32)
+        sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+        target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+
+        for b in range(self.n_buckets):
+            bucket_active = active_flat[:, b]
+            if not bucket_active.any():
+                continue
+
+            bs = self.bucket_sizes[b].item()
+            members = self.bucket_members[b, :bs]
+            iface = self.interface
+
+            patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
+            patterns = patterns.to(dtype=g_flat.dtype)
+            bl_shared = torch.einsum('nsd,vsd->nv', g_flat, patterns)
+
+            embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
+            bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
+
+            bl = (bl_shared + bl_tok).float()  # (N, bs)
+
+            # Zero-out inactive positions
+            bl = torch.where(bucket_active.unsqueeze(-1), bl,
+                             torch.tensor(-1e30, device=bl.device, dtype=bl.dtype))
+
+            # Update streaming LSE
+            bucket_max = bl.max(dim=-1).values
+            new_max = torch.maximum(max_val, bucket_max)
+            sum_exp = (sum_exp * torch.exp(max_val - new_max)
+                       + torch.exp(bl - new_max.unsqueeze(-1)).sum(dim=-1))
+            max_val = new_max
+
+            # Grab target logit from this bucket
+            in_bucket = (target_buckets == b)
+            if in_bucket.any():
+                idx = target_local[in_bucket]
+                target_logit[in_bucket] = bl[in_bucket].gather(1, idx.unsqueeze(1)).squeeze(1)
+
+        log_z = max_val + torch.log(sum_exp.clamp(min=1e-30))
+        ce_loss = (log_z - target_logit).mean()
+        total_loss = ce_loss + self.router_aux_weight * router_loss
+        return total_loss, ce_loss, router_loss
+
+
 def _resolved_head_type() -> str:
     head_type = HP.lm_head_type.strip().lower()
     if not head_type:
@@ -2153,10 +2334,10 @@ def _make_head():
 def _make_embed_head_pair():
     """Create embedding + head pair, including coupled PIT interface."""
     head_type = _resolved_head_type()
-    if head_type == "pit":
-        if HP.composite_embed:
+    if head_type in ("pit", "bucketed_pit"):
+        if HP.composite_embed or head_type == "bucketed_pit":
             if HP.composite_lora or HP.composite_conv:
-                raise ValueError("LM_HEAD_TYPE=pit with COMPOSITE_EMBED does not support COMPOSITE_LORA/COMPOSITE_CONV")
+                raise ValueError(f"LM_HEAD_TYPE={head_type} does not support COMPOSITE_LORA/COMPOSITE_CONV")
             interface = CompositePITTokenInterface(
                 HP.vocab_size,
                 HP.d_model,
@@ -2165,6 +2346,12 @@ def _make_embed_head_pair():
                 eps=HP.pit_eps,
                 orth_init=HP.pit_orth_init,
             )
+            if head_type == "bucketed_pit":
+                return (CompositePITEmbedding(interface),
+                        BucketedCompositePITHead(interface,
+                                                  n_buckets=HP.pit_n_buckets,
+                                                  top_k=HP.pit_top_k,
+                                                  router_aux_weight=HP.pit_router_aux_weight))
             return CompositePITEmbedding(interface), CompositePITHead(interface)
 
         interface = PITTokenInterface(
@@ -2279,6 +2466,9 @@ class GPTTransformer(nn.Module):
                 token_chunk_size=HP.decoder_head_token_chunk,
             )
             return None, loss
+        if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
+            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -2790,6 +2980,9 @@ class GPTMoE(nn.Module):
                 token_chunk_size=HP.decoder_head_token_chunk,
             )
             return None, loss
+        if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
+            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -3002,6 +3195,8 @@ def main():
     if HP.model_type == "moe":
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
+    if _head == "bucketed_pit":
+        _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
