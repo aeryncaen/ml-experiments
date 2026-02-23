@@ -2006,7 +2006,6 @@ class PITTokenInterface(nn.Module):
         self.memory = nn.Parameter(torch.empty(vocab_size, d_model))         # Z
         self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))          # unconstrained L
         self.embed_norm = RMSNorm(d_model)
-        self.project_norm = RMSNorm(d_model)
 
         self.reset_parameters(orth_init=orth_init)
 
@@ -2044,12 +2043,10 @@ class PITTokenInterface(nn.Module):
         if D != self.d_model:
             raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
 
-        hidden = self.project_norm(hidden)
         L = self._chol_factor(hidden.dtype, hidden.device)
         g = hidden.reshape(-1, D) @ L
         g = g @ L.transpose(0, 1)
-        mem = F.rms_norm(self.memory.to(dtype=g.dtype), (self.d_model,), None, 1e-5)
-        logits = F.linear(g, mem)
+        logits = F.linear(g, self.memory.to(dtype=g.dtype))
         return logits.view(B, T, self.vocab_size)
 
 
@@ -2104,7 +2101,6 @@ class CompositePITTokenInterface(nn.Module):
         self.byte_chol_raw = nn.Parameter(torch.zeros(self.shared_per_byte, self.shared_per_byte))
         self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
         self.shared_norm = RMSNorm(self.shared_per_byte)
-        self.token_norm = RMSNorm(self.max_bytes * self.token_per_byte)
         self.embed_out_norm = RMSNorm(self.d_model)
 
         self.pad_idx = 256
@@ -2158,7 +2154,7 @@ class CompositePITTokenInterface(nn.Module):
             raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
 
         slots = hidden.view(B, T, self.max_bytes, self.dims_per_slot)
-        h_shared = self.shared_norm(slots[..., :self.shared_per_byte])
+        h_shared = slots[..., :self.shared_per_byte]
         h_tok = slots[..., self.shared_per_byte:]
 
         L = self._byte_chol_factor(hidden.dtype, hidden.device)
@@ -2167,20 +2163,12 @@ class CompositePITTokenInterface(nn.Module):
 
         token_shared = F.embedding(self.token_bytes, self.byte_memory)               # (V, 16, shared)
         token_shared = token_shared.to(dtype=g_shared.dtype)
-        token_shared = F.rms_norm(token_shared, (token_shared.shape[-1],), None, 1e-5)
         logits_shared = torch.einsum('btsd,vsd->btv', g_shared, token_shared)
 
         h_tok_flat = h_tok.reshape(B, T, self.max_bytes * self.token_per_byte)
-        h_tok_flat = self.token_norm(h_tok_flat)
-        token_w = F.rms_norm(
-            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
-            (self.token_embed.weight.shape[-1],),
-            None,
-            1e-5,
-        )
         logits_token = F.linear(
             h_tok_flat,
-            token_w,
+            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
             self.token_out_bias,
         )
         return logits_shared + logits_token
