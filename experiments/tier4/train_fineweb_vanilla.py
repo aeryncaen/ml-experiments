@@ -104,7 +104,7 @@ class HParams:
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
     ngpt: bool = _env_bool("NGPT", False)
-    ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.05)   # eigen LR init (paper: ~1/n_layers)
+    ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.0)    # 0 = auto -> 1/n_layers
     ngpt_alpha_scale: float = _env_float("NGPT_ALPHA_SCALE", 0.0)  # 0 = auto -> 1/sqrt(d_model)
     ngpt_sqk_init: float = _env_float("NGPT_SQK_INIT", 1.0)       # QK scaling init
     ngpt_su_init: float = _env_float("NGPT_SU_INIT", 1.0)         # MLP u scaling init
@@ -1224,9 +1224,10 @@ class NGPTBlock(nn.Module):
         self.mlp = NGPTMLP(d_model)
 
         # Eigen learning rates (per embedding dimension)
+        alpha_init = HP.ngpt_alpha_init if HP.ngpt_alpha_init > 0 else 1.0 / HP.n_layer
         alpha_scale = HP.ngpt_alpha_scale if HP.ngpt_alpha_scale > 0 else 1.0 / math.sqrt(d_model)
-        self.alpha_attn = _ngpt_scale_param((d_model,), HP.ngpt_alpha_init, alpha_scale)
-        self.alpha_mlp = _ngpt_scale_param((d_model,), HP.ngpt_alpha_init, alpha_scale)
+        self.alpha_attn = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
+        self.alpha_mlp = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("ngpt/block_attn"):
