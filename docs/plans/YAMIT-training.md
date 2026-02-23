@@ -202,7 +202,7 @@ Start from `experiments/tier4/train_fineweb_vanilla.py`. It already has:
 | **Dual loss** | `L_AR + L_MDM` with `1/p_mask` importance weighting and `1/answer_length` normalization. |
 | **MLA attention** | Dense MLA with compressed KV latent, separate rope cache, arbitrary `position_ids`. |
 | **uint32 token loading** | Extend shard reader to handle uint32 tokens (vocab > 65535). |
-| **Qwen3 tokenizer + remap** | Long-token surgery: deterministic remap of 1,920 tokens > 16 bytes. |
+| **Modified Qwen3 tokenizer** | Long tokens (> 16 bytes) removed from vocab and BPE merges by tokenizer generator. |
 | **Diffusion sampler** | Iterative block/slot decode with verification, for eval-time generation. |
 | **DiffusionMLACache** | Per-layer latent KV cache with crop/select/append/batch ops. |
 | **Checkpoint save/load** | `model.state_dict()`, `optimizer.state_dict()`, step, RNG states. The existing trainer has none. |
@@ -224,6 +224,6 @@ Start from `experiments/tier4/train_fineweb_vanilla.py`. It already has:
 
 - **Token budget for Model-S**: 3B tokens is Quartet's budget for a 30M model. Our 130M model probably needs more. Need to decide: fixed budget, or train until loss plateaus?
 - **WSD vs. cosine**: SmolLM3 uses WSD. Quartet uses cosine with OneCycleLR. Both work. SmolLM3's WSD is the baseline; switch to cosine if WSD causes issues.
-- **Data sources**: SmolLM3 uses FineWeb-Edu, DCLM, The Stack v2, FineMath, etc. We need access to these or equivalent corpora. Tokenization must go through the Qwen3 + remap pipeline.
+- **Data sources**: SmolLM3 uses FineWeb-Edu, DCLM, The Stack v2, FineMath, etc. We need access to these or equivalent corpora. Tokenization must use the generated modified Qwen3 tokenizer.
 - **FlashMLA dimension adaptation**: Can we pad our smaller head dimensions to match FlashMLA's expected sizes without excessive waste? Or do we fork?
 - **Intra-document masking + ReFusion interaction**: SmolLM3's intra-doc masking is straightforward attention masking. ReFusion's slot shuffling changes token order. Need to verify these compose correctly.

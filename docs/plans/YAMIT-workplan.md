@@ -37,7 +37,7 @@ No DSA indexer in v1.
 
 - YAMIT architecture spec approved (`docs/YAMIT-spec.md`).
 - Model-S and Model-P dimensions locked.
-- Tokenizer surgery policy locked (Qwen3 + long-token remap).
+- Tokenizer generation policy locked (Qwen3 + long-token removal from vocab/merges).
 - FP4 policy locked (Quartet-style low precision + FP32 safety paths).
 
 ### Environment Setup
@@ -59,7 +59,7 @@ No DSA indexer in v1.
 ### 4.1 Implementation Scope
 
 - Generalize composite byte table build to Qwen3 tokenizer.
-- Add deterministic retokenization map pipeline for long tokens.
+- Generate modified tokenizer with long tokens removed from vocab/merges.
 - Add uint32 shard read/write path.
 - Implement dense MLA with arbitrary `position_ids` support.
 - Implement ReFusion forward process (slot split, masking, AR shuffle, labels).
@@ -68,7 +68,7 @@ No DSA indexer in v1.
 
 ### 4.2 Required Tests
 
-- Unit test: byte table generation and token remap invariants.
+- Unit test: byte table generation and tokenizer generation invariants.
 - Unit test: forward process shape and label-mask correctness.
 - Unit test: `position_ids` correctness under slot shuffling.
 - Unit test: diffusion cache crop/select/append semantics.
@@ -175,7 +175,7 @@ Deferred until v1 completion. Planned sequence:
 ### Hard Stop Conditions
 
 - **NaN/Inf:** 3 or more NaN/Inf events within any 100-step window after applying all mitigations (grad clip, FP32 safety paths, loss scaling). A single NaN in first 100 steps triggers investigation but is not a hard stop.
-- **Tokenizer/remap inconsistency:** any token round-trip failure (encode -> remap -> decode != original) on the validation corpus.
+- **Tokenizer inconsistency:** any token round-trip failure (encode -> decode != original) on the validation corpus with the generated tokenizer.
 - **PIT factorization instability:** Cholesky diagonal floor triggered on >10% of batches for 500 consecutive steps, or any non-finite output from PIT path after FP32 safeguards.
 - **Sampler non-termination:** any single block fails to converge within `slot_size` refinement iterations AND the force-accept fallback fails to produce finite logits.
 - **Loss divergence:** `train_loss_total` increases by >50% from its 1000-step rolling minimum and does not recover within 500 steps.
@@ -219,9 +219,9 @@ Deferred until v1 completion. Planned sequence:
 
 ### Task Group A: Data and Tokenizer
 
-- [ ] Implement long-token remap artifact generator for Qwen3.
+- [ ] Generate modified Qwen3 tokenizer (long tokens removed from vocab/merges).
 - [ ] Implement uint32 shard writer and reader.
-- [ ] Add validation script for tokenizer/remap consistency.
+- [ ] Add validation script for generated tokenizer consistency.
 
 ### Task Group B: Model Core
 

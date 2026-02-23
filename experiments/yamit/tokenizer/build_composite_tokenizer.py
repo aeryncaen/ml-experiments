@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-"""Build composite-tokenizer artifacts from a HuggingFace tokenizer.
+"""Generate a modified tokenizer for YAMIT composite embeddings.
 
-This script prepares the artifacts required by YAMIT composite embeddings:
+This script takes a base HuggingFace tokenizer and produces a new tokenizer
+with long tokens (> max_bytes) removed directly from the vocabulary and BPE
+merges.  The modified tokenizer is self-contained: no surgery maps, no ID
+remaps, no post-processing — it natively produces the correct token IDs.
 
-1) `tokenizer.json` copy from a base HF tokenizer
-2) `surgery_map.json` mapping long tokens (> max_bytes) to byte-token ID sequences
-3) `id_remap.json` mapping base token IDs -> pruned token IDs
-4) `token_bytes.pt` table of shape [final_vocab_size, max_bytes]
-5) `artifact_meta.json` with vocab/special-token metadata
+Outputs:
+  1) `tokenizer.json`   — modified HF-format tokenizer (long tokens removed,
+                           IDs compacted, special tokens added)
+  2) `tokenizer_go.json` — same but with Go-compatible regex patterns
+  3) `token_bytes.pt`   — (final_vocab_size, max_bytes) byte-ID table
+  4) `token_bytes.npy`  — same table as numpy array
+  5) `artifact_meta.json` — vocabulary and special-token metadata
 
-Notes:
-- YAMIT does not require rewriting BPE merges. Long tokens are handled by
-  deterministic retokenization ("long-token surgery") at preprocessing time.
-- A tokenizer is considered compatible only if full byte fallback is available
-  (all 256 byte values map to tokenizer IDs, via <0xHH> tokens or equivalent).
+Algorithm:
+  1. Identify all BPE vocab tokens whose byte representation exceeds max_bytes.
+  2. Walk BPE merges in priority order.  Any merge whose input or output is in
+     the removed set is dropped, and its output is added to the removed set
+     (transitively unreachable).
+  3. Surviving vocab tokens receive new contiguous IDs (preserving original
+     relative order).  Added/special tokens are placed after the BPE vocab.
+  4. A new <|mask|> token is appended.  Final vocab is padded to a multiple.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -26,11 +35,20 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-from transformers import AutoTokenizer
 
 
 HEX_BYTE_RE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
+# Go's regexp package does not support lookaheads.  We replace the one
+# lookahead pattern that appears in Qwen3's pre-tokenizer regex.
+_GO_REGEX_SUBS = [
+    (r"\s+(?!\S)", r"\s+"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Byte decoding helpers (reused from original script)
+# ---------------------------------------------------------------------------
 
 def _gpt2_bytes_to_unicode_decoder() -> Dict[str, int]:
     """Return GPT-2 byte-level unicode decoder map (char -> byte)."""
@@ -50,96 +68,59 @@ def _gpt2_bytes_to_unicode_decoder() -> Dict[str, int]:
     return {ch: b for b, ch in zip(bs, chars)}
 
 
-def _decode_single_token_bytes(
-    tokenizer,
-    token_id: int,
-    token_str: str,
-    byte_decoder: Optional[Dict[str, int]],
-    gpt2_decoder: Dict[str, int],
-) -> bytes:
-    """Token-id -> bytes using tokenizer-native byte decoders when available."""
-    # Explicit <0xHH> tokens.
+_GPT2_DECODER = _gpt2_bytes_to_unicode_decoder()
+
+
+def _token_str_to_bytes(token_str: str) -> bytes:
+    """Decode a BPE vocab token string to its raw byte representation."""
     m = HEX_BYTE_RE.match(token_str)
     if m:
         return bytes([int(m.group(1), 16)])
 
-    # Tokenizer-provided byte decoder (char -> byte).
-    if byte_decoder and token_str and all(ch in byte_decoder for ch in token_str):
-        return bytes(byte_decoder[ch] for ch in token_str)
+    if token_str and all(ch in _GPT2_DECODER for ch in token_str):
+        return bytes(_GPT2_DECODER[ch] for ch in token_str)
 
-    # GPT2-style byte decoder fallback.
-    if token_str and all(ch in gpt2_decoder for ch in token_str):
-        return bytes(gpt2_decoder[ch] for ch in token_str)
-
-    # Last-resort generic decode.
-    text = tokenizer.decode(
-        [token_id],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-    return text.encode("utf-8")
+    return token_str.encode("utf-8")
 
 
-def _build_id_to_token(tokenizer, vocab_size: int) -> Dict[int, str]:
-    id_to_token: Dict[int, str] = {}
-    for token_id in range(vocab_size):
-        tok = tokenizer.convert_ids_to_tokens(token_id)
-        if tok is None:
-            tok = ""
-        id_to_token[token_id] = tok
-    return id_to_token
+# ---------------------------------------------------------------------------
+# Go regex sanitisation
+# ---------------------------------------------------------------------------
+
+def _sanitize_regex_for_go(pattern: str) -> tuple[str, int]:
+    """Apply Go-compatibility regex substitutions.  Returns (new_pattern, n_changes)."""
+    changes = 0
+    for old, new in _GO_REGEX_SUBS:
+        if old in pattern:
+            pattern = pattern.replace(old, new)
+            changes += 1
+    return pattern, changes
 
 
-def _find_byte_token_ids(
-    tokenizer,
-    vocab_size: int,
-    id_to_token: Dict[int, str],
-    byte_decoder: Optional[Dict[str, int]],
-    gpt2_decoder: Dict[str, int],
-) -> Dict[int, int]:
-    """Find tokenizer IDs corresponding to each byte value 0..255.
+def _make_go_tokenizer_json(data: dict) -> tuple[dict, int]:
+    """Return a deep copy of *data* with Go-compatible regex patterns."""
+    go_data = copy.deepcopy(data)
+    total_changes = 0
 
-    Strategy:
-      1) Prefer explicit <0xHH> token names.
-      2) Fallback to single-byte decode matches.
-    """
-    byte_to_id: Dict[int, int] = {}
+    def walk(obj):
+        nonlocal total_changes
+        if isinstance(obj, dict):
+            if "Regex" in obj and isinstance(obj["Regex"], str):
+                obj["Regex"], n = _sanitize_regex_for_go(obj["Regex"])
+                total_changes += n
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
 
-    # Pass 1: explicit <0xHH> token names.
-    for token_id, tok in id_to_token.items():
-        m = HEX_BYTE_RE.match(tok)
-        if not m:
-            continue
-        b = int(m.group(1), 16)
-        byte_to_id[b] = token_id
+    walk(go_data)
+    return go_data, total_changes
 
-    # Pass 2: fallback to single-byte decode.
-    if len(byte_to_id) < 256:
-        for token_id in range(vocab_size):
-            if len(byte_to_id) == 256:
-                break
-            raw = _decode_single_token_bytes(
-                tokenizer,
-                token_id,
-                id_to_token[token_id],
-                byte_decoder=byte_decoder,
-                gpt2_decoder=gpt2_decoder,
-            )
-            if len(raw) == 1:
-                b = raw[0]
-                if b not in byte_to_id:
-                    byte_to_id[b] = token_id
 
-    missing = [b for b in range(256) if b not in byte_to_id]
-    if missing:
-        missing_preview = ", ".join(str(b) for b in missing[:16])
-        raise RuntimeError(
-            "Tokenizer is incompatible with composite long-token surgery: "
-            f"missing {len(missing)} byte fallback IDs. "
-            f"First missing bytes: {missing_preview}"
-        )
-    return byte_to_id
-
+# ---------------------------------------------------------------------------
+# Core: modify tokenizer
+# ---------------------------------------------------------------------------
 
 def _round_up_to_multiple(x: int, multiple: int) -> int:
     if multiple <= 0:
@@ -154,192 +135,206 @@ def build_artifacts(
     pad_byte_id: int,
     vocab_multiple: int,
     add_special_tokens: List[str],
-    prune_long_tokens: bool,
 ) -> Dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True, use_fast=True)
-    if not tokenizer.is_fast:
-        raise RuntimeError("Fast tokenizer required (tokenizer.json export unsupported for slow tokenizer)")
+    # ------------------------------------------------------------------
+    # 1. Load base tokenizer.json
+    # ------------------------------------------------------------------
+    from transformers import AutoTokenizer
 
-    # Save exact tokenizer.json used for tokenization pipeline.
-    tokenizer_json_path = output_dir / "tokenizer.json"
-    tokenizer.backend_tokenizer.save(str(tokenizer_json_path))
+    hf_tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True, use_fast=True)
+    if not hf_tokenizer.is_fast:
+        raise RuntimeError("Fast tokenizer required")
 
+    # We work on the raw JSON, not through the HF API, so we can
+    # manipulate vocab and merges directly.
+    base_json_str = hf_tokenizer.backend_tokenizer.to_str()
+    tok_data = json.loads(base_json_str)
 
-    base_vocab_size = len(tokenizer)
-    id_to_token = _build_id_to_token(tokenizer, base_vocab_size)
+    base_vocab: Dict[str, int] = tok_data["model"]["vocab"]
+    base_merges: List[List[str]] = tok_data["model"]["merges"]
+    base_added: List[dict] = tok_data.get("added_tokens", [])
 
-    byte_decoder = getattr(tokenizer, "byte_decoder", None)
-    if not isinstance(byte_decoder, dict):
-        byte_decoder = None
-    gpt2_decoder = _gpt2_bytes_to_unicode_decoder()
+    base_vocab_size = len(base_vocab)
 
-    byte_to_id = _find_byte_token_ids(
-        tokenizer,
-        base_vocab_size,
-        id_to_token,
-        byte_decoder=byte_decoder,
-        gpt2_decoder=gpt2_decoder,
-    )
+    # ------------------------------------------------------------------
+    # 2. Identify tokens > max_bytes
+    # ------------------------------------------------------------------
+    removed_tokens: set[str] = set()
+    for token_str in base_vocab:
+        if len(_token_str_to_bytes(token_str)) > max_bytes:
+            removed_tokens.add(token_str)
 
-    # Build surgery map and byte table for base vocab.
-    surgery_map: Dict[int, List[int]] = {}
-    long_token_ids: List[int] = []
-    keep_token_ids: List[int] = []
+    initial_removed = len(removed_tokens)
 
-    base_token_bytes = torch.full((base_vocab_size, max_bytes), pad_byte_id, dtype=torch.long)
-
-    for token_id in range(base_vocab_size):
-        raw = _decode_single_token_bytes(
-            tokenizer,
-            token_id,
-            id_to_token[token_id],
-            byte_decoder=byte_decoder,
-            gpt2_decoder=gpt2_decoder,
-        )
-        if len(raw) > max_bytes:
-            long_token_ids.append(token_id)
-            surgery_map[token_id] = [byte_to_id[b] for b in raw]
+    # ------------------------------------------------------------------
+    # 3. Walk merges: drop any merge touching the removed set,
+    #    propagate removals transitively.
+    # ------------------------------------------------------------------
+    new_merges: List[List[str]] = []
+    for merge in base_merges:
+        a, b = merge[0], merge[1]
+        result = a + b
+        if a in removed_tokens or b in removed_tokens or result in removed_tokens:
+            removed_tokens.add(result)
             continue
+        new_merges.append(merge)
 
-        keep_token_ids.append(token_id)
-        for i, b in enumerate(raw):
-            base_token_bytes[token_id, i] = b
+    transitive_removed = len(removed_tokens) - initial_removed
 
-    # Build old->new ID remap.
-    # - If prune_long_tokens=True: remove >max_bytes tokens from model ID space.
-    # - Else: identity remap for base vocab.
+    # ------------------------------------------------------------------
+    # 4. Build surviving BPE vocab with compacted IDs
+    # ------------------------------------------------------------------
+    # Sort by original ID to preserve relative order.
+    added_token_strs = {entry["content"] for entry in base_added}
+
+    surviving_bpe = [
+        (token_str, old_id)
+        for token_str, old_id in base_vocab.items()
+        if token_str not in removed_tokens and token_str not in added_token_strs
+    ]
+    surviving_bpe.sort(key=lambda x: x[1])
+
+    new_vocab: Dict[str, int] = {}
     old_to_new: Dict[int, int] = {}
-    new_to_old: Dict[int, int] = {}
+    for new_id, (token_str, old_id) in enumerate(surviving_bpe):
+        new_vocab[token_str] = new_id
+        old_to_new[old_id] = new_id
 
-    if prune_long_tokens:
-        for new_id, old_id in enumerate(keep_token_ids):
-            old_to_new[old_id] = new_id
-            new_to_old[new_id] = old_id
-        next_id = len(keep_token_ids)
-    else:
-        for old_id in range(base_vocab_size):
-            old_to_new[old_id] = old_id
-            new_to_old[old_id] = old_id
-        next_id = base_vocab_size
+    next_id = len(surviving_bpe)
 
-    # Special token ID mapping (new IDs if token not in kept/base vocab).
-    special_token_ids: Dict[str, int] = {}
+    # ------------------------------------------------------------------
+    # 5. Place added/special tokens after BPE vocab
+    # ------------------------------------------------------------------
+    # Sort by original ID.
+    sorted_added = sorted(base_added, key=lambda e: e["id"])
+    new_added: List[dict] = []
+    for entry in sorted_added:
+        old_id = entry["id"]
+        new_entry = dict(entry)
+        new_entry["id"] = next_id
+        old_to_new[old_id] = next_id
+        new_added.append(new_entry)
+        next_id += 1
+
+    # ------------------------------------------------------------------
+    # 6. Add requested new special tokens (e.g. <|mask|>)
+    # ------------------------------------------------------------------
+    new_special_ids: Dict[str, int] = {}
     for tok in add_special_tokens:
         if not tok:
             continue
-        existing = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(existing, int) and existing in old_to_new:
-            special_token_ids[tok] = old_to_new[existing]
+        # Check if it already exists.
+        existing_entry = None
+        for entry in new_added:
+            if entry["content"] == tok:
+                existing_entry = entry
+                break
+        if existing_entry is not None:
+            new_special_ids[tok] = existing_entry["id"]
         else:
-            special_token_ids[tok] = next_id
+            new_special_ids[tok] = next_id
+            new_added.append({
+                "id": next_id,
+                "content": tok,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            })
             next_id += 1
 
     unpadded_vocab_size = next_id
     final_vocab_size = _round_up_to_multiple(unpadded_vocab_size, vocab_multiple)
 
+    # ------------------------------------------------------------------
+    # 7. Assemble modified tokenizer.json
+    # ------------------------------------------------------------------
+    tok_data["model"]["vocab"] = new_vocab
+    tok_data["model"]["merges"] = new_merges
+    tok_data["added_tokens"] = new_added
+
+    tokenizer_json_path = output_dir / "tokenizer.json"
+    with open(tokenizer_json_path, "w") as f:
+        json.dump(tok_data, f, ensure_ascii=False)
+
+    # Go-compatible version.
+    go_data, go_regex_changes = _make_go_tokenizer_json(tok_data)
+    tokenizer_go_json_path = output_dir / "tokenizer_go.json"
+    with open(tokenizer_go_json_path, "w") as f:
+        json.dump(go_data, f, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    # 8. Build token_bytes table
+    # ------------------------------------------------------------------
     token_bytes = torch.full((final_vocab_size, max_bytes), pad_byte_id, dtype=torch.long)
 
-    # Copy base bytes through remap.
-    for old_id, new_id in old_to_new.items():
-        token_bytes[new_id] = base_token_bytes[old_id]
+    for token_str, new_id in new_vocab.items():
+        raw = _token_str_to_bytes(token_str)
+        assert len(raw) <= max_bytes, f"Surviving token {token_str!r} has {len(raw)} bytes > {max_bytes}"
+        for i, b in enumerate(raw):
+            token_bytes[new_id, i] = b
 
-    # Fill bytes for newly added specials if they were assigned new IDs.
-    for tok, tok_id in special_token_ids.items():
-        if tok_id in new_to_old:
-            continue
-        raw = tok.encode("utf-8")
+    # Fill bytes for added/special tokens.
+    for entry in new_added:
+        tok_id = entry["id"]
+        raw = entry["content"].encode("utf-8")
         if len(raw) <= max_bytes:
             for i, b in enumerate(raw):
                 token_bytes[tok_id, i] = b
 
-    # Keep surgery map in base-tokenizer ID space.
-    # Pipeline order is: encode(base IDs) -> surgery(base IDs) -> id_remap(base->new IDs).
-    remapped_surgery_map: Dict[int, List[int]] = {}
-    for old_long_id, seq_old in surgery_map.items():
-        remapped_surgery_map[old_long_id] = seq_old
-
-    # Export artifacts.
-    surgery_map_json = {str(k): v for k, v in sorted(remapped_surgery_map.items())}
-
-    surgery_path = output_dir / "surgery_map.json"
-    with open(surgery_path, "w") as f:
-        json.dump(surgery_map_json, f, indent=2)
-
-    id_remap_path = output_dir / "id_remap.json"
-    with open(id_remap_path, "w") as f:
-        json.dump({str(k): v for k, v in sorted(old_to_new.items())}, f, indent=2)
-
     token_bytes_pt = output_dir / "token_bytes.pt"
     torch.save(token_bytes, token_bytes_pt)
 
-    token_bytes_npy = output_dir / "token_bytes.npy"
     import numpy as np
-
+    token_bytes_npy = output_dir / "token_bytes.npy"
     np.save(token_bytes_npy, token_bytes.numpy())
 
-    pruned_vocab_path = output_dir / "pruned_vocab.json"
-    with open(pruned_vocab_path, "w") as f:
-        json.dump(
-            {
-                "keep_token_ids": keep_token_ids,
-                "long_token_ids": long_token_ids,
-                "old_to_new_count": len(old_to_new),
-            },
-            f,
-        )
+    # ------------------------------------------------------------------
+    # 9. Resolve special token IDs in the new ID space
+    # ------------------------------------------------------------------
+    def _resolve_special(attr_name: str) -> Optional[int]:
+        old_id = getattr(hf_tokenizer, f"{attr_name}_token_id", None)
+        if old_id is not None and old_id in old_to_new:
+            return old_to_new[old_id]
+        return None
 
+    # ------------------------------------------------------------------
+    # 10. Write metadata
+    # ------------------------------------------------------------------
     meta = {
         "source": source,
-        "tokenizer_json": str(tokenizer_json_path.name),
+        "tokenizer_json": tokenizer_json_path.name,
+        "tokenizer_go_json": tokenizer_go_json_path.name,
+        "go_regex_sanitize_changes": go_regex_changes,
         "max_bytes": max_bytes,
         "pad_byte_id": pad_byte_id,
-        "base_vocab_size": base_vocab_size,
-        "pruned_vocab_size": len(old_to_new),
+        "base_vocab_size": base_vocab_size + len(base_added),
+        "removed_long_tokens": initial_removed,
+        "removed_transitive": transitive_removed,
+        "removed_total": len(removed_tokens),
+        "bpe_vocab_size": len(new_vocab),
         "final_vocab_size": final_vocab_size,
         "unpadded_vocab_size": unpadded_vocab_size,
         "vocab_multiple": vocab_multiple,
-        "prune_long_tokens": prune_long_tokens,
-        "long_token_count": len(long_token_ids),
-        "byte_token_count": len(byte_to_id),
-        "special_token_ids": special_token_ids,
+        "merges_base": len(base_merges),
+        "merges_final": len(new_merges),
+        "added_token_count": len(new_added),
+        "new_special_token_ids": new_special_ids,
         "special_tokens": {
-            "mask": tokenizer.mask_token,
-            "bos": tokenizer.bos_token,
-            "eos": tokenizer.eos_token,
-            "pad": tokenizer.pad_token,
-            "unk": tokenizer.unk_token,
-        },
-        "resolved_special_ids": {
-            "mask": special_token_ids.get("<|mask|>", None),
-            "bos": (
-                old_to_new[tokenizer.bos_token_id]
-                if getattr(tokenizer, "bos_token_id", None) in old_to_new
-                else None
-            ),
-            "eos": (
-                old_to_new[tokenizer.eos_token_id]
-                if getattr(tokenizer, "eos_token_id", None) in old_to_new
-                else None
-            ),
-            "pad": (
-                old_to_new[tokenizer.pad_token_id]
-                if getattr(tokenizer, "pad_token_id", None) in old_to_new
-                else None
-            ),
-            "unk": (
-                old_to_new[tokenizer.unk_token_id]
-                if getattr(tokenizer, "unk_token_id", None) in old_to_new
-                else None
-            ),
+            "mask": new_special_ids.get("<|mask|>"),
+            "bos": _resolve_special("bos"),
+            "eos": _resolve_special("eos"),
+            "pad": _resolve_special("pad"),
+            "unk": _resolve_special("unk"),
         },
         "artifacts": {
-            "surgery_map": surgery_path.name,
-            "id_remap": id_remap_path.name,
+            "tokenizer_json": tokenizer_json_path.name,
+            "tokenizer_go_json": tokenizer_go_json_path.name,
             "token_bytes_pt": token_bytes_pt.name,
             "token_bytes_npy": token_bytes_npy.name,
-            "pruned_vocab": pruned_vocab_path.name,
         },
     }
 
@@ -350,9 +345,13 @@ def build_artifacts(
     return meta
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Build YAMIT composite-tokenizer artifacts from any HF tokenizer"
+        description="Generate a modified YAMIT tokenizer with long tokens removed from vocab/merges"
     )
     p.add_argument(
         "--source",
@@ -362,36 +361,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         required=True,
-        help="Directory to write tokenizer.json + composite artifacts",
+        help="Directory to write modified tokenizer + artifacts",
     )
     p.add_argument(
         "--max-bytes",
         type=int,
         default=16,
-        help="Maximum bytes per token for composite slots",
+        help="Maximum bytes per token for composite slots (default: 16)",
     )
     p.add_argument(
         "--pad-byte-id",
         type=int,
         default=256,
-        help="Pad byte symbol ID in token_bytes table",
+        help="Pad byte symbol ID in token_bytes table (default: 256)",
     )
     p.add_argument(
         "--vocab-multiple",
         type=int,
         default=256,
-        help="Pad final vocab size to this multiple",
+        help="Pad final vocab size to this multiple (default: 256)",
     )
     p.add_argument(
         "--add-special-token",
         action="append",
         default=["<|mask|>"],
         help="Extra special token to reserve in final vocab (repeatable)",
-    )
-    p.add_argument(
-        "--no-prune-long-tokens",
-        action="store_true",
-        help="Disable long-token pruning (keeps base token ID space)",
     )
     return p.parse_args()
 
@@ -408,18 +402,18 @@ def main() -> None:
         pad_byte_id=args.pad_byte_id,
         vocab_multiple=args.vocab_multiple,
         add_special_tokens=extra_specials,
-        prune_long_tokens=not args.no_prune_long_tokens,
     )
 
     print("\nComposite tokenizer artifacts written:")
-    print(f"  output_dir       : {output_dir}")
-    print(f"  base_vocab_size  : {meta['base_vocab_size']:,}")
-    print(f"  pruned_vocab_size: {meta['pruned_vocab_size']:,}")
-    print(f"  final_vocab_size : {meta['final_vocab_size']:,}")
-    print(f"  long_token_count : {meta['long_token_count']:,}")
-    print(f"  surgery_map      : {meta['artifacts']['surgery_map']}")
-    print(f"  id_remap         : {meta['artifacts']['id_remap']}")
-    print(f"  token_bytes      : {meta['artifacts']['token_bytes_pt']}")
+    print(f"  output_dir          : {output_dir}")
+    print(f"  base_vocab_size     : {meta['base_vocab_size']:,}")
+    print(f"  removed (long)      : {meta['removed_long_tokens']:,}")
+    print(f"  removed (transitive): {meta['removed_transitive']:,}")
+    print(f"  removed (total)     : {meta['removed_total']:,}")
+    print(f"  bpe_vocab_size      : {meta['bpe_vocab_size']:,}")
+    print(f"  final_vocab_size    : {meta['final_vocab_size']:,}")
+    print(f"  merges              : {meta['merges_base']:,} -> {meta['merges_final']:,}")
+    print(f"  go_regex_changes    : {meta['go_regex_sanitize_changes']}")
 
 
 if __name__ == "__main__":

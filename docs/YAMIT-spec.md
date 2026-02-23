@@ -25,7 +25,7 @@ The v1 goal is correctness and stable training on a small model, then speed via 
 
 - Dense MLA attention with compressed KV cache.
 - End-to-end ReFusion-style AR+MDM training and iterative sampler.
-- Llama 3.2 tokenizer integration with long-token surgery and composite byte table generalization.
+- Modified tokenizer generation (long tokens removed from vocab/merges) and composite byte table.
 - Quartet kernel port and FP4 mixed-precision training policy.
 
 ### Explicitly Out of Scope (v1)
@@ -454,7 +454,7 @@ Kernels are ported from `Quartet/` and integrated behind runtime switch.
 
 Token IDs must use `uint32`/`int32` storage to support 151k+ vocab.
 
-Preprocessing: raw text -> Qwen3 tokenize -> long-token remap -> uint32 storage -> ReFusion forward process at train time.
+Preprocessing: raw text -> modified Qwen3 tokenizer (long tokens removed) -> uint32 storage -> ReFusion forward process at train time.
 
 Training details (optimizer, scheduler, data, batch size) are in `docs/plans/YAMIT-training.md`.
 
