@@ -2182,6 +2182,7 @@ class BucketedCompositePITHead(nn.Module):
         self.register_buffer('bucket_sizes', sizes)            # (K,)
         self.register_buffer('token_in_bucket_idx', tok_in_bucket)  # (V,)
         self.max_bucket_size = max_bs
+        self._bucket_sizes_list = sizes.tolist()  # plain Python list, no .item() graph breaks
 
         # ── SwiGLU Router ──
         router_hidden = d_model // 4
@@ -2227,7 +2228,7 @@ class BucketedCompositePITHead(nn.Module):
                        bucket_idx: int) -> torch.Tensor:
         """Compute PIT logits for one bucket. Returns (*, bucket_size)."""
         iface = self.interface
-        bs = self.bucket_sizes[bucket_idx]
+        bs = self._bucket_sizes_list[bucket_idx]
         members = self.bucket_members[bucket_idx, :bs]
 
         patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
@@ -2251,7 +2252,7 @@ class BucketedCompositePITHead(nn.Module):
                             device=hidden.device, dtype=hidden.dtype)
         for b_idx in active:
             b = b_idx.item()
-            bs = self.bucket_sizes[b]
+            bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
             logits[:, :, members] = self._bucket_logits(g_shared, h_tok_flat, b)
         return logits
@@ -2283,7 +2284,7 @@ class BucketedCompositePITHead(nn.Module):
         target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
 
         for b in range(self.n_buckets):
-            bs = self.bucket_sizes[b].item()
+            bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
             iface = self.interface
 
