@@ -2313,14 +2313,15 @@ class BucketedCompositePITHead(nn.Module):
         token_loss = token_loss_sum / N
         total_loss = bucket_loss + token_loss
 
-        # ── Accuracy: full joint argmax over P(bucket)*P(token|bucket) ──
-        # Compute log P(bucket) + log P(token|bucket) for every token, take global argmax.
+        # ── Accuracy: top-k routed argmax (matches inference path) ──
         with torch.no_grad():
-            log_p_bucket = F.log_softmax(router_logits.reshape(N, -1).float(), dim=-1)  # (N, K)
+            router_flat = router_logits.reshape(N, -1)  # (N, K)
+            _, top_k_idx = router_flat.topk(self.top_k, dim=-1)  # (N, top_k)
+            log_p_bucket = F.log_softmax(router_flat.float(), dim=-1)
             best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
             best_score = torch.full((N,), float('-inf'), device=hidden.device)
             iface = self.interface
-            for b in range(self.n_buckets):
+            for b in top_k_idx.unique().tolist():
                 bs = self._bucket_sizes_list[b]
                 members = self.bucket_members[b, :bs]
                 patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
