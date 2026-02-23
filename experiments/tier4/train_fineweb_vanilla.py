@@ -2313,29 +2313,25 @@ class BucketedCompositePITHead(nn.Module):
         token_loss = token_loss_sum / N
         total_loss = bucket_loss + token_loss
 
-        # ── Accuracy: top-k routed argmax (matches inference path) ──
+        # ── Accuracy: router top-1 bucket, argmax within it ──
         with torch.no_grad():
             router_flat = router_logits.reshape(N, -1)  # (N, K)
-            _, top_k_idx = router_flat.topk(self.top_k, dim=-1)  # (N, top_k)
-            log_p_bucket = F.log_softmax(router_flat.float(), dim=-1)
-            best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
-            best_score = torch.full((N,), float('-inf'), device=hidden.device)
-            iface = self.interface
-            for b in top_k_idx.unique().tolist():
+            pred_bucket = router_flat.argmax(dim=-1)     # (N,)
+            # Gather per-position: compute logits only for the router's chosen bucket
+            pred_global = torch.zeros(N, device=hidden.device, dtype=torch.long)
+            for b in pred_bucket.unique().tolist():
+                mask = pred_bucket == b
                 bs = self._bucket_sizes_list[b]
                 members = self.bucket_members[b, :bs]
+                iface = self.interface
                 patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
                 patterns = patterns.to(dtype=g_flat.dtype)
-                bl_shared = torch.einsum('nsd,vsd->nv', g_flat, patterns)
+                bl_shared = torch.einsum('nsd,vsd->nv', g_flat[mask], patterns)
                 embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
-                bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
-                log_p_tok = F.log_softmax((bl_shared + bl_tok).float(), dim=-1)  # (N, bs)
-                joint = log_p_bucket[:, b].unsqueeze(1) + log_p_tok               # (N, bs)
-                top_val, top_idx = joint.max(dim=-1)
-                improved = top_val > best_score
-                best_score = torch.where(improved, top_val, best_score)
-                best_token = torch.where(improved, members[top_idx], best_token)
-            token_acc = (best_token == target_flat).float().mean()
+                bl_tok = F.linear(h_tok_2d[mask], embeds, iface.token_out_bias[members])
+                local_pred = (bl_shared + bl_tok).float().argmax(dim=-1)  # local index
+                pred_global[mask] = members[local_pred]
+            token_acc = (pred_global == target_flat).float().mean()
 
         return total_loss, bucket_loss, token_loss, token_acc
 
