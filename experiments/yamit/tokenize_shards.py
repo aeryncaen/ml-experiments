@@ -3,6 +3,7 @@
 
 Example:
   python experiments/yamit/tokenize_shards.py \
+    --tokenizer experiments/yamit/tokenizer/artifacts/qwen3/tokenizer_go.json \
     --input raw_data \
     --output tokenized \
     --workers 16 \
@@ -27,14 +28,6 @@ def _resolve(repo_root: Path, value: str) -> Path:
     return repo_root / p
 
 
-def _resolve_artifacts(repo_root: Path, value: str) -> Path:
-    p = Path(value)
-    if p.is_absolute():
-        return p
-    # For artifacts we default to repo-root relative path.
-    return repo_root / p
-
-
 def _discover_raw_roots(repo_root: Path) -> list[tuple[Path, int]]:
     counts: dict[Path, int] = {}
     for shard in repo_root.rglob("shard_*.jsonl"):
@@ -48,13 +41,9 @@ def _discover_raw_roots(repo_root: Path) -> list[tuple[Path, int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run YAMIT tokenizer with sane defaults")
+    parser.add_argument("--tokenizer", required=True, help="Path to tokenizer.json (or tokenizer_go.json)")
     parser.add_argument("--input", required=True, help="Input raw JSONL directory (repo-relative or absolute)")
     parser.add_argument("--output", required=True, help="Output tokenized directory (repo-relative or absolute)")
-    parser.add_argument(
-        "--artifacts-dir",
-        default="experiments/yamit/tokenizer/artifacts/qwen3",
-        help="Tokenizer artifact directory containing tokenizer_go.json",
-    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--val-fraction", type=float, default=0.005)
     parser.add_argument(
@@ -69,15 +58,13 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     tokenizer_dir = repo_root / "experiments/yamit/tokenizer"
 
+    tok_json = _resolve(repo_root, args.tokenizer)
     input_dir = _resolve(repo_root, args.input)
     output_dir = _resolve(repo_root, args.output)
-    artifacts_dir = _resolve_artifacts(repo_root, args.artifacts_dir)
-
-    tok_json = artifacts_dir / "tokenizer_go.json"
 
     if not tok_json.exists():
         raise SystemExit(
-            f"Missing tokenizer artifact: {tok_json}\n"
+            f"Tokenizer not found: {tok_json}\n"
             "Generate it with build_composite_tokenizer.py first."
         )
 
