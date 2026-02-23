@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -221,12 +222,19 @@ def main():
         action="store_true",
         help="Print download plan without downloading",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of datasets to download in parallel",
+    )
     args = parser.parse_args()
 
     if not args.stage and not args.datasets:
         parser.error("Must specify --stage or --datasets")
 
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Build download plan.
     plan: list[tuple[str, str, str | None, str, int]] = []
@@ -275,17 +283,61 @@ def main():
         return
 
     # Execute downloads.
-    results = []
-    for name, hf_path, hf_subset, text_column, target_tokens in plan:
-        result = download_dataset(
-            name=name,
-            hf_path=hf_path,
-            hf_subset=hf_subset,
-            text_column=text_column,
-            target_tokens=target_tokens,
-            output_dir=output_dir,
-        )
-        results.append(result)
+    workers = max(1, args.workers)
+    log.info(
+        f"Starting download for {len(plan)} datasets with {workers} worker(s)"
+    )
+
+    def run_one(spec: tuple[str, str, str | None, str, int]) -> dict:
+        name, hf_path, hf_subset, text_column, target_tokens = spec
+        try:
+            return download_dataset(
+                name=name,
+                hf_path=hf_path,
+                hf_subset=hf_subset,
+                text_column=text_column,
+                target_tokens=target_tokens,
+                output_dir=output_dir,
+            )
+        except Exception as e:
+            log.exception(f"[{name}] Unhandled error")
+            return {
+                "name": name,
+                "shards": 0,
+                "samples": 0,
+                "chars": 0,
+                "est_tokens": 0,
+                "error": str(e),
+            }
+
+    results_by_name: dict[str, dict] = {}
+    if workers == 1 or len(plan) == 1:
+        for spec in plan:
+            r = run_one(spec)
+            results_by_name[r["name"]] = r
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_name = {
+                ex.submit(run_one, spec): spec[0]
+                for spec in plan
+            }
+            for fut in concurrent.futures.as_completed(future_to_name):
+                name = future_to_name[fut]
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = {
+                        "name": name,
+                        "shards": 0,
+                        "samples": 0,
+                        "chars": 0,
+                        "est_tokens": 0,
+                        "error": str(e),
+                    }
+                results_by_name[name] = r
+
+    # Preserve plan order in summary output.
+    results = [results_by_name[name] for name, *_ in plan]
 
     # Summary.
     print(f"\n{'='*70}")
