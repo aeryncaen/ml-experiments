@@ -1,8 +1,5 @@
 {
   "source": "Qwen/Qwen3-8B",
-  "tokenizer_json": "tokenizer.json",
-  "tokenizer_go_json": "tokenizer_go.json",
-  "go_regex_sanitize_changes": 1,
   "max_bytes": 16,
   "pad_byte_id": 256,
   "base_vocab_size": 151669,
@@ -28,7 +25,6 @@
   },
   "artifacts": {
     "tokenizer_json": "tokenizer.json",
-    "tokenizer_go_json": "tokenizer_go.json",
     "token_bytes_pt": "token_bytes.pt",
     "token_bytes_npy": "token_bytes.npy"
   }

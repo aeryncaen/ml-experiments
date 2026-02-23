@@ -9,10 +9,9 @@ remaps, no post-processing — it natively produces the correct token IDs.
 Outputs:
   1) `tokenizer.json`   — modified HF-format tokenizer (long tokens removed,
                            IDs compacted, special tokens added)
-  2) `tokenizer_go.json` — same but with Go-compatible regex patterns
-  3) `token_bytes.pt`   — (final_vocab_size, max_bytes) byte-ID table
-  4) `token_bytes.npy`  — same table as numpy array
-  5) `artifact_meta.json` — vocabulary and special-token metadata
+  2) `token_bytes.pt`   — (final_vocab_size, max_bytes) byte-ID table
+  3) `token_bytes.npy`  — same table as numpy array
+  4) `artifact_meta.json` — vocabulary and special-token metadata
 
 Algorithm:
   1. Identify all BPE vocab tokens whose byte representation exceeds max_bytes.
@@ -27,7 +26,6 @@ Algorithm:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import re
@@ -39,15 +37,9 @@ import torch
 
 HEX_BYTE_RE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
-# Go's regexp package does not support lookaheads.  We replace the one
-# lookahead pattern that appears in Qwen3's pre-tokenizer regex.
-_GO_REGEX_SUBS = [
-    (r"\s+(?!\S)", r"\s+"),
-]
-
 
 # ---------------------------------------------------------------------------
-# Byte decoding helpers (reused from original script)
+# Byte decoding helpers
 # ---------------------------------------------------------------------------
 
 def _gpt2_bytes_to_unicode_decoder() -> Dict[str, int]:
@@ -81,41 +73,6 @@ def _token_str_to_bytes(token_str: str) -> bytes:
         return bytes(_GPT2_DECODER[ch] for ch in token_str)
 
     return token_str.encode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Go regex sanitisation
-# ---------------------------------------------------------------------------
-
-def _sanitize_regex_for_go(pattern: str) -> tuple[str, int]:
-    """Apply Go-compatibility regex substitutions.  Returns (new_pattern, n_changes)."""
-    changes = 0
-    for old, new in _GO_REGEX_SUBS:
-        if old in pattern:
-            pattern = pattern.replace(old, new)
-            changes += 1
-    return pattern, changes
-
-
-def _make_go_tokenizer_json(data: dict) -> tuple[dict, int]:
-    """Return a deep copy of *data* with Go-compatible regex patterns."""
-    go_data = copy.deepcopy(data)
-    total_changes = 0
-
-    def walk(obj):
-        nonlocal total_changes
-        if isinstance(obj, dict):
-            if "Regex" in obj and isinstance(obj["Regex"], str):
-                obj["Regex"], n = _sanitize_regex_for_go(obj["Regex"])
-                total_changes += n
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-
-    walk(go_data)
-    return go_data, total_changes
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +217,6 @@ def build_artifacts(
     with open(tokenizer_json_path, "w") as f:
         json.dump(tok_data, f, ensure_ascii=False)
 
-    # Go-compatible version.
-    go_data, go_regex_changes = _make_go_tokenizer_json(tok_data)
-    tokenizer_go_json_path = output_dir / "tokenizer_go.json"
-    with open(tokenizer_go_json_path, "w") as f:
-        json.dump(go_data, f, ensure_ascii=False)
-
     # ------------------------------------------------------------------
     # 8. Build token_bytes table
     # ------------------------------------------------------------------
@@ -306,9 +257,6 @@ def build_artifacts(
     # ------------------------------------------------------------------
     meta = {
         "source": source,
-        "tokenizer_json": tokenizer_json_path.name,
-        "tokenizer_go_json": tokenizer_go_json_path.name,
-        "go_regex_sanitize_changes": go_regex_changes,
         "max_bytes": max_bytes,
         "pad_byte_id": pad_byte_id,
         "base_vocab_size": base_vocab_size + len(base_added),
@@ -332,7 +280,6 @@ def build_artifacts(
         },
         "artifacts": {
             "tokenizer_json": tokenizer_json_path.name,
-            "tokenizer_go_json": tokenizer_go_json_path.name,
             "token_bytes_pt": token_bytes_pt.name,
             "token_bytes_npy": token_bytes_npy.name,
         },
@@ -413,7 +360,6 @@ def main() -> None:
     print(f"  bpe_vocab_size      : {meta['bpe_vocab_size']:,}")
     print(f"  final_vocab_size    : {meta['final_vocab_size']:,}")
     print(f"  merges              : {meta['merges_base']:,} -> {meta['merges_final']:,}")
-    print(f"  go_regex_changes    : {meta['go_regex_sanitize_changes']}")
 
 
 if __name__ == "__main__":

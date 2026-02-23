@@ -3,7 +3,7 @@
 
 Example:
   python experiments/yamit/tokenize_shards.py \
-    --tokenizer experiments/yamit/tokenizer/artifacts/qwen3/tokenizer_go.json \
+    --tokenizer experiments/yamit/tokenizer/artifacts/qwen3/tokenizer.json \
     --input raw_data \
     --output tokenized \
     --workers 16 \

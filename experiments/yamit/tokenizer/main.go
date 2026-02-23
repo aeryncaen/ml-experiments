@@ -14,7 +14,7 @@
 // Usage:
 //
 //	go run . \
-//	  --tokenizer ./tokenizer_go.json \
+//	  --tokenizer ./tokenizer.json \
 //	  --input ./raw_data \
 //	  --output ./tokenized \
 //	  --workers 16 \
