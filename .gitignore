@@ -57,6 +57,9 @@ htmlcov/
 wandb/
 runs/
 
+# Generated tokenizer artifacts
+experiments/yamit/tokenizer/artifacts/
+
 # Misc
 *.pdf
 .DS_Store
