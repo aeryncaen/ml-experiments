@@ -851,12 +851,12 @@ class SwiGLUMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class YAMITBlock(nn.Module):
-    """Pre-norm residual block:  h = x + MLA(norm(x));  out = h + MLP(norm(h))."""
+    """Pre-norm residual block:  h = x + Attn(norm(x));  out = h + MLP(norm(h))."""
 
     def __init__(self, cfg: YAMITConfig):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.d_model, cfg.rms_norm_eps)
-        self.attn = MLAAttention(cfg)
+        self.attn = BaselineAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.d_model, cfg.rms_norm_eps)
         self.mlp = SwiGLUMLP(cfg)
 
@@ -875,32 +875,14 @@ class YAMITBlock(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-        layer_cache: Optional[MLALayerCache],
-        use_cache: bool,
-        decode_mode: bool,
-        mask: Optional[torch.Tensor] = None,
-        sparse_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[MLALayerCache]]:
-        x_norm = self.attn_norm(x)
-        if decode_mode:
-            attn_out, new_entry = self.attn.forward_decode_absorbed(
-                x_norm,
-                position_ids,
-                layer_cache=layer_cache,
-                mask=mask,
-                sparse_mask=sparse_mask,
-            )
-        else:
-            attn_out, new_entry = self.attn.forward_prefill(
-                x_norm,
-                position_ids,
-                mask=mask,
-                sparse_mask=sparse_mask,
-            )
-
+        layer_cache: Optional[BaselineLayerCache] = None,
+    ) -> tuple[torch.Tensor, BaselineLayerCache]:
+        attn_out, new_cache = self.attn.forward_with_cache(
+            self.attn_norm(x), position_ids, layer_cache,
+        )
         x = x + attn_out
         x = x + self.mlp(self.mlp_norm(x))
-        return x, (new_entry if use_cache else None)
+        return x, new_cache
 
 
 # ---------------------------------------------------------------------------
@@ -1006,82 +988,37 @@ class YAMIT(nn.Module):
         logits = self.head(x)
         return logits
 
-    def init_cache(self) -> DiffusionMLACache:
-        return DiffusionMLACache(n_layers=self.cfg.n_layers)
+    def init_cache(self) -> BaselineKVCache:
+        return BaselineKVCache(n_layers=self.cfg.n_layers)
 
     def forward_with_cache(
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
-        cache: Optional[DiffusionMLACache] = None,
+        cache: Optional[BaselineKVCache] = None,
         use_cache: bool = True,
         mask: Optional[torch.Tensor] = None,
         sparse_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[DiffusionMLACache]]:
-        """Cache-aware forward used by diffusion sampler.
-
-        - If cache is empty or sequence length > 1: dense prefill path.
-        - If cache has history and sequence length == 1: absorbed decode path.
-        - If cache has history and sequence length > 1: decode token-by-token.
-        """
+    ) -> tuple[torch.Tensor, Optional[BaselineKVCache]]:
         B, T = input_ids.shape
 
         if position_ids is None:
-            if cache is not None:
-                start = cache.seq_len
-            else:
-                start = 0
-            position_ids = (
-                torch.arange(start, start + T, device=input_ids.device)
-                .unsqueeze(0)
-                .expand(B, -1)
-            )
-
-        # Decode chunk path: step token-by-token so absorbed mode remains correct.
-        if cache is not None and cache.seq_len > 0 and T > 1:
-            logits_steps = []
-            cur_cache = cache
-            for t in range(T):
-                logits_t, cur_cache = self.forward_with_cache(
-                    input_ids=input_ids[:, t : t + 1],
-                    position_ids=position_ids[:, t : t + 1],
-                    cache=cur_cache,
-                    use_cache=use_cache,
-                    mask=mask,
-                    sparse_mask=sparse_mask,
-                )
-                logits_steps.append(logits_t)
-            logits = torch.cat(logits_steps, dim=1)
-            return logits, cur_cache
+            start = cache.seq_len if cache is not None else 0
+            position_ids = torch.arange(start, start + T, device=input_ids.device).unsqueeze(0).expand(B, -1)
 
         x = self.embed(input_ids)
 
         if cache is None and use_cache:
             cache = self.init_cache()
 
-        decode_mode = cache is not None and cache.seq_len > 0 and T == 1
-        new_entries: list[MLALayerCache] = []
-
         for i, layer in enumerate(self.layers):
             layer_cache = cache.layers[i] if cache is not None else None
-            x, entry = layer.forward_with_cache(
-                x,
-                position_ids,
-                layer_cache=layer_cache,
-                use_cache=use_cache,
-                decode_mode=decode_mode,
-                mask=mask,
-                sparse_mask=sparse_mask,
-            )
-            if use_cache and entry is not None:
-                new_entries.append(entry)
+            x, new_layer_cache = layer.forward_with_cache(x, position_ids, layer_cache)
+            if cache is not None:
+                cache.layers[i] = new_layer_cache
 
         x = self.norm(x)
         logits = self.head(x)
-
-        if use_cache and cache is not None:
-            cache.append(new_entries)
-
         return logits, cache
 
     # --------------------------------------------------------------- utils
