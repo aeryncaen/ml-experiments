@@ -106,6 +106,7 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
+    pit_bucket_mode: str = os.environ.get("PIT_BUCKET_MODE", "semantic")  # semantic | first_byte | hash
     pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_labels.npy"))
     pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_centers.npy"))
 
@@ -2368,11 +2369,18 @@ def _make_embed_head_pair():
             if head_type == "bucketed_pit":
                 bucket_labels = None
                 bucket_centers = None
-                if HP.pit_bucket_labels and os.path.isfile(HP.pit_bucket_labels):
-                    import numpy as np
-                    bucket_labels = torch.from_numpy(np.load(HP.pit_bucket_labels))
-                    if HP.pit_bucket_centers and os.path.isfile(HP.pit_bucket_centers):
-                        bucket_centers = torch.from_numpy(np.load(HP.pit_bucket_centers))
+                if HP.pit_bucket_mode == "first_byte":
+                    byte_table = _build_token_byte_table(HP.vocab_size, 16, 256)
+                    first_bytes = byte_table[:, 0].clone()
+                    first_bytes[first_bytes == 256] = 0  # all-pad tokens → bucket 0
+                    bucket_labels = first_bytes
+                elif HP.pit_bucket_mode == "semantic":
+                    if HP.pit_bucket_labels and os.path.isfile(HP.pit_bucket_labels):
+                        import numpy as np
+                        bucket_labels = torch.from_numpy(np.load(HP.pit_bucket_labels))
+                        if HP.pit_bucket_centers and os.path.isfile(HP.pit_bucket_centers):
+                            bucket_centers = torch.from_numpy(np.load(HP.pit_bucket_centers))
+                # else: hash (bucket_labels stays None)
                 return (CompositePITEmbedding(interface),
                         BucketedCompositePITHead(interface,
                                                   n_buckets=HP.pit_n_buckets,
@@ -3233,7 +3241,7 @@ def main():
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
     _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
     if _head == "bucketed_pit":
-        _routing = "semantic" if HP.pit_bucket_labels else "hash"
+        _routing = HP.pit_bucket_mode
         _extra += f" pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={_routing}"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
