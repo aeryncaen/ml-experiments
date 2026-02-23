@@ -253,23 +253,11 @@ def build_artifacts(
             for i, b in enumerate(raw):
                 token_bytes[tok_id, i] = b
 
-    # Remap surgery targets to pruned/new IDs.
+    # Keep surgery map in base-tokenizer ID space.
+    # Pipeline order is: encode(base IDs) -> surgery(base IDs) -> id_remap(base->new IDs).
     remapped_surgery_map: Dict[int, List[int]] = {}
     for old_long_id, seq_old in surgery_map.items():
-        if old_long_id in old_to_new:
-            # Long tokens are expected removed in prune mode, but allow if not pruned.
-            src_id = old_to_new[old_long_id]
-        else:
-            src_id = old_long_id
-
-        seq_new: List[int] = []
-        for old_id in seq_old:
-            if old_id not in old_to_new:
-                raise RuntimeError(
-                    f"Surgery target token {old_id} is missing from old_to_new remap"
-                )
-            seq_new.append(old_to_new[old_id])
-        remapped_surgery_map[src_id] = seq_new
+        remapped_surgery_map[old_long_id] = seq_old
 
     # Export artifacts.
     surgery_map_json = {str(k): v for k, v in sorted(remapped_surgery_map.items())}
