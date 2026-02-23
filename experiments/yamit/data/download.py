@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Add parent to path so we can import registry
@@ -45,6 +46,48 @@ CHARS_PER_TOKEN_ESTIMATE = 4
 
 # How many text samples to buffer before flushing to disk.
 SHARD_SIZE = 50_000
+
+
+def _coerce_text(value) -> str | None:
+    """Best-effort conversion of dataset field value into text."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        return s if s else None
+    if isinstance(value, bytes):
+        s = value.decode("utf-8", errors="replace").strip()
+        return s if s else None
+    if isinstance(value, dict):
+        for k in ("content", "text", "raw_content", "code", "body", "document"):
+            if k in value:
+                t = _coerce_text(value.get(k))
+                if t:
+                    return t
+        return None
+    if isinstance(value, list):
+        parts = [_coerce_text(v) for v in value]
+        parts = [p for p in parts if p]
+        if not parts:
+            return None
+        return "\n".join(parts)
+    return None
+
+
+def _extract_text(sample: dict, preferred_column: str) -> tuple[str | None, str | None]:
+    """Extract text from sample. Returns (text, source_column)."""
+    keys = [preferred_column, "content", "text", "Text", "document", "raw_content", "code", "body"]
+    seen = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key not in sample:
+            continue
+        txt = _coerce_text(sample.get(key))
+        if txt:
+            return txt, key
+    return None, None
 
 
 def count_existing_dataset(name: str, output_dir: Path) -> dict:
@@ -98,6 +141,10 @@ def download_dataset(
     text_column: str,
     target_tokens: int,
     output_dir: Path,
+    progress_every: int,
+    fail_no_text_after: int,
+    fail_no_text_seconds: int,
+    debug_first_rows: int,
 ) -> dict:
     """Stream a single dataset and write JSONL shards.
 
@@ -174,6 +221,11 @@ def download_dataset(
 
     shard_idx = start_shard
     buffer: list[str] = []
+    raw_seen = 0
+    skipped_empty = 0
+    skipped_missing = 0
+    source_col_counts: dict[str, int] = {}
+    start_time = time.time()
 
     def flush_buffer():
         nonlocal shard_idx, buffer
@@ -190,17 +242,57 @@ def download_dataset(
         buffer = []
 
     for sample in ds:
-        text = sample.get(text_column)
+        raw_seen += 1
+
+        if debug_first_rows > 0 and raw_seen <= debug_first_rows:
+            preview = {k: type(v).__name__ for k, v in sample.items()}
+            log.info(f"[{name}] Row {raw_seen} schema preview: {preview}")
+
+        text, src_col = _extract_text(sample, text_column)
         if text is None:
-            # Try common alternative column names.
-            for alt in ("content", "text", "Text", "document"):
-                text = sample.get(alt)
-                if text is not None:
-                    break
-        if text is None or not isinstance(text, str) or len(text.strip()) == 0:
+            skipped_missing += 1
+            if total_samples == 0 and fail_no_text_after > 0 and raw_seen >= fail_no_text_after:
+                err = (
+                    f"no usable text found in first {raw_seen:,} rows "
+                    f"(text_column='{text_column}')"
+                )
+                log.error(f"[{name}] {err}")
+                return {
+                    "name": name,
+                    "shards": shard_idx,
+                    "samples": total_samples,
+                    "chars": total_chars,
+                    "est_tokens": total_chars // CHARS_PER_TOKEN_ESTIMATE,
+                    "error": err,
+                }
+            if total_samples == 0 and fail_no_text_seconds > 0 and (time.time() - start_time) >= fail_no_text_seconds:
+                err = (
+                    f"no usable text after {int(time.time() - start_time)}s "
+                    f"(rows seen: {raw_seen:,}, text_column='{text_column}')"
+                )
+                log.error(f"[{name}] {err}")
+                return {
+                    "name": name,
+                    "shards": shard_idx,
+                    "samples": total_samples,
+                    "chars": total_chars,
+                    "est_tokens": total_chars // CHARS_PER_TOKEN_ESTIMATE,
+                    "error": err,
+                }
+            if progress_every > 0 and raw_seen % progress_every == 0:
+                log.info(
+                    f"[{name}] Progress: rows={raw_seen:,}, kept={total_samples:,}, "
+                    f"missing={skipped_missing:,}, empty={skipped_empty:,}"
+                )
             continue
 
-        text = text.strip()
+        if src_col is not None:
+            source_col_counts[src_col] = source_col_counts.get(src_col, 0) + 1
+
+        if len(text) == 0:
+            skipped_empty += 1
+            continue
+
         buffer.append(text)
         total_chars += len(text)
         total_samples += 1
@@ -211,6 +303,15 @@ def download_dataset(
         if total_chars >= target_chars:
             break
 
+        if progress_every > 0 and raw_seen % progress_every == 0:
+            est_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
+            pct = 100.0 * min(1.0, total_chars / max(1, target_chars))
+            log.info(
+                f"[{name}] Progress: rows={raw_seen:,}, kept={total_samples:,}, "
+                f"~tokens={est_tokens:,}/{target_tokens:,} ({pct:.1f}%), "
+                f"missing={skipped_missing:,}, empty={skipped_empty:,}"
+            )
+
     flush_buffer()
 
     est_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
@@ -218,12 +319,20 @@ def download_dataset(
         f"[{name}] Done — {total_samples:,} samples, "
         f"~{est_tokens:,} tokens, {shard_idx} shards"
     )
+    if source_col_counts:
+        top = sorted(source_col_counts.items(), key=lambda kv: kv[1], reverse=True)
+        top_str = ", ".join(f"{k}:{v:,}" for k, v in top[:4])
+        log.info(f"[{name}] Text source columns: {top_str}")
+
     return {
         "name": name,
         "shards": shard_idx,
         "samples": total_samples,
         "chars": total_chars,
         "est_tokens": est_tokens,
+        "raw_seen": raw_seen,
+        "skipped_missing": skipped_missing,
+        "skipped_empty": skipped_empty,
     }
 
 
@@ -276,6 +385,30 @@ def main():
         "--count-only",
         action="store_true",
         help="Only count already-downloaded tokens/samples; do not download",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=50_000,
+        help="Log per-dataset progress every N raw rows while streaming",
+    )
+    parser.add_argument(
+        "--fail-no-text-after",
+        type=int,
+        default=200_000,
+        help="Fail dataset if zero kept samples after N rows (0 disables)",
+    )
+    parser.add_argument(
+        "--fail-no-text-seconds",
+        type=int,
+        default=600,
+        help="Fail dataset if zero kept samples after N seconds (0 disables)",
+    )
+    parser.add_argument(
+        "--debug-first-rows",
+        type=int,
+        default=0,
+        help="Print schema preview for first N raw rows per dataset",
     )
     args = parser.parse_args()
 
@@ -425,6 +558,10 @@ def main():
                 text_column=text_column,
                 target_tokens=target_tokens,
                 output_dir=output_dir,
+                progress_every=max(0, args.progress_every),
+                fail_no_text_after=max(0, args.fail_no_text_after),
+                fail_no_text_seconds=max(0, args.fail_no_text_seconds),
+                debug_first_rows=max(0, args.debug_first_rows),
             )
         except Exception as e:
             log.exception(f"[{name}] Unhandled error")
