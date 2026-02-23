@@ -1,10 +1,10 @@
 module github.com/bzoidberg/heuristic-secrets/experiments/yamit/tokenizer
 
-go 1.24
+go 1.23.0
 
 require (
 	github.com/sugarme/tokenizer v0.3.0
-	github.com/valyala/fastjson v1.6.10
+	github.com/valyala/fastjson v1.6.7
 	golang.org/x/text v0.25.0
 )
 

@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument(
         "--artifacts-dir",
         default="experiments/yamit/tokenizer/artifacts/qwen3",
-        help="Tokenizer artifact directory containing tokenizer.json/surgery_map.json/id_remap.json",
+        help="Tokenizer artifact directory containing tokenizer_go.json",
     )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--val-fraction", type=float, default=0.005)
@@ -73,17 +73,12 @@ def main() -> None:
     output_dir = _resolve(repo_root, args.output)
     artifacts_dir = _resolve_artifacts(repo_root, args.artifacts_dir)
 
-    tok_json = artifacts_dir / "tokenizer.json"
-    surgery_map = artifacts_dir / "surgery_map.json"
-    id_remap = artifacts_dir / "id_remap.json"
+    tok_json = artifacts_dir / "tokenizer_go.json"
 
-    missing = [p for p in (tok_json, surgery_map, id_remap) if not p.exists()]
-    if missing:
-        miss = "\n".join(f"  - {p}" for p in missing)
+    if not tok_json.exists():
         raise SystemExit(
-            "Missing tokenizer artifacts:\n"
-            f"{miss}\n"
-            "Generate them with build_composite_tokenizer.py first."
+            f"Missing tokenizer artifact: {tok_json}\n"
+            "Generate it with build_composite_tokenizer.py first."
         )
 
     if not input_dir.exists():
@@ -109,10 +104,6 @@ def main() -> None:
         ".",
         "--tokenizer",
         str(tok_json),
-        "--surgery-map",
-        str(surgery_map),
-        "--id-remap",
-        str(id_remap),
         "--input",
         str(input_dir),
         "--output",
