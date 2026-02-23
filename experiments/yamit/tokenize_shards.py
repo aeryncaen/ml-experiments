@@ -18,7 +18,32 @@ from pathlib import Path
 
 def _resolve(repo_root: Path, value: str) -> Path:
     p = Path(value)
-    return p if p.is_absolute() else (repo_root / p)
+    if p.is_absolute():
+        return p
+    # Prefer caller CWD for relative paths; fallback to repo-root relative.
+    cwd_path = Path.cwd() / p
+    if cwd_path.exists():
+        return cwd_path
+    return repo_root / p
+
+
+def _resolve_artifacts(repo_root: Path, value: str) -> Path:
+    p = Path(value)
+    if p.is_absolute():
+        return p
+    # For artifacts we default to repo-root relative path.
+    return repo_root / p
+
+
+def _discover_raw_roots(repo_root: Path) -> list[tuple[Path, int]]:
+    counts: dict[Path, int] = {}
+    for shard in repo_root.rglob("shard_*.jsonl"):
+        # Expected layout: <raw_root>/<dataset>/shard_XXXXX.jsonl
+        if len(shard.parents) < 2:
+            continue
+        raw_root = shard.parent.parent
+        counts[raw_root] = counts.get(raw_root, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
 
 
 def main() -> None:
@@ -40,7 +65,7 @@ def main() -> None:
 
     input_dir = _resolve(repo_root, args.input)
     output_dir = _resolve(repo_root, args.output)
-    artifacts_dir = _resolve(repo_root, args.artifacts_dir)
+    artifacts_dir = _resolve_artifacts(repo_root, args.artifacts_dir)
 
     tok_json = artifacts_dir / "tokenizer.json"
     surgery_map = artifacts_dir / "surgery_map.json"
@@ -56,7 +81,21 @@ def main() -> None:
         )
 
     if not input_dir.exists():
-        raise SystemExit(f"Input directory not found: {input_dir}")
+        discovered = _discover_raw_roots(repo_root)
+        if len(discovered) == 1:
+            input_dir = discovered[0][0]
+            print(
+                f"[tokenize_shards] Input '{args.input}' not found; "
+                f"auto-using discovered raw dir: {input_dir}"
+            )
+        else:
+            msg = [f"Input directory not found: {input_dir}"]
+            if discovered:
+                msg.append("Discovered raw-data candidates:")
+                for p, n in discovered[:6]:
+                    msg.append(f"  - {p} ({n} shards)")
+            msg.append("Pass --input with the correct path.")
+            raise SystemExit("\n".join(msg))
 
     cmd = [
         args.go_bin,
