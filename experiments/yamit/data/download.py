@@ -293,6 +293,7 @@ def main():
     print(f"{'='*70}")
     total_tokens = 0
     total_samples = 0
+    errors = []
     for r in results:
         status = "SKIP" if r.get("skipped") else ("ERR" if r.get("error") else "OK")
         print(
@@ -301,9 +302,20 @@ def main():
             f"{r['samples']:>10,} samples  "
             f"{r['shards']:>4} shards"
         )
+        if r.get("error"):
+            errors.append(r)
         total_tokens += r["est_tokens"]
         total_samples += r["samples"]
     print(f"\nTotal: ~{total_tokens:,} tokens, {total_samples:,} samples")
+
+    if errors:
+        print(f"\n{'='*70}")
+        print(f"Errors ({len(errors)}):")
+        print(f"{'='*70}")
+        for r in errors:
+            print(f"  {r['name']}")
+            print(f"    {r['error']}")
+            print()
 
     # Write manifest for the tokenizer to consume.
     manifest_path = output_dir / "manifest.json"
