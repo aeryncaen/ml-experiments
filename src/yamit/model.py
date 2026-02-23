@@ -20,6 +20,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from flash_mla import flash_attn_varlen_func as _flash_mla_varlen
+    HAS_FLASH_MLA = True
+except ImportError:
+    HAS_FLASH_MLA = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -614,35 +620,29 @@ class MLAAttention(nn.Module):
         # ── output ──
         self.wo = nn.Linear(cfg.n_heads * cfg.v_head_dim, cfg.d_model, bias=False)
 
-        # ── RoPE inverse frequencies ──
+        # ── RoPE: precompute cos/sin table for max_seq_len ──
         inv_freq = 1.0 / (
             cfg.rope_theta
             ** (torch.arange(0, cfg.qk_rope_head_dim, 2).float() / cfg.qk_rope_head_dim)
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        positions = torch.arange(cfg.max_seq_len).float()
+        freqs = torch.einsum("t,d->td", positions, inv_freq)  # (T, D/2)
+        emb = torch.cat([freqs, freqs], dim=-1)                # (T, rope_dim)
+        self.register_buffer("rope_cos", emb.cos(), persistent=False)  # (T, rope_dim)
+        self.register_buffer("rope_sin", emb.sin(), persistent=False)
 
     # ------------------------------------------------------------------ RoPE
     def _rope_cos_sin(
         self, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute RoPE cos/sin from arbitrary position IDs.
+        """Look up precomputed RoPE cos/sin by position ID.
 
         Args:
-            position_ids: (B, T) integer positions.
+            position_ids: (B, T) integer positions in [0, max_seq_len).
         Returns:
             cos, sin: each (B, T, rope_dim).
         """
-        pos = position_ids.float()
-        # Linear RoPE scaling for long context extension.
-        max_pos = int(position_ids.max().item()) + 1
-        if max_pos > self.orig_ctx_len:
-            factor = math.ceil(max_pos / self.orig_ctx_len)
-            pos = pos / factor
-
-        # (B, T) x (D/2,) → (B, T, D/2)
-        freqs = torch.einsum("bt,d->btd", pos, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)  # (B, T, rope_dim)
-        return emb.cos(), emb.sin()
+        return self.rope_cos[position_ids], self.rope_sin[position_ids]
 
     def _project_q(
         self,
@@ -700,28 +700,46 @@ class MLAAttention(nn.Module):
         kv_latent, k_pe = self._project_kv_latent(x, position_ids)
         k_nope, v = self._expand_kv(kv_latent)
 
+        # q: (B, T, H, qk_nope + qk_rope)  k: same  v: (B, T, H, v_head_dim)
         q = torch.cat([q_nope, q_pe], dim=-1)
         k_pe_exp = k_pe.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
         k = torch.cat([k_nope, k_pe_exp], dim=-1)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        if HAS_FLASH_MLA and mask is None and sparse_mask is None:
+            # FlashMLA varlen: (B*T, H, D) packed format, causal.
+            q_packed = q.reshape(B * T, self.n_heads, -1)
+            k_packed = k.reshape(B * T, self.n_heads, -1)
+            v_packed = v.reshape(B * T, self.n_heads, self.v_head_dim)
+            cu_seqlens = torch.arange(
+                0, (B + 1) * T, T, device=x.device, dtype=torch.int32
+            )
+            out_packed, _ = _flash_mla_varlen(
+                q_packed, k_packed, v_packed,
+                cu_seqlens, cu_seqlens, T, T,
+                causal=True,
+                softmax_scale=self.scale,
+            )
+            out = out_packed.view(B, T, self.n_heads, self.v_head_dim)
+        else:
+            # Fallback: F.scaled_dot_product_attention (BHSD format).
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
 
-        attn_mask = mask
-        if sparse_mask is not None:
-            attn_mask = sparse_mask if attn_mask is None else (attn_mask + sparse_mask)
+            attn_mask = mask
+            if sparse_mask is not None:
+                attn_mask = sparse_mask if attn_mask is None else (attn_mask + sparse_mask)
 
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            is_causal=(attn_mask is None),
-            dropout_p=(self.cfg.attn_dropout if self.training else 0.0),
-            scale=self.scale,
-        )
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=(attn_mask is None),
+                dropout_p=(self.cfg.attn_dropout if self.training else 0.0),
+                scale=self.scale,
+            )
+            out = out.transpose(1, 2)
+
+        out = out.contiguous().view(B, T, -1)
         out = self.wo(out)
 
         cache_entry = MLALayerCache(kv_latent=kv_latent, k_pe=k_pe)
@@ -1082,6 +1100,168 @@ class YAMIT(nn.Module):
             lines.append(f"  {name:60s} {str(tuple(p.shape)):>30s}  {n:>12,}")
         lines.append(f"  {'TOTAL':60s} {'':>30s}  {total:>12,}")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Baseline Transformer (for ablation / comparison)
+# ---------------------------------------------------------------------------
+
+class BaselineAttention(nn.Module):
+    """Standard multi-head attention with RoPE. No MLA, no latent compression."""
+
+    def __init__(self, cfg: YAMITConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.n_heads = cfg.n_heads
+        head_dim = cfg.d_model // cfg.n_heads
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+
+        self.wq = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wk = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wv = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+        # RoPE: precompute cos/sin table.
+        inv_freq = 1.0 / (
+            cfg.rope_theta
+            ** (torch.arange(0, head_dim, 2).float() / head_dim)
+        )
+        positions = torch.arange(cfg.max_seq_len).float()
+        freqs = torch.einsum("t,d->td", positions, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("rope_cos", emb.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb.sin(), persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        sparse_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, D = self.n_heads, self.head_dim
+
+        q = self.wq(x).view(B, T, H, D)
+        k = self.wk(x).view(B, T, H, D)
+        v = self.wv(x).view(B, T, H, D)
+
+        cos = self.rope_cos[position_ids].unsqueeze(2)  # (B, T, 1, D)
+        sin = self.rope_sin[position_ids].unsqueeze(2)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        if HAS_FLASH_MLA and mask is None and sparse_mask is None:
+            q_packed = q.reshape(B * T, H, D)
+            k_packed = k.reshape(B * T, H, D)
+            v_packed = v.reshape(B * T, H, D)
+            cu_seqlens = torch.arange(
+                0, (B + 1) * T, T, device=x.device, dtype=torch.int32
+            )
+            out_packed, _ = _flash_mla_varlen(
+                q_packed, k_packed, v_packed,
+                cu_seqlens, cu_seqlens, T, T,
+                causal=True, softmax_scale=self.scale,
+            )
+            out = out_packed.view(B, T, H, D)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            attn_mask = mask
+            if sparse_mask is not None:
+                attn_mask = sparse_mask if attn_mask is None else (attn_mask + sparse_mask)
+
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=(attn_mask is None),
+                dropout_p=(self.cfg.attn_dropout if self.training else 0.0),
+                scale=self.scale,
+            )
+            out = out.transpose(1, 2)
+
+        out = out.contiguous().view(B, T, -1)
+        return self.wo(out)
+
+
+class BaselineBlock(nn.Module):
+    """Pre-norm residual block with standard MHA + SwiGLU."""
+
+    def __init__(self, cfg: YAMITConfig):
+        super().__init__()
+        self.attn_norm = RMSNorm(cfg.d_model, cfg.rms_norm_eps)
+        self.attn = BaselineAttention(cfg)
+        self.mlp_norm = RMSNorm(cfg.d_model, cfg.rms_norm_eps)
+        self.mlp = SwiGLUMLP(cfg)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        sparse_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), position_ids, mask, sparse_mask=sparse_mask)
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
+
+
+class BaselineTransformer(nn.Module):
+    """Standard transformer for baselining against YAMIT.
+
+    Same d_model, n_layers, n_heads, mlp_hidden, max_seq_len.
+    Standard MHA + nn.Embedding + tied linear head. No MLA, no PIT.
+    Same forward(input_ids, position_ids) -> logits signature as YAMIT.
+    """
+
+    def __init__(self, cfg: YAMITConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.layers = nn.ModuleList([BaselineBlock(cfg) for _ in range(cfg.n_layers)])
+        self.norm = RMSNorm(cfg.d_model, cfg.rms_norm_eps)
+        # Tied head: share embed weights.
+        self.head_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
+        self._init_weights()
+
+    def _init_weights(self):
+        std = self.cfg.init_std
+        nn.init.normal_(self.embed.weight, mean=0.0, std=std)
+        nn.init.zeros_(self.head_bias)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        sparse_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T = input_ids.shape
+        if position_ids is None:
+            position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+
+        x = self.embed(input_ids)
+        for layer in self.layers:
+            x = layer(x, position_ids, mask, sparse_mask=sparse_mask)
+        x = self.norm(x)
+        logits = F.linear(x, self.embed.weight, self.head_bias)
+        return logits
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def trainable_param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from yamit.model import YAMIT, MODEL_S, MODEL_P
+from yamit.model import YAMIT, MODEL_S, MODEL_P, BaselineTransformer
 from yamit.refusion import forward_process, refusion_loss
 from yamit.sampler import generate_refusion, ReFusionSamplerConfig
 from yamit.training import (
@@ -370,6 +370,7 @@ def train(args):
 
     # ── Token bytes ──
     token_bytes_path = args.token_bytes
+    token_bytes = None
     artifact_meta = None
     if token_bytes_path and Path(token_bytes_path).exists():
         log.info(f"Loading token bytes from {token_bytes_path}")
@@ -384,7 +385,7 @@ def train(args):
         if token_bytes_path:
             torch.save(token_bytes, token_bytes_path)
             log.info(f"Saved token bytes to {token_bytes_path}")
-    else:
+    elif not args.baseline:
         raise ValueError(
             "Missing token-bytes mapping. For spec-conform training, pass "
             "--token-bytes <path>. If you only want a quick smoke test, pass "
@@ -392,7 +393,8 @@ def train(args):
         )
 
     # Sync config vocab/special IDs with tokenizer artifacts when present.
-    cfg.vocab_size = int(token_bytes.shape[0])
+    if token_bytes is not None:
+        cfg.vocab_size = int(token_bytes.shape[0])
     special_token_ids: list[int] = []
     if artifact_meta:
         resolved = artifact_meta.get("special_tokens", {})
@@ -426,8 +428,12 @@ def train(args):
         )
 
     # ── Model ──
-    model = YAMIT(cfg, token_bytes=token_bytes, special_token_ids=special_token_ids or None).to(device)
-    log.info(f"Model-{args.model_size} params: {model.param_count():,}")
+    if args.baseline:
+        model = BaselineTransformer(cfg).to(device)
+        log.info(f"Baseline Model-{args.model_size} params: {model.param_count():,}")
+    else:
+        model = YAMIT(cfg, token_bytes=token_bytes, special_token_ids=special_token_ids or None).to(device)
+        log.info(f"YAMIT Model-{args.model_size} params: {model.param_count():,}")
 
     # torch.compile for speed.
     compiled_model = model
@@ -436,7 +442,22 @@ def train(args):
         compiled_model = torch.compile(model)
 
     # ── Optimizer ──
-    param_groups = yamit_param_groups(model, args.weight_decay)
+    if args.baseline:
+        # Simple decay/no-decay split for baseline: no decay on norms, biases, embeddings.
+        decay, no_decay = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(kw in name for kw in ["norm", "bias", "embed"]):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        param_groups = [
+            {"params": decay, "weight_decay": args.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+    else:
+        param_groups = yamit_param_groups(model, args.weight_decay)
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=args.lr,
@@ -664,7 +685,7 @@ def train(args):
 
     elapsed = time.time() - t0
     summary = {
-        "model": f"YAMIT Model-{args.model_size}",
+        "model": f"{'Baseline' if args.baseline else 'YAMIT'} Model-{args.model_size}",
         "total_steps": step,
         "total_tokens": tokens_seen,
         "best_val_loss": best_val_loss,
@@ -701,6 +722,8 @@ def main():
     # Model
     parser.add_argument("--model-size", type=str, default="S", choices=["S", "P"],
                         help="Model size: S (~130M) or P (~347M)")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Use standard transformer baseline (no MLA, no PIT) for comparison")
 
     # Training
     parser.add_argument("--total-tokens", type=int, default=3_000_000_000)

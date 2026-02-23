@@ -1,4 +1,4 @@
-from yamit.model import YAMIT, YAMITConfig, MODEL_S, MODEL_P
+from yamit.model import YAMIT, YAMITConfig, MODEL_S, MODEL_P, BaselineTransformer
 from yamit.refusion import forward_process, refusion_loss
 from yamit.sampler import generate_refusion, ReFusionSamplerConfig
 from yamit.training import (
