@@ -28,8 +28,6 @@ import os
 import sys
 from pathlib import Path
 
-from datasets import load_dataset
-
 # Add parent to path so we can import registry
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data.registry import DATASETS, get_stage_mix
@@ -47,6 +45,50 @@ CHARS_PER_TOKEN_ESTIMATE = 4
 
 # How many text samples to buffer before flushing to disk.
 SHARD_SIZE = 50_000
+
+
+def count_existing_dataset(name: str, output_dir: Path) -> dict:
+    """Count already-downloaded samples/chars/tokens for one dataset."""
+    ds_dir = output_dir / name
+    if not ds_dir.exists():
+        return {
+            "name": name,
+            "shards": 0,
+            "samples": 0,
+            "chars": 0,
+            "est_tokens": 0,
+            "parse_errors": 0,
+        }
+
+    shards = sorted(ds_dir.glob("shard_*.jsonl"))
+    total_chars = 0
+    total_samples = 0
+    parse_errors = 0
+
+    for shard_path in shards:
+        try:
+            with open(shard_path) as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        parse_errors += 1
+                        continue
+                    text = obj.get("text")
+                    if isinstance(text, str):
+                        total_chars += len(text)
+                        total_samples += 1
+        except Exception:
+            parse_errors += 1
+
+    return {
+        "name": name,
+        "shards": len(shards),
+        "samples": total_samples,
+        "chars": total_chars,
+        "est_tokens": total_chars // CHARS_PER_TOKEN_ESTIMATE,
+        "parse_errors": parse_errors,
+    }
 
 
 def download_dataset(
@@ -110,6 +152,8 @@ def download_dataset(
     )
 
     try:
+        from datasets import load_dataset
+
         ds = load_dataset(
             hf_path,
             name=hf_subset,
@@ -228,10 +272,17 @@ def main():
         default=4,
         help="Number of datasets to download in parallel",
     )
+    parser.add_argument(
+        "--count-only",
+        action="store_true",
+        help="Only count already-downloaded tokens/samples; do not download",
+    )
     args = parser.parse_args()
 
     if not args.stage and not args.datasets:
         parser.error("Must specify --stage or --datasets")
+    if args.count_only and args.dry_run:
+        parser.error("--count-only and --dry-run are mutually exclusive")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +331,82 @@ def main():
         for name, hf_path, hf_subset, _, tokens in plan:
             path_str = hf_path + (f"/{hf_subset}" if hf_subset else "")
             print(f"{name:<30} {path_str:<45} {tokens:>15,}")
+        return
+
+    if args.count_only:
+        workers = max(1, args.workers)
+        log.info(
+            f"Counting existing data for {len(plan)} datasets with {workers} worker(s)"
+        )
+
+        results_by_name: dict[str, dict] = {}
+
+        def count_one(spec: tuple[str, str, str | None, str, int]) -> dict:
+            name, _, _, _, _ = spec
+            r = count_existing_dataset(name, output_dir)
+            return r
+
+        if workers == 1 or len(plan) == 1:
+            for spec in plan:
+                r = count_one(spec)
+                results_by_name[r["name"]] = r
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                future_to_name = {ex.submit(count_one, spec): spec[0] for spec in plan}
+                for fut in concurrent.futures.as_completed(future_to_name):
+                    name = future_to_name[fut]
+                    try:
+                        r = fut.result()
+                    except Exception as e:
+                        r = {
+                            "name": name,
+                            "shards": 0,
+                            "samples": 0,
+                            "chars": 0,
+                            "est_tokens": 0,
+                            "parse_errors": 1,
+                            "error": str(e),
+                        }
+                    results_by_name[name] = r
+
+        results = [results_by_name[name] for name, *_ in plan]
+
+        print(f"\n{'='*86}")
+        print("Existing Data Summary")
+        print(f"{'='*86}")
+        print(
+            f"{'Dataset':<30} {'Have Tokens':>14} {'Target':>14} {'Progress':>10} {'Shards':>8}"
+        )
+        print("-" * 86)
+
+        total_have = 0
+        total_target = 0
+        total_samples = 0
+        total_shards = 0
+        total_parse_errors = 0
+
+        target_by_name = {name: tokens for name, _, _, _, tokens in plan}
+        for r in results:
+            target = target_by_name[r["name"]]
+            have = r["est_tokens"]
+            progress = (100.0 * have / target) if target > 0 else 0.0
+            print(
+                f"{r['name']:<30} {have:>14,} {target:>14,} {progress:>9.1f}% {r['shards']:>8,}"
+            )
+            total_have += have
+            total_target += target
+            total_samples += r["samples"]
+            total_shards += r["shards"]
+            total_parse_errors += r.get("parse_errors", 0)
+
+        total_progress = (100.0 * total_have / total_target) if total_target > 0 else 0.0
+        print("-" * 86)
+        print(
+            f"{'TOTAL':<30} {total_have:>14,} {total_target:>14,} {total_progress:>9.1f}% {total_shards:>8,}"
+        )
+        print(f"\nSamples: {total_samples:,}")
+        if total_parse_errors > 0:
+            print(f"Parse errors while counting: {total_parse_errors:,}")
         return
 
     # Execute downloads.
