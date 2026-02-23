@@ -2146,7 +2146,7 @@ class BucketedCompositePITHead(nn.Module):
 
         # ── Bucket assignment ──
         if bucket_labels is not None:
-            # Semantic clustering — labels may cover fewer tokens than V
+            # Maximally-dissimilar (anti-clustered) buckets — labels may cover fewer tokens than V
             n_labeled = len(bucket_labels)
             n_buckets = int(bucket_labels.max().item()) + 1
             if n_labeled < V:
@@ -2265,7 +2265,7 @@ class BucketedCompositePITHead(nn.Module):
         Level 2: within-bucket softmax → CE against target token in its bucket.
         Total loss = bucket_loss + token_loss. Exact, no approximation.
 
-        Returns (total_loss, bucket_loss, token_loss).
+        Returns (total_loss, bucket_loss, token_loss, token_acc).
         """
         B, T, D = hidden.shape
         N = B * T
@@ -2285,6 +2285,7 @@ class BucketedCompositePITHead(nn.Module):
         g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
         h_tok_2d = h_tok_flat.reshape(N, -1)
         token_loss_sum = torch.zeros(1, device=hidden.device, dtype=torch.float32)
+        correct = torch.zeros(1, device=hidden.device, dtype=torch.long)
 
         for b in range(self.n_buckets):
             in_bucket = (target_buckets == b)
@@ -2310,9 +2311,14 @@ class BucketedCompositePITHead(nn.Module):
             bl = (bl_shared + bl_tok).float()  # (n_b, bs)
             token_loss_sum += F.cross_entropy(bl, local_idx, reduction='sum')
 
+            # Accuracy: map within-bucket argmax back to global token ID
+            pred_local = bl.detach().argmax(dim=-1)  # (n_b,)
+            correct += (pred_local == local_idx).sum()
+
         token_loss = token_loss_sum / N
+        token_acc = correct.float() / N
         total_loss = bucket_loss + token_loss
-        return total_loss, bucket_loss, token_loss
+        return total_loss, bucket_loss, token_loss, token_acc
 
 
 def _resolved_head_type() -> str:
@@ -2499,14 +2505,17 @@ class GPTTransformer(nn.Module):
                 vocab_chunk_size=vocab_chunk,
                 token_chunk_size=HP.decoder_head_token_chunk,
             )
+            self._last_acc = None
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            total_loss, _, _, acc = self.lm_head.routed_cross_entropy(x, targets)
+            self._last_acc = acc
             return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            self._last_acc = (logits.detach().argmax(-1) == targets).float().mean()
         return logits, loss
 
 
@@ -3013,14 +3022,17 @@ class GPTMoE(nn.Module):
                 vocab_chunk_size=vocab_chunk,
                 token_chunk_size=HP.decoder_head_token_chunk,
             )
+            self._last_acc = None
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            total_loss, _, _, acc = self.lm_head.routed_cross_entropy(x, targets)
+            self._last_acc = acc
             return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            self._last_acc = (logits.detach().argmax(-1) == targets).float().mean()
         return logits, loss
 
 
@@ -3185,13 +3197,16 @@ def lr_for_step(step: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int) -> float:
+def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
+    """Returns (val_loss, val_acc) where val_acc may be None."""
+    raw = model.module if hasattr(model, 'module') else model
     model.eval()
     loss_sum = torch.zeros(1, device=device)
+    acc_sum = torch.zeros(1, device=device)
+    has_acc = False
     for _ in range(HP.val_steps):
         x, y = val_stream.next_batch(device)
         if HP.llada:
-            # Fixed 50% mask for consistent evaluation
             B, T = x.shape
             mask = torch.rand(B, T, device=device) < 0.5
             p_mask = torch.full((B,), 0.5, device=device)
@@ -3207,11 +3222,18 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
             else:
                 _, loss = model(x, y)
         loss_sum += loss
+        if hasattr(raw, '_last_acc') and raw._last_acc is not None:
+            acc_sum += raw._last_acc
+            has_acc = True
     loss_sum /= HP.val_steps
+    if has_acc:
+        acc_sum /= HP.val_steps
     if world_size > 1:
         dist.all_reduce(loss_sum, op=dist.ReduceOp.AVG)
+        if has_acc:
+            dist.all_reduce(acc_sum, op=dist.ReduceOp.AVG)
     model.train()
-    return float(loss_sum.item())
+    return float(loss_sum.item()), float(acc_sum.item()) if has_acc else None
 
 
 def main():
@@ -3266,6 +3288,7 @@ def main():
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
+    raw_model = model  # keep ref before compile/DDP wrapping
     if HP.compile:
         model = torch.compile(model, dynamic=False)
     if world_size > 1:
@@ -3290,8 +3313,9 @@ def main():
     t0 = time.time()
     for step in range(HP.train_steps + 1):
         if step % HP.val_every == 0 or step == HP.train_steps:
-            val_loss = evaluate(model, val_stream, device, world_size)
-            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}")
+            val_loss, val_acc = evaluate(model, val_stream, device, world_size)
+            _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
+            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str}")
             if step == HP.train_steps:
                 break
 
@@ -3326,7 +3350,10 @@ def main():
             if world_size > 1:
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f} | lr {lr:.3e} | sec/step {dt:.3f}")
+            _train_acc_str = ""
+            if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
+                _train_acc_str = f" | train_acc {raw_model._last_acc:.4f}"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | sec/step {dt:.3f}")
 
         if profiler is not None:
             profiler.step()
