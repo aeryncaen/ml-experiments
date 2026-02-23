@@ -3428,8 +3428,8 @@ def build_model_maybe_llada() -> nn.Module:
 
 
 def lr_for_step(step: int) -> float:
-    warmup_steps = 0 if HP.ngpt else int(HP.train_steps * HP.warmup_frac)
-    # Warmup phase (same for all schedules; nGPT skips warmup)
+    warmup_steps = int(HP.train_steps * HP.warmup_frac)
+    # Warmup phase (same for all schedules)
     if step < warmup_steps:
         return HP.lr * (step + 1) / max(1, warmup_steps)
 
