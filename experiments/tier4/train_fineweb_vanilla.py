@@ -2185,8 +2185,8 @@ class BucketedCompositePITHead(nn.Module):
         self.max_bucket_size = max_bs
         self._bucket_sizes_list = sizes.tolist()  # plain Python list, no .item() graph breaks
 
-        # ── SwiGLU Router ──
-        router_hidden = d_model // 4
+        # ── SwiGLU Router (full MLP size) ──
+        router_hidden = ((int(d_model * 8 / 3) + 255) // 256) * 256
         self.router_gate = nn.Linear(d_model, router_hidden, bias=False)
         self.router_up = nn.Linear(d_model, router_hidden, bias=False)
         self.router_down = nn.Linear(router_hidden, n_buckets, bias=False)
@@ -2202,9 +2202,11 @@ class BucketedCompositePITHead(nn.Module):
                 # Simple approach: init router_down to align with centers directly.
                 c = bucket_centers.float()  # (K, d_model)
                 c = c / (c.norm(dim=-1, keepdim=True) + 1e-8)
-                # Truncate or pad to match router_hidden
+                # Project centers into router_hidden space for init
                 if d_model >= router_hidden:
                     self.router_down.weight.copy_(c[:, :router_hidden].to(self.router_down.weight.dtype))
+                else:
+                    self.router_down.weight[:, :d_model].copy_(c.to(self.router_down.weight.dtype))
                 # This is approximate but gives the router a head start
 
     def _route(self, hidden: torch.Tensor) -> torch.Tensor:
