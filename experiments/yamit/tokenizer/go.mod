@@ -1,10 +1,16 @@
 module github.com/bzoidberg/heuristic-secrets/experiments/yamit/tokenizer
 
-go 1.23.0
+go 1.24
 
-require github.com/sugarme/tokenizer v0.3.0
+require (
+	github.com/sugarme/tokenizer v0.3.0
+	github.com/valyala/fastjson v1.6.10
+	golang.org/x/text v0.25.0
+)
 
-replace github.com/sugarme/tokenizer => ../../../tokenizer
+replace github.com/sugarme/tokenizer => github.com/aeryncaen/tokenizer v0.0.0-20260223074333-36a1f5bada00
+
+replace github.com/dlclark/regexp2 => github.com/aeryncaen/regexp2 v0.0.0-20260223063553-3a989801f37f
 
 require (
 	github.com/dlclark/regexp2 v1.11.5 // indirect
@@ -13,8 +19,6 @@ require (
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/schollz/progressbar/v2 v2.15.0 // indirect
-	github.com/sugarme/regexpset v0.0.0-20200920021344-4d4ec8eaf93c // indirect
 	golang.org/x/sync v0.14.0 // indirect
-	golang.org/x/text v0.25.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
