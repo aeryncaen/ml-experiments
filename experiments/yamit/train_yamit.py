@@ -36,17 +36,15 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# Reuse data loading, scheduler, and checkpointing from vanilla trainer.
-from train import (
+from yamit.model import YAMIT, MODEL_S, MODEL_P
+from yamit.refusion import forward_process, refusion_loss
+from yamit.sampler import generate_refusion, ReFusionSamplerConfig
+from yamit.training import (
     ShardedTokenDataset,
     WSDScheduler,
     save_checkpoint,
     load_checkpoint,
 )
-
-from yamit_model import YAMIT, MODEL_S, MODEL_P
-from refusion import forward_process, refusion_loss
-from sampler import generate_refusion, ReFusionSamplerConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -396,7 +394,7 @@ def train(args):
     # Sync config vocab/special IDs with tokenizer artifacts when present.
     cfg.vocab_size = int(token_bytes.shape[0])
     if artifact_meta:
-        resolved = artifact_meta.get("resolved_special_ids", {})
+        resolved = artifact_meta.get("special_tokens", {})
         if resolved.get("mask") is not None:
             cfg.mask_token_id = int(resolved["mask"])
         if resolved.get("eos") is not None:
