@@ -2259,10 +2259,10 @@ class BucketedCompositePITHead(nn.Module):
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
-        """Training: full-vocab streaming CE + router aux loss.
+        """Streaming CE over router-selected buckets + teacher-forced target bucket.
 
-        All K buckets contribute to the partition function (correct CE).
-        The router is trained via aux loss only — it gates inference, not training.
+        Only top_k buckets (+ target bucket) contribute to the partition
+        function — the router is in the critical path.
 
         Returns (total_loss, ce_loss, router_loss).
         """
@@ -2272,19 +2272,32 @@ class BucketedCompositePITHead(nn.Module):
         g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
         h_tok_2d = h_tok_flat.reshape(N, -1)
 
-        # Router (aux loss only — does not gate training)
+        # Router
         router_logits = self._route(hidden)
+        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)  # (B, T, k)
+
         target_flat = targets.reshape(N)
         target_buckets = self.token_to_bucket[target_flat]
         target_local = self.token_in_bucket_idx[target_flat]
+
+        # Aux loss: router should predict target bucket
         router_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
 
-        # Streaming log-sum-exp over ALL buckets (fp32)
+        # Per-position active mask: top-k + teacher-forced target bucket
+        active_mask = torch.zeros(N, self.n_buckets, dtype=torch.bool, device=hidden.device)
+        active_mask.scatter_(-1, top_k_idx.reshape(N, -1), True)
+        active_mask.scatter_(-1, target_buckets.unsqueeze(-1), True)
+
+        # Streaming log-sum-exp over ACTIVE buckets only (fp32)
         max_val = torch.full((N,), -1e30, device=hidden.device, dtype=torch.float32)
         sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
         target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
 
         for b in range(self.n_buckets):
+            bucket_active = active_mask[:, b]
+            if not bucket_active.any():
+                continue
+
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
             iface = self.interface
@@ -2297,6 +2310,10 @@ class BucketedCompositePITHead(nn.Module):
             bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
 
             bl = (bl_shared + bl_tok).float()  # (N, bs)
+
+            # Mask inactive positions for this bucket
+            bl = torch.where(bucket_active.unsqueeze(-1), bl,
+                             torch.tensor(-1e30, device=bl.device, dtype=bl.dtype))
 
             # Update streaming LSE
             bucket_max = bl.max(dim=-1).values
@@ -2503,13 +2520,8 @@ class GPTTransformer(nn.Module):
             )
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            if self.training:
-                total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
-                return None, total_loss
-            # Eval: full-vocab CE so val loss is comparable to other heads
-            logits = self.lm_head.interface.project(x)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            return None, loss
+            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -3022,12 +3034,8 @@ class GPTMoE(nn.Module):
             )
             return None, loss
         if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
-            if self.training:
-                total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
-                return None, total_loss
-            logits = self.lm_head.interface.project(x)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            return None, loss
+            total_loss, _, _ = self.lm_head.routed_cross_entropy(x, targets)
+            return None, total_loss
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
