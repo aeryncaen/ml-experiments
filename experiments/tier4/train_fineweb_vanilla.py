@@ -40,11 +40,27 @@ def _env_float(name: str, default: float) -> float:
 @dataclass
 class HParams:
     data_path: str = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parent))
-    train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")
-    val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")
+    data_format: str = os.environ.get("DATA_FORMAT", "gpt2")  # gpt2 (uint16+header) | yamit (flat uint32)
+    train_files: str = os.environ.get(
+        "TRAIN_FILES",
+        os.path.join(data_path, "train/*.bin") if data_format == "yamit"
+        else os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin"),
+    )
+    val_files: str = os.environ.get(
+        "VAL_FILES",
+        os.path.join(data_path, "val/*.bin") if data_format == "yamit"
+        else os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin"),
+    )
+    token_bytes_path: str = os.environ.get(
+        "TOKEN_BYTES_PATH",
+        str(Path(__file__).resolve().parent.parent / "yamit/tokenizer/artifacts/qwen3/token_bytes.npy")
+        if data_format == "yamit" else "",
+    )  # path to pre-built token_bytes (.npy/.pt)
+    yamit_use_idx: bool = _env_bool("YAMIT_USE_IDX", True)  # insert EOS between docs using .idx offsets
+    yamit_eos_token_id: int = _env_int("YAMIT_EOS_TOKEN_ID", 149727)
 
     model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn | moe
-    vocab_size: int = 50304
+    vocab_size: int = _env_int("VOCAB_SIZE", 50304)
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
     d_model: int = _env_int("D_MODEL", 768)
@@ -201,6 +217,28 @@ def _retokenize(tokens: torch.Tensor) -> torch.Tensor:
 
 
 def _load_data_shard(file: Path) -> torch.Tensor:
+    if HP.data_format == "yamit":
+        # YAMIT format: flat uint32 tokens; optional .idx doc boundaries.
+        import numpy as np
+        tokens_np = np.fromfile(str(file), dtype=np.uint32)
+        if HP.yamit_use_idx:
+            idx_path = file.with_suffix(".idx")
+            if idx_path.exists():
+                offsets = np.fromfile(str(idx_path), dtype=np.uint64)
+                if offsets.size >= 2:
+                    tok_off = offsets // 4  # byte offsets -> uint32 token offsets
+                    docs = []
+                    eos = np.array([HP.yamit_eos_token_id], dtype=np.uint32)
+                    for i in range(len(tok_off) - 1):
+                        s = int(tok_off[i])
+                        e = int(tok_off[i + 1])
+                        if e > s:
+                            docs.append(tokens_np[s:e])
+                            docs.append(eos)
+                    if docs:
+                        tokens_np = np.concatenate(docs)
+        return torch.from_numpy(tokens_np.astype(np.int64)).pin_memory()
+    # GPT-2 format: 1024-byte header + uint16 tokens
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
     assert int(header[0]) == 20240520, "magic number mismatch in .bin"
     assert int(header[1]) == 1, "unsupported .bin version"
@@ -1684,6 +1722,29 @@ def _run_blocks(blocks: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
 
 def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int = 256):
     """Build a lookup table mapping each token ID to its byte sequence, padded to max_bytes."""
+    if HP.data_format == "yamit" and not (HP.token_bytes_path and os.path.isfile(HP.token_bytes_path)):
+        raise FileNotFoundError(
+            f"YAMIT mode requires TOKEN_BYTES_PATH to an existing .npy/.pt file, got: {HP.token_bytes_path!r}"
+        )
+    if HP.token_bytes_path and os.path.isfile(HP.token_bytes_path):
+        if HP.token_bytes_path.endswith(".pt"):
+            table = torch.load(HP.token_bytes_path, map_location="cpu", weights_only=True).long()
+        else:
+            import numpy as np
+            table = torch.from_numpy(np.load(HP.token_bytes_path)).long()
+        # Trim or pad byte width to match max_bytes
+        if table.shape[1] < max_bytes:
+            extra_cols = torch.full((table.shape[0], max_bytes - table.shape[1]), pad_idx, dtype=torch.long)
+            table = torch.cat([table, extra_cols], dim=1)
+        elif table.shape[1] > max_bytes:
+            table = table[:, :max_bytes]
+        # Trim or pad to match vocab_size
+        if table.shape[0] < vocab_size:
+            extra = torch.full((vocab_size - table.shape[0], max_bytes), pad_idx, dtype=torch.long)
+            table = torch.cat([table, extra])
+        elif table.shape[0] > vocab_size:
+            table = table[:vocab_size]
+        return table
     import tiktoken
     enc = tiktoken.get_encoding("gpt2")
     table = torch.full((vocab_size, max_bytes), pad_idx, dtype=torch.long)
@@ -3239,6 +3300,15 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
+    # If a pre-built token_bytes table is provided, derive vocab size from it.
+    if HP.token_bytes_path and os.path.isfile(HP.token_bytes_path):
+        if HP.token_bytes_path.endswith(".pt"):
+            _tb = torch.load(HP.token_bytes_path, map_location="cpu", weights_only=True)
+            HP.vocab_size = int(_tb.shape[0])
+        else:
+            import numpy as np
+            HP.vocab_size = int(np.load(HP.token_bytes_path, mmap_mode="r").shape[0])
+
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
     _extra = f" n_features={HP.n_features} desc_dim={HP.desc_dim}" if HP.n_features > 0 and HP.desc_dim > 0 else ""
     if HP.model_type == "feat_attn":
@@ -3255,7 +3325,7 @@ def main():
     _eff_bs = HP.batch_size * HP.grad_accum
     _tok_per_step = _eff_bs * HP.seq_len
     print0(rank, f"model_type={HP.model_type} lm_head={_head} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
-    print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,}")
+    print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,} vocab={HP.vocab_size} data_format={HP.data_format}")
     if HP.llada:
         _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
         print0(rank, _llada_feats)
