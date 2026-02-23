@@ -145,7 +145,7 @@ def yamit_param_groups(
         # No-decay: PIT params, embeddings, norms, biases, gates
         if any(kw in name for kw in [
             "byte_memory", "byte_chol_raw", "token_embed",
-            "mask_embed", "token_up_gate", "token_out_bias",
+            "special_patterns", "token_up_gate", "token_out_bias",
             "norm", "bias",
         ]):
             no_decay.append(param)
@@ -393,22 +393,40 @@ def train(args):
 
     # Sync config vocab/special IDs with tokenizer artifacts when present.
     cfg.vocab_size = int(token_bytes.shape[0])
+    special_token_ids: list[int] = []
     if artifact_meta:
         resolved = artifact_meta.get("special_tokens", {})
+        for key in ("mask", "eos", "pad", "bos", "unk"):
+            val = resolved.get(key)
+            if val is not None and isinstance(val, int):
+                special_token_ids.append(val)
         if resolved.get("mask") is not None:
             cfg.mask_token_id = int(resolved["mask"])
         if resolved.get("eos") is not None:
             cfg.eos_token_id = int(resolved["eos"])
         if resolved.get("pad") is not None:
             cfg.pad_token_id = int(resolved["pad"])
+        # Also include any extra special tokens from the artifact.
+        for tok_id in artifact_meta.get("new_special_token_ids", {}).values():
+            if isinstance(tok_id, int):
+                special_token_ids.append(tok_id)
+        # Include all added tokens (they're all control tokens without byte structure).
+        bpe_vocab_size = artifact_meta.get("bpe_vocab_size")
+        if bpe_vocab_size is not None:
+            # Added tokens start at bpe_vocab_size and go up to unpadded_vocab_size.
+            unpadded = artifact_meta.get("unpadded_vocab_size", cfg.vocab_size)
+            for tid in range(int(bpe_vocab_size), int(unpadded)):
+                special_token_ids.append(tid)
+        special_token_ids = sorted(set(special_token_ids))
         log.info(
             "Tokenizer artifact config: "
             f"vocab_size={cfg.vocab_size}, mask={cfg.mask_token_id}, "
-            f"eos={cfg.eos_token_id}, pad={cfg.pad_token_id}"
+            f"eos={cfg.eos_token_id}, pad={cfg.pad_token_id}, "
+            f"special_tokens={len(special_token_ids)}"
         )
 
     # ── Model ──
-    model = YAMIT(cfg, token_bytes=token_bytes).to(device)
+    model = YAMIT(cfg, token_bytes=token_bytes, special_token_ids=special_token_ids or None).to(device)
     log.info(f"Model-{args.model_size} params: {model.param_count():,}")
 
     # torch.compile for speed.

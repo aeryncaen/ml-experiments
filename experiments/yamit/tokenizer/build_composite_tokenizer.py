@@ -228,13 +228,8 @@ def build_artifacts(
         for i, b in enumerate(raw):
             token_bytes[new_id, i] = b
 
-    # Fill bytes for added/special tokens.
-    for entry in new_added:
-        tok_id = entry["id"]
-        raw = entry["content"].encode("utf-8")
-        if len(raw) <= max_bytes:
-            for i, b in enumerate(raw):
-                token_bytes[tok_id, i] = b
+    # Special/added tokens get all-pad (no byte representation).
+    # They rely on the token-private embedding path, not the shared byte path.
 
     token_bytes_pt = output_dir / "token_bytes.pt"
     torch.save(token_bytes, token_bytes_pt)

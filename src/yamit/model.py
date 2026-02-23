@@ -358,17 +358,19 @@ class CompositePITInterface(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CompositePITEmbedding(nn.Module):
-    """Composite-PIT embedding with mask-token override.
+    """Composite-PIT embedding with special-token support.
 
-    Forward:
-        1. Look up byte memory for each slot → z_shared (..., 16, S_shared)
-        2. Compute T⁻¹ = (L L^T)⁻¹ from Cholesky factor  (FP32)
-        3. x_shared = z_shared @ T⁻¹
-        4. Look up token_embed → tok (..., 16, S_token)
-        5. Apply token_up gate (starts at 0, so token path starts closed)
-        6. Concatenate: [x_shared ; tok * gate]  → (..., 16, dims_per_slot)
-        7. Reshape to (..., d_model)
-        8. Override mask-token positions with learned mask_embed
+    Regular (BPE) tokens:
+        1. Look up byte memory for each slot -> z_shared (..., 16, S_shared)
+        2. Apply T^{-1} via cholesky_solve  (FP32)
+        3. Look up token_embed -> tok (..., 16, S_token), gated
+        4. Concatenate [x_shared ; tok * gate] -> reshape to d_model
+
+    Special tokens (mask, EOS, PAD, etc.) have no byte structure but still
+    participate in PIT.  Their shared-path patterns come from a learned
+    ``special_patterns`` parameter (n_special, 16, S_shared) instead of
+    byte_memory lookup.  The same T^{-1} is applied, maintaining PIT duality
+    with the head (which uses T on the same patterns).
     """
 
     def __init__(self, pit: CompositePITInterface, cfg: YAMITConfig):
@@ -376,11 +378,48 @@ class CompositePITEmbedding(nn.Module):
         self.pit = pit
         self.cfg = cfg
 
-        # Learned mask embedding (replaces composite embedding for mask tokens).
-        self.mask_embed = nn.Parameter(torch.randn(cfg.d_model) * cfg.init_std)
-
-        # Token-private gate (starts closed: zeros init → output is 0 at init).
+        # Token-private gate (starts closed: zeros init -> output is 0 at init).
         self.token_up_gate = nn.Parameter(torch.zeros(16 * cfg.token_per_slot))
+
+        # Special token support — populated by register_special_tokens().
+        self.register_buffer(
+            "special_token_ids",
+            torch.tensor([], dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_special_id_to_idx",
+            torch.full((cfg.vocab_size,), -1, dtype=torch.long),
+            persistent=False,
+        )
+        # Learned shared-path patterns for special tokens (replaces byte_memory lookup).
+        # Shape: (n_special, 16, S_shared).  Initialised in register_special_tokens().
+        self.special_patterns = nn.Parameter(torch.empty(0, 16, cfg.shared_per_slot))
+
+    def register_special_tokens(self, token_ids: list[int]):
+        """Register token IDs that use learned patterns instead of byte lookup.
+
+        Must be called before the first forward pass (typically right after
+        model construction, using IDs from the tokenizer artifact metadata).
+        """
+        ids = torch.tensor(sorted(set(token_ids)), dtype=torch.long)
+        n = ids.numel()
+        self.special_token_ids = ids
+        # Orthogonal-ish init to match byte_memory's QR init.
+        S = self.cfg.shared_per_slot
+        patterns = torch.randn(n, 16, S)
+        for i in range(n):
+            Q, _ = torch.linalg.qr(patterns[i].t())
+            patterns[i] = Q.t()[:16]
+        self.special_patterns = nn.Parameter(patterns)
+        # Rebuild lookup.
+        self._special_id_to_idx = torch.full(
+            (self.cfg.vocab_size,), -1, dtype=torch.long,
+            device=ids.device,
+        )
+        for idx, tid in enumerate(ids.tolist()):
+            if tid < self.cfg.vocab_size:
+                self._special_id_to_idx[tid] = idx
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -398,12 +437,23 @@ class CompositePITEmbedding(nn.Module):
                 "YAMIT or call model.pit.register_token_bytes(...)."
             )
 
-        # --- shared (byte) path --- (FP32 for PIT stability)
+        # --- shared path: get z_shared patterns --- (FP32 for PIT stability)
         byte_ids = self.pit.token_bytes[input_ids]              # (B, T, 16) long
         z_shared = self.pit.byte_memory[byte_ids].float()       # (B, T, 16, S_shared)
 
+        # Override z_shared for special tokens with learned patterns.
+        if self.special_patterns.numel() > 0:
+            idx = self._special_id_to_idx[input_ids]            # (B, T)
+            is_special = idx >= 0                                # (B, T)
+            if is_special.any():
+                safe_idx = idx.clamp(min=0)
+                sp = self.special_patterns[safe_idx].float()    # (B, T, 16, S_shared)
+                z_shared = torch.where(
+                    is_special.unsqueeze(-1).unsqueeze(-1), sp, z_shared
+                )
+
+        # --- apply T^{-1} --- (same for all tokens)
         L = self.pit.cholesky_factor()                          # (S, S) FP32
-        # Embedding applies T^{-1} via cholesky_solve: x_shared = z_shared @ (L L^T)^{-1}
         z_t = z_shared.transpose(-1, -2)                        # (B, T, S_shared, 16)
         x_t = torch.cholesky_solve(z_t, L)                      # (B, T, S_shared, 16)
         x_shared = x_t.transpose(-1, -2)                        # (B, T, 16, S_shared)
@@ -418,10 +468,6 @@ class CompositePITEmbedding(nn.Module):
         out = torch.cat([x_shared.to(tok.dtype), tok], dim=-1)  # (B, T, 16, dims_per_slot)
         out = out.reshape(B, T, cfg.d_model)
 
-        # --- mask override ---
-        mask = (input_ids == cfg.mask_token_id).unsqueeze(-1)   # (B, T, 1)
-        out = torch.where(mask, self.mask_embed, out)
-
         return out
 
 
@@ -433,14 +479,15 @@ class CompositePITHead(nn.Module):
     """Composite-PIT LM head.
 
     Logit computation:
-        h  → split into 16 slots of dims_per_slot
-           → split each slot into (shared, private)
+        h  -> split into 16 slots of dims_per_slot
+           -> split each slot into (shared, private)
 
         Shared path (PIT forward):
             T = L L^T
             g = h_shared @ T
-            byte_patterns = byte_memory[token_bytes]   (V, 16, S_shared)
-            logits_shared = einsum(g, byte_patterns)
+            patterns = byte_memory[token_bytes]   (V, 16, S_shared)
+              (with special_patterns substituted for special token rows)
+            logits_shared = einsum(g, patterns)
 
         Private path:
             logits_token = h_private_flat @ token_embed.weight^T + bias
@@ -454,6 +501,8 @@ class CompositePITHead(nn.Module):
         self.cfg = cfg
         # Head-only bias on token-private path.
         self.token_out_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
+        # Reference to embedding's special_patterns, set by YAMIT.__init__.
+        self.embed: Optional[CompositePITEmbedding] = None
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -477,10 +526,18 @@ class CompositePITHead(nn.Module):
         T_gram = L @ L.t()                                     # (S, S)
         g = h_shared.float() @ T_gram                          # (B, T, 16, S_shared)
 
-        byte_patterns = self.pit.byte_memory[self.pit.token_bytes]  # (V, 16, S_shared)
+        # Build (V, 16, S_shared) pattern table: byte_memory for regular tokens,
+        # special_patterns for special tokens.
+        all_patterns = self.pit.byte_memory[self.pit.token_bytes]  # (V, 16, S_shared)
+        if self.embed is not None and self.embed.special_patterns.numel() > 0:
+            all_patterns = all_patterns.clone()
+            for idx, tid in enumerate(self.embed.special_token_ids.tolist()):
+                if tid < cfg.vocab_size:
+                    all_patterns[tid] = self.embed.special_patterns[idx]
+
         # einsum 'btsd,vsd->btv'
         logits_shared = torch.einsum(
-            "btsd,vsd->btv", g, byte_patterns.float()
+            "btsd,vsd->btv", g, all_patterns.float()
         )
 
         # --- token-private path ---
@@ -834,13 +891,22 @@ class YAMITBlock(nn.Module):
 class YAMIT(nn.Module):
     """YAMIT transformer: MLA attention + Composite-PIT embedding/head."""
 
-    def __init__(self, cfg: YAMITConfig, token_bytes: Optional[torch.Tensor] = None):
+    def __init__(
+        self,
+        cfg: YAMITConfig,
+        token_bytes: Optional[torch.Tensor] = None,
+        special_token_ids: Optional[list[int]] = None,
+    ):
         """
         Args:
-            cfg:         model configuration.
-            token_bytes: (vocab_size, 16) int tensor mapping token IDs to byte IDs
-                         (0..255 for bytes, 256 for pad).  Can be set later via
-                         ``model.pit.register_token_bytes(t)``.
+            cfg:               model configuration.
+            token_bytes:       (vocab_size, 16) int tensor mapping token IDs to byte IDs
+                               (0..255 for bytes, 256 for pad).  Can be set later via
+                               ``model.pit.register_token_bytes(t)``.
+            special_token_ids: list of token IDs that have no byte structure
+                               (e.g. mask, EOS, PAD, and other control tokens).
+                               These get learned PIT patterns instead of byte
+                               lookup, but still go through T^{-1}/T.
         """
         super().__init__()
         self.cfg = cfg
@@ -848,9 +914,10 @@ class YAMIT(nn.Module):
         # ── shared PIT interface ──
         self.pit = CompositePITInterface(cfg)
 
-        # ── embedding & head (share pit) ──
+        # ── embedding & head (share pit + special patterns) ──
         self.embed = CompositePITEmbedding(self.pit, cfg)
         self.head = CompositePITHead(self.pit, cfg)
+        self.head.embed = self.embed  # head reads embed.special_patterns
 
         # ── transformer layers ──
         self.layers = nn.ModuleList([YAMITBlock(cfg) for _ in range(cfg.n_layers)])
@@ -862,6 +929,9 @@ class YAMIT(nn.Module):
         if token_bytes is not None:
             self.pit.register_token_bytes(token_bytes)
 
+        if special_token_ids:
+            self.embed.register_special_tokens(special_token_ids)
+
     # --------------------------------------------------------------- init
     def _init_weights(self):
         cfg = self.cfg
@@ -870,7 +940,7 @@ class YAMIT(nn.Module):
         # token_out_bias
         nn.init.zeros_(self.head.token_out_bias)
 
-        # mask_embed already initialised in CompositePITEmbedding.__init__
+        # special_embeds initialised in register_special_tokens()
         # token_up_gate already zeros
 
         # Linear + Embedding + RMSNorm
