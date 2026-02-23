@@ -1107,6 +1107,43 @@ class YAMIT(nn.Module):
 # Baseline Transformer (for ablation / comparison)
 # ---------------------------------------------------------------------------
 
+class BaselineLayerCache:
+    """Per-layer KV cache for standard MHA."""
+    __slots__ = ("k", "v")
+    def __init__(self, k: torch.Tensor, v: torch.Tensor):
+        self.k = k  # (B, S, H, D)
+        self.v = v  # (B, S, H, D)
+
+
+class BaselineKVCache:
+    """KV cache for BaselineTransformer, matching DiffusionMLACache interface."""
+
+    def __init__(self, n_layers: int):
+        self.layers: list[Optional[BaselineLayerCache]] = [None] * n_layers
+
+    @property
+    def n_layers(self) -> int:
+        return len(self.layers)
+
+    @property
+    def seq_len(self) -> int:
+        for layer in self.layers:
+            if layer is not None:
+                return int(layer.k.shape[1])
+        return 0
+
+    def clone(self) -> "BaselineKVCache":
+        out = BaselineKVCache(self.n_layers)
+        for i, layer in enumerate(self.layers):
+            if layer is None:
+                out.layers[i] = None
+            else:
+                out.layers[i] = BaselineLayerCache(
+                    k=layer.k.clone(), v=layer.v.clone(),
+                )
+        return out
+
+
 class BaselineAttention(nn.Module):
     """Standard multi-head attention with RoPE. No MLA, no latent compression."""
 
@@ -1181,6 +1218,41 @@ class BaselineAttention(nn.Module):
         out = out.contiguous().view(B, T, -1)
         return self.wo(out)
 
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        layer_cache: Optional[BaselineLayerCache] = None,
+    ) -> tuple[torch.Tensor, BaselineLayerCache]:
+        """Forward with KV cache append (no flash attn — decode is small)."""
+        B, T, _ = x.shape
+        H, D = self.n_heads, self.head_dim
+
+        q = self.wq(x).view(B, T, H, D)
+        k = self.wk(x).view(B, T, H, D)
+        v = self.wv(x).view(B, T, H, D)
+
+        cos = self.rope_cos[position_ids].unsqueeze(2)
+        sin = self.rope_sin[position_ids].unsqueeze(2)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        # Append to cache.
+        if layer_cache is not None:
+            k = torch.cat([layer_cache.k, k], dim=1)
+            v = torch.cat([layer_cache.v, v], dim=1)
+        new_cache = BaselineLayerCache(k=k, v=v)
+
+        # SDPA (no flash attn for variable-length cached decode).
+        q = q.transpose(1, 2)  # (B, H, T, D)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q, k_t, v_t, is_causal=(layer_cache is None), scale=self.scale,
+        )
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.wo(out), new_cache
+
 
 class BaselineBlock(nn.Module):
     """Pre-norm residual block with standard MHA + SwiGLU."""
@@ -1202,6 +1274,19 @@ class BaselineBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), position_ids, mask, sparse_mask=sparse_mask)
         x = x + self.mlp(self.mlp_norm(x))
         return x
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        layer_cache: Optional[BaselineLayerCache] = None,
+    ) -> tuple[torch.Tensor, BaselineLayerCache]:
+        attn_out, new_cache = self.attn.forward_with_cache(
+            self.attn_norm(x), position_ids, layer_cache,
+        )
+        x = x + attn_out
+        x = x + self.mlp(self.mlp_norm(x))
+        return x, new_cache
 
 
 class BaselineTransformer(nn.Module):
@@ -1252,11 +1337,36 @@ class BaselineTransformer(nn.Module):
         logits = F.linear(x, self.embed.weight, self.head_bias)
         return logits
 
-    def init_cache(self):
-        return None
+    def init_cache(self) -> BaselineKVCache:
+        return BaselineKVCache(n_layers=self.cfg.n_layers)
 
-    def forward_with_cache(self, input_ids, position_ids=None, cache=None, use_cache=True, mask=None, sparse_mask=None):
-        logits = self.forward(input_ids, position_ids=position_ids, mask=mask, sparse_mask=sparse_mask)
+    def forward_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        cache: Optional[BaselineKVCache] = None,
+        use_cache: bool = True,
+        mask: Optional[torch.Tensor] = None,
+        sparse_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[BaselineKVCache]]:
+        B, T = input_ids.shape
+        if position_ids is None:
+            start = cache.seq_len if cache is not None else 0
+            position_ids = torch.arange(start, start + T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+
+        x = self.embed(input_ids)
+
+        if cache is None and use_cache:
+            cache = self.init_cache()
+
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache.layers[i] if cache is not None else None
+            x, new_layer_cache = layer.forward_with_cache(x, position_ids, layer_cache)
+            if cache is not None:
+                cache.layers[i] = new_layer_cache
+
+        x = self.norm(x)
+        logits = F.linear(x, self.embed.weight, self.head_bias)
         return logits, cache
 
     def param_count(self) -> int:

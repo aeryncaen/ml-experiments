@@ -643,22 +643,38 @@ func main() {
 	os.MkdirAll(valDir, 0o755)
 
 	// Determine train/val split at the shard level.
-	// Shuffle deterministically, then take the first N shards for val.
+	// Stratify by parent directory (data source) so every source gets
+	// proportional representation in val.
 	rng := rand.New(rand.NewSource(42))
-	indices := make([]int, len(jsonlFiles))
-	for i := range indices {
-		indices[i] = i
-	}
-	rng.Shuffle(len(indices), func(i, j int) { indices[i], indices[j] = indices[j], indices[i] })
 
-	valCount := int(float64(len(jsonlFiles)) * *valFraction)
-	if valCount < 1 && len(jsonlFiles) > 1 {
-		valCount = 1
+	// Group shard indices by parent directory.
+	dirShards := make(map[string][]int)
+	for i, path := range jsonlFiles {
+		dir := filepath.Dir(path)
+		dirShards[dir] = append(dirShards[dir], i)
 	}
-	valSet := make(map[int]bool, valCount)
-	for i := 0; i < valCount; i++ {
-		valSet[indices[i]] = true
+	// Sort directory keys for determinism.
+	dirs := make([]string, 0, len(dirShards))
+	for d := range dirShards {
+		dirs = append(dirs, d)
 	}
+	sort.Strings(dirs)
+
+	valSet := make(map[int]bool)
+	for _, dir := range dirs {
+		shards := dirShards[dir]
+		// Shuffle within each source.
+		rng.Shuffle(len(shards), func(i, j int) { shards[i], shards[j] = shards[j], shards[i] })
+		n := int(float64(len(shards)) * *valFraction)
+		if n < 1 && len(shards) > 1 {
+			n = 1
+		}
+		// If source has only 1 shard, it goes to train (no val for that source).
+		for j := 0; j < n; j++ {
+			valSet[shards[j]] = true
+		}
+	}
+	log.Printf("Val split: %d/%d shards across %d sources", len(valSet), len(jsonlFiles), len(dirs))
 
 	// Launch worker pool.
 	jobs := make(chan tokenizeJob, effectiveWorkers*2)
