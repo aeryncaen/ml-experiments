@@ -3606,8 +3606,11 @@ def main():
                     _, loss = model(x, y)
             loss = loss / HP.grad_accum
             loss.backward()
+        _all_params = decay_params + no_decay_params
         if HP.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(decay_params + no_decay_params, HP.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(_all_params, HP.grad_clip)
+        else:
+            grad_norm = torch.cat([p.grad.flatten() for p in _all_params if p.grad is not None]).norm()
         optimizer.step()
         if HP.ngpt:
             _ngpt_normalize_weights(raw_model)
@@ -3621,7 +3624,7 @@ def main():
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | sec/step {dt:.3f}")
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f}")
 
         if profiler is not None:
             profiler.step()
