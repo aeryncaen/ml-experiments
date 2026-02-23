@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ import (
 	"time"
 
 	"github.com/sugarme/tokenizer"
+	"github.com/sugarme/tokenizer/model/bpe"
 	"github.com/sugarme/tokenizer/pretrained"
 )
 
@@ -51,6 +53,30 @@ const maxBytesPerToken = 16
 // maxBytesPerToken to their byte-level fallback token sequences.
 type surgeryTable struct {
 	remap map[int][]int // long_token_id → []byte_token_id
+}
+
+type surgeryLookup struct {
+	table [][]int
+}
+
+func buildSurgeryLookup(s *surgeryTable, vocabSize int) *surgeryLookup {
+	if s == nil || len(s.remap) == 0 {
+		return &surgeryLookup{table: nil}
+	}
+
+	maxID := vocabSize - 1
+	for id := range s.remap {
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	table := make([][]int, maxID+1)
+	for id, seq := range s.remap {
+		table[id] = seq
+	}
+
+	return &surgeryLookup{table: table}
 }
 
 func loadSurgeryTable(path string) (*surgeryTable, error) {
@@ -156,33 +182,100 @@ func buildSurgeryTable(tk *tokenizer.Tokenizer) (*surgeryTable, error) {
 	return &surgeryTable{remap: remap}, nil
 }
 
-// apply takes a token ID sequence and expands any surgically-remapped tokens
-// into their byte-level fallback sequences.
-func (s *surgeryTable) apply(ids []int) []int {
-	if len(s.remap) == 0 {
-		return ids
-	}
-	// Pre-check: if no token needs surgery, return as-is (fast path).
-	needsSurgery := false
-	for _, id := range ids {
-		if _, ok := s.remap[id]; ok {
-			needsSurgery = true
-			break
-		}
-	}
-	if !needsSurgery {
-		return ids
+type idRemapTable struct {
+	table   []int
+	enabled bool
+}
+
+func buildIDRemapTable(remap map[int]int, vocabSize int) *idRemapTable {
+	if remap == nil {
+		return &idRemapTable{enabled: false}
 	}
 
-	out := make([]int, 0, len(ids)+len(ids)/4) // slight overalloc
+	maxID := vocabSize - 1
+	for id := range remap {
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	table := make([]int, maxID+1)
+	for i := range table {
+		table[i] = -1
+	}
+	for oldID, newID := range remap {
+		table[oldID] = newID
+	}
+
+	return &idRemapTable{table: table, enabled: true}
+}
+
+func remapOne(id int, remap *idRemapTable) (int, error) {
+	if remap == nil || !remap.enabled {
+		return id, nil
+	}
+	if id < 0 || id >= len(remap.table) {
+		return 0, fmt.Errorf("missing remap for token id %d", id)
+	}
+	nid := remap.table[id]
+	if nid < 0 {
+		return 0, fmt.Errorf("missing remap for token id %d", id)
+	}
+	return nid, nil
+}
+
+// applyTransforms applies long-token surgery then ID remap in a single pass.
+func applyTransforms(ids []int, surgery *surgeryLookup, remap *idRemapTable) ([]int, error) {
+	hasSurgery := surgery != nil && len(surgery.table) > 0
+	hasRemap := remap != nil && remap.enabled
+
+	if !hasSurgery && !hasRemap {
+		return ids, nil
+	}
+
+	if !hasSurgery && hasRemap {
+		out := make([]int, len(ids))
+		for i, id := range ids {
+			nid, err := remapOne(id, remap)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = nid
+		}
+		return out, nil
+	}
+
+	// Surgery (and optional remap) path.
+	out := make([]int, 0, len(ids)+len(ids)/4)
 	for _, id := range ids {
-		if expanded, ok := s.remap[id]; ok {
-			out = append(out, expanded...)
+		if id >= 0 && id < len(surgery.table) {
+			if expanded := surgery.table[id]; expanded != nil {
+				if hasRemap {
+					for _, eid := range expanded {
+						nid, err := remapOne(eid, remap)
+						if err != nil {
+							return nil, err
+						}
+						out = append(out, nid)
+					}
+				} else {
+					out = append(out, expanded...)
+				}
+				continue
+			}
+		}
+
+		if hasRemap {
+			nid, err := remapOne(id, remap)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nid)
 		} else {
 			out = append(out, id)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ── Shard writer ─────────────────────────────────────────────────────────
@@ -327,28 +420,32 @@ func loadIDRemap(path string) (map[int]int, error) {
 	return out, nil
 }
 
-func applyIDRemap(ids []int, remap map[int]int) ([]int, error) {
-	if remap == nil {
-		return ids, nil
-	}
-	out := make([]int, len(ids))
-	for i, id := range ids {
-		newID, ok := remap[id]
-		if !ok {
-			return nil, fmt.Errorf("missing remap for token id %d", id)
-		}
-		out[i] = newID
-	}
-	return out, nil
-}
-
 func tokenizeWorker(
-	tk *tokenizer.Tokenizer,
-	surgery *surgeryTable,
-	idRemap map[int]int,
+	tokenizerPath string,
+	bpeCacheCapacity int,
+	surgery *surgeryLookup,
+	idRemap *idRemapTable,
 	jobs <-chan string,
 	results chan<- tokenizeResult,
 ) {
+	tk, err := pretrained.FromFile(tokenizerPath)
+	if err != nil {
+		for path := range jobs {
+			results <- tokenizeResult{inputPath: path, err: fmt.Errorf("load tokenizer: %w", err)}
+		}
+		return
+	}
+
+	if bpeCacheCapacity >= 0 {
+		if m, ok := tk.GetModel().(*bpe.BPE); ok {
+			if bpeCacheCapacity == 0 {
+				m.Cache = nil
+			} else {
+				m.Cache = bpe.NewCache(bpeCacheCapacity)
+			}
+		}
+	}
+
 	for path := range jobs {
 		texts, err := readJSONLFile(path)
 		if err != nil {
@@ -367,8 +464,7 @@ func tokenizeWorker(
 				continue
 			}
 			ids := enc.Ids
-			ids = surgery.apply(ids)
-			ids, err = applyIDRemap(ids, idRemap)
+			ids, err = applyTransforms(ids, surgery, idRemap)
 			if err != nil {
 				fileErr = err
 				break
@@ -405,6 +501,8 @@ func main() {
 	outputDir := flag.String("output", "", "Output directory for .bin/.idx shards")
 	workers := flag.Int("workers", 0, "Number of worker goroutines (default: NumCPU)")
 	valFraction := flag.Float64("val-fraction", 0.005, "Fraction of shards to reserve for validation")
+	bpeCacheCapacity := flag.Int("bpe-cache-capacity", -1, "BPE cache capacity override per worker (-1 keeps tokenizer default)")
+	cpuProfile := flag.String("cpu-profile", "", "Optional path to write CPU profile")
 	flag.Parse()
 
 	if *tokenizerPath == "" || *inputDir == "" || *outputDir == "" {
@@ -413,6 +511,22 @@ func main() {
 	}
 	if *workers <= 0 {
 		*workers = runtime.NumCPU()
+	}
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatalf("Failed to create cpu profile file: %v", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			log.Fatalf("Failed to start cpu profile: %v", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+			log.Printf("CPU profile written to %s", *cpuProfile)
+		}()
 	}
 
 	startTime := time.Now()
@@ -424,6 +538,19 @@ func main() {
 		log.Fatalf("Failed to load tokenizer: %v", err)
 	}
 	log.Printf("Vocabulary size: %d", tk.GetVocabSize(true))
+	if m, ok := tk.GetModel().(*bpe.BPE); ok {
+		defaultCap := 0
+		if m.Cache != nil {
+			defaultCap = m.Cache.Capacity
+		}
+		if *bpeCacheCapacity >= 0 {
+			log.Printf("BPE cache capacity override: %d (default=%d)", *bpeCacheCapacity, defaultCap)
+		} else {
+			log.Printf("BPE cache capacity default: %d", defaultCap)
+		}
+	} else if *bpeCacheCapacity >= 0 {
+		log.Printf("WARNING: --bpe-cache-capacity ignored (model is not BPE)")
+	}
 
 	// Surgery table: prefer artifact file when provided.
 	surgery, err := loadSurgeryTable(*surgeryMapPath)
@@ -448,6 +575,9 @@ func main() {
 	if idRemap != nil {
 		log.Printf("Loaded ID remap: %d entries", len(idRemap))
 	}
+
+	surgeryLUT := buildSurgeryLookup(surgery, tk.GetVocabSize(true))
+	idRemapLUT := buildIDRemapTable(idRemap, tk.GetVocabSize(true))
 
 	// Find all JSONL files.
 	var jsonlFiles []string
@@ -503,7 +633,14 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tokenizeWorker(tk, surgery, idRemap, jobs, results)
+			tokenizeWorker(
+				*tokenizerPath,
+				*bpeCacheCapacity,
+				surgeryLUT,
+				idRemapLUT,
+				jobs,
+				results,
+			)
 		}()
 	}
 
@@ -607,18 +744,19 @@ func main() {
 	// Write tokenization metadata.
 	metaPath := filepath.Join(*outputDir, "tokenize_meta.json")
 	meta := map[string]interface{}{
-		"tokenizer":     *tokenizerPath,
-		"vocab_size":    tk.GetVocabSize(true),
-		"surgery_count": len(surgery.remap),
-		"max_bytes":     maxBytesPerToken,
-		"total_tokens":  tTotal,
-		"total_docs":    dTotal,
-		"train_tokens":  trainTokens,
-		"val_tokens":    valTokens,
-		"val_fraction":  *valFraction,
-		"workers":       *workers,
-		"elapsed_secs":  elapsed.Seconds(),
-		"errors":        errorCount,
+		"tokenizer":          *tokenizerPath,
+		"vocab_size":         tk.GetVocabSize(true),
+		"surgery_count":      len(surgery.remap),
+		"bpe_cache_capacity": *bpeCacheCapacity,
+		"max_bytes":          maxBytesPerToken,
+		"total_tokens":       tTotal,
+		"total_docs":         dTotal,
+		"train_tokens":       trainTokens,
+		"val_tokens":         valTokens,
+		"val_fraction":       *valFraction,
+		"workers":            *workers,
+		"elapsed_secs":       elapsed.Seconds(),
+		"errors":             errorCount,
 	}
 	metaJSON, _ := json.MarshalIndent(meta, "", "  ")
 	os.WriteFile(metaPath, metaJSON, 0o644)

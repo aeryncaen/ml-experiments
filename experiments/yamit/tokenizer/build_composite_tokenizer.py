@@ -32,49 +32,6 @@ from transformers import AutoTokenizer
 HEX_BYTE_RE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
 
-def _sanitize_regex_for_re2(pattern: str) -> str:
-    """Best-effort regex sanitization for Go/RE2 compatibility.
-
-    Current Qwen tokenizer issue:
-      - ``(?!\\S)`` negative lookahead is unsupported in Go regexp.
-        In the GPT-style pretokenizer pattern this branch already has a
-        fallback ``\\s+`` alternative, so removing the lookahead keeps
-        behavior close enough for tokenization.
-    """
-    pattern = pattern.replace("(?!\\S)", "")
-    return pattern
-
-
-def _walk_and_sanitize_regex(node) -> tuple[object, int]:
-    """Recursively sanitize tokenizer JSON regex fields.
-
-    Returns:
-      (updated_node, n_changes)
-    """
-    n_changes = 0
-    if isinstance(node, dict):
-        out = {}
-        for k, v in node.items():
-            if k == "Regex" and isinstance(v, str):
-                nv = _sanitize_regex_for_re2(v)
-                if nv != v:
-                    n_changes += 1
-                out[k] = nv
-            else:
-                vv, c = _walk_and_sanitize_regex(v)
-                out[k] = vv
-                n_changes += c
-        return out, n_changes
-    if isinstance(node, list):
-        out = []
-        for v in node:
-            vv, c = _walk_and_sanitize_regex(v)
-            out.append(vv)
-            n_changes += c
-        return out, n_changes
-    return node, 0
-
-
 def _gpt2_bytes_to_unicode_decoder() -> Dict[str, int]:
     """Return GPT-2 byte-level unicode decoder map (char -> byte)."""
     bs = list(range(ord("!"), ord("~") + 1))
@@ -209,13 +166,6 @@ def build_artifacts(
     tokenizer_json_path = output_dir / "tokenizer.json"
     tokenizer.backend_tokenizer.save(str(tokenizer_json_path))
 
-    # Emit a Go/RE2-compatible variant for the Go tokenizer backend.
-    tokenizer_go_json_path = output_dir / "tokenizer_go.json"
-    with open(tokenizer_json_path) as f:
-        tok_obj = json.load(f)
-    tok_go_obj, regex_changes = _walk_and_sanitize_regex(tok_obj)
-    with open(tokenizer_go_json_path, "w") as f:
-        json.dump(tok_go_obj, f)
 
     base_vocab_size = len(tokenizer)
     id_to_token = _build_id_to_token(tokenizer, base_vocab_size)
@@ -343,8 +293,6 @@ def build_artifacts(
     meta = {
         "source": source,
         "tokenizer_json": str(tokenizer_json_path.name),
-        "tokenizer_go_json": str(tokenizer_go_json_path.name),
-        "go_regex_sanitize_changes": regex_changes,
         "max_bytes": max_bytes,
         "pad_byte_id": pad_byte_id,
         "base_vocab_size": base_vocab_size,
@@ -392,7 +340,6 @@ def build_artifacts(
             "token_bytes_pt": token_bytes_pt.name,
             "token_bytes_npy": token_bytes_npy.name,
             "pruned_vocab": pruned_vocab_path.name,
-            "tokenizer_go_json": tokenizer_go_json_path.name,
         },
     }
 
@@ -470,10 +417,8 @@ def main() -> None:
     print(f"  pruned_vocab_size: {meta['pruned_vocab_size']:,}")
     print(f"  final_vocab_size : {meta['final_vocab_size']:,}")
     print(f"  long_token_count : {meta['long_token_count']:,}")
-    print(f"  go_regex_changes : {meta['go_regex_sanitize_changes']:,}")
     print(f"  surgery_map      : {meta['artifacts']['surgery_map']}")
     print(f"  id_remap         : {meta['artifacts']['id_remap']}")
-    print(f"  tokenizer_go     : {meta['artifacts']['tokenizer_go_json']}")
     print(f"  token_bytes      : {meta['artifacts']['token_bytes_pt']}")
 
 

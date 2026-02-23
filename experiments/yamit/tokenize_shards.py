@@ -57,6 +57,12 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--val-fraction", type=float, default=0.005)
+    parser.add_argument(
+        "--bpe-cache-capacity",
+        type=int,
+        default=-1,
+        help="Per-worker BPE cache capacity override (-1 keeps tokenizer default)",
+    )
     parser.add_argument("--go-bin", default="go", help="Go binary (default: go)")
     args = parser.parse_args()
 
@@ -67,8 +73,7 @@ def main() -> None:
     output_dir = _resolve(repo_root, args.output)
     artifacts_dir = _resolve_artifacts(repo_root, args.artifacts_dir)
 
-    tok_go_json = artifacts_dir / "tokenizer_go.json"
-    tok_json = tok_go_json if tok_go_json.exists() else (artifacts_dir / "tokenizer.json")
+    tok_json = artifacts_dir / "tokenizer.json"
     surgery_map = artifacts_dir / "surgery_map.json"
     id_remap = artifacts_dir / "id_remap.json"
 
@@ -116,6 +121,8 @@ def main() -> None:
         str(args.workers),
         "--val-fraction",
         str(args.val_fraction),
+        "--bpe-cache-capacity",
+        str(args.bpe_cache_capacity),
     ]
 
     subprocess.run(cmd, cwd=tokenizer_dir, check=True)
