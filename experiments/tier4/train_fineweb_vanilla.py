@@ -2259,79 +2259,60 @@ class BucketedCompositePITHead(nn.Module):
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
-        """Streaming CE over router-selected buckets + teacher-forced target bucket.
+        """2-level hierarchical softmax: P(token) = P(bucket|h) * P(token|bucket,h).
 
-        Only top_k buckets (+ target bucket) contribute to the partition
-        function — the router is in the critical path.
+        Level 1: router softmax over K buckets → CE against target bucket.
+        Level 2: within-bucket softmax → CE against target token in its bucket.
+        Total loss = bucket_loss + token_loss. Exact, no approximation.
 
-        Returns (total_loss, ce_loss, router_loss).
+        Returns (total_loss, bucket_loss, token_loss).
         """
         B, T, D = hidden.shape
         N = B * T
         g_shared, h_tok_flat = self._prepare_hidden(hidden)
-        g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
-        h_tok_2d = h_tok_flat.reshape(N, -1)
 
-        # Router
-        router_logits = self._route(hidden)
-        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)  # (B, T, k)
-
+        # ── Level 1: bucket prediction ──
+        router_logits = self._route(hidden)  # (B, T, K)
         target_flat = targets.reshape(N)
         target_buckets = self.token_to_bucket[target_flat]
         target_local = self.token_in_bucket_idx[target_flat]
 
-        # Aux loss: router should predict target bucket
-        router_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
+        bucket_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
 
-        # Per-position active mask: top-k + teacher-forced target bucket
-        active_mask = torch.zeros(N, self.n_buckets, dtype=torch.bool, device=hidden.device)
-        active_mask.scatter_(-1, top_k_idx.reshape(N, -1), True)
-        active_mask.scatter_(-1, target_buckets.unsqueeze(-1), True)
-
-        # Streaming log-sum-exp over ACTIVE buckets only (fp32)
-        max_val = torch.full((N,), -1e30, device=hidden.device, dtype=torch.float32)
-        sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
-        target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+        # ── Level 2: within-bucket token prediction ──
+        # Only need to compute logits for the target bucket of each position.
+        # Group positions by their target bucket to vectorize.
+        g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
+        h_tok_2d = h_tok_flat.reshape(N, -1)
+        token_loss_sum = torch.zeros(1, device=hidden.device, dtype=torch.float32)
 
         for b in range(self.n_buckets):
-            bucket_active = active_mask[:, b]
-            if not bucket_active.any():
+            in_bucket = (target_buckets == b)
+            if not in_bucket.any():
                 continue
 
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
             iface = self.interface
 
+            # Gather positions whose target is in this bucket
+            g_b = g_flat[in_bucket]          # (n_b, 16, shared)
+            h_b = h_tok_2d[in_bucket]        # (n_b, token_dim)
+            local_idx = target_local[in_bucket]  # (n_b,)
+
             patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
-            patterns = patterns.to(dtype=g_flat.dtype)
-            bl_shared = torch.einsum('nsd,vsd->nv', g_flat, patterns)
+            patterns = patterns.to(dtype=g_b.dtype)
+            bl_shared = torch.einsum('nsd,vsd->nv', g_b, patterns)
 
-            embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
-            bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
+            embeds = iface.token_embed.weight[members].to(dtype=h_b.dtype)
+            bl_tok = F.linear(h_b, embeds, iface.token_out_bias[members])
 
-            bl = (bl_shared + bl_tok).float()  # (N, bs)
+            bl = (bl_shared + bl_tok).float()  # (n_b, bs)
+            token_loss_sum += F.cross_entropy(bl, local_idx, reduction='sum')
 
-            # Mask inactive positions for this bucket
-            bl = torch.where(bucket_active.unsqueeze(-1), bl,
-                             torch.tensor(-1e30, device=bl.device, dtype=bl.dtype))
-
-            # Update streaming LSE
-            bucket_max = bl.max(dim=-1).values
-            new_max = torch.maximum(max_val, bucket_max)
-            sum_exp = (sum_exp * torch.exp(max_val - new_max)
-                       + torch.exp(bl - new_max.unsqueeze(-1)).sum(dim=-1))
-            max_val = new_max
-
-            # Grab target logit from this bucket
-            in_bucket = (target_buckets == b)
-            if in_bucket.any():
-                idx = target_local[in_bucket]
-                target_logit[in_bucket] = bl[in_bucket].gather(1, idx.unsqueeze(1)).squeeze(1)
-
-        log_z = max_val + torch.log(sum_exp.clamp(min=1e-30))
-        ce_loss = (log_z - target_logit).mean()
-        total_loss = ce_loss + self.router_aux_weight * router_loss
-        return total_loss, ce_loss, router_loss
+        token_loss = token_loss_sum / N
+        total_loss = bucket_loss + token_loss
+        return total_loss, bucket_loss, token_loss
 
 
 def _resolved_head_type() -> str:
