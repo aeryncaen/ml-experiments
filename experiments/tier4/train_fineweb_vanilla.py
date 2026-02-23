@@ -76,7 +76,7 @@ class HParams:
     val_steps: int = _env_int("VAL_STEPS", 32)
     val_every: int = _env_int("VAL_EVERY", 100)
     lr: float = _env_float("LR", 3e-4)
-    warmup_steps: int = _env_int("WARMUP_STEPS", 2000)
+    warmup_frac: float = _env_float("WARMUP_FRAC", 0.02)  # fraction of train_steps for warmup
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
@@ -3172,9 +3172,10 @@ def build_model_maybe_llada() -> nn.Module:
 
 
 def lr_for_step(step: int) -> float:
+    warmup_steps = int(HP.train_steps * HP.warmup_frac)
     # Warmup phase (same for all schedules)
-    if step < HP.warmup_steps:
-        return HP.lr * (step + 1) / max(1, HP.warmup_steps)
+    if step < warmup_steps:
+        return HP.lr * (step + 1) / max(1, warmup_steps)
 
     if HP.lr_schedule == "wsd":
         # Warmup-Stable-Decay: hold peak LR, then cosine decay in final fraction
@@ -3187,7 +3188,7 @@ def lr_for_step(step: int) -> float:
         return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
     else:
         # Default: cosine decay from warmup end to train_steps
-        t = (step - HP.warmup_steps) / max(1, HP.train_steps - HP.warmup_steps)
+        t = (step - warmup_steps) / max(1, HP.train_steps - warmup_steps)
         return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
 
 
