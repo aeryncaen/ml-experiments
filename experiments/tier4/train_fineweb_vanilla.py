@@ -2227,7 +2227,7 @@ class BucketedCompositePITHead(nn.Module):
             b = b_idx.item()
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
-            logits[:, :, members] = self._bucket_logits(g_shared, h_tok_flat, b)
+            logits[:, :, members] = self._silu2(self._bucket_logits(g_shared, h_tok_flat, b))
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
@@ -2305,7 +2305,7 @@ class BucketedCompositePITHead(nn.Module):
                 bl_shared = torch.einsum('nsd,vsd->nv', g_flat[in_topk], patterns)
                 embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
                 bl_tok = F.linear(h_tok_2d[in_topk], embeds, iface.token_out_bias[members])
-                bl = (bl_shared + bl_tok).float()  # (n, bs)
+                bl = self._silu2((bl_shared + bl_tok).float())  # (n, bs)
                 top_val, top_idx = bl.max(dim=-1)
                 improved = top_val > best_score[in_topk]
                 idx_into_n = in_topk.nonzero(as_tuple=True)[0]
