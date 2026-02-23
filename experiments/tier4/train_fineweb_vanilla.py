@@ -2173,6 +2173,10 @@ class BucketedCompositePITHead(nn.Module):
         self.router_up = nn.Linear(d_model, router_hidden, bias=False)
         self.router_down = nn.Linear(router_hidden, n_buckets, bias=False)
 
+        # ── SiLU² correction gates (learned, init 0 = pure softmax at start) ──
+        self.silu2_gate_bucket = nn.Parameter(torch.zeros(1))
+        self.silu2_gate_token = nn.Parameter(torch.zeros(1))
+
     def _route(self, hidden: torch.Tensor) -> torch.Tensor:
         """SwiGLU router: returns (B, T, n_buckets) bucket logits."""
         return self.router_down(F.silu(self.router_gate(hidden)) * self.router_up(hidden))
@@ -2210,15 +2214,23 @@ class BucketedCompositePITHead(nn.Module):
 
     @staticmethod
     def _silu2(x: torch.Tensor) -> torch.Tensor:
-        """SiLU-squared: (x * sigmoid(x))^2. Independent per-bucket routing scores."""
+        """SiLU-squared: (x * sigmoid(x))^2."""
         return F.silu(x).square()
+
+    def _corrected_bucket_scores(self, logits: torch.Tensor) -> torch.Tensor:
+        """softmax(logits) + α * SiLU²(logits) for bucket selection."""
+        return F.softmax(logits, dim=-1) + self.silu2_gate_bucket * self._silu2(logits)
+
+    def _corrected_token_scores(self, logits: torch.Tensor) -> torch.Tensor:
+        """softmax(logits) + α * SiLU²(logits) for token selection."""
+        return F.softmax(logits, dim=-1) + self.silu2_gate_token * self._silu2(logits)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Inference: top-k bucket logits only, rest -inf."""
         B, T, D = hidden.shape
         g_shared, h_tok_flat = self._prepare_hidden(hidden)
         router_logits = self._route(hidden)
-        _, top_k_idx = self._silu2(router_logits).topk(self.top_k, dim=-1)
+        _, top_k_idx = self._corrected_bucket_scores(router_logits).topk(self.top_k, dim=-1)
         active = top_k_idx.unique()
 
         logits = torch.full((B, T, self.interface.vocab_size), float('-inf'),
@@ -2227,7 +2239,8 @@ class BucketedCompositePITHead(nn.Module):
             b = b_idx.item()
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
-            logits[:, :, members] = self._silu2(self._bucket_logits(g_shared, h_tok_flat, b))
+            bl = self._bucket_logits(g_shared, h_tok_flat, b)
+            logits[:, :, members] = self._corrected_token_scores(bl)
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
@@ -2287,7 +2300,7 @@ class BucketedCompositePITHead(nn.Module):
 
         # ── Accuracy: argmax across router's top-k buckets (matches inference) ──
         with torch.no_grad():
-            routing_scores = self._silu2(router_logits).reshape(N, -1)
+            routing_scores = self._corrected_bucket_scores(router_logits).reshape(N, -1)
             _, top_k_idx = routing_scores.topk(self.top_k, dim=-1)  # (N, top_k)
             active_buckets = top_k_idx.unique().tolist()
             best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
@@ -2305,7 +2318,7 @@ class BucketedCompositePITHead(nn.Module):
                 bl_shared = torch.einsum('nsd,vsd->nv', g_flat[in_topk], patterns)
                 embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
                 bl_tok = F.linear(h_tok_2d[in_topk], embeds, iface.token_out_bias[members])
-                bl = self._silu2((bl_shared + bl_tok).float())  # (n, bs)
+                bl = self._corrected_token_scores((bl_shared + bl_tok).float())  # (n, bs)
                 top_val, top_idx = bl.max(dim=-1)
                 improved = top_val > best_score[in_topk]
                 idx_into_n = in_topk.nonzero(as_tuple=True)[0]
