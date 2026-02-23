@@ -31,7 +31,7 @@ class ShardedTokenDataset(IterableDataset):
         self,
         data_dir: str,
         seq_len: int,
-        eos_token_id: int = 151_643,  # Qwen3 EOS
+        eos_token_id: int = 149_727,  # Qwen3 EOS (generated tokenizer)
         shuffle_shards: bool = True,
         seed: int = 42,
     ):

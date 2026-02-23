@@ -400,12 +400,12 @@ def train(args):
             val = resolved.get(key)
             if val is not None and isinstance(val, int):
                 special_token_ids.append(val)
-        if resolved.get("mask") is not None:
-            cfg.mask_token_id = int(resolved["mask"])
-        if resolved.get("eos") is not None:
-            cfg.eos_token_id = int(resolved["eos"])
-        if resolved.get("pad") is not None:
-            cfg.pad_token_id = int(resolved["pad"])
+        if isinstance(resolved.get("mask"), int):
+            cfg.mask_token_id = resolved["mask"]
+        if isinstance(resolved.get("eos"), int):
+            cfg.eos_token_id = resolved["eos"]
+        if isinstance(resolved.get("pad"), int):
+            cfg.pad_token_id = resolved["pad"]
         # Also include any extra special tokens from the artifact.
         for tok_id in artifact_meta.get("new_special_token_ids", {}).values():
             if isinstance(tok_id, int):
@@ -467,7 +467,7 @@ def train(args):
     val_dir = str(Path(args.data_dir) / "val")
 
     train_dataset = ShardedTokenDataset(
-        train_dir, seq_len=args.seq_len, shuffle_shards=True
+        train_dir, seq_len=args.seq_len, eos_token_id=cfg.eos_token_id, shuffle_shards=True
     )
     train_loader = DataLoader(
         train_dataset,
@@ -478,7 +478,7 @@ def train(args):
     )
 
     val_dataset = ShardedTokenDataset(
-        val_dir, seq_len=args.seq_len, shuffle_shards=False
+        val_dir, seq_len=args.seq_len, eos_token_id=cfg.eos_token_id, shuffle_shards=False
     )
     val_loader = DataLoader(
         val_dataset,
