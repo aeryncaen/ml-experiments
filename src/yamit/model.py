@@ -21,10 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_mla import flash_attn_varlen_func as _flash_mla_varlen
-    HAS_FLASH_MLA = True
+    from flash_attn_interface import flash_attn_func as _flash_attn3
+    HAS_FLASH_ATTN3 = True
 except ImportError:
-    HAS_FLASH_MLA = False
+    HAS_FLASH_ATTN3 = False
 
 
 # ---------------------------------------------------------------------------
@@ -705,21 +705,22 @@ class MLAAttention(nn.Module):
         k_pe_exp = k_pe.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
         k = torch.cat([k_nope, k_pe_exp], dim=-1)
 
-        if HAS_FLASH_MLA and mask is None and sparse_mask is None:
-            # FlashMLA varlen: (B*T, H, D) packed format, causal.
-            q_packed = q.reshape(B * T, self.n_heads, -1)
-            k_packed = k.reshape(B * T, self.n_heads, -1)
-            v_packed = v.reshape(B * T, self.n_heads, self.v_head_dim)
-            cu_seqlens = torch.arange(
-                0, (B + 1) * T, T, device=x.device, dtype=torch.int32
-            )
-            out_packed, _ = _flash_mla_varlen(
-                q_packed, k_packed, v_packed,
-                cu_seqlens, cu_seqlens, T, T,
-                causal=True,
+        if HAS_FLASH_ATTN3 and mask is None and sparse_mask is None:
+            # flash_attn_func expects (B, T, H, D) with uniform D for Q/K/V.
+            # Our V has v_head_dim (64) < qk_head_dim (96), so pad V to match.
+            qk_dim = q.shape[-1]  # qk_nope + qk_rope
+            v_pad = qk_dim - self.v_head_dim
+            if v_pad > 0:
+                v_padded = F.pad(v, (0, v_pad))  # (B, T, H, qk_dim)
+            else:
+                v_padded = v
+            out_padded = _flash_attn3(
+                q, k, v_padded,
                 softmax_scale=self.scale,
+                causal=True,
             )
-            out = out_packed.view(B, T, self.n_heads, self.v_head_dim)
+            # Slice output back to v_head_dim.
+            out = out_padded[..., :self.v_head_dim]
         else:
             # Fallback: F.scaled_dot_product_attention (BHSD format).
             q = q.transpose(1, 2)
@@ -1152,19 +1153,13 @@ class BaselineAttention(nn.Module):
         q = q * cos + _rotate_half(q) * sin
         k = k * cos + _rotate_half(k) * sin
 
-        if HAS_FLASH_MLA and mask is None and sparse_mask is None:
-            q_packed = q.reshape(B * T, H, D)
-            k_packed = k.reshape(B * T, H, D)
-            v_packed = v.reshape(B * T, H, D)
-            cu_seqlens = torch.arange(
-                0, (B + 1) * T, T, device=x.device, dtype=torch.int32
+        if HAS_FLASH_ATTN3 and mask is None and sparse_mask is None:
+            # flash_attn_func: (B, T, H, D) format, uniform head dim.
+            out = _flash_attn3(
+                q, k, v,
+                softmax_scale=self.scale,
+                causal=True,
             )
-            out_packed, _ = _flash_mla_varlen(
-                q_packed, k_packed, v_packed,
-                cu_seqlens, cu_seqlens, T, T,
-                causal=True, softmax_scale=self.scale,
-            )
-            out = out_packed.view(B, T, H, D)
         else:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)

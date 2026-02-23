@@ -166,144 +166,249 @@ At $B = 8, T = 2048$, the largest attention matrix ($256 \times 256 \times 16384
 
 ### 4.1 Validation loss curves
 
-<!-- TODO: Insert loss curves. One plot per activation function with all 6 ratios overlaid, plus baseline. -->
+![Val loss by activation function](../analysis/val_loss_by_activation.png)
 
-#### Softmax activation
+All 18 feature attention configs converge on similar trajectories in early training (steps 0-2000), then gradually separate. Baseline (black) maintains a consistent lead throughout. Key observations:
 
-```
-[PLACEHOLDER: loss curve plot — softmax variants vs baseline]
-```
+- **Softmax** variants stay tightest together (smallest spread across factorizations) and closest to baseline.
+- **SiLU** variants show moderate spread, with 32x64 and 64x32 closest to baseline.
+- **SiLU²** variants show the largest spread — 8x256-silu² is the worst overall config.
 
-#### SiLU activation
+![Val loss by factorization](../analysis/val_loss_by_factorization.png)
 
-```
-[PLACEHOLDER: loss curve plot — silu variants vs baseline]
-```
+Within each factorization, softmax consistently achieves the lowest final loss, followed by silu, then silu².
 
-#### SiLU² activation
+![Late-stage val loss zoom (steps 4000-7500)](../analysis/late_stage_zoom.png)
 
-```
-[PLACEHOLDER: loss curve plot — silu² variants vs baseline]
-```
-
-#### Best of each activation
-
-```
-[PLACEHOLDER: loss curve plot — best ratio from each activation + baseline]
-```
+The late-stage zoom reveals that feature attention configs are converging faster than baseline in the 5000-7500 step range: their slopes are steeper, closing the gap. The step-6700 spike visible in all configs is a training data artifact (bad batch).
 
 ### 4.2 Final validation loss
 
-<!-- TODO: Fill in after runs complete -->
+| Rank | Run ID | Val loss (7.5k) | Best val | Best @ step | Δ% vs baseline |
+|------|--------|-----------------|----------|-------------|----------------|
+| 1 | **baseline** | **4.4697** | 4.3435 | 7200 | — |
+| 2 | fa-64x32-softmax | 4.5614 | 4.4449 | 7200 | +2.05% |
+| 3 | fa-256x8-softmax | 4.5703 | 4.4560 | 7200 | +2.25% |
+| 4 | fa-32x64-silu | 4.5734 | 4.4611 | 7200 | +2.32% |
+| 5 | fa-32x64-softmax | 4.5781 | 4.4635 | 7200 | +2.43% |
+| 6 | fa-128x16-softmax | 4.5807 | 4.4690 | 7200 | +2.48% |
+| 7 | fa-64x32-silu | 4.5834 | 4.4693 | 7200 | +2.55% |
+| 8 | fa-16x128-softmax | 4.6130 | 4.4982 | 7200 | +3.21% |
+| 9 | fa-64x32-silu2 | 4.6179 | 4.5096 | 7200 | +3.32% |
+| 10 | fa-32x64-silu2 | 4.6292 | 4.5199 | 7200 | +3.57% |
+| 11 | fa-16x128-silu | 4.6335 | 4.5234 | 7200 | +3.66% |
+| 12 | fa-128x16-silu2 | 4.6382 | 4.5331 | 7200 | +3.77% |
+| 13 | fa-8x256-silu | 4.6618 | 4.5528 | 7200 | +4.30% |
+| 14 | fa-128x16-silu | 4.6680 | 4.5666 | 7200 | +4.44% |
+| 15 | fa-8x256-softmax | 4.6824 | 4.5716 | 7200 | +4.76% |
+| 16 | fa-256x8-silu | 4.6908 | 4.5913 | 7000 | +4.95% |
+| 17 | fa-256x8-silu2 | 4.7029 | 4.6050 | 7200 | +5.22% |
+| 18 | fa-16x128-silu2 | 4.7110 | 4.6133 | 7000 | +5.40% |
+| 19 | fa-8x256-silu2 | 4.7759 | 4.6742 | 7000 | +6.85% |
 
-| Run ID | Val loss (7.5k steps) | Δ vs baseline |
-|--------|----------------------|---------------|
-| baseline | | — |
-| fa-256x8-softmax | | |
-| fa-256x8-silu | | |
-| fa-256x8-silu2 | | |
-| fa-128x16-softmax | | |
-| fa-128x16-silu | | |
-| fa-128x16-silu2 | | |
-| fa-64x32-softmax | | |
-| fa-64x32-silu | | |
-| fa-64x32-silu2 | | |
-| fa-32x64-softmax | | |
-| fa-32x64-silu | | |
-| fa-32x64-silu2 | | |
-| fa-16x128-softmax | | |
-| fa-16x128-silu | | |
-| fa-16x128-silu2 | | |
-| fa-8x256-softmax | | |
-| fa-8x256-silu | | |
-| fa-8x256-silu2 | | |
+All 18 feature attention configs underperform baseline at 7,500 steps. The gap ranges from +2.05% (64x32-softmax) to +6.85% (8x256-silu²). However, as shown in §4.5, feature attention configs are converging faster in the late-training regime.
 
 ### 4.3 Effect of factorization ratio
 
-<!-- TODO: Plot val loss at 7.5k steps vs N_f, one line per activation. This is the key plot — does the optimal ratio differ by activation? -->
+Averaging across activations:
 
-```
-[PLACEHOLDER: scatter/line plot — final val loss vs N_f, grouped by activation]
-```
+| $N_f \times D_f$ | Avg final val | Avg convergence rate (5k-7.5k) | Avg overfit gap | Avg sec/step |
+|-------------------|---------------|-------------------------------|-----------------|--------------|
+| 64x32 | **4.5876** | 0.0515 | 0.0559 | 0.107 |
+| 32x64 | 4.5936 | 0.0522 | 0.0549 | 0.096 |
+| 128x16 | 4.6290 | 0.0529 | 0.0737 | 0.148 |
+| 16x128 | 4.6525 | 0.0557 | 0.0685 | 0.095 |
+| 256x8 | 4.6547 | 0.0534 | 0.0830 | 0.311 |
+| 8x256 | 4.7067 | 0.0553 | 0.0681 | 0.098 |
+
+**Finding**: 64x32 and 32x64 are the best factorizations. The sweet spot is 32-64 features with 32-64 descriptor dimensions. Extremes in either direction hurt:
+- **Too many features** (256x8): 8-dimensional descriptors are too small for meaningful similarity computation, and the 256×256 attention matrix is expensive.
+- **Too few features** (8x256): Only 8 features means minimal cross-feature interaction — an 8×8 attention matrix provides little beyond per-feature gating.
+
+The U-shaped relationship is clear: optimal is in the middle where both feature count and descriptor dimensionality are large enough to be useful.
 
 ### 4.4 Effect of activation function
 
-<!-- TODO: For each factorization ratio, which activation wins? Is there a consistent winner? -->
+Averaging across factorizations:
 
-```
-[PLACEHOLDER: grouped bar chart — final val loss by activation, grouped by ratio]
-```
+| Activation | Avg final val | Avg convergence rate (5k-7.5k) | Avg overfit gap |
+|------------|---------------|-------------------------------|-----------------|
+| **softmax** | **4.5976** | 0.0474 | **0.0480** |
+| silu | 4.6352 | 0.0560 | 0.0717 |
+| silu² | 4.6792 | **0.0571** | 0.0824 |
 
-### 4.5 Training dynamics
+![Heatmaps: factorization x activation](../analysis/heatmaps.png)
 
-<!-- TODO: Do any variants show instability? Do silu/silu² variants diverge at certain ratios? How does loss curvature differ early vs late in training? -->
+**Finding**: Softmax wins on final loss and overfitting, but silu/silu² converge faster.
 
-```
-[PLACEHOLDER: training loss (not val) curves for any interesting dynamics — divergence, instability, etc.]
-```
+- **Softmax** achieves the best loss at every factorization (left heatmap). It also has the lowest overfitting gap (right heatmap). This makes sense: softmax normalizes attention weights, which acts as implicit regularization.
+- **SiLU/SiLU²** converge 1.2-1.4× faster than softmax in the 5k-7.5k step range (center heatmap). Their unnormalized weights allow larger-magnitude updates, which speeds convergence but increases overfitting.
+- **SiLU²** consistently underperforms SiLU on final loss despite faster convergence — the overfitting penalty outweighs the convergence benefit at this training length.
+
+The softmax-vs-silu tradeoff (lower loss vs faster convergence) is the key open question for chinchilla-length training.
+
+### 4.5 Training dynamics and convergence rates
+
+Convergence rates (val loss drop per 1,000 steps) in three training phases:
+
+| Config | Rate 0-2k | Rate 2k-5k | Rate 5k-7.5k |
+|--------|-----------|------------|--------------|
+| baseline | 1.417 | 0.203 | 0.045 |
+| fa-64x32-softmax | 1.472 | 0.185 | 0.046 |
+| fa-32x64-silu | 1.392 | 0.201 | 0.053 |
+| fa-32x64-silu2 | 1.385 | 0.179 | 0.057 |
+| fa-16x128-silu2 | 1.373 | 0.154 | 0.062 |
+
+**Key finding: Feature attention configs converge slower early but faster late.**
+
+- Steps 0-2k: Baseline converges at 1.42 loss/1k-steps. Softmax configs match or slightly exceed this (e.g., 256x8-softmax: 1.50); silu/silu² configs are slightly slower (1.37-1.40).
+- Steps 2k-5k: Baseline still leads (0.203). Feature attention configs range 0.15-0.20.
+- Steps 5k-7.5k: **Feature attention configs converge 1.0-1.4× faster than baseline.** All 18 configs have higher convergence rates than baseline (0.045) in this range. The fastest is 16x128-silu² at 0.062.
+
+This crossover in convergence rate is the most interesting finding: it suggests feature attention may require more training to realize its benefits.
+
+#### Extrapolated crossover with baseline
+
+Using linear extrapolation from the 5k-7.5k val loss trends, we estimate when each config would cross baseline:
+
+| Config | Est. crossover step | Est. wall-clock |
+|--------|--------------------:|----------------:|
+| fa-32x64-silu | ~21,000 | ~0.6h |
+| fa-32x64-silu2 | ~21,100 | ~0.6h |
+| fa-64x32-silu | ~20,900 | ~0.6h |
+| fa-16x128-silu | ~20,800 | ~0.5h |
+| fa-16x128-silu2 | ~22,200 | ~0.6h |
+| fa-64x32-silu2 | ~23,100 | ~0.7h |
+| fa-128x16-silu | ~23,400 | ~1.0h |
+| fa-8x256-silu | ~23,500 | ~0.6h |
+| fa-256x8-silu | ~25,200 | ~2.2h |
+| fa-256x8-silu2 | ~27,200 | ~2.3h |
+| fa-128x16-silu2 | ~29,000 | ~1.2h |
+| fa-8x256-silu2 | ~28,800 | ~0.8h |
+| fa-128x16-softmax | ~46,100 | ~1.9h |
+| fa-16x128-softmax | ~48,400 | ~1.3h |
+| fa-8x256-softmax | ~56,600 | ~1.6h |
+| fa-32x64-softmax | ~65,500 | ~1.8h |
+| fa-64x32-softmax | ~75,300 | ~2.3h |
+| fa-256x8-softmax | ~207,900 | ~18.0h |
+
+**Caveat**: Linear extrapolation from 2,500 steps of data is unreliable. The actual crossover could occur earlier (if feature attention's advantage accelerates) or never (if the rate difference was transient). Chinchilla-length runs (~150k steps) are needed to resolve this.
+
+The silu configs are predicted to cross baseline around step 21k — well within chinchilla length. Softmax configs cross much later (46k-208k steps) because their convergence advantage over baseline is smaller.
 
 ### 4.6 Throughput
 
-<!-- TODO: Wall-clock time per step for each factorization. Feature attention adds matmuls — how much does it actually cost? -->
+| $N_f \times D_f$ | sec/step | Baseline sec/step | Overhead |
+|-------------------|----------|-------------------|----------|
+| 8x256 | 0.098 | 0.080 | +22% |
+| 16x128 | 0.095 | 0.080 | +18% |
+| 32x64 | 0.096 | 0.080 | +20% |
+| 64x32 | 0.107 | 0.080 | +34% |
+| 128x16 | 0.148 | 0.080 | +85% |
+| 256x8 | 0.311 | 0.080 | +289% |
 
-| $N_f$ | sec/step (feature attn) | sec/step (baseline) | Overhead |
-|--------|--------------------------|----------------------|----------|
-| 256 | | | |
-| 128 | | | |
-| 64 | | | |
-| 32 | | | |
-| 16 | | | |
-| 8 | | | |
+Throughput overhead scales with $N_f^2$ (the attention matrix size). For the sweet-spot factorizations (32x64, 64x32), overhead is 20-34% — manageable. The 256x8 config is nearly 4× slower, dominated by the 256×256 attention computation repeated for every token.
+
+For chinchilla-length runs (~150k steps), estimated wall-clock times:
+- Baseline: ~3.3 hours
+- 32x64 configs: ~4.0 hours (+20%)
+- 64x32 configs: ~4.5 hours (+34%)
+
+The throughput penalty is modest enough that even a small loss improvement would justify the extra compute.
 
 ---
 
 ## 5. Analysis
 
-### 5.1 What does feature attention learn?
+### 5.1 Overfitting behavior
 
-<!-- TODO: Visualize attention patterns. For a trained model, extract the feature attention matrices and look at: (1) are they sparse or dense? (2) do certain features consistently attend to each other? (3) does the pattern differ by layer? (4) how diagonal-dominant is the attention? -->
+![Overfitting gap over time](../analysis/overfitting_gap.png)
 
-```
-[PLACEHOLDER: heatmaps of feature attention matrices at different layers]
-```
+The overfitting gap (val loss - train loss) is surprisingly uniform across configs when measured at each evaluation point. All five top configs track each other closely. The large oscillations are driven by the validation batch ordering: certain val batches are systematically easier or harder than adjacent train batches, creating correlated spikes across all configs.
 
-### 5.2 Diagonal dominance
+At the final evaluation (step 7500):
 
-<!-- TODO: Measure what fraction of attention weight lands on the diagonal across layers and training. Does it start diagonal and diversify, or stay diagonal? Compare softmax (which normalizes, forcing diagonal dominance) vs silu/silu² (which don't). -->
+| Config | Overfit gap | Relative to baseline |
+|--------|------------|---------------------|
+| baseline | 0.034 | 1.0× |
+| fa-64x32-softmax | 0.040 | 1.2× |
+| fa-32x64-softmax | 0.045 | 1.3× |
+| fa-32x64-silu | 0.056 | 1.6× |
+| fa-32x64-silu2 | 0.064 | 1.9× |
+| fa-128x16-silu | 0.099 | 2.9× |
 
-```
-[PLACEHOLDER: diagonal mass fraction over training steps, by activation]
-```
+Feature attention overfits 1.2-2.9× more than baseline. The pattern is clear:
+- **Softmax** overfits least (1.2-1.3×) — normalization acts as regularization.
+- **SiLU** overfits moderately (1.6×).
+- **SiLU²** overfits most (1.9×) — unbounded, non-negative weights with sharp peaks.
+- **High $N_f$** overfits more (128x16 at 2.9×) — more cross-feature interaction = more capacity = more overfitting.
 
-### 5.3 Feature specialization
+### 5.2 Interaction between factorization and activation
 
-<!-- TODO: Do individual features specialize? Compare feature activation distributions between SwiGLU baseline and feature attention variants. Does feature attention encourage or suppress dead features? -->
+The heatmaps in §4.4 reveal a non-trivial interaction:
 
-```
-[PLACEHOLDER: feature activation histograms — baseline vs best feature attention variant]
-```
+- **Softmax** is relatively insensitive to factorization — its final val loss ranges from 4.56 (64x32) to 4.68 (8x256), a span of 0.12. This stability comes from normalization constraining the attention distribution regardless of matrix size.
+- **SiLU/SiLU²** are more sensitive — silu ranges from 4.57 (32x64) to 4.69 (256x8), and silu² from 4.62 (32x64) to 4.78 (8x256). Without normalization, the raw score magnitudes depend strongly on $D_f$ (via the $1/\sqrt{D_f}$ scaling).
+- **Best factorization differs by activation**: softmax prefers 64x32, while silu and silu² prefer 32x64. This makes sense: softmax benefits from more features to attend over (larger attention matrix), while silu/silu² benefit from higher-dimensional descriptors (more stable similarity scores).
 
-### 5.4 Gradient norms
+### 5.3 Why does feature attention start slower?
 
-<!-- TODO: Compare gradient norms through the MLP across variants. Does feature attention change gradient flow meaningfully? -->
+Feature attention configs lag baseline in the first ~5,000 steps. Several factors likely contribute:
 
-```
-[PLACEHOLDER: per-layer gradient norm comparison]
-```
+1. **Initialization mismatch**: At initialization, gate_proj outputs are near-zero, making all QK scores near-zero. Under softmax, this produces a uniform attention matrix (every feature attends equally to all others), which is very different from the near-zero gating of SwiGLU's SiLU(0)≈0. The model must first learn non-trivial feature similarity structure before attention becomes useful.
+
+2. **Higher effective capacity**: Feature attention introduces cross-feature interactions that SwiGLU cannot express. Higher capacity models typically take longer to find good solutions but eventually achieve lower loss — consistent with the convergence crossover we observe.
+
+3. **Optimization landscape**: The N×N attention matrix creates a more complex loss surface with more saddle points and local minima than element-wise gating, slowing early optimization.
+
+### 5.4 Deferred analyses (require model checkpoints)
+
+The following analyses require saved model checkpoints from chinchilla-length training, which are not yet available:
+
+- **Attention pattern visualization**: Are feature attention matrices sparse or dense? Diagonal-dominant or distributed?
+- **Diagonal dominance over training**: Does attention start uniform and sharpen, or start diagonal and diversify?
+- **Feature specialization**: Does feature attention encourage or suppress dead features compared to SwiGLU?
+- **Gradient norms**: Does feature attention change gradient flow through the MLP?
+
+These will be filled in after chinchilla-length runs with checkpoint saving enabled.
 
 ---
 
 ## 6. Discussion
 
-<!-- TODO: Write after experiments. Key questions to address:
+### 6.1 Does feature attention beat SwiGLU?
 
-1. Does feature attention beat SwiGLU at any configuration?
-2. Is there a clear best activation function?
-3. Is there a clear best factorization ratio, and does it interact with activation choice?
-4. Is the compute overhead worth it?
-5. How diagonal-dominant is the learned attention? Does it effectively collapse to SwiGLU?
-6. Does the answer change with scale? (motivation for future work at larger sizes)
--->
+**Not yet, at 7,500 steps.** The best feature attention config (64x32-softmax) lags baseline by 2.05%. However, the convergence rate crossover at ~5,000 steps suggests this gap is closing. Linear extrapolation predicts silu configs crossing baseline around step 21,000 — well within chinchilla-optimal training length (150,845 steps).
+
+The answer is genuinely uncertain: the extrapolation could be wrong, and the higher overfitting of feature attention could prevent it from ever matching baseline. Chinchilla-length runs are needed.
+
+### 6.2 Best activation function
+
+**Softmax** wins on absolute loss and overfitting control. **SiLU** wins on convergence speed. The optimal choice depends on training length:
+- Short training (≤10k steps): softmax, because it has the lowest loss at every evaluation point.
+- Long training (≥20k steps): silu may overtake softmax due to its faster convergence rate.
+- **SiLU² is dominated** — it converges only marginally faster than silu but overfits substantially more. There is no training regime where silu² is the best choice.
+
+### 6.3 Best factorization ratio
+
+**64x32 and 32x64** are the clear winners, with 64x32 slightly favored for softmax and 32x64 for silu. The sweet spot is ~32-64 features with ~32-64 descriptor dimensions.
+
+The intuition: you need enough features for attention to be meaningfully cross-feature (ruling out 8x256), and enough descriptor dimensions for similarity scores to be meaningful (ruling out 256x8).
+
+### 6.4 Is the compute overhead worth it?
+
+At the sweet-spot factorizations, overhead is 20-34%. For the potential benefit of cross-feature interaction, this is cheap. The question is whether the loss improvement materializes at chinchilla length.
+
+If feature attention matches or beats baseline at 150k steps, the +20% compute overhead translates to needing 20% more training time for equal loss — which would make it borderline. Feature attention would need to *beat* baseline by enough to compensate for the throughput penalty.
+
+### 6.5 Implications for scaling
+
+This study is at 124M parameters. Several aspects likely change at larger scale:
+- **Higher hidden dim** means more factorization options and potentially more benefit from cross-feature interaction.
+- **Longer training** (chinchilla-optimal scales as 20× params) gives more time for feature attention's convergence advantage to manifest.
+- **More layers** means feature attention in later layers can build on structured representations from earlier layers.
+
+We expect feature attention to be more competitive at larger scales, but this is speculative.
 
 ### 6.1 Follow-up: projection variants
 
@@ -338,7 +443,17 @@ These would be run at whichever factorization ratio(s) win the initial sweep.
 
 ## 7. Conclusion
 
-<!-- TODO: Write after experiments. -->
+We introduced feature attention — replacing SwiGLU's element-wise gating with self-attention over the token's own hidden features — and swept 18 configurations (6 factorizations × 3 activations) against a SwiGLU baseline at 124M parameters.
+
+**Main findings from the 7,500-step sweep:**
+
+1. **No config beats baseline yet**, but feature attention converges 1.0-1.4× faster than baseline in the 5k-7.5k step range, suggesting a crossover may occur with longer training.
+2. **64x32 and 32x64** are the optimal factorizations — a sweet spot where both feature count and descriptor dimensionality are large enough for meaningful computation.
+3. **Softmax** achieves the best absolute loss and lowest overfitting; **silu** converges fastest; **silu²** is dominated.
+4. **Zero additional parameters** and **20-34% throughput overhead** at the sweet-spot factorizations.
+5. **Overfitting** is the primary risk: feature attention overfits 1.2-2.9× more than baseline, with unnormalized activations (silu, silu²) overfitting more.
+
+**Next step**: Chinchilla-length training (~150k steps) on the top 5 configs to determine whether the convergence crossover is real and whether feature attention can match or beat SwiGLU when trained to completion.
 
 ---
 
