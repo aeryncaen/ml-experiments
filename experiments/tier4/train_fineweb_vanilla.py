@@ -106,7 +106,7 @@ class HParams:
     pit_n_buckets: int = _env_int("PIT_N_BUCKETS", 64)
     pit_top_k: int = _env_int("PIT_TOP_K", 8)
     pit_router_aux_weight: float = _env_float("PIT_ROUTER_AUX_WEIGHT", 0.01)
-    pit_bucket_mode: str = os.environ.get("PIT_BUCKET_MODE", "semantic")  # semantic | first_byte | hash
+    pit_bucket_mode: str = os.environ.get("PIT_BUCKET_MODE", "hash")  # semantic | first_byte | hash
     pit_bucket_labels: str = os.environ.get("PIT_BUCKET_LABELS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_labels.npy"))
     pit_bucket_centers: str = os.environ.get("PIT_BUCKET_CENTERS", os.path.join(os.path.dirname(__file__), "data", "gpt2_trimmed_centers.npy"))
 
