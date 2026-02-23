@@ -305,7 +305,11 @@ def refusion_loss(
     else:
         loss_mdm = logits.new_tensor(0.0)
 
-    loss_total = loss_ar + loss_mdm
+    # Contraharmonic mean: (a² + b²) / (a + b)
+    # Weights the larger loss more heavily, preventing one objective from
+    # hiding behind the other while remaining scale-aware.
+    denom = (loss_ar + loss_mdm).clamp(min=1e-8)
+    loss_total = (loss_ar.square() + loss_mdm.square()) / denom
     return loss_total, loss_ar, loss_mdm
 
 

@@ -315,7 +315,7 @@ class CompositePITInterface(nn.Module):
         # -- token_bytes lookup: (vocab_size, 16) uint8→int mapping --
         # Must be registered via register_token_bytes() before forward.
         self.register_buffer("token_bytes", torch.zeros(cfg.vocab_size, 16, dtype=torch.long))
-        self.register_buffer("token_bytes_initialized", torch.tensor(False), persistent=False)
+        self.token_bytes_initialized: bool = False
 
     def _init_weights(self, cfg: YAMITConfig):
         S = cfg.shared_per_slot
@@ -338,7 +338,7 @@ class CompositePITInterface(nn.Module):
         if token_bytes.min().item() < 0 or token_bytes.max().item() >= 257:
             raise ValueError("token_bytes values must be in range [0, 256]")
         self.token_bytes.copy_(token_bytes.long())
-        self.token_bytes_initialized.fill_(True)
+        self.token_bytes_initialized = True
 
     def cholesky_factor(self) -> torch.Tensor:
         """Compute stabilised lower-triangular Cholesky factor L (FP32).
@@ -431,7 +431,7 @@ class CompositePITEmbedding(nn.Module):
         cfg = self.cfg
         B, T = input_ids.shape
 
-        if not bool(self.pit.token_bytes_initialized.item()):
+        if not self.pit.token_bytes_initialized:
             raise RuntimeError(
                 "token_bytes table is not initialized. Provide token_bytes when creating "
                 "YAMIT or call model.pit.register_token_bytes(...)."
