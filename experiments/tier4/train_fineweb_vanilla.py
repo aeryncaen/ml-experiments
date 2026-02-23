@@ -2224,7 +2224,10 @@ class BucketedCompositePITHead(nn.Module):
         return logits
 
     def routed_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor):
-        """Training: streaming CE with teacher-forced routing + aux loss.
+        """Training: full-vocab streaming CE + router aux loss.
+
+        All K buckets contribute to the partition function (correct CE).
+        The router is trained via aux loss only — it gates inference, not training.
 
         Returns (total_loss, ce_loss, router_loss).
         """
@@ -2234,33 +2237,19 @@ class BucketedCompositePITHead(nn.Module):
         g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
         h_tok_2d = h_tok_flat.reshape(N, -1)
 
-        # Router
+        # Router (aux loss only — does not gate training)
         router_logits = self._route(hidden)
-        _, top_k_idx = router_logits.topk(self.top_k, dim=-1)  # (B, T, k)
-
         target_flat = targets.reshape(N)
         target_buckets = self.token_to_bucket[target_flat]
         target_local = self.token_in_bucket_idx[target_flat]
-
-        # Aux loss: router should predict target bucket
         router_loss = F.cross_entropy(router_logits.reshape(N, -1), target_buckets)
 
-        # Per-position active mask
-        active_mask = torch.zeros(B, T, self.n_buckets, dtype=torch.bool, device=hidden.device)
-        active_mask.scatter_(-1, top_k_idx, True)
-        active_mask.scatter_(-1, target_buckets.reshape(B, T, 1), True)
-        active_flat = active_mask.reshape(N, -1)
-
-        # Streaming log-sum-exp (fp32)
+        # Streaming log-sum-exp over ALL buckets (fp32)
         max_val = torch.full((N,), -1e30, device=hidden.device, dtype=torch.float32)
         sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
         target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
 
         for b in range(self.n_buckets):
-            bucket_active = active_flat[:, b]
-            if not bucket_active.any():
-                continue
-
             bs = self.bucket_sizes[b].item()
             members = self.bucket_members[b, :bs]
             iface = self.interface
@@ -2273,10 +2262,6 @@ class BucketedCompositePITHead(nn.Module):
             bl_tok = F.linear(h_tok_2d, embeds, iface.token_out_bias[members])
 
             bl = (bl_shared + bl_tok).float()  # (N, bs)
-
-            # Zero-out inactive positions
-            bl = torch.where(bucket_active.unsqueeze(-1), bl,
-                             torch.tensor(-1e30, device=bl.device, dtype=bl.dtype))
 
             # Update streaming LSE
             bucket_max = bl.max(dim=-1).values
