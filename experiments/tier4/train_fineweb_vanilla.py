@@ -391,6 +391,12 @@ class MixedShardStream:
 
         total = sum(self.weights)
         self.probs = [w / total for w in self.weights]
+        # Clamp: no source below 1% — prevents stale CH loss for rare sources
+        min_prob = 0.01
+        if any(p < min_prob and p > 0 for p in self.probs):
+            self.probs = [max(p, min_prob) for p in self.probs]
+            ptotal = sum(self.probs)
+            self.probs = [p / ptotal for p in self.probs]
         self.n_sources = len(self.source_names)
         self._seed = seed + rank
         self.rng = _random.Random(self._seed)
