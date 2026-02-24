@@ -1,0 +1,3327 @@
+[
+  {
+    "name": "baseline",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "batch_size": 16,
+      "lr": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.0397893667221068,
+    "final_val_loss": 2.0397893667221068,
+    "final_train_loss": 1.9878090583548254,
+    "elapsed": 33.55616283416748,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.691687754222325,
+        "val_loss": 2.7672560453414916,
+        "elapsed": 4.106875896453857
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4876025185293082,
+        "val_loss": 2.636001229286194,
+        "elapsed": 7.549900054931641
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.438374883120822,
+        "val_loss": 2.529114270210266,
+        "elapsed": 11.224348783493042
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.3684753520148143,
+        "val_loss": 2.4794885873794557,
+        "elapsed": 14.197773694992065
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.302389166793045,
+        "val_loss": 2.3687737941741944,
+        "elapsed": 16.961600065231323
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.223801428509742,
+        "val_loss": 2.2929856061935423,
+        "elapsed": 19.96839666366577
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1560491493770053,
+        "val_loss": 2.2213929891586304,
+        "elapsed": 23.17032504081726
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.094675510513539,
+        "val_loss": 2.1251431465148927,
+        "elapsed": 26.4864718914032
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0422096940659986,
+        "val_loss": 2.0725467443466186,
+        "elapsed": 29.81329894065857
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.9878090583548254,
+        "val_loss": 2.0397893667221068,
+        "elapsed": 33.55616283416748
+      }
+    ],
+    "sample": "\n\nGod but mercherfalen.\n\nMORIONGETHES:\nHave mon: wirs spear in is bed it andore will:\nThe you sou we pron of he wor jatul your he shouse, of I is he in tor sof teins\nWith mare grachm this gain: him, ea"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS5e-05_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.785673439502716,
+    "final_val_loss": 1.785673439502716,
+    "final_train_loss": 1.8136812910741689,
+    "elapsed": 38.329010009765625,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8723293372562955,
+        "val_loss": 2.8593451738357545,
+        "elapsed": 1.8369190692901611
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5083528367840513,
+        "val_loss": 2.6865467548370363,
+        "elapsed": 4.8592119216918945
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.439275859557476,
+        "val_loss": 2.59299373626709,
+        "elapsed": 8.021183013916016
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.3159801692378763,
+        "val_loss": 2.3523993730545043,
+        "elapsed": 11.111289739608765
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1713611787679246,
+        "val_loss": 2.18824188709259,
+        "elapsed": 15.027277708053589
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.0742706638021566,
+        "val_loss": 2.0844110012054444,
+        "elapsed": 18.5045268535614
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9845601064818246,
+        "val_loss": 2.0606814861297607,
+        "elapsed": 22.766947746276855
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9162474967995469,
+        "val_loss": 1.9461743474006652,
+        "elapsed": 27.30422592163086
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8643734725480228,
+        "val_loss": 1.8921945333480834,
+        "elapsed": 32.509697914123535
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8136812910741689,
+        "val_loss": 1.785673439502716,
+        "elapsed": 38.329010009765625
+      }
+    ],
+    "sample": "\nLUCIO, it well hear unfence.\n\nCORIOLANTIO:\nGo, say thou gent, noness, with dame peake the never acled!\n\nLUpOHES:\nHow I came I word in a prait you and, I cannot dive tear.\n\nHEN Enow:\nI may have a gain "
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS1e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.7604244709014893,
+    "final_val_loss": 1.7604244709014893,
+    "final_train_loss": 1.7950907884811869,
+    "elapsed": 52.137168884277344,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8604363227377134,
+        "val_loss": 2.7988168001174927,
+        "elapsed": 2.2842917442321777
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.497757775442941,
+        "val_loss": 2.6917047262191773,
+        "elapsed": 7.535215854644775
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.421859660099462,
+        "val_loss": 2.5442517518997194,
+        "elapsed": 12.950644969940186
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.292955982441805,
+        "val_loss": 2.3228755712509157,
+        "elapsed": 18.79440188407898
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.140160465727047,
+        "val_loss": 2.2816011905670166,
+        "elapsed": 24.319050073623657
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.036805385166837,
+        "val_loss": 2.157563638687134,
+        "elapsed": 29.56620192527771
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.962745582570835,
+        "val_loss": 2.038945746421814,
+        "elapsed": 35.57679796218872
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.8904920378509833,
+        "val_loss": 1.917462408542633,
+        "elapsed": 41.50807285308838
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.834233234838112,
+        "val_loss": 1.8779632568359375,
+        "elapsed": 47.15494894981384
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.7950907884811869,
+        "val_loss": 1.7604244709014893,
+        "elapsed": 52.137168884277344
+      }
+    ],
+    "sample": "\n\nTell!\n\nMERCS:\nHereed fair it my to sples:\nHe to hather a gable\nWell'd bearrower pret of own empl to sovenss\nMorks and at to a god my sonselves our auring my my sorrown givie me to the murricentrest?\n"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS3e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.6912436008453369,
+    "final_val_loss": 1.6912436008453369,
+    "final_train_loss": 1.7891480010382983,
+    "elapsed": 42.85520601272583,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8800264596939087,
+        "val_loss": 2.7866742610931396,
+        "elapsed": 2.1555960178375244
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5092862990437723,
+        "val_loss": 2.680099368095398,
+        "elapsed": 6.534502983093262
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4268578475283595,
+        "val_loss": 2.51155743598938,
+        "elapsed": 10.316818952560425
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.2516821136279983,
+        "val_loss": 2.2755578994750976,
+        "elapsed": 15.055922031402588
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1138200832872975,
+        "val_loss": 2.203144598007202,
+        "elapsed": 19.6999990940094
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.024831389643482,
+        "val_loss": 2.059858775138855,
+        "elapsed": 24.236430168151855
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9488291995865958,
+        "val_loss": 1.9886757731437683,
+        "elapsed": 28.581268072128296
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.8800626664745563,
+        "val_loss": 1.951262104511261,
+        "elapsed": 33.192261934280396
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8219173839411784,
+        "val_loss": 1.831785762310028,
+        "elapsed": 38.09078311920166
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.7891480010382983,
+        "val_loss": 1.6912436008453369,
+        "elapsed": 42.85520601272583
+      }
+    ],
+    "sample": "\n\nShownos Mart will my shalms, and so:\nI that do at withose scarrabe it hearther hill.\n\nHEN OF BRAANCENTERSET:\nAs nat, what me of holy,\nSul alll ber my Engly dow; thas saul time and but thou are,\nGoods"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS5e-05_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8279731750488282,
+    "final_val_loss": 1.8279731750488282,
+    "final_train_loss": 1.8141077975837552,
+    "elapsed": 43.73532509803772,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.832287031777051,
+        "val_loss": 2.7833723545074465,
+        "elapsed": 2.117741107940674
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4953020957051493,
+        "val_loss": 2.6853655099868776,
+        "elapsed": 6.248011112213135
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.421522432995826,
+        "val_loss": 2.4820070266723633,
+        "elapsed": 9.637782096862793
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.27320950858447,
+        "val_loss": 2.294107747077942,
+        "elapsed": 13.871592998504639
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.133846716004975,
+        "val_loss": 2.174773836135864,
+        "elapsed": 18.692833185195923
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.042613505088177,
+        "val_loss": 2.1180712461471556,
+        "elapsed": 23.271008014678955
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9644349290400136,
+        "val_loss": 1.9895664215087892,
+        "elapsed": 28.19825005531311
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9004656599492442,
+        "val_loss": 1.9262284517288208,
+        "elapsed": 32.61515712738037
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8570291172597826,
+        "val_loss": 1.858276605606079,
+        "elapsed": 37.77485013008118
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8141077975837552,
+        "val_loss": 1.8279731750488282,
+        "elapsed": 43.73532509803772
+      }
+    ],
+    "sample": "\nWuterh say, my onot made\nAnd throthing I hat camenten this grown their Rut ise.\n\nMARCIAUS:\nbut is gard your fither.\n\nMISABELLOO:\nSet is of ellound the a what,\nAnd you crade ears, ber of Mother as brin"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS1e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8279743313789367,
+    "final_val_loss": 1.8279743313789367,
+    "final_train_loss": 1.7890570990893306,
+    "elapsed": 45.0894570350647,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8326971068674203,
+        "val_loss": 2.803964138031006,
+        "elapsed": 2.3339478969573975
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4932072162628174,
+        "val_loss": 2.6640231132507326,
+        "elapsed": 7.318824052810669
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.41987208238582,
+        "val_loss": 2.4510829210281373,
+        "elapsed": 11.655014038085938
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.250302818356728,
+        "val_loss": 2.279610753059387,
+        "elapsed": 16.157503128051758
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1089601565380485,
+        "val_loss": 2.1661633968353273,
+        "elapsed": 21.122507095336914
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.018767769803706,
+        "val_loss": 2.146353530883789,
+        "elapsed": 26.227903127670288
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.929974642335152,
+        "val_loss": 1.9855848789215087,
+        "elapsed": 31.076877117156982
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.8715636632880386,
+        "val_loss": 1.9688313961029054,
+        "elapsed": 35.535757064819336
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8219131968685032,
+        "val_loss": 1.9500537633895874,
+        "elapsed": 40.03643822669983
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.7890570990893306,
+        "val_loss": 1.8279743313789367,
+        "elapsed": 45.0894570350647
+      }
+    ],
+    "sample": "\n\nGLOUCESTCLST RICHNRY VI:\nGod groad the feargungrace and hall the deads\nThey of aunding the for the set purse.\n\nTCARUTER:\nI can impert a know conse can you comedom of wither,\nYou tount fatcer be tell "
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS3e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8963495016098022,
+    "final_val_loss": 1.8963495016098022,
+    "final_train_loss": 1.8606605189187186,
+    "elapsed": 25.52600908279419,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.9945086386738993,
+        "val_loss": 2.8477384090423583,
+        "elapsed": 2.1367437839508057
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5337811611136614,
+        "val_loss": 2.7401727199554444,
+        "elapsed": 6.616576910018921
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.469469072892494,
+        "val_loss": 2.6041826486587523,
+        "elapsed": 12.45287799835205
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.3401117446471233,
+        "val_loss": 2.343341016769409,
+        "elapsed": 14.35330080986023
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.183570664756152,
+        "val_loss": 2.2761332988739014,
+        "elapsed": 16.21047282218933
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.087767994280943,
+        "val_loss": 2.1742358207702637,
+        "elapsed": 18.06816601753235
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.0121062203329436,
+        "val_loss": 2.0796277046203615,
+        "elapsed": 19.966371059417725
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.94264525540021,
+        "val_loss": 2.0285990715026854,
+        "elapsed": 21.845543146133423
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8957126263490658,
+        "val_loss": 2.0022119998931887,
+        "elapsed": 23.688309907913208
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8606605189187186,
+        "val_loss": 1.8963495016098022,
+        "elapsed": 25.52600908279419
+      }
+    ],
+    "sample": "\nAUTIO:\nWith ong mod he man, if I wo my ear and sman, sperisser thers all has frieve thed thour'st me frain,\nSo lets to throngues abous no ther well eard, veine he well ading chis.\n\nMARILA:\nDeat brintr"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS5e-05_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8574434041976928,
+    "final_val_loss": 1.8574434041976928,
+    "final_train_loss": 1.8162331666265215,
+    "elapsed": 18.596851110458374,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.799460153190457,
+        "val_loss": 2.802952599525452,
+        "elapsed": 1.8476507663726807
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4946139758946946,
+        "val_loss": 2.640375089645386,
+        "elapsed": 3.7121617794036865
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.422238251597611,
+        "val_loss": 2.4412816762924194,
+        "elapsed": 5.5461649894714355
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.273184817664477,
+        "val_loss": 2.2785055875778197,
+        "elapsed": 7.376407861709595
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1283909325696984,
+        "val_loss": 2.2017857789993287,
+        "elapsed": 9.209606885910034
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.0416170321788982,
+        "val_loss": 2.164200687408447,
+        "elapsed": 11.078174114227295
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.973017665804649,
+        "val_loss": 2.0264223217964172,
+        "elapsed": 12.94904088973999
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.908143288018752,
+        "val_loss": 1.9613263726234436,
+        "elapsed": 14.809238910675049
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8438705169048506,
+        "val_loss": 1.8639026880264282,
+        "elapsed": 16.701495885849
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8162331666265215,
+        "val_loss": 1.8574434041976928,
+        "elapsed": 18.596851110458374
+      }
+    ],
+    "sample": "\nBALUS:\nMy wallines hee at cond brieffirs.\n\nKING RICHARD I:\n\nARISHASTIO:\nMystrue not and him, be still yours in the bloods fold:\nAs thius ofull being you prienqueens my God let\nThis on and of him themi"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS1e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9294796466827393,
+    "final_val_loss": 1.9294796466827393,
+    "final_train_loss": 1.8320829369583909,
+    "elapsed": 18.40903615951538,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8329113016323166,
+        "val_loss": 2.814724254608154,
+        "elapsed": 1.900170087814331
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5102643893689525,
+        "val_loss": 2.700621485710144,
+        "elapsed": 3.777275323867798
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.42950862707551,
+        "val_loss": 2.519274139404297,
+        "elapsed": 5.633687257766724
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.2875890293899848,
+        "val_loss": 2.332846760749817,
+        "elapsed": 7.4595372676849365
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1500150524840063,
+        "val_loss": 2.2219253063201903,
+        "elapsed": 9.291293144226074
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.059387660518135,
+        "val_loss": 2.1679126977920533,
+        "elapsed": 11.099761962890625
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9796925710172069,
+        "val_loss": 2.097371554374695,
+        "elapsed": 12.925819158554077
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9192391439360015,
+        "val_loss": 1.998835849761963,
+        "elapsed": 14.750303030014038
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8685813859565972,
+        "val_loss": 1.9313471794128418,
+        "elapsed": 16.55593514442444
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8320829369583909,
+        "val_loss": 1.9294796466827393,
+        "elapsed": 18.40903615951538
+      }
+    ],
+    "sample": "\nMorbere be to the theiscard thy looks, pilleanting my by of you havien\nThe the but binds so cand in is dother one myself.\n\nServoictiong\nI'll him is comirdermergue:\nYou hid, of you my bay bracie day th"
+  },
+  {
+    "name": "mpb2_bps2_lrB3e-04_lrS3e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.1237869262695312,
+    "final_val_loss": 2.1237869262695312,
+    "final_train_loss": 2.0700054497134928,
+    "elapsed": 18.190638780593872,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.95106582495631,
+        "val_loss": 2.8847279071807863,
+        "elapsed": 1.845571756362915
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.568836272979269,
+        "val_loss": 2.77570161819458,
+        "elapsed": 3.6861860752105713
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.516580102369957,
+        "val_loss": 2.7206756591796877,
+        "elapsed": 5.499933958053589
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.44413474141335,
+        "val_loss": 2.5533145904541015,
+        "elapsed": 7.318197011947632
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.319854047833657,
+        "val_loss": 2.359174060821533,
+        "elapsed": 9.146029949188232
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.2420082387235976,
+        "val_loss": 2.2515650272369383,
+        "elapsed": 10.945246934890747
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.181670123217057,
+        "val_loss": 2.2716736793518066,
+        "elapsed": 12.751949071884155
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.133477135580413,
+        "val_loss": 2.1771867275238037,
+        "elapsed": 14.571118116378784
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.096802069968784,
+        "val_loss": 2.177520513534546,
+        "elapsed": 16.369695901870728
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.0700054497134928,
+        "val_loss": 2.1237869262695312,
+        "elapsed": 18.190638780593872
+      }
+    ],
+    "sample": "\nMasirss of my, iway bet, we dess loted wellike post thou my fritt heem of tons,\nOf thell the withe fir, then hightere for hat. Hat of coond a would, in wite\nby mar as hou exelf is a lience pehi lices "
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS5e-05_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8797562003135682,
+    "final_val_loss": 1.8797562003135682,
+    "final_train_loss": 1.8308091455576372,
+    "elapsed": 19.13478398323059,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.851530454596695,
+        "val_loss": 2.862717080116272,
+        "elapsed": 1.8157801628112793
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.502825527775044,
+        "val_loss": 2.6997693300247194,
+        "elapsed": 3.627150058746338
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4390548824035014,
+        "val_loss": 2.5845250844955445,
+        "elapsed": 5.417220830917358
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.333472633848385,
+        "val_loss": 2.350313425064087,
+        "elapsed": 7.215723991394043
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.188073815131674,
+        "val_loss": 2.244096875190735,
+        "elapsed": 9.01413106918335
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.078159794365008,
+        "val_loss": 2.187690544128418,
+        "elapsed": 10.787528038024902
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.997463311467852,
+        "val_loss": 2.0597591638565063,
+        "elapsed": 12.562381029129028
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9214200705898052,
+        "val_loss": 2.015065312385559,
+        "elapsed": 14.402388095855713
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8702335210190606,
+        "val_loss": 1.921150004863739,
+        "elapsed": 16.32556915283203
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8308091455576372,
+        "val_loss": 1.8797562003135682,
+        "elapsed": 19.13478398323059
+      }
+    ],
+    "sample": "\nAllay andess rimine, fort way Boldower?\n\nMOLINIUS:\nHere I mord forth him stand sa tore: and, the there comet of and and will any\nWhat thinke of the of have\nshe Bont bord, but wither the sove I not?\nWh"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS1e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8117596507072449,
+    "final_val_loss": 1.8117596507072449,
+    "final_train_loss": 1.812667856411058,
+    "elapsed": 29.44715905189514,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8149902479989186,
+        "val_loss": 2.781003475189209,
+        "elapsed": 2.931885004043579
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.503115546946623,
+        "val_loss": 2.6401675224304197,
+        "elapsed": 5.8954758644104
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.437197028976126,
+        "val_loss": 2.5545830726623535,
+        "elapsed": 8.838346004486084
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.3222781176469764,
+        "val_loss": 2.3614207983016966,
+        "elapsed": 11.81366491317749
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1720921263402824,
+        "val_loss": 2.1596338748931885,
+        "elapsed": 14.759302139282227
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.075002104965682,
+        "val_loss": 2.1187899112701416,
+        "elapsed": 17.600871801376343
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9930372663906641,
+        "val_loss": 1.9889302015304566,
+        "elapsed": 20.56882405281067
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9226828205342195,
+        "val_loss": 1.9473916888237,
+        "elapsed": 23.539621114730835
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.868392444148506,
+        "val_loss": 1.8725886821746827,
+        "elapsed": 26.482482194900513
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.812667856411058,
+        "val_loss": 1.8117596507072449,
+        "elapsed": 29.44715905189514
+      }
+    ],
+    "sample": "\nAll the lour ghtises with to must confiniouold.\n\nCLA3\n\nLADUFELLINES:\nThe bour what cresse my learter'd but by dise dire of the lem;\nThing-good fair care to your trefor that should the you lord be thy "
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS3e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.791898000240326,
+    "final_val_loss": 1.791898000240326,
+    "final_train_loss": 1.7798449762013493,
+    "elapsed": 29.318709135055542,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.808251648533101,
+        "val_loss": 2.776476740837097,
+        "elapsed": 2.9758501052856445
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4873654112523917,
+        "val_loss": 2.6806246757507326,
+        "elapsed": 5.826437950134277
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4180891071398234,
+        "val_loss": 2.549664092063904,
+        "elapsed": 8.738357067108154
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.2597955562630476,
+        "val_loss": 2.280015730857849,
+        "elapsed": 11.691915035247803
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1112921091974997,
+        "val_loss": 2.1660184144973753,
+        "elapsed": 14.658681154251099
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.0113263929013123,
+        "val_loss": 2.139637994766235,
+        "elapsed": 17.6168429851532
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9358659520441173,
+        "val_loss": 1.9721662759780885,
+        "elapsed": 20.569576025009155
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.868628627183486,
+        "val_loss": 1.9053001046180724,
+        "elapsed": 23.54090905189514
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8197073985620873,
+        "val_loss": 1.8540900230407715,
+        "elapsed": 26.35095500946045
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.7798449762013493,
+        "val_loss": 1.791898000240326,
+        "elapsed": 29.318709135055542
+      }
+    ],
+    "sample": "\nSecution mother'd cown.\nA what and thy regen! Saime cons nown thy love,\nWho suit of let's the pris, heartal to thoub one of the no cul:\nMustreatter's breath fear awars sir?\nThat's hangurcastillichmust"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS5e-05_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8721038579940796,
+    "final_val_loss": 1.8721038579940796,
+    "final_train_loss": 1.814544790861558,
+    "elapsed": 30.370795011520386,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8230853737617028,
+        "val_loss": 2.8085416316986085,
+        "elapsed": 2.9787330627441406
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.503870798616993,
+        "val_loss": 2.697307515144348,
+        "elapsed": 5.9755330085754395
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4365915342704536,
+        "val_loss": 2.597661924362183,
+        "elapsed": 8.94650387763977
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.314678450019992,
+        "val_loss": 2.3294159173965454,
+        "elapsed": 11.99045205116272
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.165082118949112,
+        "val_loss": 2.2298024892807007,
+        "elapsed": 14.998416185379028
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.068375276536057,
+        "val_loss": 2.0744221806526184,
+        "elapsed": 18.068047046661377
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9816925002604115,
+        "val_loss": 2.024910938739777,
+        "elapsed": 21.176136016845703
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9195612997424847,
+        "val_loss": 1.963808500766754,
+        "elapsed": 24.22148823738098
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8645116090774536,
+        "val_loss": 1.8783207654953002,
+        "elapsed": 27.332970142364502
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.814544790861558,
+        "val_loss": 1.8721038579940796,
+        "elapsed": 30.370795011520386
+      }
+    ],
+    "sample": "\n\nDUKE VINCE:\nWhere sting tood ase and from ore tjonce to this bring spleep reeing,\nWho frieth met you a plast toners enchiand for have one\nAnd timon seet resen onfen so bereajery, for in min long tows"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS1e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.7570940136909485,
+    "final_val_loss": 1.7570940136909485,
+    "final_train_loss": 1.8103070733498554,
+    "elapsed": 29.562885999679565,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.7947178349202995,
+        "val_loss": 2.789075422286987,
+        "elapsed": 2.8847079277038574
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5008554726230856,
+        "val_loss": 2.5821619749069216,
+        "elapsed": 5.912629842758179
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4379013223746386,
+        "val_loss": 2.5398723602294924,
+        "elapsed": 8.87296199798584
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.3063375025379416,
+        "val_loss": 2.350624108314514,
+        "elapsed": 11.869473934173584
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.150906639439719,
+        "val_loss": 2.179416465759277,
+        "elapsed": 14.80786395072937
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.053705334663391,
+        "val_loss": 2.0868292570114138,
+        "elapsed": 17.747447967529297
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9641524030237782,
+        "val_loss": 2.019661712646484,
+        "elapsed": 20.762229919433594
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.899660897498228,
+        "val_loss": 1.9293326616287232,
+        "elapsed": 23.71484684944153
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8425076118449575,
+        "val_loss": 1.7994447827339173,
+        "elapsed": 26.64797306060791
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8103070733498554,
+        "val_loss": 1.7570940136909485,
+        "elapsed": 29.562885999679565
+      }
+    ],
+    "sample": "\n\n\n\nDUUCHESS OF YORK:\nI will but my do blain,\nWhow man, I mad, to pe a have nor you we a tampain\nA shall my wous learthis earefoull am your with of you areignguediousudly frome,\nPardiend I am to the br"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS3e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8313149333000183,
+    "final_val_loss": 1.8313149333000183,
+    "final_train_loss": 1.7842833205145232,
+    "elapsed": 29.411154985427856,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8109111226334864,
+        "val_loss": 2.8563890933990477,
+        "elapsed": 2.9370429515838623
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4995366626856277,
+        "val_loss": 2.643443489074707,
+        "elapsed": 5.886854887008667
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4170657801873907,
+        "val_loss": 2.5027464866638183,
+        "elapsed": 8.796594858169556
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.244903493900688,
+        "val_loss": 2.2523606538772585,
+        "elapsed": 11.719026803970337
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1079393649587828,
+        "val_loss": 2.175659728050232,
+        "elapsed": 14.631226778030396
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.016677835552963,
+        "val_loss": 2.05828914642334,
+        "elapsed": 17.568980932235718
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9325772864477975,
+        "val_loss": 2.014216887950897,
+        "elapsed": 20.567501068115234
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.8717422789456892,
+        "val_loss": 1.966207253932953,
+        "elapsed": 23.518077850341797
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8221554657847612,
+        "val_loss": 1.9033580899238587,
+        "elapsed": 26.51138710975647
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.7842833205145232,
+        "val_loss": 1.8313149333000183,
+        "elapsed": 29.411154985427856
+      }
+    ],
+    "sample": "\nAs she liessent well Richars: deepservinishef\nWefpenistraintisting enpeast aim\nAnd feed; but extaint and this tation\nIn ming them well in the canress. When recouelance hear Would of the denough?\n\nESCA"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS5e-05_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.843765389919281,
+    "final_val_loss": 1.843765389919281,
+    "final_train_loss": 1.8258917477666115,
+    "elapsed": 29.283798933029175,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.7966548034123013,
+        "val_loss": 2.7963846921920776,
+        "elapsed": 2.9821207523345947
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4987618096020756,
+        "val_loss": 2.6870036363601684,
+        "elapsed": 5.968263864517212
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4207298288640287,
+        "val_loss": 2.523783874511719,
+        "elapsed": 8.890326976776123
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.271513357454417,
+        "val_loss": 2.3502400398254393,
+        "elapsed": 11.79084300994873
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1364036384893925,
+        "val_loss": 2.2511551141738892,
+        "elapsed": 14.687386989593506
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.044545688579992,
+        "val_loss": 2.0723726391792296,
+        "elapsed": 17.592267990112305
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9607105157813247,
+        "val_loss": 2.0143603920936584,
+        "elapsed": 20.455476760864258
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.90885954973649,
+        "val_loss": 1.9608492970466613,
+        "elapsed": 23.364919900894165
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.8569292616598385,
+        "val_loss": 1.8603890419006348,
+        "elapsed": 26.29262399673462
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8258917477666115,
+        "val_loss": 1.843765389919281,
+        "elapsed": 29.283798933029175
+      }
+    ],
+    "sample": "\ncord Send the the stalt?\nI do frare me broneorse dold made word, sowls forfort?\n\nWhy,\nThis fir cond isends I sir, fords cread, botness of GAURENCE:\nIt the dest thatfe take themner what with word,\nMan "
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS1e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.8085343480110168,
+    "final_val_loss": 1.8085343480110168,
+    "final_train_loss": 1.812905531756732,
+    "elapsed": 23.391298055648804,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.785039317851164,
+        "val_loss": 2.8920525312423706,
+        "elapsed": 2.9077818393707275
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.4894049751515293,
+        "val_loss": 2.683773922920227,
+        "elapsed": 5.786105155944824
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4303298021100233,
+        "val_loss": 2.542995071411133,
+        "elapsed": 8.708940029144287
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.276884283338274,
+        "val_loss": 2.2858525991439818,
+        "elapsed": 10.88581395149231
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.1251536169830634,
+        "val_loss": 2.2166435956954955,
+        "elapsed": 12.744959115982056
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.033958336741654,
+        "val_loss": 2.137461447715759,
+        "elapsed": 14.553599119186401
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 1.9637716011125215,
+        "val_loss": 2.126415729522705,
+        "elapsed": 16.38967990875244
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9041127489537608,
+        "val_loss": 1.9628516793251038,
+        "elapsed": 18.232265949249268
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.851708378988443,
+        "val_loss": 1.902550995349884,
+        "elapsed": 20.647795915603638
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.812905531756732,
+        "val_loss": 1.8085343480110168,
+        "elapsed": 23.391298055648804
+      }
+    ],
+    "sample": "\nES:\nHe can greath I then he had your s, I have spreverter undon\nTheresight crubtents\n'It withat thinks flieve to such wis too;\nYour misc to shoulder'd his the riscelf\nFirst as him:\nAnd dear hobelive t"
+  },
+  {
+    "name": "mpb2_bps4_lrB3e-04_lrS3e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 2,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9147355675697326,
+    "final_val_loss": 1.959554088115692,
+    "final_train_loss": 1.8621522212515071,
+    "elapsed": 26.911235094070435,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 2.8953808010840905,
+        "val_loss": 2.8010143518447874,
+        "elapsed": 2.7121798992156982
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.512114247497247,
+        "val_loss": 2.7299580812454223,
+        "elapsed": 5.389616966247559
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4532061655496813,
+        "val_loss": 2.5648652791976927,
+        "elapsed": 8.027856826782227
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.324743874218999,
+        "val_loss": 2.3489100456237795,
+        "elapsed": 10.711720943450928
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.190368399328115,
+        "val_loss": 2.236669087409973,
+        "elapsed": 13.393243789672852
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.1006484179152656,
+        "val_loss": 2.21127564907074,
+        "elapsed": 16.045392751693726
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.0168168544769287,
+        "val_loss": 2.1545654296875,
+        "elapsed": 18.720121145248413
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 1.9561228581837244,
+        "val_loss": 2.0047786831855774,
+        "elapsed": 21.450419902801514
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.9001719140514886,
+        "val_loss": 1.9147355675697326,
+        "elapsed": 24.15901803970337
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.8621522212515071,
+        "val_loss": 1.959554088115692,
+        "elapsed": 26.911235094070435
+      }
+    ],
+    "sample": "\npery late dother.\n\nDUKE MINENENT:\nThou hore goye madry,\nI pruse have that you all unclart not husentrarings your wink the by all come hall,\nIf ther all'w thance the to the was souble,\nTake of hat that"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS5e-05_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.170390748977661,
+    "final_val_loss": 2.1769917964935304,
+    "final_train_loss": 2.0738589605506585,
+    "elapsed": 26.152148962020874,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0674948716650206,
+        "val_loss": 2.911413288116455,
+        "elapsed": 2.6558098793029785
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.595324679296844,
+        "val_loss": 2.7995415925979614,
+        "elapsed": 5.24979305267334
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.5203179870684123,
+        "val_loss": 2.7975327014923095,
+        "elapsed": 7.796841859817505
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.487850807151016,
+        "val_loss": 2.647692632675171,
+        "elapsed": 10.38645076751709
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4438250210820414,
+        "val_loss": 2.580564785003662,
+        "elapsed": 12.99550986289978
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.4117708894395338,
+        "val_loss": 2.5266809463500977,
+        "elapsed": 15.591439962387085
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.3296247842360516,
+        "val_loss": 2.367089629173279,
+        "elapsed": 18.179428100585938
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.218928045156051,
+        "val_loss": 2.2710180282592773,
+        "elapsed": 20.829025983810425
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.152282972925717,
+        "val_loss": 2.170390748977661,
+        "elapsed": 23.464407920837402
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.0738589605506585,
+        "val_loss": 2.1769917964935304,
+        "elapsed": 26.152148962020874
+      }
+    ],
+    "sample": "\n\nNULIUS:\nNo failou f is nay fles fere sets this\nNose thesere an and fay you tond the shid Gaded,\nIn othe wich drange he uned a beeprromesin thould the rnot will'd sto him, agay ble lead wir and yst st"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS1e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.1565501928329467,
+    "final_val_loss": 2.167090153694153,
+    "final_train_loss": 2.0291134508288637,
+    "elapsed": 26.722198009490967,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.051884656049767,
+        "val_loss": 2.886614179611206,
+        "elapsed": 2.6834018230438232
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5803182052106273,
+        "val_loss": 2.736921286582947,
+        "elapsed": 5.345829963684082
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.508701572713164,
+        "val_loss": 2.7112678050994874,
+        "elapsed": 8.010946989059448
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.461237578975911,
+        "val_loss": 2.6497360467910767,
+        "elapsed": 10.704337120056152
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4263489076069424,
+        "val_loss": 2.6017879962921144,
+        "elapsed": 13.43544316291809
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3591418462930265,
+        "val_loss": 2.5083756923675535,
+        "elapsed": 16.16828203201294
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.2632518082248922,
+        "val_loss": 2.2792197465896606,
+        "elapsed": 18.879167795181274
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.159545351047905,
+        "val_loss": 2.1920192003250123,
+        "elapsed": 21.796900033950806
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0903304434314216,
+        "val_loss": 2.1565501928329467,
+        "elapsed": 24.57029390335083
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.0291134508288637,
+        "val_loss": 2.167090153694153,
+        "elapsed": 26.722198009490967
+      }
+    ],
+    "sample": "\nSam m\nUnd teet atest fruce.\n\nCUULESTUS:\nHick itiits, son he you and nourysh ale',\nThe me but son ady dot wild ponst ther to lo you hould wild to lef\nTh sate againss things aption mady thert of sTh the"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS3e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9404670119285583,
+    "final_val_loss": 1.9404670119285583,
+    "final_train_loss": 1.934518654735721,
+    "elapsed": 17.830846071243286,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.260161390109938,
+        "val_loss": 2.8857666730880736,
+        "elapsed": 1.8202760219573975
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.572357484272548,
+        "val_loss": 2.8013585805892944,
+        "elapsed": 3.589232921600342
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.488027850377191,
+        "val_loss": 2.6629913330078123,
+        "elapsed": 5.370425224304199
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.447086443706435,
+        "val_loss": 2.55560462474823,
+        "elapsed": 7.188301086425781
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.384689744637937,
+        "val_loss": 2.5437294960021974,
+        "elapsed": 9.019426107406616
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.282808878987106,
+        "val_loss": 2.3753817796707155,
+        "elapsed": 10.785135269165039
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1516109267059638,
+        "val_loss": 2.2051889657974244,
+        "elapsed": 12.548527240753174
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.0673032013737425,
+        "val_loss": 2.0912646532058714,
+        "elapsed": 14.308903932571411
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.9945693986932027,
+        "val_loss": 2.030780863761902,
+        "elapsed": 16.055227041244507
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.934518654735721,
+        "val_loss": 1.9404670119285583,
+        "elapsed": 17.830846071243286
+      }
+    ],
+    "sample": "\nTen, is time to musire, why deelf all it, your you;\nUntere some this the on, be mear took the the of my your gate fiar with his bard here be though,\nAnd he laver his now this the pace thess then to en"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS5e-05_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.1250168085098267,
+    "final_val_loss": 2.1250168085098267,
+    "final_train_loss": 2.010746238183002,
+    "elapsed": 17.58746600151062,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.012636211453652,
+        "val_loss": 2.9879635334014893,
+        "elapsed": 1.7819201946258545
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5752625465393066,
+        "val_loss": 2.7536240816116333,
+        "elapsed": 3.5565781593322754
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.5025915485067465,
+        "val_loss": 2.6516821146011353,
+        "elapsed": 5.3258702754974365
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4623727944432474,
+        "val_loss": 2.60400128364563,
+        "elapsed": 7.08911395072937
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.424441252435957,
+        "val_loss": 2.517666292190552,
+        "elapsed": 8.856963157653809
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3622899448748718,
+        "val_loss": 2.451608180999756,
+        "elapsed": 10.593287944793701
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.227822970370857,
+        "val_loss": 2.257124900817871,
+        "elapsed": 12.345515012741089
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.1514344774946874,
+        "val_loss": 2.227061057090759,
+        "elapsed": 14.096227884292603
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0846553070029032,
+        "val_loss": 2.173934268951416,
+        "elapsed": 15.82442307472229
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.010746238183002,
+        "val_loss": 2.1250168085098267,
+        "elapsed": 17.58746600151062
+      }
+    ],
+    "sample": "\n\nWThand the th not you to that not to but mas an thall be hurt.\n\nMARIIUS:\nThat linl to do have andestal, and the of dist with this de.\n\nNCAR-game not sprack theasterd pron noth to seer!\n\nknow it sorr'"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS1e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.0373334527015685,
+    "final_val_loss": 2.0373334527015685,
+    "final_train_loss": 1.9655905086167005,
+    "elapsed": 17.507905960083008,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.112706189252892,
+        "val_loss": 2.870266819000244,
+        "elapsed": 1.7840561866760254
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5717434834460824,
+        "val_loss": 2.711013078689575,
+        "elapsed": 3.531419038772583
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.495311697733771,
+        "val_loss": 2.651987361907959,
+        "elapsed": 5.2906129360198975
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.449337219705387,
+        "val_loss": 2.6101695775985716,
+        "elapsed": 7.050240993499756
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4048784436011803,
+        "val_loss": 2.4956164598464965,
+        "elapsed": 8.805127143859863
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3121224408297194,
+        "val_loss": 2.38989679813385,
+        "elapsed": 10.537462949752808
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.187309138628901,
+        "val_loss": 2.2691687107086183,
+        "elapsed": 12.286216974258423
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.1022490615747413,
+        "val_loss": 2.2167390823364257,
+        "elapsed": 14.042718887329102
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.032829196182723,
+        "val_loss": 2.1765538454055786,
+        "elapsed": 15.76691198348999
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.9655905086167005,
+        "val_loss": 2.0373334527015685,
+        "elapsed": 17.507905960083008
+      }
+    ],
+    "sample": "\nFRICIO:\nI'll, for you dukes, and tere aff,\nHen teeent moroud, hem your to for thered\nMannot a blain haver th ouse thim to thence to how peard all four'd go.\n\nDUKE foore, he des my nand,\nWhat my thous "
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS3e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9612985372543335,
+    "final_val_loss": 1.9612985372543335,
+    "final_train_loss": 1.927265703678131,
+    "elapsed": 17.344135999679565,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.1048216041253536,
+        "val_loss": 2.9069928884506226,
+        "elapsed": 1.7540769577026367
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.56746206721481,
+        "val_loss": 2.759104347229004,
+        "elapsed": 3.4955320358276367
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.495474626108543,
+        "val_loss": 2.644031620025635,
+        "elapsed": 5.219904899597168
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.445778968382855,
+        "val_loss": 2.5783538818359375,
+        "elapsed": 6.952311992645264
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.3890740263218784,
+        "val_loss": 2.531481647491455,
+        "elapsed": 8.695335865020752
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.252800014830127,
+        "val_loss": 2.3187216997146605,
+        "elapsed": 10.41361403465271
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1474582200147667,
+        "val_loss": 2.210682225227356,
+        "elapsed": 12.153728008270264
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.06165759904044,
+        "val_loss": 2.1618711709976197,
+        "elapsed": 13.889580965042114
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.9921572736858093,
+        "val_loss": 2.063797128200531,
+        "elapsed": 15.60683798789978
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.927265703678131,
+        "val_loss": 1.9612985372543335,
+        "elapsed": 17.344135999679565
+      }
+    ],
+    "sample": "\nBoddsth peaster four rose, to thath\nword with the but mands.\nNot brat to sing as tingenturn'stlance.\n\nSechers I bing sword.\nWhuld, to pradstand and Though forch.\nI prOw yearth'd thought\nAs to bavictun"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS5e-05_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9779393553733826,
+    "final_val_loss": 1.9779393553733826,
+    "final_train_loss": 1.9473835594800053,
+    "elapsed": 17.324538707733154,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.051147979132983,
+        "val_loss": 2.884642720222473,
+        "elapsed": 1.7533109188079834
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.55639855472409,
+        "val_loss": 2.78238365650177,
+        "elapsed": 3.508774757385254
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.488081406072243,
+        "val_loss": 2.679890775680542,
+        "elapsed": 5.258937835693359
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4441182589044375,
+        "val_loss": 2.6527721881866455,
+        "elapsed": 7.0166709423065186
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.386497755439914,
+        "val_loss": 2.4215392112731933,
+        "elapsed": 8.741557836532593
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.285598791751665,
+        "val_loss": 2.265021252632141,
+        "elapsed": 10.434114933013916
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.169674887949107,
+        "val_loss": 2.213001179695129,
+        "elapsed": 12.134184837341309
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.082508064046198,
+        "val_loss": 2.154436635971069,
+        "elapsed": 13.884548902511597
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0087386640076783,
+        "val_loss": 2.1083362102508545,
+        "elapsed": 15.596348762512207
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.9473835594800053,
+        "val_loss": 1.9779393553733826,
+        "elapsed": 17.324538707733154
+      }
+    ],
+    "sample": "\nRAS:\nWhen ttand shall had aged woe carss wording;\nGood be that me not ennot ild do a beting you prowerthe and thuth would with harry pariut set enterier\nTheret o go be I howereng,\nThat now beld Rance "
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS1e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.0337349653244017,
+    "final_val_loss": 2.0337349653244017,
+    "final_train_loss": 1.938653059151708,
+    "elapsed": 17.340447902679443,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.053882119606952,
+        "val_loss": 2.8490716934204103,
+        "elapsed": 1.7339849472045898
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.553153874922772,
+        "val_loss": 2.7502301692962647,
+        "elapsed": 3.4742519855499268
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.483675216891102,
+        "val_loss": 2.664404582977295,
+        "elapsed": 5.21478796005249
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.436631971476029,
+        "val_loss": 2.5980700492858886,
+        "elapsed": 6.960638999938965
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.3590376425762565,
+        "val_loss": 2.4496195793151854,
+        "elapsed": 8.713399887084961
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.2401384373301085,
+        "val_loss": 2.277894973754883,
+        "elapsed": 10.443480014801025
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1374088525772095,
+        "val_loss": 2.2229591369628907,
+        "elapsed": 12.175132036209106
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.0655693302349167,
+        "val_loss": 2.134055805206299,
+        "elapsed": 13.898871898651123
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 1.9991638758747847,
+        "val_loss": 2.073663330078125,
+        "elapsed": 15.602856159210205
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.938653059151708,
+        "val_loss": 2.0337349653244017,
+        "elapsed": 17.340447902679443
+      }
+    ],
+    "sample": "\nPith pand I proved me\nA a clompter lovor;\nLet this same was you this from to thame our my faore the will.\n\nDUKE Where dong and ANGERET:\nBothe thou ist you thesel.\n\nPLO:\nDook myou wher his him, I the m"
+  },
+  {
+    "name": "mpb4_bps2_lrB3e-04_lrS3e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 2,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.000509870052338,
+    "final_val_loss": 2.000509870052338,
+    "final_train_loss": 1.9407900024433524,
+    "elapsed": 17.291474103927612,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.154987561459444,
+        "val_loss": 2.961138892173767,
+        "elapsed": 1.772698163986206
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.575897749589414,
+        "val_loss": 2.745755910873413,
+        "elapsed": 3.5065691471099854
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.499530276072394,
+        "val_loss": 2.65176842212677,
+        "elapsed": 5.227542161941528
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4464397065493526,
+        "val_loss": 2.674537682533264,
+        "elapsed": 6.961661100387573
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.3832492414785893,
+        "val_loss": 2.4635177135467528,
+        "elapsed": 8.70249605178833
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.2578515342830383,
+        "val_loss": 2.313689684867859,
+        "elapsed": 10.414465188980103
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.144874319738271,
+        "val_loss": 2.2192399501800537,
+        "elapsed": 12.1407790184021
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.0721602573686715,
+        "val_loss": 2.169565296173096,
+        "elapsed": 13.86654019355774
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.01209703302875,
+        "val_loss": 2.043181049823761,
+        "elapsed": 15.571402072906494
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.9407900024433524,
+        "val_loss": 2.000509870052338,
+        "elapsed": 17.291474103927612
+      }
+    ],
+    "sample": "\nTiss and the lis at broy\nAnd not thatt come\nInoth is that that my Anysened thing the you sue hone fir to a for in have the eve the but would\nELLA:\nThe in the put 'd a doy this worsuch locko all st I h"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS5e-05_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.2174474954605103,
+    "final_val_loss": 2.2174474954605103,
+    "final_train_loss": 2.1111342833966624,
+    "elapsed": 18.344249963760376,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0578809319710243,
+        "val_loss": 2.9428516387939454,
+        "elapsed": 1.7349109649658203
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.600437962279028,
+        "val_loss": 2.812337875366211,
+        "elapsed": 3.459866762161255
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.5307464353817024,
+        "val_loss": 2.734526586532593,
+        "elapsed": 5.18469500541687
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4897870263274835,
+        "val_loss": 2.6835465669631957,
+        "elapsed": 6.984050989151001
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4537253866390305,
+        "val_loss": 2.607373070716858,
+        "elapsed": 8.77783203125
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.410571321998675,
+        "val_loss": 2.5122964143753053,
+        "elapsed": 10.566514015197754
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.3472220313792325,
+        "val_loss": 2.4006489515304565,
+        "elapsed": 12.46450400352478
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.247543276572714,
+        "val_loss": 2.2741830348968506,
+        "elapsed": 14.49981689453125
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.1802118365297614,
+        "val_loss": 2.2585403680801392,
+        "elapsed": 16.43176507949829
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.1111342833966624,
+        "val_loss": 2.2174474954605103,
+        "elapsed": 18.344249963760376
+      }
+    ],
+    "sample": "\nArl, lannar my you at thingone;\nAn thy gnceeir fore you is an sa: therest beat mestyakes preares the me willice sont thal the hish is boutre mup sturer of herel thertight you shon son ther:\nLemarth no"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS1e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.108616805076599,
+    "final_val_loss": 2.108616805076599,
+    "final_train_loss": 2.0688629746437073,
+    "elapsed": 18.754590034484863,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0174327358907584,
+        "val_loss": 2.941136932373047,
+        "elapsed": 1.8163361549377441
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.599617308499862,
+        "val_loss": 2.7447819232940676,
+        "elapsed": 3.659494161605835
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.5228215959883227,
+        "val_loss": 2.7040525913238525,
+        "elapsed": 5.557773113250732
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.472809069010676,
+        "val_loss": 2.653370666503906,
+        "elapsed": 7.512650012969971
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4410737485301737,
+        "val_loss": 2.6075489282608033,
+        "elapsed": 9.431631088256836
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3836113079307006,
+        "val_loss": 2.4919877529144285,
+        "elapsed": 11.304810047149658
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.303192211657154,
+        "val_loss": 2.3209905862808227,
+        "elapsed": 13.179872989654541
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.209251744406564,
+        "val_loss": 2.252287745475769,
+        "elapsed": 15.048727035522461
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.133697932528466,
+        "val_loss": 2.186408853530884,
+        "elapsed": 16.893145084381104
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.0688629746437073,
+        "val_loss": 2.108616805076599,
+        "elapsed": 18.754590034484863
+      }
+    ],
+    "sample": "\nSir love I do stjues ther death he pof ore\nFreart soun len he shis in! lik, of hou' arlork hen tir hour wice ard thin a\nFor mes, of to soent sold hathe of sould ha a guin arenthe,\nMore froway thearel,"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS3e-04_db0.85_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.85,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.0279300093650816,
+    "final_val_loss": 2.0279300093650816,
+    "final_train_loss": 1.966038564030005,
+    "elapsed": 18.98571801185608,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0014324699129378,
+        "val_loss": 2.904161882400513,
+        "elapsed": 1.822782039642334
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.568416736563858,
+        "val_loss": 2.7207450389862062,
+        "elapsed": 3.6435980796813965
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4959970282525132,
+        "val_loss": 2.647759127616882,
+        "elapsed": 5.492138862609863
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.45116494626415,
+        "val_loss": 2.680688905715942,
+        "elapsed": 7.465718984603882
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.414540122966377,
+        "val_loss": 2.573636507987976,
+        "elapsed": 9.429906129837036
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.317098617553711,
+        "val_loss": 2.3149400472640993,
+        "elapsed": 11.345712184906006
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1952161618641446,
+        "val_loss": 2.2495492696762085,
+        "elapsed": 13.267967224121094
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.112834092305631,
+        "val_loss": 2.15136182308197,
+        "elapsed": 15.179716110229492
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.030502423797686,
+        "val_loss": 2.100999879837036,
+        "elapsed": 17.065440893173218
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.966038564030005,
+        "val_loss": 2.0279300093650816,
+        "elapsed": 18.98571801185608
+      }
+    ],
+    "sample": "\nThOMBETL:\nI him nie 3urnes; lise forfese hish infecames,\n\nAnd shenkst with fall in hishis,\nLorownat tiverer for me, tourraward,\nInnot he fore were it,\nSo pation olloverit.\nIndeeaventior yourners, but "
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS5e-05_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.083745503425598,
+    "final_val_loss": 2.083745503425598,
+    "final_train_loss": 2.0617683104106357,
+    "elapsed": 18.857825994491577,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.053918999068591,
+        "val_loss": 2.862483859062195,
+        "elapsed": 1.8830108642578125
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5841432323261184,
+        "val_loss": 2.726880669593811,
+        "elapsed": 3.755129814147949
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.5224095742727064,
+        "val_loss": 2.6825845718383787,
+        "elapsed": 5.620685815811157
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4805485010147095,
+        "val_loss": 2.629175639152527,
+        "elapsed": 7.544043064117432
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.431144120741864,
+        "val_loss": 2.605642080307007,
+        "elapsed": 9.470157146453857
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3867791583857585,
+        "val_loss": 2.4948076009750366,
+        "elapsed": 11.335463047027588
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.2880520212407016,
+        "val_loss": 2.310818099975586,
+        "elapsed": 13.213195085525513
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.190355442008194,
+        "val_loss": 2.2118090867996214,
+        "elapsed": 15.073896884918213
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.1197502502461067,
+        "val_loss": 2.171890878677368,
+        "elapsed": 16.962538957595825
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.0617683104106357,
+        "val_loss": 2.083745503425598,
+        "elapsed": 18.857825994491577
+      }
+    ],
+    "sample": "\nKING RIhIV qe, e\nbet to yennoulde; to he to my bether mentemp, te tom enguen the ther.\nYou he ford, Lorks your ve nows,\nGood you him len the and, this mepink dengones.\n\nMy ROMEORYARCALUS:\nWhe be I muP"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS1e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.135876727104187,
+    "final_val_loss": 2.135876727104187,
+    "final_train_loss": 2.02972756234967,
+    "elapsed": 18.74646496772766,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.1245516611605275,
+        "val_loss": 2.9024399518966675,
+        "elapsed": 1.8011629581451416
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.579221720598182,
+        "val_loss": 2.7868396520614622,
+        "elapsed": 3.6001498699188232
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.50601788648625,
+        "val_loss": 2.6333892345428467,
+        "elapsed": 5.439105033874512
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4658501829419817,
+        "val_loss": 2.612007904052734,
+        "elapsed": 7.321609973907471
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.429804561089496,
+        "val_loss": 2.551856756210327,
+        "elapsed": 9.222913980484009
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.350726997729429,
+        "val_loss": 2.435106611251831,
+        "elapsed": 11.15864896774292
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.240653334831705,
+        "val_loss": 2.3233244895935057,
+        "elapsed": 13.072244882583618
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.1611464583143896,
+        "val_loss": 2.2192888975143434,
+        "elapsed": 14.978851079940796
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.087659000121441,
+        "val_loss": 2.1928022623062136,
+        "elapsed": 16.867612838745117
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 2.02972756234967,
+        "val_loss": 2.135876727104187,
+        "elapsed": 18.74646496772766
+      }
+    ],
+    "sample": "\nTHaten: the of the? to he he lost cont mory ster not clon\nwings of mair frearthe of the reang with ther thers son on and be prat wenture my your not with wath'd lor nothe's bothne dexth badng\nBe yould"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS3e-04_db0.9_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.9,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.0658538222312925,
+    "final_val_loss": 2.0658538222312925,
+    "final_train_loss": 1.952330624570652,
+    "elapsed": 18.78461003303528,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0384270731283696,
+        "val_loss": 2.9222671508789064,
+        "elapsed": 1.8149211406707764
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.56738111924152,
+        "val_loss": 2.7873547792434694,
+        "elapsed": 3.616741895675659
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.489831921980553,
+        "val_loss": 2.7368996143341064,
+        "elapsed": 5.426177024841309
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4584160751226,
+        "val_loss": 2.6778576374053955,
+        "elapsed": 7.271287202835083
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.388306683423568,
+        "val_loss": 2.4465235471725464,
+        "elapsed": 9.138559103012085
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.3035693906017185,
+        "val_loss": 2.3305627584457396,
+        "elapsed": 11.018373012542725
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1884281854240264,
+        "val_loss": 2.203110098838806,
+        "elapsed": 12.959286212921143
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.093044641066571,
+        "val_loss": 2.1195688962936403,
+        "elapsed": 14.914143085479736
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.016755934843083,
+        "val_loss": 2.0774895787239074,
+        "elapsed": 16.86279821395874
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.952330624570652,
+        "val_loss": 2.0658538222312925,
+        "elapsed": 18.78461003303528
+      }
+    ],
+    "sample": "\nFasss:\nWhich this the we care him, afful of uprough of hinds,\nAnd the not may and beth Have now, bray,\npRirt re's ther aphace them tour andaw at pupin hon sruse ther think ward to fear head let?\nArt w"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS5e-05_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 5e-05,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9847068786621094,
+    "final_val_loss": 1.9847068786621094,
+    "final_train_loss": 1.9714144602113841,
+    "elapsed": 18.78888487815857,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.07675116159478,
+        "val_loss": 2.8890783071517943,
+        "elapsed": 1.8284778594970703
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.5680636216183097,
+        "val_loss": 2.76388897895813,
+        "elapsed": 3.6575369834899902
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.497644407233012,
+        "val_loss": 2.6745457887649535,
+        "elapsed": 5.523942947387695
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4511342072973448,
+        "val_loss": 2.6338967800140383,
+        "elapsed": 7.436827898025513
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.4020504489236947,
+        "val_loss": 2.5141332387924193,
+        "elapsed": 9.346032857894897
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.308346492728007,
+        "val_loss": 2.3907042264938356,
+        "elapsed": 11.211756944656372
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1887379982033552,
+        "val_loss": 2.2661067724227903,
+        "elapsed": 13.095818996429443
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.107675839443596,
+        "val_loss": 2.1472445011138914,
+        "elapsed": 14.97663688659668
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0269615871390116,
+        "val_loss": 2.0176926612854005,
+        "elapsed": 16.856877088546753
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.9714144602113841,
+        "val_loss": 1.9847068786621094,
+        "elapsed": 18.78888487815857
+      }
+    ],
+    "sample": "\nIn on am the mut connall fielt t my the of oulde theem and hees\nWhe fll abce you his bel thought Lind for hate death the your stry cous.\n\nKARD Year:\nARWICK:\nThe love our have! I that are and I s of th"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS1e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0001,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 2.020035707950592,
+    "final_val_loss": 2.020035707950592,
+    "final_train_loss": 1.957746941216138,
+    "elapsed": 18.54704785346985,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.0028572277146943,
+        "val_loss": 2.8783777475357057,
+        "elapsed": 1.8193080425262451
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.559376200851129,
+        "val_loss": 2.718121814727783,
+        "elapsed": 3.625124931335449
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.488406129719056,
+        "val_loss": 2.68615517616272,
+        "elapsed": 5.4364049434661865
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.444093171431094,
+        "val_loss": 2.6180235385894775,
+        "elapsed": 7.289563894271851
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.3801113269766985,
+        "val_loss": 2.5098498344421385,
+        "elapsed": 9.161821842193604
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.274967591787122,
+        "val_loss": 2.335557389259338,
+        "elapsed": 11.019907712936401
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.165301410519347,
+        "val_loss": 2.2365222692489626,
+        "elapsed": 12.89380669593811
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.084397943652406,
+        "val_loss": 2.1508124589920046,
+        "elapsed": 14.763423919677734
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0154799333552726,
+        "val_loss": 2.071838176250458,
+        "elapsed": 16.644577026367188
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.957746941216138,
+        "val_loss": 2.020035707950592,
+        "elapsed": 18.54704785346985
+      }
+    ],
+    "sample": "\n not be, how yead Enow I set in the sious\ndake to genor thy pave and bearster opowe thou mants ther seche\nBut behe weeand to you, is deave make will ags had;\nBut my your, will wal let thy wn falt I li"
+  },
+  {
+    "name": "mpb4_bps4_lrB3e-04_lrS3e-04_db0.95_ds0.95",
+    "config": {
+      "block_size": 128,
+      "n_layer": 4,
+      "n_head": 4,
+      "n_embd": 256,
+      "dropout": 0.1,
+      "val_frac": 0.1,
+      "total_tokens": 2000000,
+      "eval_every_tokens": 200000,
+      "eval_samples": 10,
+      "device": "mps",
+      "micro_batch_size": 16,
+      "micros_per_batch": 4,
+      "ema_decay_batch": 0.95,
+      "lr_batch": 0.0003,
+      "batches_per_super": 4,
+      "ema_decay_super": 0.95,
+      "lr_super": 0.0003,
+      "weight_decay": 0.1
+    },
+    "best_val_loss": 1.9698988795280457,
+    "final_val_loss": 1.9698988795280457,
+    "final_train_loss": 1.937918181322059,
+    "elapsed": 18.774365186691284,
+    "log": [
+      {
+        "tokens_seen": 200704,
+        "train_loss": 3.184215183160743,
+        "val_loss": 2.877182197570801,
+        "elapsed": 1.8364808559417725
+      },
+      {
+        "tokens_seen": 401408,
+        "train_loss": 2.561302056117934,
+        "val_loss": 2.7195568799972536,
+        "elapsed": 3.66087007522583
+      },
+      {
+        "tokens_seen": 600064,
+        "train_loss": 2.4897521377838765,
+        "val_loss": 2.6233336448669435,
+        "elapsed": 5.483905076980591
+      },
+      {
+        "tokens_seen": 800768,
+        "train_loss": 2.4462457870950503,
+        "val_loss": 2.5441056728363036,
+        "elapsed": 7.352406024932861
+      },
+      {
+        "tokens_seen": 1001472,
+        "train_loss": 2.377289112733335,
+        "val_loss": 2.4137675523757935,
+        "elapsed": 9.25209903717041
+      },
+      {
+        "tokens_seen": 1200128,
+        "train_loss": 2.2615178786602215,
+        "val_loss": 2.297869062423706,
+        "elapsed": 11.152917861938477
+      },
+      {
+        "tokens_seen": 1400832,
+        "train_loss": 2.1534220004568296,
+        "val_loss": 2.161728310585022,
+        "elapsed": 13.051432132720947
+      },
+      {
+        "tokens_seen": 1601536,
+        "train_loss": 2.0737758753251057,
+        "val_loss": 2.140105438232422,
+        "elapsed": 14.948523044586182
+      },
+      {
+        "tokens_seen": 1800192,
+        "train_loss": 2.0017628301050245,
+        "val_loss": 2.076179587841034,
+        "elapsed": 16.840467929840088
+      },
+      {
+        "tokens_seen": 2000896,
+        "train_loss": 1.937918181322059,
+        "val_loss": 1.9698988795280457,
+        "elapsed": 18.774365186691284
+      }
+    ],
+    "sample": "\nThat you.\n\nSecaus lord'sed is his poven:\nA have mes the fall man, good,\nThere as, the sont, but grace the dentre\nThis de the the at is be base on hat tears\nOf may fat we fir calised.\n\nBISLAndey disher"
+  }
+]
