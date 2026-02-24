@@ -324,7 +324,7 @@ DATASETS: list[Dataset] = [
         hf_subset=None,
         text_column="content",
         category=Category.CODE,
-        stage_weights={1: 0.06, 2: 0.06, 3: 0.05},
+        stage_weights={1: 0.12, 2: 0.12, 3: 0.10},
     ),
     # =========================================================================
     # CODE — GitHub auxiliary (all stages)
