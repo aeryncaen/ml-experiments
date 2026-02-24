@@ -59,7 +59,7 @@ class HParams:
     yamit_use_idx: bool = _env_bool("YAMIT_USE_IDX", True)  # insert EOS between docs using .idx offsets
     yamit_eos_token_id: int = _env_int("YAMIT_EOS_TOKEN_ID", 149727)
 
-    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn | moe
+    model_type: str = os.environ.get("MODEL_TYPE", "transformer")  # transformer | feat_attn | fused_seq_feat | fused_qkv | three_stage | three_stage_fsa | qvo | dual_q | transformer_shift | transformer_gate | fused_gate | transformer_s4d | s6 | ulb | ulb_fa | ulb_2d | byte_attn | moe | ngpt_moe
     vocab_size: int = _env_int("VOCAB_SIZE", 50304)
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
@@ -1455,11 +1455,47 @@ class NGPTBlock(nn.Module):
         return x
 
 
+class NGPTMoEBlock(nn.Module):
+    """nGPT transformer block with MoE MLP.
+
+    Same LERP-on-hypersphere update as NGPTBlock, but replaces the dense MLP
+    with a top-k gated Mixture of Experts. No RMSNorm — hidden state stays
+    unit-norm throughout.
+    """
+
+    def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int,
+                 bypass: bool = False, shared_frac: float = 0.0, bias_lr: float = 0.001):
+        super().__init__()
+        self.attn = NGPTSelfAttention(d_model, n_head)
+        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass,
+                          shared_frac=shared_frac, bias_lr=bias_lr)
+
+        # Eigen learning rates (per embedding dimension)
+        alpha_init = HP.ngpt_alpha_init if HP.ngpt_alpha_init > 0 else 1.0 / HP.n_layer
+        alpha_scale = HP.ngpt_alpha_scale if HP.ngpt_alpha_scale > 0 else 1.0 / math.sqrt(d_model)
+        self.alpha_attn = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
+        self.alpha_mlp = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autograd.profiler.record_function("ngpt_moe/block_attn"):
+            h_a = _unit_norm(self.attn(x))
+            alpha_a = _ngpt_actual(self.alpha_attn).abs()
+            x = _unit_norm(x + alpha_a * (h_a - x))
+        with torch.autograd.profiler.record_function("ngpt_moe/block_mlp"):
+            h_m, _ = self.mlp(x)  # MoEMLP returns (out, aux_loss=0)
+            h_m = _unit_norm(h_m)
+            alpha_m = _ngpt_actual(self.alpha_mlp).abs()
+            x = _unit_norm(x + alpha_m * (h_m - x))
+        return x
+
+
 def _ngpt_normalize_weights(model: nn.Module):
     """Post-optimizer-step: normalize all weight matrices along embedding dim.
 
     nn.Linear weight is (out, in) — normalize along dim=1 (input/embedding dim).
     nn.Embedding weight is (vocab, dim) — normalize along dim=1 (embedding dim).
+    MoEMLP expert weights (E, out, in) — normalize along dim=2 (input dim) for
+    gate/up, dim=1 (output/hidden dim) for down.
     This keeps all dot products interpretable as cosine similarities.
     """
     with torch.no_grad():
@@ -1468,6 +1504,17 @@ def _ngpt_normalize_weights(model: nn.Module):
                 m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
             elif isinstance(m, nn.Embedding):
                 m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
+            elif isinstance(m, MoEMLP):
+                # gate_expert, up_expert: (E, hidden, d_model) — normalize along input dim=2
+                m.gate_expert.div_(m.gate_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
+                m.up_expert.div_(m.up_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
+                # down_expert: (E, d_model, hidden) — normalize along input dim=2
+                m.down_expert.div_(m.down_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
+                # Shared weights if present
+                if m.shared_hidden > 0:
+                    m.gate_shared.div_(m.gate_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
+                    m.up_shared.div_(m.up_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
+                    m.down_shared.div_(m.down_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
 
 
 def _ngpt_normalize_pit_memory(model: nn.Module):
@@ -3543,6 +3590,52 @@ class GPTMoE(nn.Module):
         return logits, loss
 
 
+class GPTNGPTMoE(nn.Module):
+    """nGPT with Mixture of Experts MLP — LERP updates on the hypersphere + MoE."""
+
+    def __init__(self):
+        super().__init__()
+        self.wte, self.lm_head = _make_embed_head_pair()
+        self.blocks = nn.ModuleList([
+            NGPTMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k,
+                         bypass=HP.moe_bypass, shared_frac=HP.moe_shared, bias_lr=HP.moe_bias_lr)
+            for _ in range(HP.n_layer)
+        ])
+        self.ln_f = nn.Identity()  # nGPT: hidden state is already unit-norm
+        # Logit scaling: per-vocab learnable temperature
+        s_z_scale = 1.0 / math.sqrt(HP.d_model)
+        self.s_z = _ngpt_scale_param((HP.vocab_size,), HP.ngpt_sz_init, s_z_scale)
+        self.apply(_init_weights)
+        _tie_weights(self)
+        _ngpt_normalize_weights(self)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        x = _unit_norm(self.wte(idx))
+        x = _run_blocks(self.blocks, x)
+        # x is already unit-norm from the blocks
+        if targets is not None and isinstance(self.lm_head, DecoderHead):
+            vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
+            loss = self.lm_head.streamed_cross_entropy(
+                x,
+                targets,
+                vocab_chunk_size=vocab_chunk,
+                token_chunk_size=HP.decoder_head_token_chunk,
+            )
+            self._last_acc = None
+            return None, loss
+        if targets is not None and isinstance(self.lm_head, BucketedCompositePITHead):
+            total_loss, _, _, acc = self.lm_head.routed_cross_entropy(x, targets)
+            self._last_acc = acc
+            return None, total_loss
+        logits = self.lm_head(x)
+        logits = logits * _ngpt_actual(self.s_z)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            self._last_acc = (logits.detach().argmax(-1) == targets).float().mean()
+        return logits, loss
+
+
 # ── LLaDA wrapper ───────────────────────────────────────────────────────────
 
 class LLaDAWrapper(nn.Module):
@@ -3657,12 +3750,14 @@ def build_model() -> nn.Module:
         return GPTByteAttn()
     if HP.model_type == "moe":
         return GPTMoE()
+    if HP.model_type == "ngpt_moe":
+        return GPTNGPTMoE()
     raise ValueError(f"Unknown MODEL_TYPE={HP.model_type}")
 
 
 def _llada_apply_head_override(backbone: nn.Module) -> nn.Module:
     """For LLaDA, allow any backbone to use the configured LM head type."""
-    if HP.model_type in ("transformer", "moe"):
+    if HP.model_type in ("transformer", "moe", "ngpt_moe"):
         # These already route through _make_embed_head_pair().
         return backbone
 
@@ -3768,9 +3863,9 @@ def main():
     if HP.model_type == "feat_attn" or HP.feat_attn_mlp:
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
-    if HP.model_type == "moe":
+    if HP.model_type in ("moe", "ngpt_moe"):
         _extra += f" n_experts={HP.n_experts} top_k={HP.top_k} bypass={HP.moe_bypass} shared={HP.moe_shared} bias_lr={HP.moe_bias_lr}"
-    _head = _resolved_head_type() if HP.model_type in ("transformer", "moe") else "fixed"
+    _head = _resolved_head_type() if HP.model_type in ("transformer", "moe", "ngpt_moe") else "fixed"
     if _head == "bucketed_pit":
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag} pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={HP.pit_bucket_mode}"
     elif _head == "pit":
@@ -3822,7 +3917,8 @@ def main():
             no_decay_params.append(p)
         else:
             decay_params.append(p)
-    _wd = 0.0 if HP.ngpt else HP.weight_decay
+    _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
+    _wd = 0.0 if _is_ngpt else HP.weight_decay
     print0(rank, f"optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params (wd={_wd})")
     param_groups = [
         {"params": decay_params, "weight_decay": _wd},
@@ -3961,7 +4057,7 @@ def main():
         else:
             grad_norm = torch.cat([p.grad.flatten() for p in _all_params if p.grad is not None]).norm()
         optimizer.step()
-        if HP.ngpt:
+        if _is_ngpt:
             _ngpt_normalize_weights(raw_model)
             _ngpt_normalize_pit_memory(raw_model)
 
