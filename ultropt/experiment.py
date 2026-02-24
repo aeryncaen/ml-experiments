@@ -25,7 +25,7 @@ from train import (
 
 # --- Standard GPT grids ---
 THREE_TIER_GRID = {
-    "micro_batch_size":   [64],
+    "micro_batch_size":   [256],
     "micros_per_batch":   [2, 4, 8],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.85, 0.9, 0.95],
@@ -35,7 +35,7 @@ THREE_TIER_GRID = {
 }
 
 THREE_TIER_GRID_SMALL = {
-    "micro_batch_size":   [64],
+    "micro_batch_size":   [256],
     "micros_per_batch":   [2],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.85, 0.9],
@@ -46,7 +46,7 @@ THREE_TIER_GRID_SMALL = {
 
 # --- nGPT grids (Riemannian SGD needs much higher LRs) ---
 NGPT_THREE_TIER_GRID = {
-    "micro_batch_size":   [64],
+    "micro_batch_size":   [256],
     "micros_per_batch":   [2, 4],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.8, 0.85, 0.9, 0.95, 0.98, 0.99],
@@ -56,7 +56,7 @@ NGPT_THREE_TIER_GRID = {
 }
 
 NGPT_THREE_TIER_GRID_SMALL = {
-    "micro_batch_size":   [64],
+    "micro_batch_size":   [256],
     "micros_per_batch":   [2],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.8, 0.85, 0.9, 0.95, 0.98, 0.99],
@@ -99,7 +99,7 @@ def run_experiment(
     data_dir: str = "../tokenized",
     tokenizer_dir: str = "../experiments/yamit/tokenizer/artifacts/yamit",
     seq_len: int = 256,
-    batch_size: int = 64,
+    batch_size: int = 256,
     compile: bool = True,
 ):
     """
