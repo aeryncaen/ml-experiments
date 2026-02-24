@@ -1483,7 +1483,11 @@ class NGPTMoEBlock(nn.Module):
             x = _unit_norm(x + alpha_a * (h_a - x))
         with torch.autograd.profiler.record_function("ngpt_moe/block_mlp"):
             h_m, _ = self.mlp(x)  # MoEMLP returns (out, aux_loss=0)
-            h_m = _unit_norm(h_m)
+            # Dropped tokens (capacity overflow) get near-zero output from MoE.
+            # Normalizing near-zero vectors explodes gradients, so fall back to x
+            # (no update) for those tokens: alpha * (x - x) = 0.
+            h_m_norm = h_m.norm(dim=-1, keepdim=True)
+            h_m = torch.where(h_m_norm > 1e-6, h_m / h_m_norm.clamp(min=1e-8), x)
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
             x = _unit_norm(x + alpha_m * (h_m - x))
         return x
