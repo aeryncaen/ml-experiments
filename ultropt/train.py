@@ -54,7 +54,7 @@ class BaseConfig:
 @dataclass
 class BaselineConfig(BaseConfig):
     """Config for vanilla single-LR training."""
-    batch_size: int = 256
+    batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-1
 
@@ -68,7 +68,7 @@ class ThreeTierConfig(BaseConfig):
     Super level  : every `batches_per_super` batches, step with lr_super (SMALL).
     """
     # micro-batch — no step, just accumulate
-    micro_batch_size: int = 256
+    micro_batch_size: int = 64
     micros_per_batch: int = 4
     ema_decay_batch: float = 0.95
     # batch — primary optimizer step

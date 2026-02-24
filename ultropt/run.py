@@ -38,7 +38,7 @@ def main():
                         help="Tokenizer artifacts directory (with artifact_meta.json)")
     parser.add_argument("--seq-len", type=int, default=256,
                         help="Sequence length (default 256)")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for baseline and micro_batch_size for three-tier")
     # infra
     parser.add_argument("--device", type=str, default=None,
