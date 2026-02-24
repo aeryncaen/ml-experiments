@@ -25,7 +25,7 @@ from train import (
 
 # --- Standard GPT grids ---
 THREE_TIER_GRID = {
-    "micro_batch_size":   [16],
+    "micro_batch_size":   [64],
     "micros_per_batch":   [2, 4, 8],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.85, 0.9, 0.95],
@@ -35,7 +35,7 @@ THREE_TIER_GRID = {
 }
 
 THREE_TIER_GRID_SMALL = {
-    "micro_batch_size":   [16],
+    "micro_batch_size":   [64],
     "micros_per_batch":   [2],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.85, 0.9],
@@ -46,7 +46,7 @@ THREE_TIER_GRID_SMALL = {
 
 # --- nGPT grids (Riemannian SGD needs much higher LRs) ---
 NGPT_THREE_TIER_GRID = {
-    "micro_batch_size":   [16],
+    "micro_batch_size":   [64],
     "micros_per_batch":   [2, 4],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.8, 0.85, 0.9, 0.95, 0.98, 0.99],
@@ -56,7 +56,7 @@ NGPT_THREE_TIER_GRID = {
 }
 
 NGPT_THREE_TIER_GRID_SMALL = {
-    "micro_batch_size":   [16],
+    "micro_batch_size":   [64],
     "micros_per_batch":   [2],
     "batches_per_super":  [2, 4],
     "ema_decay_batch":    [0.8, 0.85, 0.9, 0.95, 0.98, 0.99],
@@ -91,11 +91,16 @@ def _grid_configs(grid: dict, base_overrides: dict | None = None):
 
 def run_experiment(
     grid: str = "small",
-    total_tokens: int = 2_000_000,
-    eval_every_tokens: int = 200_000,
+    total_tokens: int = 20_000_000,
+    eval_every_tokens: int = 2_000_000,
     baseline_lr: float = 3e-4,
     device: str | None = None,
     ngpt: bool = False,
+    data_dir: str = "../tokenized",
+    tokenizer_dir: str = "../experiments/yamit/tokenizer/artifacts/yamit",
+    seq_len: int = 256,
+    batch_size: int = 64,
+    compile: bool = True,
 ):
     """
     Run baseline + grid of three-tier configs.
@@ -112,6 +117,10 @@ def run_experiment(
         "eval_every_tokens": eval_every_tokens,
         "device": device,
         "ngpt": ngpt,
+        "data_dir": data_dir,
+        "tokenizer_dir": tokenizer_dir,
+        "seq_len": seq_len,
+        "compile": compile,
     }
 
     # --- Baseline ---
@@ -119,14 +128,18 @@ def run_experiment(
     print(f"BASELINE ({model_tag})")
     print("=" * 70)
     bcfg = BaselineConfig(
-        batch_size=16,
+        batch_size=batch_size,
         lr=baseline_lr,
         total_tokens=total_tokens,
         eval_every_tokens=eval_every_tokens,
         device=device,
         ngpt=ngpt,
+        data_dir=data_dir,
+        tokenizer_dir=tokenizer_dir,
+        seq_len=seq_len,
+        compile=compile,
     )
-    blog, bmodel, tokenizer = train_baseline(bcfg)
+    blog, bmodel, tok_meta = train_baseline(bcfg)
     best_val = min(entry["val_loss"] for entry in blog)
     results.append({
         "name": "baseline",
@@ -138,12 +151,7 @@ def run_experiment(
         "log": blog,
     })
 
-    # Generate a sample from baseline
-    dev = next(bmodel.parameters()).device
-    seed = torch.tensor([[tokenizer.stoi["\n"]]], dtype=torch.long, device=dev)
-    sample = tokenizer.decode(bmodel.generate(seed, max_new_tokens=200, temperature=0.8)[0].tolist())
-    results[-1]["sample"] = sample
-    print(f"\n  Baseline sample:\n{sample[:300]}\n")
+    print(f"\n  Baseline best val: {best_val:.4f}\n")
 
     # --- Three-tier grid ---
     if ngpt:
@@ -175,11 +183,6 @@ def run_experiment(
             "log": tlog,
         })
 
-        dev = next(tmodel.parameters()).device
-        seed = torch.tensor([[tokenizer.stoi["\n"]]], dtype=torch.long, device=dev)
-        sample = tokenizer.decode(tmodel.generate(seed, max_new_tokens=200, temperature=0.8)[0].tolist())
-        results[-1]["sample"] = sample
-
     return results
 
 
@@ -204,8 +207,6 @@ def print_summary(results):
 
     best = min(results, key=lambda r: r["best_val_loss"])
     print(f"\nBest config: {best['name']}  (val_loss = {best['best_val_loss']:.4f})")
-    if best.get("sample"):
-        print(f"\nSample from best model:\n{best['sample'][:500]}")
 
 
 def save_results(results, path="results.json"):

@@ -1,72 +1,115 @@
 """
-Shakespeare dataset: download, tokenize (char-level), and batch.
+Data loading for ultropt experiments.
+
+Reads tokenized yamit shards (.bin uint32 + .idx doc boundaries).
+Tokenizer metadata (vocab_size, eos) loaded from artifact_meta.json.
 """
 
+import glob
+import json
 import os
-import urllib.request
+from pathlib import Path
+
+import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-
-DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DATA_FILE = os.path.join(DATA_DIR, "shakespeare.txt")
 
 
-def download_shakespeare():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(DATA_FILE):
-        print(f"Downloading Shakespeare to {DATA_FILE} ...")
-        urllib.request.urlretrieve(DATA_URL, DATA_FILE)
-    with open(DATA_FILE, "r") as f:
-        text = f.read()
-    return text
+# ---------------------------------------------------------------------------
+# Tokenizer metadata
+# ---------------------------------------------------------------------------
+
+def load_tokenizer_meta(tokenizer_dir: str) -> dict:
+    """Load artifact_meta.json from a yamit tokenizer artifacts directory.
+
+    Returns dict with at least: vocab_size (int), eos_token_id (int).
+    """
+    meta_path = os.path.join(tokenizer_dir, "artifact_meta.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return {
+        "vocab_size": meta["final_vocab_size"],
+        "eos_token_id": meta["special_tokens"]["eos"],
+        "raw": meta,
+    }
 
 
-class CharTokenizer:
-    """Dead-simple char-level tokenizer."""
+# ---------------------------------------------------------------------------
+# Shard loading
+# ---------------------------------------------------------------------------
 
-    def __init__(self, text):
-        chars = sorted(set(text))
-        self.stoi = {c: i for i, c in enumerate(chars)}
-        self.itos = {i: c for c, i in self.stoi.items()}
-        self.vocab_size = len(chars)
-
-    def encode(self, s):
-        return [self.stoi[c] for c in s]
-
-    def decode(self, ids):
-        return "".join(self.itos[i] for i in ids)
-
-
-class ShakespeareDataset(Dataset):
-    def __init__(self, data_tensor, block_size):
-        self.data = data_tensor
-        self.block_size = block_size
-
-    def __len__(self):
-        return len(self.data) - self.block_size
-
-    def __getitem__(self, idx):
-        x = self.data[idx : idx + self.block_size]
-        y = self.data[idx + 1 : idx + self.block_size + 1]
-        return x, y
+def _load_data_shard(file: Path, eos_token_id: int) -> torch.Tensor:
+    """Load a yamit .bin shard.  Insert EOS between documents if .idx exists."""
+    tokens_np = np.fromfile(str(file), dtype=np.uint32)
+    idx_path = file.with_suffix(".idx")
+    if idx_path.exists():
+        offsets = np.fromfile(str(idx_path), dtype=np.uint64)
+        if offsets.size >= 2:
+            tok_off = offsets // 4  # byte offsets -> token offsets
+            docs = []
+            eos = np.array([eos_token_id], dtype=np.uint32)
+            for i in range(len(tok_off) - 1):
+                s, e = int(tok_off[i]), int(tok_off[i + 1])
+                if e > s:
+                    docs.append(tokens_np[s:e])
+                    docs.append(eos)
+            if docs:
+                tokens_np = np.concatenate(docs)
+    return torch.from_numpy(tokens_np.astype(np.int64)).pin_memory()
 
 
-def get_datasets(block_size=128, val_frac=0.1):
-    """Return (train_dataset, val_dataset, tokenizer)."""
-    text = download_shakespeare()
-    tokenizer = CharTokenizer(text)
-    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+# ---------------------------------------------------------------------------
+# ShardStream — simple memmap-based batch iterator
+# ---------------------------------------------------------------------------
 
-    n = len(data)
-    split = int(n * (1 - val_frac))
-    train_data = data[:split]
-    val_data = data[split:]
+class ShardStream:
+    """Streams (x, y) batches from tokenized binary shards.
 
-    train_ds = ShakespeareDataset(train_data, block_size)
-    val_ds = ShakespeareDataset(val_data, block_size)
-    return train_ds, val_ds, tokenizer
+    Single-process, no DataLoader overhead.  Cycles through shards.
+    Designed for single-GPU (rank=0, world_size=1) but supports DDP.
+    """
 
+    def __init__(
+        self,
+        pattern: str,
+        seq_len: int,
+        batch_size: int,
+        eos_token_id: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        self.files = [Path(f) for f in sorted(glob.glob(pattern, recursive=True))]
+        if not self.files:
+            raise FileNotFoundError(f"No .bin files matched: {pattern}")
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.eos_token_id = eos_token_id
+        self.rank = rank
+        self.world_size = world_size
+        self.tokens_per_rank = seq_len * batch_size
+        self.tokens_per_global_step = self.tokens_per_rank * world_size
+        self.file_idx = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[0], eos_token_id)
 
-def make_loader(dataset, batch_size, shuffle=True):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    def _advance_shard(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = _load_data_shard(self.files[self.file_idx], self.eos_token_id)
+        self.pos = 0
+
+    def reset(self):
+        """Reset to start of first shard (for deterministic val eval)."""
+        self.file_idx = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[0], self.eos_token_id)
+
+    def next_batch(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        needed = self.tokens_per_global_step + 1
+        if self.pos + needed >= self.tokens.numel():
+            self._advance_shard()
+        start = self.pos + self.rank * self.tokens_per_rank
+        end = start + self.tokens_per_rank + 1
+        buf = self.tokens[start:end]
+        self.pos += self.tokens_per_global_step
+        x = buf[:-1].view(self.batch_size, self.seq_len)
+        y = buf[1:].view(self.batch_size, self.seq_len)
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
