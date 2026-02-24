@@ -316,8 +316,16 @@ DATASETS: list[Dataset] = [
         stage_weights={2: 0.02, 3: 0.05},
     ),
     # =========================================================================
-    # CODE — Stack sources removed (local policy)
+    # CODE — StarCoder / The Stack
     # =========================================================================
+    Dataset(
+        name="starcoder",
+        hf_path="bigcode/starcoderdata",
+        hf_subset=None,
+        text_column="content",
+        category=Category.CODE,
+        stage_weights={1: 0.06, 2: 0.06, 3: 0.05},
+    ),
     # =========================================================================
     # CODE — GitHub auxiliary (all stages)
     # =========================================================================
