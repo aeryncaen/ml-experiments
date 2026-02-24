@@ -272,17 +272,10 @@ def _load_data_shard(file: Path) -> torch.Tensor:
 
 
 class ShardStream:
-    def __init__(self, pattern: str, rank: int, world_size: int, seq_len: int, batch_size: int,
-                 shuffle: bool = False, seed: int = 42):
-        # Recursive glob for subdirectory structures (e.g. YAMIT per-source dirs)
-        files = sorted(glob.glob(pattern, recursive=True))
-        if not files:
+    def __init__(self, pattern: str, rank: int, world_size: int, seq_len: int, batch_size: int):
+        self.files = [Path(f) for f in sorted(glob.glob(pattern, recursive=True))]
+        if not self.files:
             raise FileNotFoundError(f"No files matched pattern: {pattern}")
-        if shuffle:
-            import random
-            rng = random.Random(seed)
-            rng.shuffle(files)
-        self.files = [Path(f) for f in files]
         self.rank = rank
         self.world_size = world_size
         self.seq_len = seq_len
@@ -315,6 +308,111 @@ class ShardStream:
         x = buf[:-1].to(dtype=torch.int64).view(self.batch_size, self.seq_len)
         y = buf[1:].to(dtype=torch.int64).view(self.batch_size, self.seq_len)
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+
+class _SourceBuffer:
+    """Single data-source token stream. Returns one (seq_len+1) chunk at a time."""
+
+    def __init__(self, files: list[Path], seq_len: int):
+        self.files = files
+        self.seq_len = seq_len
+        self.file_idx = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[0])
+        self.n_tokens = sum(
+            Path(f).stat().st_size // (4 if HP.data_format == "yamit" else 2)
+            for f in self.files
+        )
+
+    def reset(self):
+        self.file_idx = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[0])
+
+    def next_seq(self) -> tuple[torch.Tensor, torch.Tensor]:
+        needed = self.seq_len + 1
+        if self.pos + needed > self.tokens.numel():
+            self.file_idx = (self.file_idx + 1) % len(self.files)
+            self.tokens = _load_data_shard(self.files[self.file_idx])
+            self.pos = 0
+        buf = self.tokens[self.pos : self.pos + needed]
+        self.pos += self.seq_len
+        return buf[:-1].to(dtype=torch.int64), buf[1:].to(dtype=torch.int64)
+
+
+class MixedShardStream:
+    """Multi-source data stream with proportional mixing.
+
+    Discovers source directories, creates per-source buffers, and samples
+    sources proportionally (by token volume) for each sequence in a batch.
+    Every batch contains a representative mix of all sources.
+    """
+
+    def __init__(self, pattern: str, rank: int, world_size: int,
+                 seq_len: int, batch_size: int, seed: int = 42):
+        import random as _random
+        all_files = sorted(glob.glob(pattern, recursive=True))
+        if not all_files:
+            raise FileNotFoundError(f"No files matched pattern: {pattern}")
+
+        # Group files by parent directory = source name
+        sources: dict[str, list[Path]] = {}
+        for f in all_files:
+            p = Path(f)
+            source = p.parent.name
+            sources.setdefault(source, []).append(p)
+
+        # If all files are in the same directory (flat layout), fall back to
+        # treating the whole thing as one source
+        if len(sources) == 1 and list(sources.keys())[0] in ("train", "val"):
+            sources = {"all": [Path(f) for f in all_files]}
+
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.rank = rank
+
+        # Build per-source buffers
+        self.source_names: list[str] = sorted(sources.keys())
+        self.buffers: list[_SourceBuffer] = []
+        self.weights: list[float] = []
+        for name in self.source_names:
+            buf = _SourceBuffer(sorted(sources[name]), seq_len)
+            self.buffers.append(buf)
+            self.weights.append(float(buf.n_tokens))
+
+        total = sum(self.weights)
+        self.probs = [w / total for w in self.weights]
+        self.n_sources = len(self.source_names)
+        self._seed = seed + rank
+        self.rng = _random.Random(self._seed)
+
+        # For compatibility with code that checks .files
+        self.files = [Path(f) for f in all_files]
+
+    def reset(self):
+        """Reset all source buffers and RNG for deterministic eval."""
+        import random as _random
+        for buf in self.buffers:
+            buf.reset()
+        self.rng = _random.Random(self._seed)
+
+    def next_batch(self, device: torch.device):
+        xs: list[torch.Tensor] = []
+        ys: list[torch.Tensor] = []
+        for _ in range(self.batch_size):
+            src_idx = self.rng.choices(range(self.n_sources), weights=self.probs, k=1)[0]
+            x, y = self.buffers[src_idx].next_seq()
+            xs.append(x)
+            ys.append(y)
+        x = torch.stack(xs).to(device, non_blocking=True)
+        y = torch.stack(ys).to(device, non_blocking=True)
+        return x, y
+
+    def source_summary(self) -> str:
+        parts = []
+        for name, prob in zip(self.source_names, self.probs):
+            parts.append(f"{name}={prob:.3f}")
+        return f"{self.n_sources} sources: {', '.join(parts)}"
 
 
 class Mamba3Mixer(nn.Module):
@@ -3685,12 +3783,15 @@ def main():
         _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
         print0(rank, _llada_feats)
 
-    _shuffle_shards = HP.data_format == "yamit"
-    train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size,
-                               shuffle=_shuffle_shards, seed=42)
-    val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size,
-                             shuffle=_shuffle_shards, seed=1337)
-    print0(rank, f"train_shards={len(train_stream.files)} val_shards={len(val_stream.files)} shuffle={_shuffle_shards}")
+    if HP.data_format == "yamit":
+        train_stream = MixedShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size, seed=42)
+        val_stream = MixedShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size, seed=1337)
+        print0(rank, f"train: {train_stream.source_summary()}")
+        print0(rank, f"val:   {val_stream.source_summary()}")
+    else:
+        train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
+        val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
+        print0(rank, f"train_shards={len(train_stream.files)} val_shards={len(val_stream.files)}")
 
     model = build_model_maybe_llada().to(device)
     n_params = sum(p.numel() for p in model.parameters())
