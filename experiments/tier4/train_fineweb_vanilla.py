@@ -97,11 +97,11 @@ class HParams:
     val_steps: int = _env_int("VAL_STEPS", 32)
     val_every: int = _env_int("VAL_EVERY", 100)
     lr: float = _env_float("LR", 3e-4)
-    warmup_frac: float = _env_float("WARMUP_FRAC", 0.02)  # fraction of train_steps for warmup
+    warmup_frac: float = _env_float("WARMUP_FRAC", 0.02)  # fraction of total tokens for warmup (no grad_accum during warmup)
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
-    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of steps for decay phase
+    wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
@@ -3670,24 +3670,25 @@ def build_model_maybe_llada() -> nn.Module:
     return backbone
 
 
-def lr_for_step(step: int) -> float:
-    warmup_steps = int(HP.train_steps * HP.warmup_frac)
+def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
+    """LR schedule based on fraction of total tokens consumed."""
+    warmup_tokens = int(total_tokens * HP.warmup_frac)
     # Warmup phase (same for all schedules)
-    if step < warmup_steps:
-        return HP.lr * (step + 1) / max(1, warmup_steps)
+    if tokens_seen < warmup_tokens:
+        return HP.lr * tokens_seen / max(1, warmup_tokens)
 
     if HP.lr_schedule == "wsd":
         # Warmup-Stable-Decay: hold peak LR, then cosine decay in final fraction
-        decay_steps = int(HP.train_steps * HP.wsd_decay_frac)
-        stable_end = HP.train_steps - decay_steps
-        if step <= stable_end:
+        decay_tokens = int(total_tokens * HP.wsd_decay_frac)
+        stable_end = total_tokens - decay_tokens
+        if tokens_seen <= stable_end:
             return HP.lr
         # Cosine decay from peak to ~0 over the decay phase
-        t = (step - stable_end) / max(1, decay_steps)
+        t = (tokens_seen - stable_end) / max(1, decay_tokens)
         return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
     else:
-        # Default: cosine decay from warmup end to train_steps
-        t = (step - warmup_steps) / max(1, HP.train_steps - warmup_steps)
+        # Default: cosine decay from warmup end to total_tokens
+        t = (tokens_seen - warmup_tokens) / max(1, total_tokens - warmup_tokens)
         return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
 
 
@@ -3774,8 +3775,9 @@ def main():
         _sched += f" decay_frac={HP.wsd_decay_frac}"
     _eff_bs = HP.batch_size * HP.grad_accum
     _tok_per_step = _eff_bs * HP.seq_len
+    _warmup_tok_per_step = HP.batch_size * HP.seq_len
     print0(rank, f"model_type={HP.model_type} lm_head={_head} layers={HP.n_layer} heads={HP.n_head} d_model={HP.d_model} seq_len={HP.seq_len}{_extra} {_sched}")
-    print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tokens/step={_tok_per_step:,} vocab={HP.vocab_size} data_format={HP.data_format}")
+    print0(rank, f"batch_size={HP.batch_size} grad_accum={HP.grad_accum} effective_batch={_eff_bs} tok/step(stable)={_tok_per_step:,} tok/step(warmup)={_warmup_tok_per_step:,} vocab={HP.vocab_size} data_format={HP.data_format}")
     if HP.llada:
         _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
         print0(rank, _llada_feats)
@@ -3845,25 +3847,39 @@ def main():
         _ch_weights = _ch_source_losses / _ch_source_losses.sum()  # init equal weights
         print0(rank, f"ch_loss=True sources={_ch_n_src} ({', '.join(train_stream.source_names)})")
 
+    # Token-based schedule: total tokens budget is fixed regardless of grad_accum changes
+    _tok_per_micro = HP.batch_size * HP.seq_len
+    _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
+    _warmup_tokens = int(_total_tokens * HP.warmup_frac)
+    print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
+
     t0 = time.time()
-    for step in range(HP.train_steps + 1):
-        if step % HP.val_every == 0 or step == HP.train_steps:
+    tokens_seen = 0
+    step = 0
+    while tokens_seen <= _total_tokens:
+        if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
             val_loss, val_acc = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
-            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str}")
-            if step == HP.train_steps:
+            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            if tokens_seen >= _total_tokens:
                 break
 
-        lr = lr_for_step(step)
+        # During warmup: no grad_accum (raw batch_size, faster steps)
+        _in_warmup = tokens_seen < _warmup_tokens
+        _eff_accum = 1 if _in_warmup else HP.grad_accum
+
+        lr = lr_for_tokens(tokens_seen, _total_tokens)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
         # Per-source loss accumulators for contraharmonic weighting
-        if _ch_on:
+        # CH_LOSS only active after warmup
+        _ch_active = _ch_on and not _in_warmup
+        if _ch_active:
             _ch_src_loss_sum = torch.zeros(_ch_n_src, device=device)
             _ch_src_count = torch.zeros(_ch_n_src, device=device)
-        for _micro in range(HP.grad_accum):
+        for _micro in range(_eff_accum):
             _tbatch = train_stream.next_batch(device)
             x, y = _tbatch[0], _tbatch[1]
             src_ids = _tbatch[2] if len(_tbatch) > 2 else None
@@ -3881,7 +3897,7 @@ def main():
                 else:
                     logits, loss = model(x, y)
                 # Contraharmonic loss: reweight per-sequence losses by source
-                if _ch_on and logits is not None and src_ids is not None:
+                if _ch_active and logits is not None and src_ids is not None:
                     B, T, V = logits.shape
                     per_tok = F.cross_entropy(logits.view(-1, V), y.view(-1), reduction='none').view(B, T)
                     per_seq = per_tok.mean(dim=1)  # (B,)
@@ -3894,10 +3910,11 @@ def main():
                     # Apply contraharmonic weights from previous step
                     seq_w = _ch_weights[src_ids]  # (B,)
                     loss = (per_seq * seq_w).sum() / seq_w.sum()
-            loss = loss / HP.grad_accum
+            loss = loss / _eff_accum
             loss.backward()
+            tokens_seen += _tok_per_micro
         # Update contraharmonic weights for next step
-        if _ch_on:
+        if _ch_active:
             for _si in range(_ch_n_src):
                 if _ch_src_count[_si] > 0:
                     _ch_source_losses[_si] = _ch_src_loss_sum[_si] / _ch_src_count[_si]
@@ -3914,17 +3931,20 @@ def main():
             _ngpt_normalize_pit_memory(raw_model)
 
         if step % 20 == 0:
-            loss_t = loss.detach() * HP.grad_accum
+            loss_t = loss.detach() * _eff_accum
             if world_size > 1:
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = (time.time() - t0) / max(1, step + 1)
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f}")
-            if _ch_on and step % 100 == 0 and step > 0:
+            _phase = "warmup" if _in_warmup else "stable"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+            if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
+
+        step += 1
 
         if profiler is not None:
             profiler.step()
