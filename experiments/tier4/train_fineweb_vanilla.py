@@ -155,6 +155,9 @@ class HParams:
 
     moe_bypass: bool = _env_bool("MOE_BYPASS", False)  # add a null expert that skips MLP
     moe_shared: float = _env_float("MOE_SHARED", 0.5)  # fraction of hidden dim shared across experts (0=none)
+    moe_n_group: int = _env_int("MOE_N_GROUP", 1)            # expert groups for group top-k (1=flat)
+    moe_topk_group: int = _env_int("MOE_TOPK_GROUP", 1)      # groups to select from
+    moe_scaling_factor: float = _env_float("MOE_SCALING_FACTOR", 1.0)  # routed weight scaling
 
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
@@ -1171,6 +1174,117 @@ class MoEMLP(nn.Module):
         return out.view(B, T, D), torch.tensor(0.0, device=x.device)
 
 
+class DSMoEMLP(nn.Module):
+    """DeepSeek/GLM-4-style MoE: sigmoid routing, group top-k, no token dropping,
+    separate shared expert as dense MLP, routed scaling factor.
+
+    Used by NGPTMoEBlock (MODEL_TYPE=ngpt_moe). Old MoEMLP kept for MODEL_TYPE=moe.
+    """
+
+    def __init__(self, d_model: int, n_experts: int, top_k: int,
+                 n_group: int = 1, topk_group: int = 1,
+                 scaling_factor: float = 1.0, bias_lr: float = 0.001):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.d_model = d_model
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.scaling_factor = scaling_factor
+        self.bias_lr = bias_lr
+
+        hidden = int(d_model * 8 / 3)
+        hidden = ((hidden + 255) // 256) * 256
+        self.hidden = hidden
+
+        # 3D expert weights: fused gate+up as (E, 2*hidden, d_model), down as (E, d_model, hidden)
+        self.gate_up_proj = nn.Parameter(torch.empty(n_experts, 2 * hidden, d_model))
+        self.down_proj = nn.Parameter(torch.empty(n_experts, d_model, hidden))
+
+        # Router: sigmoid-based (no softmax)
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+
+        # Loss-free balancing: gradient-isolated per-expert bias
+        self.register_buffer('expert_bias', torch.zeros(n_experts))
+
+        # Shared expert: separate dense SwiGLU MLP added to routed output
+        self.shared_gate_proj = nn.Linear(d_model, hidden, bias=False)
+        self.shared_up_proj = nn.Linear(d_model, hidden, bias=False)
+        self.shared_down_proj = nn.Linear(hidden, d_model, bias=False)
+
+        # Init
+        for p in [self.gate_up_proj, self.down_proj]:
+            nn.init.normal_(p, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)
+        N = x_flat.shape[0]
+        E = self.n_experts
+        K = self.top_k
+
+        # Sigmoid routing (fp32 for stability, cast weight explicitly for bf16 compat)
+        router_logits = F.linear(x_flat.float(), self.router.weight.float())
+        scores = router_logits.sigmoid()
+        scores_for_choice = scores + self.expert_bias
+
+        # Group-based top-k
+        if self.n_group > 1 and self.topk_group < self.n_group:
+            group_scores = (
+                scores_for_choice.view(N, self.n_group, E // self.n_group)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(-1, self.n_group, E // self.n_group)
+                .reshape(N, E)
+            )
+            scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+        topk_indices = torch.topk(scores_for_choice, k=K, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_indices)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.scaling_factor
+
+        # Loss-free balancing bias update
+        if self.training:
+            with torch.no_grad():
+                counts = torch.zeros(E, device=x.device)
+                counts.scatter_add_(0, topk_indices.view(-1),
+                                    torch.ones(N * K, device=x.device))
+                target = N * K / E
+                self.expert_bias += self.bias_lr * torch.sign(target - counts)
+
+        # No-drop expert loop with index_add_
+        with torch.no_grad():
+            expert_mask = F.one_hot(topk_indices, num_classes=E).permute(2, 1, 0)
+            expert_hit = expert_mask.sum(dim=(-1, -2)).nonzero()
+
+        final_out = torch.zeros(N, D, device=x.device, dtype=x_flat.dtype)
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = x_flat[token_idx]
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            current_out = F.linear(F.silu(gate) * up, self.down_proj[expert_idx])
+            current_out = current_out * topk_weights[token_idx, top_k_pos, None]
+            final_out.index_add_(0, token_idx, current_out.to(final_out.dtype))
+
+        # Shared expert (dense SwiGLU, added to routed output)
+        shared_out = self.shared_down_proj(
+            F.silu(self.shared_gate_proj(x_flat)) * self.shared_up_proj(x_flat)
+        )
+        final_out = final_out + shared_out
+
+        return final_out.view(B, T, D)
+
+
 class TransformerMoEBlock(nn.Module):
     """Pre-norm block: SelfAttention + MoEMLP. Returns (x, aux_loss)."""
 
@@ -1456,19 +1570,21 @@ class NGPTBlock(nn.Module):
 
 
 class NGPTMoEBlock(nn.Module):
-    """nGPT transformer block with MoE MLP.
+    """nGPT transformer block with DeepSeek-style MoE MLP.
 
     Same LERP-on-hypersphere update as NGPTBlock, but replaces the dense MLP
-    with a top-k gated Mixture of Experts. No RMSNorm — hidden state stays
-    unit-norm throughout.
+    with DSMoEMLP (sigmoid routing, group top-k, no token dropping, shared expert).
+    No RMSNorm — hidden state stays unit-norm throughout.
     """
 
     def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int,
-                 bypass: bool = False, shared_frac: float = 0.0, bias_lr: float = 0.001):
+                 n_group: int = 1, topk_group: int = 1,
+                 scaling_factor: float = 1.0, bias_lr: float = 0.001):
         super().__init__()
         self.attn = NGPTSelfAttention(d_model, n_head)
-        self.mlp = MoEMLP(d_model, n_experts, top_k, bypass=bypass,
-                          shared_frac=shared_frac, bias_lr=bias_lr)
+        self.mlp = DSMoEMLP(d_model, n_experts, top_k, n_group=n_group,
+                            topk_group=topk_group, scaling_factor=scaling_factor,
+                            bias_lr=bias_lr)
 
         # Eigen learning rates (per embedding dimension)
         alpha_init = HP.ngpt_alpha_init if HP.ngpt_alpha_init > 0 else 1.0 / HP.n_layer
@@ -1482,12 +1598,7 @@ class NGPTMoEBlock(nn.Module):
             alpha_a = _ngpt_actual(self.alpha_attn).abs()
             x = _unit_norm(x + alpha_a * (h_a - x))
         with torch.autograd.profiler.record_function("ngpt_moe/block_mlp"):
-            h_m, _ = self.mlp(x)  # MoEMLP returns (out, aux_loss=0)
-            # Dropped tokens (capacity overflow) get near-zero output from MoE.
-            # Normalizing near-zero vectors explodes gradients, so fall back to x
-            # (no update) for those tokens: alpha * (x - x) = 0.
-            h_m_norm = h_m.norm(dim=-1, keepdim=True)
-            h_m = torch.where(h_m_norm > 1e-6, h_m / h_m_norm.clamp(min=1e-8), x)
+            h_m = _unit_norm(self.mlp(x))  # DSMoEMLP returns tensor directly, no drops
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
             x = _unit_norm(x + alpha_m * (h_m - x))
         return x
@@ -1519,6 +1630,12 @@ def _ngpt_normalize_weights(model: nn.Module):
                     m.gate_shared.div_(m.gate_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
                     m.up_shared.div_(m.up_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
                     m.down_shared.div_(m.down_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
+            elif isinstance(m, DSMoEMLP):
+                # gate_up_proj: (E, 2*hidden, d_model) — normalize along input dim=2
+                m.gate_up_proj.div_(m.gate_up_proj.norm(dim=2, keepdim=True).clamp(min=1e-8))
+                # down_proj: (E, d_model, hidden) — normalize along input dim=2
+                m.down_proj.div_(m.down_proj.norm(dim=2, keepdim=True).clamp(min=1e-8))
+                # Shared expert Linear weights handled by the nn.Linear branch above
 
 
 def _ngpt_normalize_pit_memory(model: nn.Module):
@@ -3602,7 +3719,8 @@ class GPTNGPTMoE(nn.Module):
         self.wte, self.lm_head = _make_embed_head_pair()
         self.blocks = nn.ModuleList([
             NGPTMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k,
-                         bypass=HP.moe_bypass, shared_frac=HP.moe_shared, bias_lr=HP.moe_bias_lr)
+                         n_group=HP.moe_n_group, topk_group=HP.moe_topk_group,
+                         scaling_factor=HP.moe_scaling_factor, bias_lr=HP.moe_bias_lr)
             for _ in range(HP.n_layer)
         ])
         self.ln_f = nn.Identity()  # nGPT: hidden state is already unit-norm
