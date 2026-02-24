@@ -125,7 +125,6 @@ class HParams:
     # Composite embedding (byte-factored)
     composite_embed: bool = _env_bool("COMPOSITE_EMBED", False)
     composite_token_dims: int = _env_int("COMPOSITE_TOKEN_DIMS", 8)  # per-token dims per byte slot (rest is shared)
-    composite_pad_bytes: int = _env_int("COMPOSITE_PAD_BYTES", 4)  # extra learned pad bytes appended to every token
     composite_lora: bool = _env_bool("COMPOSITE_LORA", False)
     composite_lora_rank: int = _env_int("COMPOSITE_LORA_RANK", 16)
     composite_conv: bool = _env_bool("COMPOSITE_CONV", False)
@@ -2142,43 +2141,46 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 
 
 class CompositeEmbedding(nn.Module):
-    """Matryoshka byte-factored embedding with learned pad bytes.
+    """Matryoshka byte-factored embedding: no padding, variable byte utilization.
 
-    Every token gets n_pad extra pad bytes (byte_embed[256]) appended after its
-    real bytes. These participate in the matryoshka slot layout, giving every
-    token a shared learned subspace.
+    Each token's d_model dims are packed from its actual bytes:
+      - byte_embed: 257 x byte_budget  (byte_budget = d_model - 16*token_per_byte)
+      - token_params: V x max_tok_params  (16*token_per_byte per-token learned dims)
 
-    Effective byte count = real_bytes + n_pad.  Slot layout unchanged.
+    For a token with N bytes (clamped min 1):
+      byte_budget   = d_model - max_tok_params   (fixed across all N)
+      bps           = byte_budget // N            (byte dims per slot)
+      tps           = max_tok_params // N          (token dims per slot)
+      remainder     = byte_budget % N + max_tok_params % N
+
+      Layout: [byte0_shared | byte0_tok | ... | byteN_shared | byteN_tok | remainder_tok | pad]
+      where byte_shared = byte_embed[value][:bps]  (matryoshka: lowest ranks first)
+
+    All max_tok_params are always used regardless of byte count.
+    Short tokens get richer byte representations (more byte dims per slot).
     """
-    def __init__(self, vocab_size: int, model_dim: int,
-                 token_per_byte: int = 8, n_pad: int = 4):
+    def __init__(self, vocab_size: int, model_dim: int, token_per_byte: int = 8):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.token_per_byte = token_per_byte
         self.max_bytes = 16
-        self.n_pad = n_pad
-        self.max_tok_params = (self.max_bytes + n_pad) * token_per_byte
-        self.byte_budget = model_dim - self.max_tok_params
+        self.max_tok_params = self.max_bytes * token_per_byte  # 128
+        self.byte_budget = model_dim - self.max_tok_params      # 640
         self.pad_idx = 256
 
-        self.byte_embed = nn.Embedding(257, self.byte_budget)  # 256 byte values + 1 pad
+        self.byte_embed = nn.Embedding(257, self.byte_budget)  # 256 byte values + 1 pad/special
 
         self.token_params = nn.Embedding(vocab_size, self.max_tok_params)
 
-        # Build byte table: real bytes then n_pad pad bytes appended
-        raw_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
-        real_n = (raw_table != self.pad_idx).sum(dim=1).clamp(min=1)  # (V,)
-        if n_pad > 0:
-            pad_cols = torch.full((vocab_size, n_pad), self.pad_idx, dtype=raw_table.dtype)
-            token_bytes_table = torch.cat([raw_table, pad_cols], dim=1)  # (V, 20)
-        else:
-            token_bytes_table = raw_table
-        n_bytes = real_n + n_pad  # effective byte count per token
+        # Precompute byte counts
+        token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
+        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)  # (V,), min 1
 
-        self.register_buffer('token_bytes', token_bytes_table, persistent=False)
-        self.register_buffer('n_bytes', n_bytes, persistent=False)
+        self.register_buffer('token_bytes', token_bytes_table, persistent=False)  # (V, 16)
+        self.register_buffer('n_bytes', n_bytes, persistent=False)               # (V,)
 
+        # Precompute which byte counts exist for the loop
         self._unique_n = sorted(set(n_bytes.tolist()))
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -2489,18 +2491,13 @@ class PITHead(nn.Module):
 
 
 class CompositePITTokenInterface(nn.Module):
-    """Matryoshka composite PIT with learned pad bytes.
-
-    Every token gets n_pad extra pad bytes (byte_memory[256]) appended after
-    its real bytes. Full d_model Cholesky transform on the assembled pattern.
-    """
+    """Matryoshka composite PIT: full d_model Cholesky transform, matryoshka byte assembly."""
 
     def __init__(
         self,
         vocab_size: int,
         d_model: int,
         token_per_byte: int = 8,
-        n_pad: int = 4,
         eps: float = 1e-6,
         min_diag: float = 1e-3,
         orth_init: bool = True,
@@ -2510,9 +2507,8 @@ class CompositePITTokenInterface(nn.Module):
         self.d_model = d_model
         self.token_per_byte = token_per_byte
         self.max_bytes = 16
-        self.n_pad = n_pad
-        self.max_tok_params = (self.max_bytes + n_pad) * token_per_byte
-        self.byte_budget = d_model - self.max_tok_params
+        self.max_tok_params = self.max_bytes * token_per_byte  # 128
+        self.byte_budget = d_model - self.max_tok_params        # 640
         self.eps = eps
         self.min_diag = max(min_diag, eps)
         self.pad_idx = 256
@@ -2525,16 +2521,8 @@ class CompositePITTokenInterface(nn.Module):
         self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
         self.embed_out_norm = RMSNorm(d_model)
 
-        # Build byte table: real bytes then n_pad pad bytes appended
-        raw_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
-        real_n = (raw_table != self.pad_idx).sum(dim=1).clamp(min=1)
-        if n_pad > 0:
-            pad_cols = torch.full((vocab_size, n_pad), self.pad_idx, dtype=raw_table.dtype)
-            token_bytes_table = torch.cat([raw_table, pad_cols], dim=1)
-        else:
-            token_bytes_table = raw_table
-        n_bytes = real_n + n_pad
-
+        token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
+        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
         self.register_buffer('token_bytes', token_bytes_table, persistent=False)
         self.register_buffer('n_bytes', n_bytes, persistent=False)
         self._unique_n = sorted(set(n_bytes.tolist()))
@@ -2864,7 +2852,6 @@ def _make_embed():
         return CompositeEmbedding(
             HP.vocab_size, HP.d_model,
             token_per_byte=HP.composite_token_dims,
-            n_pad=HP.composite_pad_bytes,
         )
     return nn.Embedding(HP.vocab_size, HP.d_model)
 
@@ -2892,7 +2879,6 @@ def _make_embed_head_pair():
                 HP.vocab_size,
                 HP.d_model,
                 token_per_byte=HP.composite_token_dims,
-                n_pad=HP.composite_pad_bytes,
                 eps=HP.pit_eps,
                 min_diag=HP.pit_min_diag,
                 orth_init=HP.pit_orth_init,
