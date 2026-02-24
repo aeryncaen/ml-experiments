@@ -43,12 +43,12 @@ class HParams:
     data_format: str = os.environ.get("DATA_FORMAT", "gpt2")  # gpt2 (uint16+header) | yamit (flat uint32)
     train_files: str = os.environ.get(
         "TRAIN_FILES",
-        os.path.join(data_path, "train/*.bin") if data_format == "yamit"
+        os.path.join(data_path, "train/**/*.bin") if data_format == "yamit"
         else os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin"),
     )
     val_files: str = os.environ.get(
         "VAL_FILES",
-        os.path.join(data_path, "val/*.bin") if data_format == "yamit"
+        os.path.join(data_path, "val/**/*.bin") if data_format == "yamit"
         else os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin"),
     )
     token_bytes_path: str = os.environ.get(
@@ -272,10 +272,17 @@ def _load_data_shard(file: Path) -> torch.Tensor:
 
 
 class ShardStream:
-    def __init__(self, pattern: str, rank: int, world_size: int, seq_len: int, batch_size: int):
-        self.files = [Path(f) for f in sorted(glob.glob(pattern))]
-        if not self.files:
+    def __init__(self, pattern: str, rank: int, world_size: int, seq_len: int, batch_size: int,
+                 shuffle: bool = False, seed: int = 42):
+        # Recursive glob for subdirectory structures (e.g. YAMIT per-source dirs)
+        files = sorted(glob.glob(pattern, recursive=True))
+        if not files:
             raise FileNotFoundError(f"No files matched pattern: {pattern}")
+        if shuffle:
+            import random
+            rng = random.Random(seed)
+            rng.shuffle(files)
+        self.files = [Path(f) for f in files]
         self.rank = rank
         self.world_size = world_size
         self.seq_len = seq_len
@@ -3671,8 +3678,11 @@ def main():
         _llada_feats = f"llada=True subs={HP.llada_subs} antithetic={HP.llada_antithetic} bidirectional=True"
         print0(rank, _llada_feats)
 
-    train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size)
+    _shuffle_shards = HP.data_format == "yamit"
+    train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size,
+                               shuffle=_shuffle_shards, seed=42)
     val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
+    print0(rank, f"train_shards={len(train_stream.files)} val_shards={len(val_stream.files)} shuffle={_shuffle_shards}")
 
     model = build_model_maybe_llada().to(device)
     n_params = sum(p.numel() for p in model.parameters())
