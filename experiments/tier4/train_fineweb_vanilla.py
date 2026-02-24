@@ -298,6 +298,12 @@ class ShardStream:
         self.tokens = _load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
+    def reset(self):
+        """Reset to start of first shard (for deterministic val eval)."""
+        self.file_idx = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[0])
+
     def next_batch(self, device: torch.device):
         needed = self.tokens_per_global_step + 1
         if self.pos + needed >= self.tokens.numel():
@@ -3596,6 +3602,7 @@ def lr_for_step(step: int) -> float:
 @torch.no_grad()
 def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
     """Returns (val_loss, val_acc) where val_acc may be None."""
+    val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
     model.eval()
     loss_sum = torch.zeros(1, device=device)
@@ -3681,7 +3688,8 @@ def main():
     _shuffle_shards = HP.data_format == "yamit"
     train_stream = ShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size,
                                shuffle=_shuffle_shards, seed=42)
-    val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
+    val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size,
+                             shuffle=_shuffle_shards, seed=1337)
     print0(rank, f"train_shards={len(train_stream.files)} val_shards={len(val_stream.files)} shuffle={_shuffle_shards}")
 
     model = build_model_maybe_llada().to(device)
