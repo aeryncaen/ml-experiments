@@ -105,6 +105,7 @@ class HParams:
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
+    ckpt_dir: str = os.environ.get("CKPT_DIR", "")  # directory for checkpoints; empty = no saving
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -3853,6 +3854,13 @@ def main():
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
+    # Checkpoint saving
+    _ckpt_on = bool(HP.ckpt_dir) and rank == 0
+    _best_val_loss = float("inf")
+    if _ckpt_on:
+        os.makedirs(HP.ckpt_dir, exist_ok=True)
+        print0(rank, f"checkpoints → {HP.ckpt_dir}")
+
     t0 = time.time()
     tokens_seen = 0
     step = 0
@@ -3861,6 +3869,21 @@ def main():
             val_loss, val_acc = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
             print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            # Save checkpoints
+            if _ckpt_on:
+                _ckpt = {
+                    "step": step,
+                    "tokens_seen": tokens_seen,
+                    "val_loss": val_loss,
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "hparams": {f.name: getattr(HP, f.name) for f in HP.__dataclass_fields__.values()},
+                }
+                torch.save(_ckpt, os.path.join(HP.ckpt_dir, "last.pt"))
+                if val_loss < _best_val_loss:
+                    _best_val_loss = val_loss
+                    torch.save(_ckpt, os.path.join(HP.ckpt_dir, "best.pt"))
+                    print0(rank, f"  saved best checkpoint (val_loss={val_loss:.5f})")
             if tokens_seen >= _total_tokens:
                 break
 
