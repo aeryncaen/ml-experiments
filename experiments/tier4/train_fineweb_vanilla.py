@@ -104,6 +104,7 @@ class HParams:
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of steps for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
+    ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -400,14 +401,16 @@ class MixedShardStream:
     def next_batch(self, device: torch.device):
         xs: list[torch.Tensor] = []
         ys: list[torch.Tensor] = []
+        src_ids: list[int] = []
         for _ in range(self.batch_size):
             src_idx = self.rng.choices(range(self.n_sources), weights=self.probs, k=1)[0]
             x, y = self.buffers[src_idx].next_seq()
             xs.append(x)
             ys.append(y)
+            src_ids.append(src_idx)
         x = torch.stack(xs).to(device, non_blocking=True)
         y = torch.stack(ys).to(device, non_blocking=True)
-        return x, y
+        return x, y, torch.tensor(src_ids, dtype=torch.long, device=device)
 
     def source_summary(self) -> str:
         parts = []
@@ -3708,7 +3711,8 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     acc_sum = torch.zeros(1, device=device)
     has_acc = False
     for _ in range(HP.val_steps):
-        x, y = val_stream.next_batch(device)
+        _vbatch = val_stream.next_batch(device)
+        x, y = _vbatch[0], _vbatch[1]
         if HP.llada:
             B, T = x.shape
             mask = torch.rand(B, T, device=device) < 0.5
@@ -3773,6 +3777,8 @@ def main():
         _extra += " dd_rope=True"
     if HP.trap_mix:
         _extra += " trap_mix=True"
+    if HP.ch_loss:
+        _extra += " ch_loss=True"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
@@ -3841,6 +3847,14 @@ def main():
         profiler.start()
         print0(rank, f"torch profiler enabled for {HP.torch_profile_steps} train steps")
 
+    # Contraharmonic loss state
+    _ch_on = HP.ch_loss and isinstance(train_stream, MixedShardStream)
+    if _ch_on:
+        _ch_n_src = train_stream.n_sources
+        _ch_source_losses = torch.ones(_ch_n_src, device=device)  # init uniform
+        _ch_weights = _ch_source_losses / _ch_source_losses.sum()  # init equal weights
+        print0(rank, f"ch_loss=True sources={_ch_n_src} ({', '.join(train_stream.source_names)})")
+
     t0 = time.time()
     for step in range(HP.train_steps + 1):
         if step % HP.val_every == 0 or step == HP.train_steps:
@@ -3855,8 +3869,14 @@ def main():
             pg["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
+        # Per-source loss accumulators for contraharmonic weighting
+        if _ch_on:
+            _ch_src_loss_sum = torch.zeros(_ch_n_src, device=device)
+            _ch_src_count = torch.zeros(_ch_n_src, device=device)
         for _micro in range(HP.grad_accum):
-            x, y = train_stream.next_batch(device)
+            _tbatch = train_stream.next_batch(device)
+            x, y = _tbatch[0], _tbatch[1]
+            src_ids = _tbatch[2] if len(_tbatch) > 2 else None
             if HP.llada:
                 mask, p_mask = llada_make_mask(x, device)
                 if device.type == "cuda":
@@ -3867,11 +3887,32 @@ def main():
             else:
                 if device.type == "cuda":
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        _, loss = model(x, y)
+                        logits, loss = model(x, y)
                 else:
-                    _, loss = model(x, y)
+                    logits, loss = model(x, y)
+                # Contraharmonic loss: reweight per-sequence losses by source
+                if _ch_on and logits is not None and src_ids is not None:
+                    B, T, V = logits.shape
+                    per_tok = F.cross_entropy(logits.view(-1, V), y.view(-1), reduction='none').view(B, T)
+                    per_seq = per_tok.mean(dim=1)  # (B,)
+                    # Accumulate per-source losses (detached) for next step's weights
+                    for _si in range(_ch_n_src):
+                        _mask = src_ids == _si
+                        if _mask.any():
+                            _ch_src_loss_sum[_si] += per_seq[_mask].detach().sum()
+                            _ch_src_count[_si] += _mask.sum()
+                    # Apply contraharmonic weights from previous step
+                    seq_w = _ch_weights[src_ids]  # (B,)
+                    loss = (per_seq * seq_w).sum() / seq_w.sum()
             loss = loss / HP.grad_accum
             loss.backward()
+        # Update contraharmonic weights for next step
+        if _ch_on:
+            for _si in range(_ch_n_src):
+                if _ch_src_count[_si] > 0:
+                    _ch_source_losses[_si] = _ch_src_loss_sum[_si] / _ch_src_count[_si]
+            # CH weight: w_i = L_i / sum(L_j) — high-loss sources get upweighted
+            _ch_weights = _ch_source_losses / _ch_source_losses.sum().clamp(min=1e-8)
         _all_params = decay_params + no_decay_params
         if HP.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(_all_params, HP.grad_clip)
@@ -3891,6 +3932,9 @@ def main():
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
             print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f}")
+            if _ch_on and step % 100 == 0 and step > 0:
+                _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
+                print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
 
         if profiler is not None:
             profiler.step()
