@@ -125,72 +125,7 @@ Two thin wrapper modules connect to the model:
 Flat PIT head. Assembles patterns for the full vocabulary on every forward
 pass. Exact logits, but O(V × d_model) compute per position.
 
-## 3. Bucketed PIT Head
-
-### Motivation
-
-Full-vocab PIT is expensive for large V. The bucketed variant uses
-**hierarchical softmax**: route to a bucket first, then score tokens within
-that bucket only.
-
-### Architecture (`BucketedCompositePITHead`)
-
-Enabled via `LM_HEAD_TYPE=bucketed_pit`.
-
-**Bucket assignment** — two modes:
-
-- `PIT_BUCKET_MODE=hash` (default): deterministic hash
-  `(token_id * 2654435761) % 2^32 % n_buckets`
-- `PIT_BUCKET_MODE=semantic`: pre-computed cluster labels from
-  `PIT_BUCKET_LABELS` (.npy file). Optional `PIT_BUCKET_CENTERS` for
-  warm-starting the router.
-
-**Router** — SwiGLU MLP:
-
-```
-router_logits = W_down(SiLU(W_gate(h)) * W_up(h))     # (B, T, K)
-```
-
-Hidden dim = `ceil(d_model * 8/3 / 256) * 256`.
-
-**SiLU² correction** — learned gates (init 0 = pure softmax at start):
-
-```
-scores = softmax(logits) + α * SiLU(logits)²
-```
-
-Separate α for bucket and token levels.
-
-### Training: `routed_cross_entropy`
-
-Two-level exact hierarchical softmax (no approximation):
-
-1. **Level 1 (bucket)**: CE loss on router logits vs target bucket.
-2. **Level 2 (token)**: For each bucket, gather positions whose target is
-   in that bucket, compute within-bucket logits via `_bucket_logits`,
-   CE loss on local index. Sum over all buckets, divide by N.
-
-```
-total_loss = bucket_loss + token_loss
-```
-
-**Accuracy**: argmax across the router's top-k buckets, matching inference
-behavior. For each active bucket, compute corrected token scores × bucket
-confidence, track best token per position.
-
-### Inference: `forward`
-
-1. Route: top-k buckets per position.
-2. For each active bucket: `_bucket_logits(g, b)` → corrected scores × confidence.
-3. Scatter into full-vocab logits (rest = -inf).
-
-### `_prepare_hidden` and `_bucket_logits`
-
-- `_prepare_hidden(h)`: applies `g = h @ (L @ L^T)` — the Cholesky metric.
-- `_bucket_logits(g, b)`: assembles patterns for bucket members via
-  `_assemble_patterns`, computes `g @ Z^T + bias`.
-
-## 4. Byte Table Construction
+## 3. Byte Table Construction
 
 `_build_token_byte_table(vocab_size, max_bytes, pad_idx)`:
 
@@ -214,21 +149,10 @@ confidence, track best token per position.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LM_HEAD_TYPE` | `""` | Set to `pit` or `bucketed_pit` |
+| `LM_HEAD_TYPE` | `""` | Set to `pit` |
 | `PIT_ORTH_INIT` | `True` | QR-orthonormal init for byte_memory |
 | `PIT_EPS` | `1e-6` | Cholesky softplus epsilon |
 | `PIT_MIN_DIAG` | `1e-3` | Cholesky minimum diagonal value |
-
-### Bucketed PIT
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PIT_N_BUCKETS` | `64` | Number of vocab buckets |
-| `PIT_TOP_K` | `8` | Buckets scored per position at inference |
-| `PIT_ROUTER_AUX_WEIGHT` | `0.01` | Router auxiliary loss weight |
-| `PIT_BUCKET_MODE` | `hash` | `hash` or `semantic` |
-| `PIT_BUCKET_LABELS` | `""` | Path to .npy cluster labels |
-| `PIT_BUCKET_CENTERS` | `""` | Path to .npy cluster centers |
 
 ### Legacy / Optional
 
@@ -240,15 +164,8 @@ confidence, track best token per position.
 
 ## 6. Recommended Configuration
 
-For training with bucketed PIT (the current default path):
-
 ```bash
 COMPOSITE_EMBED=1
 COMPOSITE_TOKEN_DIMS=8
-LM_HEAD_TYPE=bucketed_pit
-PIT_BUCKET_MODE=semantic
-PIT_BUCKET_LABELS=experiments/tier4/data/gpt2wte_simcl_labels.npy
-PIT_BUCKET_CENTERS=experiments/tier4/data/gpt2wte_simcl_centers.npy
-PIT_N_BUCKETS=64
-PIT_TOP_K=8
+LM_HEAD_TYPE=pit
 ```
