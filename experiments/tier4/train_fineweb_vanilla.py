@@ -103,6 +103,7 @@ class HParams:
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of steps for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
+    dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
@@ -3793,9 +3794,12 @@ def main():
         val_stream = ShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size)
         print0(rank, f"train_shards={len(train_stream.files)} val_shards={len(val_stream.files)}")
 
-    model = build_model_maybe_llada().to(device)
+    _pt_dtype = torch.bfloat16 if HP.dtype == "bf16" else torch.float32
+    model = build_model_maybe_llada().to(device=device, dtype=_pt_dtype)
     n_params = sum(p.numel() for p in model.parameters())
-    print0(rank, f"parameters={n_params:,}")
+    _mem_per_param = 2 if HP.dtype == "bf16" else 4
+    _weight_mb = n_params * _mem_per_param / 1024 / 1024
+    print0(rank, f"parameters={n_params:,} dtype={HP.dtype} weight_mem={_weight_mb:.0f}MB")
 
     # Build optimizer param groups before compile/DDP wrap
     decay_params = []
@@ -3820,7 +3824,8 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[device.index])
 
-    optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95))
+    _fused = device.type == "cuda"
+    optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95), fused=_fused)
 
     profiler = None
     if HP.torch_profile:
