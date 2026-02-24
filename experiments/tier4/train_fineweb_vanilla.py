@@ -1164,7 +1164,7 @@ class MoEMLP(nn.Module):
 
         # Gather outputs and scatter back to tokens
         slot_output = expert_output.view(-1, D)[buffer_idx.squeeze(-1)]  # (N*K, D)
-        weighted = slot_output * flat_weight.unsqueeze(-1) * valid.float()
+        weighted = slot_output * flat_weight.unsqueeze(-1) * valid.to(slot_output.dtype)
         out = torch.zeros_like(x_flat)
         out.scatter_add_(0, flat_token.unsqueeze(-1).expand(-1, D), weighted)
 
