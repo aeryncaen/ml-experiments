@@ -76,6 +76,7 @@ class HParams:
     fa_post_act: str = os.environ.get("FA_POST_ACT", "none")  # none | silu | gelu — element-wise activation after feature attention
     fa_pre_act: str = os.environ.get("FA_PRE_ACT", "none")   # none | silu | gelu — element-wise activation on gate before Q=K scores
     fa_qk_norm: bool = _env_bool("FA_QK_NORM", False)        # RMSNorm on Q=K before scoring
+    feat_attn_mlp: bool = _env_bool("FEAT_ATTN_MLP", False)  # swap SwiGLU MLP for FeatureAttentionMLP in transformer/nGPT blocks
 
     # Fused gate knobs (0 = use d_model, no expansion)
     fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
@@ -1103,7 +1104,12 @@ class TransformerBlock(nn.Module):
         self.ln1 = RMSNorm(d_model)
         self.attn = SelfAttention(d_model, n_head)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = MLP(d_model)
+        if HP.feat_attn_mlp:
+            self.mlp = FeatureAttentionMLP(d_model, HP.fa_n_features, HP.fa_activation,
+                                           post_act=HP.fa_post_act, pre_act=HP.fa_pre_act,
+                                           qk_norm=HP.fa_qk_norm)
+        else:
+            self.mlp = MLP(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("tf/block_attn"):
@@ -1221,7 +1227,12 @@ class NGPTBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
         self.attn = NGPTSelfAttention(d_model, n_head)
-        self.mlp = NGPTMLP(d_model)
+        if HP.feat_attn_mlp:
+            self.mlp = FeatureAttentionMLP(d_model, HP.fa_n_features, HP.fa_activation,
+                                           post_act=HP.fa_post_act, pre_act=HP.fa_pre_act,
+                                           qk_norm=HP.fa_qk_norm)
+        else:
+            self.mlp = NGPTMLP(d_model)
 
         # Eigen learning rates (per embedding dimension)
         alpha_init = HP.ngpt_alpha_init if HP.ngpt_alpha_init > 0 else 1.0 / HP.n_layer
@@ -3507,7 +3518,7 @@ def main():
 
     print0(rank, f"rank={rank} world_size={world_size} device={device}")
     _extra = f" n_features={HP.n_features} desc_dim={HP.desc_dim}" if HP.n_features > 0 and HP.desc_dim > 0 else ""
-    if HP.model_type == "feat_attn":
+    if HP.model_type == "feat_attn" or HP.feat_attn_mlp:
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
         _extra += f" fa_n_features={HP.fa_n_features} fa_desc_dim={hidden // HP.fa_n_features} fa_activation={HP.fa_activation} fa_pre_act={HP.fa_pre_act} fa_post_act={HP.fa_post_act} fa_qk_norm={HP.fa_qk_norm}"
     if HP.model_type == "moe":
