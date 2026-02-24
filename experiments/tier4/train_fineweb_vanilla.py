@@ -2144,41 +2144,38 @@ class CompositeEmbedding(nn.Module):
     """Matryoshka byte-factored embedding: no padding, variable byte utilization.
 
     Each token's d_model dims are packed from its actual bytes:
-      - byte_embed: 257 x byte_dim  (byte_dim = d_model - token_per_byte)
-      - token_params: V x max_tok_params  (per-token learned dims)
+      - byte_embed: 257 x byte_budget  (byte_budget = d_model - 16*token_per_byte)
+      - token_params: V x max_tok_params  (16*token_per_byte per-token learned dims)
 
     For a token with N bytes (clamped min 1):
-      dims_per_byte = d_model // N
-      byte_slice    = dims_per_byte - token_per_byte
-      remainder     = d_model % N  (extra token-specific dims)
+      byte_budget   = d_model - max_tok_params   (fixed across all N)
+      bps           = byte_budget // N            (byte dims per slot)
+      tps           = max_tok_params // N          (token dims per slot)
+      remainder     = byte_budget % N + max_tok_params % N
 
-      Layout: [byte0_shared | byte0_tok | byte1_shared | byte1_tok | ... | remainder_tok]
-      where byte_shared = byte_embed[value][:byte_slice]  (matryoshka: lowest ranks first)
+      Layout: [byte0_shared | byte0_tok | ... | byteN_shared | byteN_tok | remainder_tok | pad]
+      where byte_shared = byte_embed[value][:bps]  (matryoshka: lowest ranks first)
 
-    Short tokens get richer byte representations (more dims per byte).
-    Long tokens get compressed byte representations but more token-specific capacity.
+    All max_tok_params are always used regardless of byte count.
+    Short tokens get richer byte representations (more byte dims per slot).
     """
     def __init__(self, vocab_size: int, model_dim: int, token_per_byte: int = 8):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.token_per_byte = token_per_byte
-        self.byte_dim = model_dim - token_per_byte  # 760 for d_model=768, tpb=8
+        self.max_bytes = 16
+        self.max_tok_params = self.max_bytes * token_per_byte  # 128
+        self.byte_budget = model_dim - self.max_tok_params      # 640
         self.pad_idx = 256
 
-        self.byte_embed = nn.Embedding(257, self.byte_dim)  # 256 byte values + 1 pad/special
+        self.byte_embed = nn.Embedding(257, self.byte_budget)  # 256 byte values + 1 pad/special
 
-        # Precompute byte counts and max token params needed
-        token_bytes_table = _build_token_byte_table(vocab_size, 16, self.pad_idx)
+        self.token_params = nn.Embedding(vocab_size, self.max_tok_params)
+
+        # Precompute byte counts
+        token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
         n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)  # (V,), min 1
-
-        max_tok_params = 0
-        for n in range(1, 17):
-            tp = n * token_per_byte + model_dim % n
-            max_tok_params = max(max_tok_params, tp)
-        self.max_tok_params = max_tok_params
-
-        self.token_params = nn.Embedding(vocab_size, max_tok_params)
 
         self.register_buffer('token_bytes', token_bytes_table, persistent=False)  # (V, 16)
         self.register_buffer('n_bytes', n_bytes, persistent=False)               # (V,)
@@ -2190,9 +2187,9 @@ class CompositeEmbedding(nn.Module):
         """Assemble embeddings only for tokens in the batch. No full-vocab rebuild."""
         shape = token_ids.shape
         flat = token_ids.reshape(-1)                                # (M,)
-        M = flat.shape[0]
         D = self.model_dim
-        tpb = self.token_per_byte
+        bb = self.byte_budget
+        mtp = self.max_tok_params
 
         n = self.n_bytes[flat]                                      # (M,)
         byte_seqs = self.token_bytes[flat]                          # (M, 16)
@@ -2206,21 +2203,34 @@ class CompositeEmbedding(nn.Module):
             if idx.numel() == 0:
                 continue
 
-            dps = D // N
-            byte_slice = dps - tpb
-            remainder = D - N * dps
+            bps = bb // N                                           # byte dims per slot
+            tps = mtp // N                                          # token dims per slot
+            slot_size = bps + tps
+            remainder = D - N * slot_size                           # leftover dims at end
 
             bs = byte_seqs[idx, :N]                                 # (count, N)
-            be = self.byte_embed(bs)[:, :, :byte_slice]             # (count, N, byte_slice)
+            be = self.byte_embed(bs)[:, :, :bps]                    # (count, N, bps)
 
             tp_sub = tp[idx]                                        # (count, max_tok_params)
-            tp_per_byte = tp_sub[:, :N * tpb].view(-1, N, tpb)     # (count, N, tpb)
+            tp_per_slot = tp_sub[:, :N * tps].view(-1, N, tps)     # (count, N, tps)
 
-            slots = torch.cat([be, tp_per_byte], dim=-1)            # (count, N, dps)
-            assembled = slots.reshape(-1, N * dps)                  # (count, N * dps)
+            slots = torch.cat([be, tp_per_slot], dim=-1)            # (count, N, slot_size)
+            assembled = slots.reshape(-1, N * slot_size)            # (count, N * slot_size)
 
             if remainder > 0:
-                rem = tp_sub[:, N * tpb : N * tpb + remainder]     # (count, remainder)
+                # Fill remainder with leftover token params, zero-pad any extra
+                tok_rem = mtp - N * tps                             # = mtp % N
+                if tok_rem > 0:
+                    rem_tok = tp_sub[:, N * tps : N * tps + tok_rem]
+                else:
+                    rem_tok = tp_sub[:, :0]                          # empty
+                pad_size = remainder - tok_rem
+                if pad_size > 0:
+                    pad = torch.zeros(rem_tok.shape[0], pad_size,
+                                      device=rem_tok.device, dtype=rem_tok.dtype)
+                    rem = torch.cat([rem_tok, pad], dim=-1)
+                else:
+                    rem = rem_tok
                 assembled = torch.cat([assembled, rem], dim=-1)     # (count, D)
 
             parts.append(assembled)
@@ -2496,26 +2506,22 @@ class CompositePITTokenInterface(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.token_per_byte = token_per_byte
-        self.byte_dim = d_model - token_per_byte  # 760 for d_model=768, tpb=8
+        self.max_bytes = 16
+        self.max_tok_params = self.max_bytes * token_per_byte  # 128
+        self.byte_budget = d_model - self.max_tok_params        # 640
         self.eps = eps
         self.min_diag = max(min_diag, eps)
         self.pad_idx = 256
 
-        self.byte_memory = nn.Parameter(torch.empty(257, self.byte_dim))
-
-        # Token params: max needed across all byte counts
-        max_tok_params = 0
-        for n in range(1, 17):
-            max_tok_params = max(max_tok_params, n * token_per_byte + d_model % n)
-        self.max_tok_params = max_tok_params
-        self.token_embed = nn.Embedding(vocab_size, max_tok_params)
+        self.byte_memory = nn.Parameter(torch.empty(257, self.byte_budget))
+        self.token_embed = nn.Embedding(vocab_size, self.max_tok_params)
 
         # Full d_model Cholesky factor
         self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))
         self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
         self.embed_out_norm = RMSNorm(d_model)
 
-        token_bytes_table = _build_token_byte_table(vocab_size, 16, self.pad_idx)
+        token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
         n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
         self.register_buffer('token_bytes', token_bytes_table, persistent=False)
         self.register_buffer('n_bytes', n_bytes, persistent=False)
@@ -2526,9 +2532,9 @@ class CompositePITTokenInterface(nn.Module):
     def reset_parameters(self, orth_init: bool = True):
         with torch.no_grad():
             if orth_init:
-                # 257 orthonormal rows in R^byte_dim
-                q, _ = torch.linalg.qr(torch.randn(self.byte_dim, 257), mode="reduced")
-                self.byte_memory.copy_(q.T)  # (257, byte_dim)
+                # 257 orthonormal rows in R^byte_budget
+                q, _ = torch.linalg.qr(torch.randn(self.byte_budget, 257), mode="reduced")
+                self.byte_memory.copy_(q.T)  # (257, byte_budget)
             else:
                 nn.init.normal_(self.byte_memory, mean=0.0, std=0.02)
 
@@ -2547,9 +2553,9 @@ class CompositePITTokenInterface(nn.Module):
         """Assemble matryoshka patterns for given tokens. Returns (..., d_model)."""
         shape = token_ids.shape
         flat = token_ids.reshape(-1)
-        M = flat.shape[0]
         D = self.d_model
-        tpb = self.token_per_byte
+        bb = self.byte_budget
+        mtp = self.max_tok_params
 
         n = self.n_bytes[flat]
         byte_seqs = self.token_bytes[flat]
@@ -2561,20 +2567,33 @@ class CompositePITTokenInterface(nn.Module):
             idx = (n == N).nonzero(as_tuple=True)[0]
             if idx.numel() == 0:
                 continue
-            dps = D // N
-            byte_slice = dps - tpb
-            remainder = D - N * dps
+
+            bps = bb // N                                           # byte dims per slot
+            tps = mtp // N                                          # token dims per slot
+            slot_size = bps + tps
+            remainder = D - N * slot_size                           # leftover dims at end
 
             bs = byte_seqs[idx, :N]
-            be = F.embedding(bs, self.byte_memory)[:, :, :byte_slice]
+            be = F.embedding(bs, self.byte_memory)[:, :, :bps]      # (count, N, bps)
             tp_sub = tp[idx]
-            tp_per_byte = tp_sub[:, :N * tpb].view(-1, N, tpb)
+            tp_per_slot = tp_sub[:, :N * tps].view(-1, N, tps)     # (count, N, tps)
 
-            slots = torch.cat([be, tp_per_byte], dim=-1)
-            assembled = slots.reshape(-1, N * dps)
+            slots = torch.cat([be, tp_per_slot], dim=-1)            # (count, N, slot_size)
+            assembled = slots.reshape(-1, N * slot_size)            # (count, N * slot_size)
 
             if remainder > 0:
-                rem = tp_sub[:, N * tpb : N * tpb + remainder]
+                tok_rem = mtp - N * tps                             # = mtp % N
+                if tok_rem > 0:
+                    rem_tok = tp_sub[:, N * tps : N * tps + tok_rem]
+                else:
+                    rem_tok = tp_sub[:, :0]
+                pad_size = remainder - tok_rem
+                if pad_size > 0:
+                    pad = torch.zeros(rem_tok.shape[0], pad_size,
+                                      device=rem_tok.device, dtype=rem_tok.dtype)
+                    rem = torch.cat([rem_tok, pad], dim=-1)
+                else:
+                    rem = rem_tok
                 assembled = torch.cat([assembled, rem], dim=-1)
 
             parts.append(assembled)
