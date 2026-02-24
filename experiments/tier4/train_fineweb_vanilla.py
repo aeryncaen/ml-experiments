@@ -63,6 +63,7 @@ class HParams:
     vocab_size: int = _env_int("VOCAB_SIZE", 50304)
     n_layer: int = _env_int("N_LAYER", 12)
     n_head: int = _env_int("N_HEAD", 12)
+    n_kv_head: int = _env_int("N_KV_HEAD", 0)  # 0 = same as n_head (MHA); < n_head = GQA; 1 = MQA
     d_model: int = _env_int("D_MODEL", 768)
     seq_len: int = _env_int("SEQ_LEN", 2048)
 
@@ -114,6 +115,7 @@ class HParams:
     ngpt: bool = _env_bool("NGPT", False)
     ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.0)    # 0 = auto -> 1/n_layers
     ngpt_alpha_scale: float = _env_float("NGPT_ALPHA_SCALE", 0.0)  # 0 = auto -> 1/sqrt(d_model)
+    ngpt_qk_bias: bool = _env_bool("NGPT_QK_BIAS", False)          # add bias to Q and K projections
     ngpt_sqk_init: float = _env_float("NGPT_SQK_INIT", 1.0)       # QK scaling init
     ngpt_su_init: float = _env_float("NGPT_SU_INIT", 1.0)         # MLP u scaling init
     ngpt_sv_init: float = _env_float("NGPT_SV_INIT", 1.0)         # MLP v scaling init
@@ -158,6 +160,7 @@ class HParams:
     moe_n_group: int = _env_int("MOE_N_GROUP", 1)            # expert groups for group top-k (1=flat)
     moe_topk_group: int = _env_int("MOE_TOPK_GROUP", 1)      # groups to select from
     moe_scaling_factor: float = _env_float("MOE_SCALING_FACTOR", 1.0)  # routed weight scaling
+    moe_dense_layers: int = _env_int("MOE_DENSE_LAYERS", 2)  # first N and last N layers use dense MLP instead of MoE
 
     # LLaDA (masked diffusion LM)
     llada: bool = _env_bool("LLADA", False)
@@ -1426,20 +1429,28 @@ def _ngpt_actual(p: nn.Parameter) -> torch.Tensor:
 
 
 class NGPTSelfAttention(nn.Module):
-    """Self-attention for nGPT: QK normalization + s_qk scaling, sqrt(dk) softmax scale."""
+    """Self-attention for nGPT: QK normalization + s_qk scaling, sqrt(dk) softmax scale.
+
+    Supports GQA (n_kv_head < n_head) and optional QK bias.
+    """
 
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.head_dim = d_model // n_head
-        self.q = nn.Linear(d_model, d_model, bias=False)
-        self.k = nn.Linear(d_model, d_model, bias=False)
-        self.v = nn.Linear(d_model, d_model, bias=False)
+        n_kv = HP.n_kv_head if HP.n_kv_head > 0 else n_head
+        assert n_head % n_kv == 0, f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv})"
+        self.n_kv_head = n_kv
+        self.n_kv_groups = n_head // n_kv  # how many Q heads per KV head
+
+        qk_bias = HP.ngpt_qk_bias
+        self.q = nn.Linear(d_model, n_head * self.head_dim, bias=qk_bias)
+        self.k = nn.Linear(d_model, n_kv * self.head_dim, bias=qk_bias)
+        self.v = nn.Linear(d_model, n_kv * self.head_dim, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-        # DD-RoPE / standard RoPE (same logic as SelfAttention)
-        # DD-RoPE / standard RoPE (same logic as SelfAttention)
+        # DD-RoPE / standard RoPE
         self.dd_rope = HP.dd_rope
         hd = self.head_dim
         if self.dd_rope:
@@ -1451,7 +1462,6 @@ class NGPTSelfAttention(nn.Module):
         # Trapezoidal K,V mixing
         self.trap_mix = HP.trap_mix
         if self.trap_mix:
-            # Project input → per-head (log_dt, lambda_logit, log_A) — all data-dependent
             self.trap_proj = nn.Linear(d_model, n_head * 3, bias=False)
 
         # QK scaling: shared per head, one scalar per head_dim element
@@ -1461,15 +1471,16 @@ class NGPTSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
         q = self.q(x).view(b, t, self.n_head, self.head_dim)
-        k = self.k(x).view(b, t, self.n_head, self.head_dim)
-        v = self.v(x).view(b, t, self.n_head, self.head_dim)
+        k = self.k(x).view(b, t, self.n_kv_head, self.head_dim)
+        v = self.v(x).view(b, t, self.n_kv_head, self.head_dim)
 
         if self.dd_rope:
             theta = self.theta_proj(x).view(b, t, self.n_head, self.head_dim // 2)
             cum_theta = theta.cumsum(dim=1)
             cos_dd, sin_dd = cum_theta.cos(), cum_theta.sin()
             q = apply_rotary(q, cos_dd, sin_dd)
-            k = apply_rotary(k, cos_dd, sin_dd)
+            # For GQA: dd-rope theta is n_head-sized, take first n_kv_head slices for k
+            k = apply_rotary(k, cos_dd[:, :, :self.n_kv_head], sin_dd[:, :, :self.n_kv_head])
         else:
             cos, sin = self.rotary(q)
             q = apply_rotary(q, cos, sin)
@@ -1485,14 +1496,20 @@ class NGPTSelfAttention(nn.Module):
             gamma = (lam * dt).unsqueeze(-1)
             beta = ((1.0 - lam) * dt * alpha).unsqueeze(-1)
             k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))
-            k = gamma * k + beta * k_shifted
+            k = gamma[:, :, :self.n_kv_head] * k + beta[:, :, :self.n_kv_head] * k_shifted
             v_shifted = F.pad(v[:, :-1], (0, 0, 0, 0, 1, 0))
-            v = gamma * v + beta * v_shifted
+            v = gamma[:, :, :self.n_kv_head] * v + beta[:, :, :self.n_kv_head] * v_shifted
 
         # nGPT: normalize q,k then apply learned scaling
         s_qk = _ngpt_actual(self.s_qk)
         q = _unit_norm(q, dim=-1) * s_qk
         k = _unit_norm(k, dim=-1) * s_qk
+
+        # GQA: expand KV heads to match Q heads
+        if self.n_kv_groups > 1:
+            # k,v: (b, t, n_kv, hd) -> (b, t, n_head, hd)
+            k = k[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
+            v = v[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
 
         # nGPT: softmax scale is sqrt(dk) instead of 1/sqrt(dk) because q,k are normalized
         # and s_qk absorbs the scaling. But flash_attn applies its own 1/sqrt(dk) internally,
@@ -1502,9 +1519,8 @@ class NGPTSelfAttention(nn.Module):
             y = flash_attn_func(q, k, v, causal=HP.is_causal)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            # Manual: scale_factor = sqrt(dk) -> pass scale = 1/sqrt(dk) * dk = sqrt(dk)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal,
-                                               scale=math.sqrt(self.head_dim))
+                                                scale=math.sqrt(self.head_dim))
             y = y.transpose(1, 2)
         y = y.contiguous().view(b, t, c)
         return self.proj(y)
@@ -3717,12 +3733,17 @@ class GPTNGPTMoE(nn.Module):
     def __init__(self):
         super().__init__()
         self.wte, self.lm_head = _make_embed_head_pair()
-        self.blocks = nn.ModuleList([
-            NGPTMoEBlock(HP.d_model, HP.n_head, HP.n_experts, HP.top_k,
-                         n_group=HP.moe_n_group, topk_group=HP.moe_topk_group,
-                         scaling_factor=HP.moe_scaling_factor, bias_lr=HP.moe_bias_lr)
-            for _ in range(HP.n_layer)
-        ])
+        D = HP.moe_dense_layers
+        blocks = []
+        for i in range(HP.n_layer):
+            if i < D or i >= HP.n_layer - D:
+                blocks.append(NGPTBlock(HP.d_model, HP.n_head))
+            else:
+                blocks.append(NGPTMoEBlock(
+                    HP.d_model, HP.n_head, HP.n_experts, HP.top_k,
+                    n_group=HP.moe_n_group, topk_group=HP.moe_topk_group,
+                    scaling_factor=HP.moe_scaling_factor, bias_lr=HP.moe_bias_lr))
+        self.blocks = nn.ModuleList(blocks)
         self.ln_f = nn.Identity()  # nGPT: hidden state is already unit-norm
         # Logit scaling: per-vocab learnable temperature
         s_z_scale = 1.0 / math.sqrt(HP.d_model)
