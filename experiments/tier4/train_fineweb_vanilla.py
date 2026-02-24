@@ -121,6 +121,14 @@ class HParams:
     ngpt_sv_init: float = _env_float("NGPT_SV_INIT", 1.0)         # MLP v scaling init
     ngpt_sz_init: float = _env_float("NGPT_SZ_INIT", 1.0)         # logit scaling init
 
+    # Hybrid architecture features (per-layer specialization for ngpt_moe)
+    ngpt_diff_attn_n: int = _env_int("NGPT_DIFF_ATTN_N", 0)       # first N layers use differential attention
+    ngpt_paired_odd: bool = _env_bool("NGPT_PAIRED_ODD", False)    # odd layers use paired head attention
+    ngpt_skip_trap_even: bool = _env_bool("NGPT_SKIP_TRAP_EVEN", False)  # even layers skip TrapMix
+    ngpt_window_layers: str = os.environ.get("NGPT_WINDOW_LAYERS", "")   # comma-sep layer indices for sliding window, e.g. "5,7"
+    ngpt_window_size: int = _env_int("NGPT_WINDOW_SIZE", 512)     # sliding window size for window layers
+    ngpt_embed_gate_layer: int = _env_int("NGPT_EMBED_GATE_LAYER", -1)  # layer index for content-dependent embed gate (-1=off)
+
     # Retokenize >16-byte tokens on load (no need to preprocess .bin files)
     retokenize: bool = _env_bool("RETOKENIZE", False)
 
@@ -1437,14 +1445,23 @@ def _ngpt_actual(p: nn.Parameter) -> torch.Tensor:
 class NGPTSelfAttention(nn.Module):
     """Self-attention for nGPT: QK normalization + s_qk scaling, sqrt(dk) softmax scale.
 
-    Supports GQA (n_kv_head < n_head) and optional QK bias.
+    Supports GQA (n_kv_head < n_head), optional QK bias, and per-layer features:
+    - differential: Differential attention (Ye et al. 2025) — Q,K split into halves,
+      two attention passes, subtracted: out1 - λ*out2
+    - paired: Paired Head Attention — adjacent heads interleaved to 2T sequence
+    - window_size: Sliding window attention (0 = full context)
     """
 
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, d_model: int, n_head: int, layer_idx: int = 0,
+                 differential: bool = False, paired: bool = False,
+                 trap_mix: bool = False, window_size: int = 0):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.head_dim = d_model // n_head
+        self.differential = differential
+        self.paired = paired
+        self.window_size = window_size
         n_kv = HP.n_kv_head if HP.n_kv_head > 0 else n_head
         assert n_head % n_kv == 0, f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv})"
         self.n_kv_head = n_kv
@@ -1456,17 +1473,35 @@ class NGPTSelfAttention(nn.Module):
         self.v = nn.Linear(d_model, n_kv * self.head_dim, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-        # DD-RoPE / standard RoPE
+        # Differential attention: λ reparameterization vectors
+        if self.differential:
+            assert self.head_dim % 2 == 0, f"head_dim ({self.head_dim}) must be even for diff attn"
+            self.half_dim = self.head_dim // 2
+            self.lambda_q1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_k1 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_q2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_k2 = nn.Parameter(torch.randn(self.half_dim) * 0.1)
+            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+            # Mark lambda params so _ngpt_normalize_weights skips them
+            for p in (self.lambda_q1, self.lambda_k1, self.lambda_q2, self.lambda_k2):
+                p._ngpt_skip_normalize = True  # type: ignore[attr-defined]
+
+        # RoPE: standard or paired, dimension depends on diff attn
+        # For diff attn: RoPE applied to sub-heads of half_dim, not full head_dim
         self.dd_rope = HP.dd_rope
         hd = self.head_dim
+        rope_dim = self.half_dim if self.differential else self.head_dim
         if self.dd_rope:
             assert hd % 2 == 0, f"head_dim ({hd}) must be even for dd-rope"
             self.theta_proj = nn.Linear(d_model, n_head * (hd // 2), bias=False)
+        elif self.paired:
+            # PairedRotary: applied to merged pair width (2*rope_dim), produces cos/sin of rope_dim width
+            self.rotary = PairedRotary(rope_dim)
         else:
-            self.rotary = Rotary(hd)
+            self.rotary = Rotary(rope_dim)
 
         # Trapezoidal K,V mixing
-        self.trap_mix = HP.trap_mix
+        self.trap_mix = trap_mix
         if self.trap_mix:
             self.trap_proj = nn.Linear(d_model, n_head * 3, bias=False)
 
@@ -1480,55 +1515,156 @@ class NGPTSelfAttention(nn.Module):
         k = self.k(x).view(b, t, self.n_kv_head, self.head_dim)
         v = self.v(x).view(b, t, self.n_kv_head, self.head_dim)
 
-        if self.dd_rope:
-            theta = self.theta_proj(x).view(b, t, self.n_head, self.head_dim // 2)
-            cum_theta = theta.cumsum(dim=1)
-            cos_dd, sin_dd = cum_theta.cos(), cum_theta.sin()
-            q = apply_rotary(q, cos_dd, sin_dd)
-            # For GQA: dd-rope theta is n_head-sized, take first n_kv_head slices for k
-            k = apply_rotary(k, cos_dd[:, :, :self.n_kv_head], sin_dd[:, :, :self.n_kv_head])
-        else:
-            cos, sin = self.rotary(q)
-            q = apply_rotary(q, cos, sin)
-            k = apply_rotary(k, cos, sin)
-
+        # TrapMix: data-dependent K,V mixing with temporal neighbor (before RoPE, before head splitting)
         if self.trap_mix:
             trap = self.trap_proj(x).view(b, t, self.n_head, 3)
             log_dt, lam_logit, log_A = trap[..., 0], trap[..., 1], trap[..., 2]
             dt = F.softplus(log_dt).clamp(max=2.0)
             A_neg = -F.softplus(log_A)
-            alpha = torch.exp(dt * A_neg).clamp(max=0.999)
+            alpha_t = torch.exp(dt * A_neg).clamp(max=0.999)
             lam = torch.sigmoid(lam_logit)
             gamma = (lam * dt).unsqueeze(-1)
-            beta = ((1.0 - lam) * dt * alpha).unsqueeze(-1)
+            beta = ((1.0 - lam) * dt * alpha_t).unsqueeze(-1)
             k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))
             k = gamma[:, :, :self.n_kv_head] * k + beta[:, :, :self.n_kv_head] * k_shifted
             v_shifted = F.pad(v[:, :-1], (0, 0, 0, 0, 1, 0))
             v = gamma[:, :, :self.n_kv_head] * v + beta[:, :, :self.n_kv_head] * v_shifted
+
+        # GQA: expand KV heads to match Q heads (before RoPE so all heads get position encoding)
+        if self.n_kv_groups > 1:
+            k = k[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
+            v = v[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
 
         # nGPT: normalize q,k then apply learned scaling
         s_qk = _ngpt_actual(self.s_qk)
         q = _unit_norm(q, dim=-1) * s_qk
         k = _unit_norm(k, dim=-1) * s_qk
 
-        # GQA: expand KV heads to match Q heads
-        if self.n_kv_groups > 1:
-            # k,v: (b, t, n_kv, hd) -> (b, t, n_head, hd)
-            k = k[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
-            v = v[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
-
-        # nGPT: softmax scale is sqrt(dk) instead of 1/sqrt(dk) because q,k are normalized
-        # and s_qk absorbs the scaling. But flash_attn applies its own 1/sqrt(dk) internally,
-        # so we pre-scale q by dk to cancel it: q * dk * (1/sqrt(dk)) = q * sqrt(dk).
-        if HAS_FLASH_ATTN:
-            q = q * self.head_dim  # flash_attn will divide by sqrt(dk)
-            y = flash_attn_func(q, k, v, causal=HP.is_causal)
+        if self.differential:
+            return self._forward_diff(x, q, k, v, b, t, c)
         else:
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=HP.is_causal,
-                                                scale=math.sqrt(self.head_dim))
-            y = y.transpose(1, 2)
+            return self._forward_standard(x, q, k, v, b, t, c)
+
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor,
+                    b: int, t: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE (standard or dd-rope). x needed for dd-rope projection."""
+        if self.dd_rope:
+            theta = self.theta_proj(x).view(b, t, self.n_head, self.head_dim // 2)
+            cum_theta = theta.cumsum(dim=1)
+            cos_dd, sin_dd = cum_theta.cos(), cum_theta.sin()
+            q = apply_rotary(q, cos_dd, sin_dd)
+            k = apply_rotary(k, cos_dd, sin_dd)
+        elif self.paired:
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+        else:
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+        return q, k
+
+    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+              head_dim: int, causal: bool = True) -> torch.Tensor:
+        """Run attention (flash or SDPA) with optional sliding window."""
+        ws = (self.window_size, -1) if self.window_size > 0 else (-1, -1)
+        if HAS_FLASH_ATTN:
+            q_s = q * head_dim  # flash_attn divides by sqrt(dk), we want sqrt(dk) scale
+            return flash_attn_func(q_s, k, v, causal=causal, window_size=ws)
+        else:
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            attn_mask = None
+            if self.window_size > 0:
+                # Build sliding-window + causal mask for SDPA fallback
+                seq_len = q_t.size(-2)
+                row = torch.arange(seq_len, device=q.device).unsqueeze(1)
+                col = torch.arange(seq_len, device=q.device).unsqueeze(0)
+                attn_mask = (row >= col) & (row - col < self.window_size)
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,T)
+                causal = False  # mask handles causality
+            y = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=causal,
+                                               attn_mask=attn_mask,
+                                               scale=math.sqrt(head_dim))
+            return y.transpose(1, 2)
+
+    def _forward_standard(self, x: torch.Tensor, q: torch.Tensor, k: torch.Tensor,
+                          v: torch.Tensor, b: int, t: int, c: int) -> torch.Tensor:
+        """Standard (non-differential) attention, optionally with PHA."""
+        if self.paired:
+            assert self.n_head % 2 == 0, "PHA requires even number of heads"
+            n2 = self.n_head // 2
+            # Merge adjacent head pairs: (b,t,H,hd) -> (b,t,H/2,2*hd)
+            q = q.view(b, t, n2, self.head_dim * 2)
+            k = k.view(b, t, n2, self.head_dim * 2)
+            # Apply paired RoPE on merged width
+            q, k = self._apply_rope(q, k, x, b, t)
+            # Split to doubled sequence: (b,t,H/2,2*hd) -> (b,2t,H/2,hd)
+            q = q.view(b, t * 2, n2, self.head_dim)
+            k = k.view(b, t * 2, n2, self.head_dim)
+            v = v.reshape(b, t * 2, n2, self.head_dim)
+            # Attention on interleaved 2T sequence
+            y = self._attn(q, k, v, self.head_dim)
+            # Reshape back: (b,2t,H/2,hd) -> (b,t,H,hd)
+            y = y.contiguous().view(b, t, self.n_head, self.head_dim)
+        else:
+            # Standard RoPE
+            q, k = self._apply_rope(q, k, x, b, t)
+            y = self._attn(q, k, v, self.head_dim)
+
         y = y.contiguous().view(b, t, c)
+        return self.proj(y)
+
+    def _forward_diff(self, x: torch.Tensor, q: torch.Tensor, k: torch.Tensor,
+                      v: torch.Tensor, b: int, t: int, c: int) -> torch.Tensor:
+        """Differential attention: out1 - λ*out2, optionally with PHA."""
+        hd2 = self.half_dim  # half_dim = head_dim // 2
+        # Split Q,K into two sub-heads: (b,t,H,hd) -> q1,q2 each (b,t,H,hd/2)
+        q1, q2 = q[..., :hd2], q[..., hd2:]
+        k1, k2 = k[..., :hd2], k[..., hd2:]
+
+        # Compute λ
+        lam = (torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+               - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+               + self.lambda_init)
+
+        if self.paired:
+            assert self.n_head % 2 == 0, "PHA requires even number of heads"
+            n2 = self.n_head // 2
+            # Merge adjacent head pairs for sub-heads: (b,t,H,hd/2) -> (b,t,H/2,hd)
+            # .contiguous() needed because slicing q[..., :hd2] produces non-contiguous view
+            q1 = q1.contiguous().view(b, t, n2, hd2 * 2)
+            k1 = k1.contiguous().view(b, t, n2, hd2 * 2)
+            q2 = q2.contiguous().view(b, t, n2, hd2 * 2)
+            k2 = k2.contiguous().view(b, t, n2, hd2 * 2)
+            # Apply paired RoPE (operates on hd = 2*hd2 width)
+            q1, k1 = self._apply_rope(q1, k1, x, b, t)
+            q2, k2 = self._apply_rope(q2, k2, x, b, t)
+            # Split to doubled sequence: (b,t,H/2,hd) -> (b,2t,H/2,hd/2)
+            q1 = q1.view(b, t * 2, n2, hd2)
+            k1 = k1.view(b, t * 2, n2, hd2)
+            q2 = q2.view(b, t * 2, n2, hd2)
+            k2 = k2.view(b, t * 2, n2, hd2)
+            # V interleaved: (b,t,H,hd) -> (b,2t,H/2,hd)
+            v_pha = v.reshape(b, t * 2, n2, self.head_dim)
+            # Two attention passes
+            out1 = self._attn(q1, k1, v_pha, hd2)  # (b,2t,H/2,hd)
+            out2 = self._attn(q2, k2, v_pha, hd2)  # (b,2t,H/2,hd)
+            # Reshape back: (b,2t,H/2,hd) -> (b,t,H,hd)
+            out1 = out1.contiguous().view(b, t, self.n_head, self.head_dim)
+            out2 = out2.contiguous().view(b, t, self.n_head, self.head_dim)
+        else:
+            # Standard RoPE on sub-heads
+            q1, k1 = self._apply_rope(q1, k1, x, b, t)
+            q2, k2 = self._apply_rope(q2, k2, x, b, t)
+            # Two attention passes with same V
+            out1 = self._attn(q1, k1, v, hd2)  # (b,t,H,hd)
+            out2 = self._attn(q2, k2, v, hd2)  # (b,t,H,hd)
+
+        # Differential: out1 - λ*out2, then per-head unit norm for direction stability
+        diff = out1 - lam * out2
+        diff = _unit_norm(diff, dim=-1)  # per-head normalization (replaces head_norm + 1-λ_init scalar)
+
+        y = diff.contiguous().view(b, t, c)
         return self.proj(y)
 
 
@@ -1560,12 +1696,18 @@ class NGPTBlock(nn.Module):
 
     h = Norm(h + alpha_A * (Norm(attn(h)) - h))
     h = Norm(h + alpha_M * (Norm(mlp(h)) - h))
+    [optional] h = Norm(h + alpha_G * (Norm(gate_proj(h) * x0) - h))  # embed gate
     No RMSNorm layers. Hidden state stays unit-norm throughout.
     """
 
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, d_model: int, n_head: int, layer_idx: int = 0,
+                 differential: bool = False, paired: bool = False,
+                 trap_mix: bool = False, window_size: int = 0,
+                 embed_gate: bool = False):
         super().__init__()
-        self.attn = NGPTSelfAttention(d_model, n_head)
+        self.attn = NGPTSelfAttention(d_model, n_head, layer_idx=layer_idx,
+                                      differential=differential, paired=paired,
+                                      trap_mix=trap_mix, window_size=window_size)
         if HP.feat_attn_mlp:
             self.mlp = FeatureAttentionMLP(d_model, HP.fa_n_features, HP.fa_activation,
                                            post_act=HP.fa_post_act, pre_act=HP.fa_pre_act,
@@ -1579,6 +1721,13 @@ class NGPTBlock(nn.Module):
         self.alpha_attn = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
         self.alpha_mlp = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
 
+        # Embed gate: content-dependent residual from original embedding
+        self.embed_gate = embed_gate
+        if self.embed_gate:
+            self.gate_proj = nn.Linear(d_model, d_model, bias=False)
+            self.alpha_gate = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
+        self._x0 = None  # set by model forward before running blocks
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("ngpt/block_attn"):
             h_a = _unit_norm(self.attn(x))
@@ -1588,6 +1737,11 @@ class NGPTBlock(nn.Module):
             h_m = _unit_norm(self.mlp(x))
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
             x = _unit_norm(x + alpha_m * (h_m - x))
+        if self.embed_gate and self._x0 is not None:
+            with torch.autograd.profiler.record_function("ngpt/embed_gate"):
+                h_g = _unit_norm(self.gate_proj(x) * self._x0)
+                alpha_g = _ngpt_actual(self.alpha_gate).abs()
+                x = _unit_norm(x + alpha_g * (h_g - x))
         return x
 
 
@@ -1601,9 +1755,15 @@ class NGPTMoEBlock(nn.Module):
 
     def __init__(self, d_model: int, n_head: int, n_experts: int, top_k: int,
                  n_group: int = 1, topk_group: int = 1,
-                 scaling_factor: float = 1.0, bias_lr: float = 0.001):
+                 scaling_factor: float = 1.0, bias_lr: float = 0.001,
+                 layer_idx: int = 0,
+                 differential: bool = False, paired: bool = False,
+                 trap_mix: bool = False, window_size: int = 0,
+                 embed_gate: bool = False):
         super().__init__()
-        self.attn = NGPTSelfAttention(d_model, n_head)
+        self.attn = NGPTSelfAttention(d_model, n_head, layer_idx=layer_idx,
+                                      differential=differential, paired=paired,
+                                      trap_mix=trap_mix, window_size=window_size)
         self.mlp = DSMoEMLP(d_model, n_experts, top_k, n_group=n_group,
                             topk_group=topk_group, scaling_factor=scaling_factor,
                             bias_lr=bias_lr)
@@ -1614,6 +1774,13 @@ class NGPTMoEBlock(nn.Module):
         self.alpha_attn = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
         self.alpha_mlp = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
 
+        # Embed gate: content-dependent residual from original embedding
+        self.embed_gate = embed_gate
+        if self.embed_gate:
+            self.gate_proj = nn.Linear(d_model, d_model, bias=False)
+            self.alpha_gate = _ngpt_scale_param((d_model,), alpha_init, alpha_scale)
+        self._x0 = None  # set by model forward before running blocks
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autograd.profiler.record_function("ngpt_moe/block_attn"):
             h_a = _unit_norm(self.attn(x))
@@ -1623,6 +1790,11 @@ class NGPTMoEBlock(nn.Module):
             h_m = _unit_norm(self.mlp(x))  # DSMoEMLP returns tensor directly, no drops
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
             x = _unit_norm(x + alpha_m * (h_m - x))
+        if self.embed_gate and self._x0 is not None:
+            with torch.autograd.profiler.record_function("ngpt_moe/embed_gate"):
+                h_g = _unit_norm(self.gate_proj(x) * self._x0)
+                alpha_g = _ngpt_actual(self.alpha_gate).abs()
+                x = _unit_norm(x + alpha_g * (h_g - x))
         return x
 
 
@@ -1635,9 +1807,18 @@ def _ngpt_normalize_weights(model: nn.Module):
     gate/up, dim=1 (output/hidden dim) for down.
     This keeps all dot products interpretable as cosine similarities.
     """
+    # Collect bare Parameters that should NOT be normalized (e.g. diff attn lambda vectors)
+    _skip_ids: set[int] = set()
+    for m in model.modules():
+        for p in m.parameters(recurse=False):
+            if getattr(p, '_ngpt_skip_normalize', False):
+                _skip_ids.add(id(p))
+
     with torch.no_grad():
         for m in model.modules():
             if isinstance(m, nn.Linear):
+                if id(m.weight) in _skip_ids:
+                    continue
                 m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
             elif isinstance(m, nn.Embedding):
                 m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
@@ -3114,14 +3295,13 @@ def _get_embed_weight(model: nn.Module) -> torch.Tensor | None:
 
 @torch.no_grad()
 def _std_cross_entropy(hidden: torch.Tensor, targets: torch.Tensor,
-                       embed_weight: torch.Tensor, temperature: float = 1.0) -> float:
+                       embed_weight: torch.Tensor) -> float:
     """Compute standard cross-entropy from hidden states and embedding weight.
 
     hidden: (B, T, D), targets: (B, T), embed_weight: (V, D).
-    temperature: scaling for logits (sqrt(d_model) for nGPT where hidden/embed are unit-normed).
     Returns scalar loss value.
     """
-    logits = F.linear(hidden.float(), embed_weight.float()) * temperature
+    logits = F.linear(hidden.float(), embed_weight.float())
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                            targets.reshape(-1)).item()
 
@@ -3771,21 +3951,47 @@ class GPTMoE(nn.Module):
 
 
 class GPTNGPTMoE(nn.Module):
-    """nGPT with Mixture of Experts MLP — LERP updates on the hypersphere + MoE."""
+    """nGPT with Mixture of Experts MLP — LERP updates on the hypersphere + MoE.
+
+    Supports per-layer specialization:
+    - Differential attention on first N layers (NGPT_DIFF_ATTN_N)
+    - Paired Head Attention on odd layers (NGPT_PAIRED_ODD)
+    - TrapMix skipped on even layers (NGPT_SKIP_TRAP_EVEN)
+    - Sliding window on specified layers (NGPT_WINDOW_LAYERS / NGPT_WINDOW_SIZE)
+    - Content-dependent embed gate at middle layer (NGPT_EMBED_GATE_LAYER)
+    """
 
     def __init__(self):
         super().__init__()
         self.wte, self.lm_head = _make_embed_head_pair()
         D = HP.moe_dense_layers
+        n_layer = HP.n_layer
+
+        # Parse per-layer config
+        window_set = set()
+        if HP.ngpt_window_layers:
+            window_set = {int(x.strip()) for x in HP.ngpt_window_layers.split(",") if x.strip()}
+
         blocks = []
-        for i in range(HP.n_layer):
-            if i < D or i >= HP.n_layer - D:
-                blocks.append(NGPTBlock(HP.d_model, HP.n_head))
+        for i in range(n_layer):
+            is_odd = (i % 2 == 1)
+            is_dense = (i < D or i >= n_layer - D)
+            attn_cfg = dict(
+                layer_idx=i,
+                differential=(i < HP.ngpt_diff_attn_n),
+                paired=(HP.ngpt_paired_odd and is_odd),
+                trap_mix=(HP.trap_mix and not (HP.ngpt_skip_trap_even and not is_odd)),
+                window_size=(HP.ngpt_window_size if i in window_set else 0),
+                embed_gate=(i == HP.ngpt_embed_gate_layer),
+            )
+            if is_dense:
+                blocks.append(NGPTBlock(HP.d_model, HP.n_head, **attn_cfg))
             else:
                 blocks.append(NGPTMoEBlock(
                     HP.d_model, HP.n_head, HP.n_experts, HP.top_k,
                     n_group=HP.moe_n_group, topk_group=HP.moe_topk_group,
-                    scaling_factor=HP.moe_scaling_factor, bias_lr=HP.moe_bias_lr))
+                    scaling_factor=HP.moe_scaling_factor, bias_lr=HP.moe_bias_lr,
+                    **attn_cfg))
         self.blocks = nn.ModuleList(blocks)
         self.ln_f = nn.Identity()  # nGPT: hidden state is already unit-norm
         # Logit scaling: per-vocab learnable temperature
@@ -3795,9 +4001,33 @@ class GPTNGPTMoE(nn.Module):
         _tie_weights(self)
         _ngpt_normalize_weights(self)
 
+        # Log layer config
+        _cfg_parts = []
+        for i, blk in enumerate(self.blocks):
+            parts = []
+            if blk.attn.differential:
+                parts.append("diff")
+            if blk.attn.paired:
+                parts.append("pha")
+            if blk.attn.trap_mix:
+                parts.append("trap")
+            if blk.attn.window_size > 0:
+                parts.append(f"win{blk.attn.window_size}")
+            if blk.embed_gate:
+                parts.append("egate")
+            mlp_type = "dense" if isinstance(blk, NGPTBlock) else "moe"
+            _cfg_parts.append(f"  L{i}: {mlp_type} {' '.join(parts) if parts else 'std'}")
+        if any(p for p in _cfg_parts if "std" not in p.split()[-1]):
+            print("\n".join(["[GPTNGPTMoE] Per-layer config:"] + _cfg_parts))
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = _unit_norm(self.wte(idx))
-        x = _run_blocks(self.blocks, x)
+        # Store x0 for embed-gate blocks
+        for blk in self.blocks:
+            if blk.embed_gate:
+                blk._x0 = x
+        for blk in self.blocks:
+            x = blk(x)
         # x is already unit-norm from the blocks
         self._last_hidden = x.detach()
         if targets is not None and isinstance(self.lm_head, DecoderHead):
@@ -3988,8 +4218,7 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int,
-             std_temp: float = 1.0):
+def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
     """Returns (val_loss, val_acc, std_loss) where val_acc/std_loss may be None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
@@ -4023,7 +4252,7 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
             acc_sum += raw._last_acc
             has_acc = True
         if has_std and hasattr(raw, '_last_hidden'):
-            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w, std_temp)
+            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w)
     loss_sum /= HP.val_steps
     if has_acc:
         acc_sum /= HP.val_steps
@@ -4149,7 +4378,6 @@ def main():
 
     # Standard CE reference: extract raw embed weight for cross-model comparison
     _embed_w = _get_embed_weight(raw_model)
-    _std_temp = math.sqrt(HP.d_model) if _is_ngpt else 1.0  # nGPT: unit-normed → cosine sims need temperature
     _last_y = None  # stashed from last micro-batch for std_loss logging
 
     # Contraharmonic loss state
@@ -4178,7 +4406,7 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size, std_temp=_std_temp)
+            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
             _std_str = f" | std_loss {val_std:.5f}" if val_std is not None else ""
             print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_std_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
@@ -4277,7 +4505,7 @@ def main():
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
             _train_std_str = ""
             if _embed_w is not None and hasattr(raw_model, '_last_hidden'):
-                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w, _std_temp):.5f}"
+                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w):.5f}"
             _phase = "warmup" if _in_warmup else "stable"
             print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
