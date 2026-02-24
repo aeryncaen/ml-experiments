@@ -2346,9 +2346,9 @@ class CompositeEmbedding(nn.Module):
         self.max_tok_params = self.max_bytes * token_per_byte  # 128
         self.byte_budget = model_dim - self.max_tok_params      # 640
         self.max_soak = max(self.byte_budget % N for N in range(1, self.max_bytes + 1))
-        self.pad_idx = 256
+        self.pad_idx = 256  # sentinel in token_bytes table (never looked up — matryoshka only reads :N)
 
-        self.byte_embed = nn.Embedding(257, self.byte_budget)
+        self.byte_embed = nn.Embedding(256, self.byte_budget)
 
         self.token_params = nn.Embedding(vocab_size, self.max_tok_params + self.max_soak)
 
@@ -2682,9 +2682,9 @@ class CompositePITTokenInterface(nn.Module):
         self.max_soak = max(self.byte_budget % N for N in range(1, self.max_bytes + 1))
         self.eps = eps
         self.min_diag = max(min_diag, eps)
-        self.pad_idx = 256
+        self.pad_idx = 256  # sentinel in token_bytes table (never looked up)
 
-        self.byte_memory = nn.Parameter(torch.empty(257, self.byte_budget))
+        self.byte_memory = nn.Parameter(torch.empty(256, self.byte_budget))
         self.token_embed = nn.Embedding(vocab_size, self.max_tok_params + self.max_soak)
 
         # Full d_model Cholesky factor
@@ -2703,9 +2703,9 @@ class CompositePITTokenInterface(nn.Module):
     def reset_parameters(self, orth_init: bool = True):
         with torch.no_grad():
             if orth_init:
-                # 257 orthonormal rows in R^byte_budget
-                q, _ = torch.linalg.qr(torch.randn(self.byte_budget, 257), mode="reduced")
-                self.byte_memory.copy_(q.T)  # (257, byte_budget)
+                # 256 orthonormal rows in R^byte_budget
+                q, _ = torch.linalg.qr(torch.randn(self.byte_budget, 256), mode="reduced")
+                self.byte_memory.copy_(q.T)  # (256, byte_budget)
             else:
                 nn.init.normal_(self.byte_memory, mean=0.0, std=0.02)
 
