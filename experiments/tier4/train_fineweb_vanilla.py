@@ -557,17 +557,14 @@ class SelfAttention(nn.Module):
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-        # DD-RoPE: half of head_dim gets standard RoPE, other half gets
-        # data-dependent RoPE (Mamba-3 §3.2: complex SSM ↔ dd-RoPE on B,C ↔ K,Q)
+        # DD-RoPE: fully data-dependent RoPE on all head dims
+        # (Mamba-3 §3.2: complex SSM ↔ dd-RoPE on B,C ↔ K,Q)
         self.dd_rope = HP.dd_rope
         hd = self.head_dim
         if self.dd_rope:
-            assert hd % 4 == 0, f"head_dim ({hd}) must be divisible by 4 for dd-rope split"
-            self.rope_dim = hd // 2           # dims with standard RoPE
-            self.dd_dim = hd - self.rope_dim  # dims with dd-RoPE
-            self.rotary = Rotary(self.rope_dim)
-            # Project input → per-head rotation angles (dd_dim/2 angles per head)
-            self.theta_proj = nn.Linear(d_model, n_head * (self.dd_dim // 2), bias=False)
+            assert hd % 2 == 0, f"head_dim ({hd}) must be even for dd-rope"
+            # Project input → per-head rotation angles (hd/2 angles per head)
+            self.theta_proj = nn.Linear(d_model, n_head * (hd // 2), bias=False)
         else:
             self.rotary = Rotary(hd)
 
@@ -588,24 +585,13 @@ class SelfAttention(nn.Module):
         v = self.v(x).view(b, t, self.n_head, self.head_dim)
 
         if self.dd_rope:
-            rd = self.rope_dim
-            dd = self.dd_dim
-            # Standard RoPE on first half of dims
-            cos, sin = self.rotary(q)
-            q_rope = apply_rotary(q[..., :rd], cos, sin)
-            k_rope = apply_rotary(k[..., :rd], cos, sin)
-
-            # Data-dependent RoPE on second half of dims
-            # theta: (b, t, n_head * dd/2) → (b, t, n_head, dd/2)
-            theta = self.theta_proj(x).view(b, t, self.n_head, dd // 2)
-            cum_theta = theta.cumsum(dim=1)  # cumulative rotation angles
+            # Data-dependent RoPE on all dims
+            theta = self.theta_proj(x).view(b, t, self.n_head, self.head_dim // 2)
+            cum_theta = theta.cumsum(dim=1)
             cos_dd = cum_theta.cos()
             sin_dd = cum_theta.sin()
-            q_dd = apply_rotary(q[..., rd:], cos_dd, sin_dd)
-            k_dd = apply_rotary(k[..., rd:], cos_dd, sin_dd)
-
-            q = torch.cat([q_rope, q_dd], dim=-1)
-            k = torch.cat([k_rope, k_dd], dim=-1)
+            q = apply_rotary(q, cos_dd, sin_dd)
+            k = apply_rotary(k, cos_dd, sin_dd)
         else:
             cos, sin = self.rotary(q)
             q = apply_rotary(q, cos, sin)
@@ -1232,14 +1218,12 @@ class NGPTSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
         # DD-RoPE / standard RoPE (same logic as SelfAttention)
+        # DD-RoPE / standard RoPE (same logic as SelfAttention)
         self.dd_rope = HP.dd_rope
         hd = self.head_dim
         if self.dd_rope:
-            assert hd % 4 == 0, f"head_dim ({hd}) must be divisible by 4 for dd-rope split"
-            self.rope_dim = hd // 2
-            self.dd_dim = hd - self.rope_dim
-            self.rotary = Rotary(self.rope_dim)
-            self.theta_proj = nn.Linear(d_model, n_head * (self.dd_dim // 2), bias=False)
+            assert hd % 2 == 0, f"head_dim ({hd}) must be even for dd-rope"
+            self.theta_proj = nn.Linear(d_model, n_head * (hd // 2), bias=False)
         else:
             self.rotary = Rotary(hd)
 
@@ -1261,17 +1245,11 @@ class NGPTSelfAttention(nn.Module):
         v = self.v(x).view(b, t, self.n_head, self.head_dim)
 
         if self.dd_rope:
-            rd = self.rope_dim
-            cos, sin = self.rotary(q)
-            q_rope = apply_rotary(q[..., :rd], cos, sin)
-            k_rope = apply_rotary(k[..., :rd], cos, sin)
-            theta = self.theta_proj(x).view(b, t, self.n_head, self.dd_dim // 2)
+            theta = self.theta_proj(x).view(b, t, self.n_head, self.head_dim // 2)
             cum_theta = theta.cumsum(dim=1)
             cos_dd, sin_dd = cum_theta.cos(), cum_theta.sin()
-            q_dd = apply_rotary(q[..., rd:], cos_dd, sin_dd)
-            k_dd = apply_rotary(k[..., rd:], cos_dd, sin_dd)
-            q = torch.cat([q_rope, q_dd], dim=-1)
-            k = torch.cat([k_rope, k_dd], dim=-1)
+            q = apply_rotary(q, cos_dd, sin_dd)
+            k = apply_rotary(k, cos_dd, sin_dd)
         else:
             cos, sin = self.rotary(q)
             q = apply_rotary(q, cos, sin)
