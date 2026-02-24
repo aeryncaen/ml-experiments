@@ -2141,23 +2141,17 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 
 
 class CompositeEmbedding(nn.Module):
-    """Matryoshka byte-factored embedding: no padding, variable byte utilization.
+    """Matryoshka byte-factored embedding: no zero-padding, variable byte utilization.
 
     Each token's d_model dims are packed from its actual bytes:
-      - byte_embed: 257 x byte_budget  (byte_budget = d_model - 16*token_per_byte)
-      - token_params: V x max_tok_params  (16*token_per_byte per-token learned dims)
+      - byte_embed: 257 x byte_budget
+      - token_params: V x (max_tok_params + max_soak)
 
-    For a token with N bytes (clamped min 1):
-      byte_budget   = d_model - max_tok_params   (fixed across all N)
-      bps           = byte_budget // N            (byte dims per slot)
-      tps           = max_tok_params // N          (token dims per slot)
-      remainder     = byte_budget % N + max_tok_params % N
+    max_tok_params = 16 * tpb  — spread across N slots (tps = mtp // N per slot)
+    max_soak = max(byte_budget % N for N in 1..16)  — fills remainder dims
 
-      Layout: [byte0_shared | byte0_tok | ... | byteN_shared | byteN_tok | remainder_tok | pad]
-      where byte_shared = byte_embed[value][:bps]  (matryoshka: lowest ranks first)
-
-    All max_tok_params are always used regardless of byte count.
-    Short tokens get richer byte representations (more byte dims per slot).
+    Layout: [slot_0 | slot_1 | ... | slot_{N-1} | tok_remainder | soak]
+    Every dim is learned. No zero-padding.
     """
     def __init__(self, vocab_size: int, model_dim: int, token_per_byte: int = 8):
         super().__init__()
@@ -2167,20 +2161,20 @@ class CompositeEmbedding(nn.Module):
         self.max_bytes = 16
         self.max_tok_params = self.max_bytes * token_per_byte  # 128
         self.byte_budget = model_dim - self.max_tok_params      # 640
+        self.max_soak = max(self.byte_budget % N for N in range(1, self.max_bytes + 1))
         self.pad_idx = 256
 
-        self.byte_embed = nn.Embedding(257, self.byte_budget)  # 256 byte values + 1 pad/special
+        self.byte_embed = nn.Embedding(257, self.byte_budget)
 
-        self.token_params = nn.Embedding(vocab_size, self.max_tok_params)
+        self.token_params = nn.Embedding(vocab_size, self.max_tok_params + self.max_soak)
 
         # Precompute byte counts
         token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
-        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)  # (V,), min 1
+        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
 
-        self.register_buffer('token_bytes', token_bytes_table, persistent=False)  # (V, 16)
-        self.register_buffer('n_bytes', n_bytes, persistent=False)               # (V,)
+        self.register_buffer('token_bytes', token_bytes_table, persistent=False)
+        self.register_buffer('n_bytes', n_bytes, persistent=False)
 
-        # Precompute which byte counts exist for the loop
         self._unique_n = sorted(set(n_bytes.tolist()))
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -2193,9 +2187,8 @@ class CompositeEmbedding(nn.Module):
 
         n = self.n_bytes[flat]                                      # (M,)
         byte_seqs = self.token_bytes[flat]                          # (M, 16)
-        tp = self.token_params(flat)                                # (M, max_tok_params)
+        tp = self.token_params(flat)                                # (M, mtp + max_soak)
 
-        # Assemble per-group, gather back to original order (no in-place ops for autograd)
         parts = []
         order = []
         for N in self._unique_n:
@@ -2208,41 +2201,34 @@ class CompositeEmbedding(nn.Module):
             slot_size = bps + tps
             remainder = D - N * slot_size                           # leftover dims at end
 
-            bs = byte_seqs[idx, :N]                                 # (count, N)
+            bs = byte_seqs[idx, :N]
             be = self.byte_embed(bs)[:, :, :bps]                    # (count, N, bps)
 
-            tp_sub = tp[idx]                                        # (count, max_tok_params)
-            tp_per_slot = tp_sub[:, :N * tps].view(-1, N, tps)     # (count, N, tps)
+            tp_sub = tp[idx]
+            tp_per_slot = tp_sub[:, :N * tps].view(-1, N, tps)
 
             slots = torch.cat([be, tp_per_slot], dim=-1)            # (count, N, slot_size)
             assembled = slots.reshape(-1, N * slot_size)            # (count, N * slot_size)
 
             if remainder > 0:
-                # Fill remainder with leftover token params, zero-pad any extra
-                tok_rem = mtp - N * tps                             # = mtp % N
+                tok_rem = mtp % N                                   # leftover from slot division
+                soak = bb % N                                       # dims that were zero-padded
+                # tok_rem from regular params, soak from soak region
+                rem_parts = []
                 if tok_rem > 0:
-                    rem_tok = tp_sub[:, N * tps : N * tps + tok_rem]
-                else:
-                    rem_tok = tp_sub[:, :0]                          # empty
-                pad_size = remainder - tok_rem
-                if pad_size > 0:
-                    pad = torch.zeros(rem_tok.shape[0], pad_size,
-                                      device=rem_tok.device, dtype=rem_tok.dtype)
-                    rem = torch.cat([rem_tok, pad], dim=-1)
-                else:
-                    rem = rem_tok
+                    rem_parts.append(tp_sub[:, N * tps : N * tps + tok_rem])
+                if soak > 0:
+                    rem_parts.append(tp_sub[:, mtp : mtp + soak])
+                rem = torch.cat(rem_parts, dim=-1) if len(rem_parts) > 1 else rem_parts[0]
                 assembled = torch.cat([assembled, rem], dim=-1)     # (count, D)
 
             parts.append(assembled)
             order.append(idx)
 
-        # Concat all groups and restore original token order
         all_parts = torch.cat(parts, dim=0)                         # (M, D)
-        all_order = torch.cat(order, dim=0)                         # (M,)
+        all_order = torch.cat(order, dim=0)
         _, restore = all_order.sort()
-        out = all_parts[restore]                                    # (M, D)
-
-        return out.view(*shape, D)
+        return all_parts[restore].view(*shape, D)
 
 
 class DecoderHead(nn.Module):
@@ -2509,12 +2495,13 @@ class CompositePITTokenInterface(nn.Module):
         self.max_bytes = 16
         self.max_tok_params = self.max_bytes * token_per_byte  # 128
         self.byte_budget = d_model - self.max_tok_params        # 640
+        self.max_soak = max(self.byte_budget % N for N in range(1, self.max_bytes + 1))
         self.eps = eps
         self.min_diag = max(min_diag, eps)
         self.pad_idx = 256
 
         self.byte_memory = nn.Parameter(torch.empty(257, self.byte_budget))
-        self.token_embed = nn.Embedding(vocab_size, self.max_tok_params)
+        self.token_embed = nn.Embedding(vocab_size, self.max_tok_params + self.max_soak)
 
         # Full d_model Cholesky factor
         self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))
@@ -2582,19 +2569,16 @@ class CompositePITTokenInterface(nn.Module):
             assembled = slots.reshape(-1, N * slot_size)            # (count, N * slot_size)
 
             if remainder > 0:
-                tok_rem = mtp - N * tps                             # = mtp % N
+                tok_rem = mtp % N                                   # leftover from slot division
+                soak = bb % N                                       # dims that were zero-padded
+                # tok_rem from regular params, soak from soak region
+                rem_parts = []
                 if tok_rem > 0:
-                    rem_tok = tp_sub[:, N * tps : N * tps + tok_rem]
-                else:
-                    rem_tok = tp_sub[:, :0]
-                pad_size = remainder - tok_rem
-                if pad_size > 0:
-                    pad = torch.zeros(rem_tok.shape[0], pad_size,
-                                      device=rem_tok.device, dtype=rem_tok.dtype)
-                    rem = torch.cat([rem_tok, pad], dim=-1)
-                else:
-                    rem = rem_tok
-                assembled = torch.cat([assembled, rem], dim=-1)
+                    rem_parts.append(tp_sub[:, N * tps : N * tps + tok_rem])
+                if soak > 0:
+                    rem_parts.append(tp_sub[:, mtp : mtp + soak])
+                rem = torch.cat(rem_parts, dim=-1) if len(rem_parts) > 1 else rem_parts[0]
+                assembled = torch.cat([assembled, rem], dim=-1)     # (count, D)
 
             parts.append(assembled)
             order.append(idx)
