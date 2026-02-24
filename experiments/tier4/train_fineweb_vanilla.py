@@ -78,6 +78,10 @@ class HParams:
     fa_qk_norm: bool = _env_bool("FA_QK_NORM", False)        # RMSNorm on Q=K before scoring
     feat_attn_mlp: bool = _env_bool("FEAT_ATTN_MLP", False)  # swap SwiGLU MLP for FeatureAttentionMLP in transformer/nGPT blocks
 
+    # Mamba-3-inspired attention enhancements
+    dd_rope: bool = _env_bool("DD_ROPE", False)    # data-dependent RoPE on half of head dims (Mamba-3 §3.2)
+    trap_mix: bool = _env_bool("TRAP_MIX", False)  # trapezoidal K,V mixing: size-2 conv before attention (Mamba-3 §3.1)
+
     # Fused gate knobs (0 = use d_model, no expansion)
     fused_inner_dim: int = _env_int("FUSED_INNER_DIM", 0)
 
@@ -552,16 +556,82 @@ class SelfAttention(nn.Module):
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.rotary = Rotary(self.head_dim)
+
+        # DD-RoPE: half of head_dim gets standard RoPE, other half gets
+        # data-dependent RoPE (Mamba-3 §3.2: complex SSM ↔ dd-RoPE on B,C ↔ K,Q)
+        self.dd_rope = HP.dd_rope
+        hd = self.head_dim
+        if self.dd_rope:
+            assert hd % 4 == 0, f"head_dim ({hd}) must be divisible by 4 for dd-rope split"
+            self.rope_dim = hd // 2           # dims with standard RoPE
+            self.dd_dim = hd - self.rope_dim  # dims with dd-RoPE
+            self.rotary = Rotary(self.rope_dim)
+            # Project input → per-head rotation angles (dd_dim/2 angles per head)
+            self.theta_proj = nn.Linear(d_model, n_head * (self.dd_dim // 2), bias=False)
+        else:
+            self.rotary = Rotary(hd)
+
+        # Trapezoidal K,V mixing: size-2 data-dependent conv before attention
+        # (Mamba-3 §3.1: K_t' = γ_t K_t + β_t K_{t-1}, same for V)
+        self.trap_mix = HP.trap_mix
+        if self.trap_mix:
+            # Project input → per-head (log_dt, lambda_logit)
+            self.trap_proj = nn.Linear(d_model, n_head * 2, bias=False)
+            # Learnable scalar decay per head (log(A), A < 0 enforced)
+            self.trap_log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
+            self.trap_log_A._no_weight_decay = True  # type: ignore[attr-defined]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
         q = self.q(x).view(b, t, self.n_head, self.head_dim)
         k = self.k(x).view(b, t, self.n_head, self.head_dim)
         v = self.v(x).view(b, t, self.n_head, self.head_dim)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+
+        if self.dd_rope:
+            rd = self.rope_dim
+            dd = self.dd_dim
+            # Standard RoPE on first half of dims
+            cos, sin = self.rotary(q)
+            q_rope = apply_rotary(q[..., :rd], cos, sin)
+            k_rope = apply_rotary(k[..., :rd], cos, sin)
+
+            # Data-dependent RoPE on second half of dims
+            # theta: (b, t, n_head * dd/2) → (b, t, n_head, dd/2)
+            theta = self.theta_proj(x).view(b, t, self.n_head, dd // 2)
+            cum_theta = theta.cumsum(dim=1)  # cumulative rotation angles
+            cos_dd = cum_theta.cos()
+            sin_dd = cum_theta.sin()
+            q_dd = apply_rotary(q[..., rd:], cos_dd, sin_dd)
+            k_dd = apply_rotary(k[..., rd:], cos_dd, sin_dd)
+
+            q = torch.cat([q_rope, q_dd], dim=-1)
+            k = torch.cat([k_rope, k_dd], dim=-1)
+        else:
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+
+        if self.trap_mix:
+            # Project dt, lambda from input: (b, t, n_head * 2)
+            trap = self.trap_proj(x).view(b, t, self.n_head, 2)
+            log_dt, lam_logit = trap[..., 0], trap[..., 1]  # (b, t, H)
+            dt = F.softplus(log_dt).clamp(max=2.0)
+            A_neg = self.trap_log_A.exp().neg()  # (H,)
+            alpha = torch.exp(dt * A_neg).clamp(max=0.999)  # (b, t, H)
+            lam = torch.sigmoid(lam_logit)
+            gamma = lam * dt           # weight for current position
+            beta = (1.0 - lam) * dt * alpha  # weight for previous position
+
+            # K_trap_t = γ_t * K_t + β_t * K_{t-1}  (zero-pad at t=0)
+            gamma_k = gamma.unsqueeze(-1)  # (b, t, H, 1)
+            beta_k = beta.unsqueeze(-1)
+            k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))  # (b, t, H, D)
+            k = gamma_k * k + beta_k * k_shifted
+
+            # Same conv on V
+            v_shifted = F.pad(v[:, :-1], (0, 0, 0, 0, 1, 0))
+            v = gamma_k * v + beta_k * v_shifted
+
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=HP.is_causal)  # (b, t, h, d)
         else:
@@ -1160,7 +1230,25 @@ class NGPTSelfAttention(nn.Module):
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.rotary = Rotary(self.head_dim)
+
+        # DD-RoPE / standard RoPE (same logic as SelfAttention)
+        self.dd_rope = HP.dd_rope
+        hd = self.head_dim
+        if self.dd_rope:
+            assert hd % 4 == 0, f"head_dim ({hd}) must be divisible by 4 for dd-rope split"
+            self.rope_dim = hd // 2
+            self.dd_dim = hd - self.rope_dim
+            self.rotary = Rotary(self.rope_dim)
+            self.theta_proj = nn.Linear(d_model, n_head * (self.dd_dim // 2), bias=False)
+        else:
+            self.rotary = Rotary(hd)
+
+        # Trapezoidal K,V mixing
+        self.trap_mix = HP.trap_mix
+        if self.trap_mix:
+            self.trap_proj = nn.Linear(d_model, n_head * 2, bias=False)
+            self.trap_log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
+            self.trap_log_A._no_weight_decay = True  # type: ignore[attr-defined]
 
         # QK scaling: shared per head, one scalar per head_dim element
         s_scale = 1.0 / math.sqrt(d_model)
@@ -1171,9 +1259,37 @@ class NGPTSelfAttention(nn.Module):
         q = self.q(x).view(b, t, self.n_head, self.head_dim)
         k = self.k(x).view(b, t, self.n_head, self.head_dim)
         v = self.v(x).view(b, t, self.n_head, self.head_dim)
-        cos, sin = self.rotary(q)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+
+        if self.dd_rope:
+            rd = self.rope_dim
+            cos, sin = self.rotary(q)
+            q_rope = apply_rotary(q[..., :rd], cos, sin)
+            k_rope = apply_rotary(k[..., :rd], cos, sin)
+            theta = self.theta_proj(x).view(b, t, self.n_head, self.dd_dim // 2)
+            cum_theta = theta.cumsum(dim=1)
+            cos_dd, sin_dd = cum_theta.cos(), cum_theta.sin()
+            q_dd = apply_rotary(q[..., rd:], cos_dd, sin_dd)
+            k_dd = apply_rotary(k[..., rd:], cos_dd, sin_dd)
+            q = torch.cat([q_rope, q_dd], dim=-1)
+            k = torch.cat([k_rope, k_dd], dim=-1)
+        else:
+            cos, sin = self.rotary(q)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+
+        if self.trap_mix:
+            trap = self.trap_proj(x).view(b, t, self.n_head, 2)
+            log_dt, lam_logit = trap[..., 0], trap[..., 1]
+            dt = F.softplus(log_dt).clamp(max=2.0)
+            A_neg = self.trap_log_A.exp().neg()
+            alpha = torch.exp(dt * A_neg).clamp(max=0.999)
+            lam = torch.sigmoid(lam_logit)
+            gamma = (lam * dt).unsqueeze(-1)
+            beta = ((1.0 - lam) * dt * alpha).unsqueeze(-1)
+            k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))
+            k = gamma * k + beta * k_shifted
+            v_shifted = F.pad(v[:, :-1], (0, 0, 0, 0, 1, 0))
+            v = gamma * v + beta * v_shifted
 
         # nGPT: normalize q,k then apply learned scaling
         s_qk = _ngpt_actual(self.s_qk)
@@ -3562,6 +3678,10 @@ def main():
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag}"
     if HP.ngpt:
         _extra += f" ngpt=True alpha_init={HP.ngpt_alpha_init}"
+    if HP.dd_rope:
+        _extra += " dd_rope=True"
+    if HP.trap_mix:
+        _extra += " trap_mix=True"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
