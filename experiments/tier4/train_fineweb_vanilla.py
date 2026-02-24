@@ -3095,6 +3095,36 @@ def _tie_weights(model: nn.Module):
     pass
 
 
+def _get_embed_weight(model: nn.Module) -> torch.Tensor | None:
+    """Extract the raw embedding weight matrix for standard CE computation.
+
+    Returns (vocab_size, d_model) tensor, or None if not extractable.
+    """
+    wte = getattr(model, 'wte', None)
+    if wte is None:
+        return None
+    # nn.Embedding
+    if isinstance(wte, nn.Embedding):
+        return wte.weight
+    # CompositeEmbedding — no single weight matrix
+    # PITEmbedding — interface.memory is the Z matrix, not a standard embed
+    # CompositePITEmbedding — same
+    return None
+
+
+@torch.no_grad()
+def _std_cross_entropy(hidden: torch.Tensor, targets: torch.Tensor,
+                       embed_weight: torch.Tensor) -> float:
+    """Compute standard cross-entropy from hidden states and embedding weight.
+
+    hidden: (B, T, D), targets: (B, T), embed_weight: (V, D).
+    Returns scalar loss value.
+    """
+    logits = F.linear(hidden.float(), embed_weight.float())
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                           targets.reshape(-1)).item()
+
+
 # ── Byte-attention MLP ───────────────────────────────────────────────────────
 
 class ByteAttentionMLP(nn.Module):
@@ -3196,6 +3226,7 @@ class GPTTransformer(nn.Module):
             x = _unit_norm(x)  # project onto hypersphere before entering nGPT blocks
         x = _run_blocks(self.blocks, x)
         x = self.ln_f(x)
+        self._last_hidden = x.detach()
         if targets is not None and isinstance(self.lm_head, DecoderHead):
             vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
             loss = self.lm_head.streamed_cross_entropy(
@@ -3715,6 +3746,7 @@ class GPTMoE(nn.Module):
             else:
                 x, _ = block(x)
         x = self.ln_f(x)
+        self._last_hidden = x.detach()
         if targets is not None and isinstance(self.lm_head, DecoderHead):
             vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
             loss = self.lm_head.streamed_cross_entropy(
@@ -3766,6 +3798,7 @@ class GPTNGPTMoE(nn.Module):
         x = _unit_norm(self.wte(idx))
         x = _run_blocks(self.blocks, x)
         # x is already unit-norm from the blocks
+        self._last_hidden = x.detach()
         if targets is not None and isinstance(self.lm_head, DecoderHead):
             vocab_chunk = HP.vocab_size if HP.decoder_head_vocab_chunk <= 0 else HP.decoder_head_vocab_chunk
             loss = self.lm_head.streamed_cross_entropy(
@@ -3955,13 +3988,16 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 @torch.no_grad()
 def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
-    """Returns (val_loss, val_acc) where val_acc may be None."""
+    """Returns (val_loss, val_acc, std_loss) where val_acc/std_loss may be None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
+    embed_w = _get_embed_weight(raw)
     model.eval()
     loss_sum = torch.zeros(1, device=device)
     acc_sum = torch.zeros(1, device=device)
+    std_loss_sum = torch.zeros(1, device=device)
     has_acc = False
+    has_std = embed_w is not None
     for _ in range(HP.val_steps):
         _vbatch = val_stream.next_batch(device)
         x, y = _vbatch[0], _vbatch[1]
@@ -3984,15 +4020,23 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
         if hasattr(raw, '_last_acc') and raw._last_acc is not None:
             acc_sum += raw._last_acc
             has_acc = True
+        if has_std and hasattr(raw, '_last_hidden'):
+            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w)
     loss_sum /= HP.val_steps
     if has_acc:
         acc_sum /= HP.val_steps
+    if has_std:
+        std_loss_sum /= HP.val_steps
     if world_size > 1:
         dist.all_reduce(loss_sum, op=dist.ReduceOp.AVG)
         if has_acc:
             dist.all_reduce(acc_sum, op=dist.ReduceOp.AVG)
+        if has_std:
+            dist.all_reduce(std_loss_sum, op=dist.ReduceOp.AVG)
     model.train()
-    return float(loss_sum.item()), float(acc_sum.item()) if has_acc else None
+    return (float(loss_sum.item()),
+            float(acc_sum.item()) if has_acc else None,
+            float(std_loss_sum.item()) if has_std else None)
 
 
 def main():
@@ -4101,6 +4145,10 @@ def main():
         profiler.start()
         print0(rank, f"torch profiler enabled for {HP.torch_profile_steps} train steps")
 
+    # Standard CE reference: extract raw embed weight for cross-model comparison
+    _embed_w = _get_embed_weight(raw_model)
+    _last_y = None  # stashed from last micro-batch for std_loss logging
+
     # Contraharmonic loss state
     _ch_on = HP.ch_loss and isinstance(train_stream, MixedShardStream)
     if _ch_on:
@@ -4127,9 +4175,10 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc = evaluate(model, val_stream, device, world_size)
+            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
-            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            _std_str = f" | std_loss {val_std:.5f}" if val_std is not None else ""
+            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_std_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
             # Save checkpoints
             if _ckpt_on:
                 _ckpt = {
@@ -4180,6 +4229,7 @@ def main():
                         logits, loss = model(x, y)
                 else:
                     logits, loss = model(x, y)
+                _last_y = y
                 # Contraharmonic loss: reweight per-sequence losses by source
                 if _ch_active and logits is not None and src_ids is not None:
                     B, T, V = logits.shape
@@ -4222,8 +4272,11 @@ def main():
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
+            _train_std_str = ""
+            if _embed_w is not None and hasattr(raw_model, '_last_hidden'):
+                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w):.5f}"
             _phase = "warmup" if _in_warmup else "stable"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
