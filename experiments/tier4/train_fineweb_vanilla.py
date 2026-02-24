@@ -2355,6 +2355,9 @@ class CompositeEmbedding(nn.Module):
         # Precompute byte counts
         token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
         n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
+        # Clamp pad entries to valid byte range — matryoshka only reads :N real bytes,
+        # but tokens with 0 real bytes (clamped to 1) would read the pad value.
+        token_bytes_table = token_bytes_table.clamp(max=255)
 
         self.register_buffer('token_bytes', token_bytes_table, persistent=False)
         self.register_buffer('n_bytes', n_bytes, persistent=False)
@@ -2694,6 +2697,7 @@ class CompositePITTokenInterface(nn.Module):
 
         token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
         n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
+        token_bytes_table = token_bytes_table.clamp(max=255)
         self.register_buffer('token_bytes', token_bytes_table, persistent=False)
         self.register_buffer('n_bytes', n_bytes, persistent=False)
         self._unique_n = sorted(set(n_bytes.tolist()))
