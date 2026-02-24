@@ -683,15 +683,12 @@ class SelfAttention(nn.Module):
         else:
             self.rotary = Rotary(hd)
 
-        # Trapezoidal K,V mixing: size-2 data-dependent conv before attention
+        # Trapezoidal K,V mixing: size-2 data-dependent mixing before attention
         # (Mamba-3 §3.1: K_t' = γ_t K_t + β_t K_{t-1}, same for V)
         self.trap_mix = HP.trap_mix
         if self.trap_mix:
-            # Project input → per-head (log_dt, lambda_logit)
-            self.trap_proj = nn.Linear(d_model, n_head * 2, bias=False)
-            # Learnable scalar decay per head (log(A), A < 0 enforced)
-            self.trap_log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
-            self.trap_log_A._no_weight_decay = True  # type: ignore[attr-defined]
+            # Project input → per-head (log_dt, lambda_logit, log_A) — all data-dependent
+            self.trap_proj = nn.Linear(d_model, n_head * 3, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -713,25 +710,19 @@ class SelfAttention(nn.Module):
             k = apply_rotary(k, cos, sin)
 
         if self.trap_mix:
-            # Project dt, lambda from input: (b, t, n_head * 2)
-            trap = self.trap_proj(x).view(b, t, self.n_head, 2)
-            log_dt, lam_logit = trap[..., 0], trap[..., 1]  # (b, t, H)
-            dt = F.softplus(log_dt).clamp(max=2.0)
-            A_neg = self.trap_log_A.exp().neg()  # (H,)
-            alpha = torch.exp(dt * A_neg).clamp(max=0.999)  # (b, t, H)
+            trap = self.trap_proj(x).view(b, t, self.n_head, 3)
+            log_dt, lam_logit, log_A = trap[..., 0], trap[..., 1], trap[..., 2]
+            dt = F.softplus(log_dt).clamp(max=2.0)               # (b, t, H)
+            A_neg = -F.softplus(log_A)                            # (b, t, H) guaranteed negative
+            alpha = torch.exp(dt * A_neg).clamp(max=0.999)       # (b, t, H)
             lam = torch.sigmoid(lam_logit)
-            gamma = lam * dt           # weight for current position
-            beta = (1.0 - lam) * dt * alpha  # weight for previous position
+            gamma = (lam * dt).unsqueeze(-1)                      # (b, t, H, 1)
+            beta = ((1.0 - lam) * dt * alpha).unsqueeze(-1)       # (b, t, H, 1)
 
-            # K_trap_t = γ_t * K_t + β_t * K_{t-1}  (zero-pad at t=0)
-            gamma_k = gamma.unsqueeze(-1)  # (b, t, H, 1)
-            beta_k = beta.unsqueeze(-1)
-            k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))  # (b, t, H, D)
-            k = gamma_k * k + beta_k * k_shifted
-
-            # Same conv on V
+            k_shifted = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))    # (b, t, H, D)
+            k = gamma * k + beta * k_shifted
             v_shifted = F.pad(v[:, :-1], (0, 0, 0, 0, 1, 0))
-            v = gamma_k * v + beta_k * v_shifted
+            v = gamma * v + beta * v_shifted
 
         if HAS_FLASH_ATTN:
             y = flash_attn_func(q, k, v, causal=HP.is_causal)  # (b, t, h, d)
@@ -1345,9 +1336,8 @@ class NGPTSelfAttention(nn.Module):
         # Trapezoidal K,V mixing
         self.trap_mix = HP.trap_mix
         if self.trap_mix:
-            self.trap_proj = nn.Linear(d_model, n_head * 2, bias=False)
-            self.trap_log_A = nn.Parameter(torch.log(0.5 * torch.ones(n_head)))
-            self.trap_log_A._no_weight_decay = True  # type: ignore[attr-defined]
+            # Project input → per-head (log_dt, lambda_logit, log_A) — all data-dependent
+            self.trap_proj = nn.Linear(d_model, n_head * 3, bias=False)
 
         # QK scaling: shared per head, one scalar per head_dim element
         s_scale = 1.0 / math.sqrt(d_model)
@@ -1371,10 +1361,10 @@ class NGPTSelfAttention(nn.Module):
             k = apply_rotary(k, cos, sin)
 
         if self.trap_mix:
-            trap = self.trap_proj(x).view(b, t, self.n_head, 2)
-            log_dt, lam_logit = trap[..., 0], trap[..., 1]
+            trap = self.trap_proj(x).view(b, t, self.n_head, 3)
+            log_dt, lam_logit, log_A = trap[..., 0], trap[..., 1], trap[..., 2]
             dt = F.softplus(log_dt).clamp(max=2.0)
-            A_neg = self.trap_log_A.exp().neg()
+            A_neg = -F.softplus(log_A)
             alpha = torch.exp(dt * A_neg).clamp(max=0.999)
             lam = torch.sigmoid(lam_logit)
             gamma = (lam * dt).unsqueeze(-1)
