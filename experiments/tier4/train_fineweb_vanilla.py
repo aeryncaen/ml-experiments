@@ -2141,66 +2141,98 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 
 
 class CompositeEmbedding(nn.Module):
-    """Factored embedding: shared byte params + per-token params + optional LoRA adapter.
+    """Matryoshka byte-factored embedding: no padding, variable byte utilization.
 
-    Per byte slot: shared dims (from byte value) + per-token dims, derived from model_dim.
-    token_per_byte defaults to 8; shared_per_byte = dims_per_slot - token_per_byte.
-    LoRA (optional): token_down(V, rank) -> token_up(rank, model_dim), added in full model_dim space.
+    Each token's d_model dims are packed from its actual bytes:
+      - byte_embed: 257 x byte_dim  (byte_dim = d_model - token_per_byte)
+      - token_params: V x max_tok_params  (per-token learned dims)
+
+    For a token with N bytes (clamped min 1):
+      dims_per_byte = d_model // N
+      byte_slice    = dims_per_byte - token_per_byte
+      remainder     = d_model % N  (extra token-specific dims)
+
+      Layout: [byte0_shared | byte0_tok | byte1_shared | byte1_tok | ... | remainder_tok]
+      where byte_shared = byte_embed[value][:byte_slice]  (matryoshka: lowest ranks first)
+
+    Short tokens get richer byte representations (more dims per byte).
+    Long tokens get compressed byte representations but more token-specific capacity.
     """
-    def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
-                 token_per_byte: int = 8, use_lora: bool = False, lora_rank: int = 16,
-                 use_conv: bool = False):
+    def __init__(self, vocab_size: int, model_dim: int, token_per_byte: int = 8):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
-        self.max_bytes = max_bytes
-        self.use_lora = use_lora
-        self.use_conv = use_conv
+        self.token_per_byte = token_per_byte
+        self.byte_dim = model_dim - token_per_byte  # 760 for d_model=768, tpb=8
         self.pad_idx = 256
 
-        assert model_dim % max_bytes == 0
-        self.dims_per_slot = model_dim // max_bytes
-        self.token_per_byte = token_per_byte
-        self.shared_per_byte = self.dims_per_slot - self.token_per_byte
-        assert self.shared_per_byte > 0, (
-            f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({self.token_per_byte})")
+        self.byte_embed = nn.Embedding(257, self.byte_dim)  # 256 byte values + 1 pad/special
 
-        self.byte_embed = nn.Embedding(257, self.shared_per_byte)
-        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.token_per_byte)
+        # Precompute byte counts and max token params needed
+        token_bytes_table = _build_token_byte_table(vocab_size, 16, self.pad_idx)
+        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)  # (V,), min 1
 
-        if use_lora:
-            self.token_down = nn.Embedding(vocab_size, lora_rank)
-            self.token_up = nn.Linear(lora_rank, model_dim, bias=False)
+        max_tok_params = 0
+        for n in range(1, 17):
+            tp = n * token_per_byte + model_dim % n
+            max_tok_params = max(max_tok_params, tp)
+        self.max_tok_params = max_tok_params
 
-        if use_conv:
-            # Cross-byte conv: kernel=3 over byte positions, mixes features across adjacent bytes
-            self.byte_conv = nn.Conv1d(self.dims_per_slot, self.dims_per_slot, kernel_size=3,
-                                       padding=1, bias=False)
+        self.token_params = nn.Embedding(vocab_size, max_tok_params)
 
-        self.register_buffer(
-            'token_bytes',
-            _build_token_byte_table(vocab_size, max_bytes, self.pad_idx),
-            persistent=False,
-        )
+        self.register_buffer('token_bytes', token_bytes_table, persistent=False)  # (V, 16)
+        self.register_buffer('n_bytes', n_bytes, persistent=False)               # (V,)
+
+        # Precompute which byte counts exist for the loop
+        self._unique_n = sorted(set(n_bytes.tolist()))
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        byte_seqs = self.token_bytes[token_ids]                                        # (..., 16)
-        shared = self.byte_embed(byte_seqs)                                            # (..., 16, shared)
-        per_tok = self.token_embed(token_ids)                                          # (..., 16*tpb)
-        per_tok = per_tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)  # (..., 16, tpb)
-        base = torch.cat([shared, per_tok], dim=-1)                                    # (..., 16, dps)
-        if self.use_conv:
-            # Conv over byte positions: (..., 16, dps) -> transpose -> conv1d -> transpose
-            shape = base.shape[:-2]                                                    # batch dims
-            flat = base.reshape(-1, self.max_bytes, self.dims_per_slot)                # (N, 16, dps)
-            flat = flat.transpose(1, 2)                                                # (N, dps, 16)
-            flat = flat + self.byte_conv(flat)                                         # residual conv
-            base = flat.transpose(1, 2).reshape(*shape, self.max_bytes, self.dims_per_slot)
-        base = base.reshape(*token_ids.shape, self.model_dim)                          # (..., model_dim)
-        if self.use_lora:
-            adapter = self.token_up(self.token_down(token_ids))
-            base = base + adapter
-        return base
+        """Assemble embeddings only for tokens in the batch. No full-vocab rebuild."""
+        shape = token_ids.shape
+        flat = token_ids.reshape(-1)                                # (M,)
+        M = flat.shape[0]
+        D = self.model_dim
+        tpb = self.token_per_byte
+
+        n = self.n_bytes[flat]                                      # (M,)
+        byte_seqs = self.token_bytes[flat]                          # (M, 16)
+        tp = self.token_params(flat)                                # (M, max_tok_params)
+
+        # Assemble per-group, gather back to original order (no in-place ops for autograd)
+        parts = []
+        order = []
+        for N in self._unique_n:
+            idx = (n == N).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+
+            dps = D // N
+            byte_slice = dps - tpb
+            remainder = D - N * dps
+
+            bs = byte_seqs[idx, :N]                                 # (count, N)
+            be = self.byte_embed(bs)[:, :, :byte_slice]             # (count, N, byte_slice)
+
+            tp_sub = tp[idx]                                        # (count, max_tok_params)
+            tp_per_byte = tp_sub[:, :N * tpb].view(-1, N, tpb)     # (count, N, tpb)
+
+            slots = torch.cat([be, tp_per_byte], dim=-1)            # (count, N, dps)
+            assembled = slots.reshape(-1, N * dps)                  # (count, N * dps)
+
+            if remainder > 0:
+                rem = tp_sub[:, N * tpb : N * tpb + remainder]     # (count, remainder)
+                assembled = torch.cat([assembled, rem], dim=-1)     # (count, D)
+
+            parts.append(assembled)
+            order.append(idx)
+
+        # Concat all groups and restore original token order
+        all_parts = torch.cat(parts, dim=0)                         # (M, D)
+        all_order = torch.cat(order, dim=0)                         # (M,)
+        _, restore = all_order.sort()
+        out = all_parts[restore]                                    # (M, D)
+
+        return out.view(*shape, D)
 
 
 class DecoderHead(nn.Module):
@@ -2817,9 +2849,6 @@ def _make_embed():
         return CompositeEmbedding(
             HP.vocab_size, HP.d_model,
             token_per_byte=HP.composite_token_dims,
-            use_lora=HP.composite_lora,
-            lora_rank=HP.composite_lora_rank,
-            use_conv=HP.composite_conv,
         )
     return nn.Embedding(HP.vocab_size, HP.d_model)
 
@@ -2843,8 +2872,6 @@ def _make_embed_head_pair():
     head_type = _resolved_head_type()
     if head_type in ("pit", "bucketed_pit"):
         if HP.composite_embed or head_type == "bucketed_pit":
-            if HP.composite_lora or HP.composite_conv:
-                raise ValueError(f"LM_HEAD_TYPE={head_type} does not support COMPOSITE_LORA/COMPOSITE_CONV")
             interface = CompositePITTokenInterface(
                 HP.vocab_size,
                 HP.d_model,
@@ -2884,9 +2911,8 @@ def _make_embed_head_pair():
 
 
 def _tie_weights(model: nn.Module):
-    """Post-init fixups: zero-init LoRA adapter if composite embedding is active."""
-    if HP.composite_embed and HP.composite_lora and hasattr(model.wte, "token_up"):
-        nn.init.zeros_(model.wte.token_up.weight)
+    """Post-init fixups (placeholder for future use)."""
+    pass
 
 
 # ── Byte-attention MLP ───────────────────────────────────────────────────────
