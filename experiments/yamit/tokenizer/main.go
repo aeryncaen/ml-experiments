@@ -355,37 +355,46 @@ func readJSONLFile(path string) ([]string, error) {
 // ── Worker pool ──────────────────────────────────────────────────────────
 
 type tokenizeResult struct {
-	inputPath  string
-	relPath    string
-	outputPath string
-	isVal      bool
-	tokenCount int
-	docCount   int
-	elapsed    time.Duration
-	err        error
+	inputPath   string
+	relPath     string
+	trainTokens int
+	trainDocs   int
+	valTokens   int
+	valDocs     int
+	elapsed     time.Duration
+	err         error
 }
 
 type tokenizeJob struct {
-	inputPath  string
-	relPath    string
-	outputPath string
-	isVal      bool
+	inputPath    string
+	relPath      string
+	trainOutPath string
+	valOutPath   string
+	rngSeed      int64
 }
 
-func tokenizeJSONLToShard(
+func tokenizeJSONLSplit(
 	path string,
-	shardPath string,
+	trainPath string,
+	valPath string,
+	valFraction float64,
+	rng *rand.Rand,
 	tk *tokenizer.Tokenizer,
 	fast *fastEncoder,
-) (docCount int, tokenCount int, err error) {
+) (trainDocs, trainTokens, valDocs, valTokens int, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 
-	writer, err := newShardWriter(shardPath)
+	trainWriter, err := newShardWriter(trainPath)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
+	}
+	valWriter, err := newShardWriter(valPath)
+	if err != nil {
+		_ = trainWriter.Close()
+		return 0, 0, 0, 0, err
 	}
 
 	fastIDs := make([]int, 0, 256)
@@ -428,8 +437,9 @@ func tokenizeJSONLToShard(
 			var usedFast bool
 			fastIDs, usedFast, err = fast.encodeIntoIDs(text, fastIDs)
 			if err != nil {
-				_ = writer.Close()
-				return 0, 0, err
+				_ = trainWriter.Close()
+				_ = valWriter.Close()
+				return 0, 0, 0, 0, err
 			}
 			if usedFast {
 				ids = fastIDs
@@ -456,25 +466,51 @@ func tokenizeJSONLToShard(
 			}
 		}
 
-		if err := writer.writeDocument(ids); err != nil {
-			_ = writer.Close()
-			return 0, 0, err
+		// Route each document to train or val.
+		if rng.Float64() < valFraction {
+			if err := valWriter.writeDocument(ids); err != nil {
+				_ = trainWriter.Close()
+				_ = valWriter.Close()
+				return 0, 0, 0, 0, err
+			}
+			valDocs++
+			valTokens += len(ids)
+		} else {
+			if err := trainWriter.writeDocument(ids); err != nil {
+				_ = trainWriter.Close()
+				_ = valWriter.Close()
+				return 0, 0, 0, 0, err
+			}
+			trainDocs++
+			trainTokens += len(ids)
 		}
-
-		docCount++
-		tokenCount += len(ids)
 	}
 
-	if err := writer.Close(); err != nil {
-		return 0, 0, err
+	if err := trainWriter.Close(); err != nil {
+		_ = valWriter.Close()
+		return 0, 0, 0, 0, err
+	}
+	if err := valWriter.Close(); err != nil {
+		return 0, 0, 0, 0, err
 	}
 
-	return docCount, tokenCount, nil
+	// Remove empty shard files.
+	if trainDocs == 0 {
+		os.Remove(trainPath + ".bin")
+		os.Remove(trainPath + ".idx")
+	}
+	if valDocs == 0 {
+		os.Remove(valPath + ".bin")
+		os.Remove(valPath + ".idx")
+	}
+
+	return trainDocs, trainTokens, valDocs, valTokens, nil
 }
 
 func tokenizeWorker(
 	tokenizerPath string,
 	bpeCacheCapacity int,
+	valFraction float64,
 	jobs <-chan tokenizeJob,
 	results chan<- tokenizeResult,
 ) {
@@ -509,38 +545,47 @@ func tokenizeWorker(
 
 		if loadErr != nil {
 			results <- tokenizeResult{
-				inputPath:  job.inputPath,
-				relPath:    job.relPath,
-				outputPath: job.outputPath,
-				isVal:      job.isVal,
-				err:        fmt.Errorf("load tokenizer: %w", loadErr),
+				inputPath: job.inputPath,
+				relPath:   job.relPath,
+				err:       fmt.Errorf("load tokenizer: %w", loadErr),
 			}
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(job.outputPath), 0o755); err != nil {
+		// Create output directories for both splits.
+		if err := os.MkdirAll(filepath.Dir(job.trainOutPath), 0o755); err != nil {
 			results <- tokenizeResult{
-				inputPath:  job.inputPath,
-				relPath:    job.relPath,
-				outputPath: job.outputPath,
-				isVal:      job.isVal,
-				err:        err,
+				inputPath: job.inputPath,
+				relPath:   job.relPath,
+				err:       err,
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(job.valOutPath), 0o755); err != nil {
+			results <- tokenizeResult{
+				inputPath: job.inputPath,
+				relPath:   job.relPath,
+				err:       err,
 			}
 			continue
 		}
 
+		rng := rand.New(rand.NewSource(job.rngSeed))
 		t0 := time.Now()
-		docs, tokens, err := tokenizeJSONLToShard(job.inputPath, job.outputPath, tk, fast)
+		trDocs, trToks, vDocs, vToks, err := tokenizeJSONLSplit(
+			job.inputPath, job.trainOutPath, job.valOutPath,
+			valFraction, rng, tk, fast,
+		)
 		dt := time.Since(t0)
 		results <- tokenizeResult{
-			inputPath:  job.inputPath,
-			relPath:    job.relPath,
-			outputPath: job.outputPath,
-			isVal:      job.isVal,
-			tokenCount: tokens,
-			docCount:   docs,
-			elapsed:    dt,
-			err:        err,
+			inputPath:   job.inputPath,
+			relPath:     job.relPath,
+			trainTokens: trToks,
+			trainDocs:   trDocs,
+			valTokens:   vToks,
+			valDocs:     vDocs,
+			elapsed:     dt,
+			err:         err,
 		}
 	}
 }
@@ -642,39 +687,9 @@ func main() {
 	os.MkdirAll(trainDir, 0o755)
 	os.MkdirAll(valDir, 0o755)
 
-	// Determine train/val split at the shard level.
-	// Stratify by parent directory (data source) so every source gets
-	// proportional representation in val.
-	rng := rand.New(rand.NewSource(42))
-
-	// Group shard indices by parent directory.
-	dirShards := make(map[string][]int)
-	for i, path := range jsonlFiles {
-		dir := filepath.Dir(path)
-		dirShards[dir] = append(dirShards[dir], i)
-	}
-	// Sort directory keys for determinism.
-	dirs := make([]string, 0, len(dirShards))
-	for d := range dirShards {
-		dirs = append(dirs, d)
-	}
-	sort.Strings(dirs)
-
-	valSet := make(map[int]bool)
-	for _, dir := range dirs {
-		shards := dirShards[dir]
-		// Shuffle within each source.
-		rng.Shuffle(len(shards), func(i, j int) { shards[i], shards[j] = shards[j], shards[i] })
-		n := int(float64(len(shards)) * *valFraction)
-		if n < 1 && len(shards) > 1 {
-			n = 1
-		}
-		// If source has only 1 shard, it goes to train (no val for that source).
-		for j := 0; j < n; j++ {
-			valSet[shards[j]] = true
-		}
-	}
-	log.Printf("Val split: %d/%d shards across %d sources", len(valSet), len(jsonlFiles), len(dirs))
+	// Val split is per-document: each document is randomly assigned to val
+	// with probability valFraction, so every source gets representation.
+	log.Printf("Val split: %.2f%% of documents per shard (per-document)", *valFraction*100)
 
 	// Launch worker pool.
 	jobs := make(chan tokenizeJob, effectiveWorkers*2)
@@ -688,6 +703,7 @@ func main() {
 			tokenizeWorker(
 				*tokenizerPath,
 				*bpeCacheCapacity,
+				*valFraction,
 				jobs,
 				results,
 			)
@@ -697,22 +713,16 @@ func main() {
 	// Feed jobs.
 	go func() {
 		for i, path := range jsonlFiles {
-			isVal := valSet[i]
-			outDir := trainDir
-			if isVal {
-				outDir = valDir
-			}
-
 			relPath, _ := filepath.Rel(*inputDir, path)
 			relDir := filepath.Dir(relPath)
 			shardName := strings.TrimSuffix(filepath.Base(path), ".jsonl")
-			outputPath := filepath.Join(outDir, relDir, shardName)
 
 			jobs <- tokenizeJob{
-				inputPath:  path,
-				relPath:    relPath,
-				outputPath: outputPath,
-				isVal:      isVal,
+				inputPath:    path,
+				relPath:      relPath,
+				trainOutPath: filepath.Join(trainDir, relDir, shardName),
+				valOutPath:   filepath.Join(valDir, relDir, shardName),
+				rngSeed:      42 + int64(i),
 			}
 		}
 		close(jobs)
@@ -737,24 +747,18 @@ func main() {
 			errorCount++
 			continue
 		}
-		totalTokens += uint64(result.tokenCount)
-		totalDocs += uint64(result.docCount)
-		if result.isVal {
-			valTokens += uint64(result.tokenCount)
-		} else {
-			trainTokens += uint64(result.tokenCount)
-		}
+		shardTokens := result.trainTokens + result.valTokens
+		shardDocs := result.trainDocs + result.valDocs
+		totalTokens += uint64(shardTokens)
+		totalDocs += uint64(shardDocs)
+		trainTokens += uint64(result.trainTokens)
+		valTokens += uint64(result.valTokens)
 		shardsCompleted++
-
-		split := "train"
-		if result.isVal {
-			split = "val  "
-		}
 
 		// Per-shard speed.
 		shardTokSec := float64(0)
 		if result.elapsed > 0 {
-			shardTokSec = float64(result.tokenCount) / result.elapsed.Seconds()
+			shardTokSec = float64(shardTokens) / result.elapsed.Seconds()
 		}
 		// Aggregate speed.
 		wallElapsed := time.Since(startTime).Seconds()
@@ -762,9 +766,9 @@ func main() {
 		if wallElapsed > 0 {
 			aggTokSec = float64(totalTokens) / wallElapsed
 		}
-		log.Printf("[%s] %s — %d docs, %dk tok, %.1fM tok/s (agg %.1fM tok/s, %d/%d shards)",
-			split, result.relPath, result.docCount,
-			result.tokenCount/1000, shardTokSec/1e6,
+		log.Printf("%s — %d docs (%d train, %d val), %dk tok, %.1fM tok/s (agg %.1fM tok/s, %d/%d shards)",
+			result.relPath, shardDocs, result.trainDocs, result.valDocs,
+			shardTokens/1000, shardTokSec/1e6,
 			aggTokSec/1e6, shardsCompleted, len(jsonlFiles))
 	}
 
