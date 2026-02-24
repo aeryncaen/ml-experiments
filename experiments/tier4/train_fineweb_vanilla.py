@@ -2481,109 +2481,129 @@ class PITHead(nn.Module):
 
 
 class CompositePITTokenInterface(nn.Module):
-    """Composite PIT: enforce PIT on byte-shared subspace, keep token subspace learned."""
+    """Matryoshka composite PIT: full d_model Cholesky transform, matryoshka byte assembly."""
 
     def __init__(
         self,
         vocab_size: int,
         d_model: int,
-        max_bytes: int = 16,
         token_per_byte: int = 8,
         eps: float = 1e-6,
         min_diag: float = 1e-3,
         orth_init: bool = True,
     ):
         super().__init__()
-        assert d_model % max_bytes == 0
         self.vocab_size = vocab_size
         self.d_model = d_model
-        self.max_bytes = max_bytes
-        self.dims_per_slot = d_model // max_bytes
         self.token_per_byte = token_per_byte
-        self.shared_per_byte = self.dims_per_slot - token_per_byte
-        if self.shared_per_byte <= 0:
-            raise ValueError(
-                f"dims_per_slot ({self.dims_per_slot}) must be > token_per_byte ({token_per_byte})"
-            )
+        self.byte_dim = d_model - token_per_byte  # 760 for d_model=768, tpb=8
         self.eps = eps
         self.min_diag = max(min_diag, eps)
-
-        self.byte_memory = nn.Parameter(torch.empty(257, self.shared_per_byte))
-        self.token_embed = nn.Embedding(vocab_size, max_bytes * token_per_byte)
-        self.byte_chol_raw = nn.Parameter(torch.zeros(self.shared_per_byte, self.shared_per_byte))
-        self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
-        self.shared_norm = RMSNorm(self.shared_per_byte)
-        self.embed_out_norm = RMSNorm(self.d_model)
-
         self.pad_idx = 256
-        self.register_buffer(
-            'token_bytes',
-            _build_token_byte_table(vocab_size, max_bytes, self.pad_idx),
-            persistent=False,
-        )
+
+        self.byte_memory = nn.Parameter(torch.empty(257, self.byte_dim))
+
+        # Token params: max needed across all byte counts
+        max_tok_params = 0
+        for n in range(1, 17):
+            max_tok_params = max(max_tok_params, n * token_per_byte + d_model % n)
+        self.max_tok_params = max_tok_params
+        self.token_embed = nn.Embedding(vocab_size, max_tok_params)
+
+        # Full d_model Cholesky factor
+        self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))
+        self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
+        self.embed_out_norm = RMSNorm(d_model)
+
+        token_bytes_table = _build_token_byte_table(vocab_size, 16, self.pad_idx)
+        n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
+        self.register_buffer('token_bytes', token_bytes_table, persistent=False)
+        self.register_buffer('n_bytes', n_bytes, persistent=False)
+        self._unique_n = sorted(set(n_bytes.tolist()))
 
         self.reset_parameters(orth_init=orth_init)
 
     def reset_parameters(self, orth_init: bool = True):
         with torch.no_grad():
             if orth_init:
-                q, _ = torch.linalg.qr(torch.randn(257, self.shared_per_byte), mode="reduced")
-                self.byte_memory.copy_(q)
+                # 257 orthonormal rows in R^byte_dim
+                q, _ = torch.linalg.qr(torch.randn(self.byte_dim, 257), mode="reduced")
+                self.byte_memory.copy_(q.T)  # (257, byte_dim)
             else:
                 nn.init.normal_(self.byte_memory, mean=0.0, std=0.02)
 
             nn.init.normal_(self.token_embed.weight, mean=0.0, std=0.02)
-            self.byte_chol_raw.zero_()
+            self.chol_raw.zero_()
             diag_init = math.log(math.expm1(1.0))
-            self.byte_chol_raw.diagonal().fill_(diag_init)
+            self.chol_raw.diagonal().fill_(diag_init)
 
-    def _byte_chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        raw = torch.tril(self.byte_chol_raw.to(device=device, dtype=dtype))
+    def _chol_factor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        raw = torch.tril(self.chol_raw.to(device=device, dtype=dtype))
         raw_diag = torch.diagonal(raw)
         pos_diag = (F.softplus(raw_diag) + self.eps).clamp_min(self.min_diag)
         return raw - torch.diag_embed(raw_diag) + torch.diag_embed(pos_diag)
 
+    def _assemble_patterns(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Assemble matryoshka patterns for given tokens. Returns (..., d_model)."""
+        shape = token_ids.shape
+        flat = token_ids.reshape(-1)
+        M = flat.shape[0]
+        D = self.d_model
+        tpb = self.token_per_byte
+
+        n = self.n_bytes[flat]
+        byte_seqs = self.token_bytes[flat]
+        tp = self.token_embed(flat)
+
+        parts = []
+        order = []
+        for N in self._unique_n:
+            idx = (n == N).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            dps = D // N
+            byte_slice = dps - tpb
+            remainder = D - N * dps
+
+            bs = byte_seqs[idx, :N]
+            be = F.embedding(bs, self.byte_memory)[:, :, :byte_slice]
+            tp_sub = tp[idx]
+            tp_per_byte = tp_sub[:, :N * tpb].view(-1, N, tpb)
+
+            slots = torch.cat([be, tp_per_byte], dim=-1)
+            assembled = slots.reshape(-1, N * dps)
+
+            if remainder > 0:
+                rem = tp_sub[:, N * tpb : N * tpb + remainder]
+                assembled = torch.cat([assembled, rem], dim=-1)
+
+            parts.append(assembled)
+            order.append(idx)
+
+        all_parts = torch.cat(parts, dim=0)
+        all_order = torch.cat(order, dim=0)
+        _, restore = all_order.sort()
+        return all_parts[restore].view(*shape, D)
+
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        byte_ids = self.token_bytes[token_ids]                                       # (..., 16)
-        z_shared = F.embedding(byte_ids, self.byte_memory)                           # (..., 16, shared)
-        flat = z_shared.reshape(-1, self.shared_per_byte)
-        L32 = self._byte_chol_factor(torch.float32, z_shared.device)
-        x_t = torch.cholesky_solve(flat.to(torch.float32).T, L32)
-        x_shared = x_t.T.reshape_as(z_shared).to(dtype=z_shared.dtype)
-        x_shared = self.shared_norm(x_shared)
-
-        tok = self.token_embed(token_ids)
-        tok = tok.view(*token_ids.shape, self.max_bytes, self.token_per_byte)        # (..., 16, token)
-        tok = F.rms_norm(tok, (tok.shape[-1],), None, 1e-5)
-
-        out = torch.cat([x_shared, tok], dim=-1)
-        out = out.reshape(*token_ids.shape, self.d_model)
-        return self.embed_out_norm(out)
+        z = self._assemble_patterns(token_ids)                  # (..., d_model)
+        flat = z.reshape(-1, self.d_model)
+        L = self._chol_factor(torch.float32, z.device)
+        x_t = torch.cholesky_solve(flat.to(torch.float32).T, L)
+        x = x_t.T.reshape_as(z).to(dtype=z.dtype)
+        return self.embed_out_norm(x)
 
     def project(self, hidden: torch.Tensor) -> torch.Tensor:
         B, T, D = hidden.shape
-        if D != self.d_model:
-            raise ValueError(f"Expected hidden dim {self.d_model}, got {D}")
+        L = self._chol_factor(hidden.dtype, hidden.device)
+        T_mat = L @ L.transpose(0, 1)                          # (D, D)
+        g = hidden @ T_mat                                      # (B, T, D)
 
-        slots = hidden.view(B, T, self.max_bytes, self.dims_per_slot)
-        h_shared = slots[..., :self.shared_per_byte]
-        h_tok = slots[..., self.shared_per_byte:]
-
-        L = self._byte_chol_factor(hidden.dtype, hidden.device)
-        g_shared = torch.matmul(h_shared, L)
-        g_shared = torch.matmul(g_shared, L.transpose(0, 1))                         # (B, T, 16, shared)
-
-        token_shared = F.embedding(self.token_bytes, self.byte_memory)               # (V, 16, shared)
-        token_shared = token_shared.to(dtype=g_shared.dtype)
-        logits_shared = torch.einsum('btsd,vsd->btv', g_shared, token_shared)
-
-        h_tok_flat = h_tok.reshape(B, T, self.max_bytes * self.token_per_byte)
-        logits_token = F.linear(
-            h_tok_flat,
-            self.token_embed.weight.to(dtype=h_tok_flat.dtype),
-            self.token_out_bias,
-        )
-        return logits_shared + logits_token
+        # Assemble patterns for full vocab
+        all_ids = torch.arange(self.vocab_size, device=hidden.device)
+        Z = self._assemble_patterns(all_ids).to(dtype=g.dtype)  # (V, D)
+        logits = g @ Z.T + self.token_out_bias
+        return logits
 
 
 class CompositePITEmbedding(nn.Module):
@@ -2685,36 +2705,21 @@ class BucketedCompositePITHead(nn.Module):
         """SwiGLU router: returns (B, T, n_buckets) bucket logits."""
         return self.router_down(F.silu(self.router_gate(hidden)) * self.router_up(hidden))
 
-    def _prepare_hidden(self, hidden: torch.Tensor):
-        """Split hidden into shared/private, apply T to shared subspace."""
+    def _prepare_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply full d_model Cholesky transform: g = h @ L @ L^T."""
         iface = self.interface
-        B, T, D = hidden.shape
-        slots = hidden.view(B, T, iface.max_bytes, iface.dims_per_slot)
-        h_shared = slots[..., :iface.shared_per_byte]
-        h_tok = slots[..., iface.shared_per_byte:]
+        L = iface._chol_factor(hidden.dtype, hidden.device)
+        T_mat = L @ L.transpose(0, 1)                          # (D, D)
+        return hidden @ T_mat                                   # (B, T, D)
 
-        L = iface._byte_chol_factor(hidden.dtype, hidden.device)
-        g_shared = torch.matmul(h_shared, L)
-        g_shared = torch.matmul(g_shared, L.transpose(0, 1))
-
-        h_tok_flat = h_tok.reshape(B, T, iface.max_bytes * iface.token_per_byte)
-        return g_shared, h_tok_flat
-
-    def _bucket_logits(self, g_shared: torch.Tensor, h_tok_flat: torch.Tensor,
-                       bucket_idx: int) -> torch.Tensor:
-        """Compute PIT logits for one bucket. Returns (*, bucket_size)."""
+    def _bucket_logits(self, g: torch.Tensor, bucket_idx: int) -> torch.Tensor:
+        """Compute PIT logits for one bucket using matryoshka patterns. Returns (*, bucket_size)."""
         iface = self.interface
         bs = self._bucket_sizes_list[bucket_idx]
         members = self.bucket_members[bucket_idx, :bs]
 
-        patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
-        patterns = patterns.to(dtype=g_shared.dtype)
-        logits_shared = torch.einsum('...sd,vsd->...v', g_shared, patterns)
-
-        embeds = iface.token_embed.weight[members].to(dtype=h_tok_flat.dtype)
-        logits_tok = F.linear(h_tok_flat, embeds, iface.token_out_bias[members])
-
-        return logits_shared + logits_tok
+        Z = iface._assemble_patterns(members).to(dtype=g.dtype)  # (bs, D)
+        return g @ Z.T + iface.token_out_bias[members]            # (*, bs)
 
     @staticmethod
     def _silu2(x: torch.Tensor) -> torch.Tensor:
@@ -2732,7 +2737,7 @@ class BucketedCompositePITHead(nn.Module):
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Inference: top-k bucket logits, scaled by router confidence."""
         B, T, D = hidden.shape
-        g_shared, h_tok_flat = self._prepare_hidden(hidden)
+        g = self._prepare_hidden(hidden)
         router_logits = self._route(hidden)
         bucket_scores = self._corrected_bucket_scores(router_logits)  # (B, T, K)
         _, top_k_idx = bucket_scores.topk(self.top_k, dim=-1)
@@ -2745,7 +2750,7 @@ class BucketedCompositePITHead(nn.Module):
             bs = self._bucket_sizes_list[b]
             members = self.bucket_members[b, :bs]
             confidence = bucket_scores[:, :, b].unsqueeze(-1)  # (B, T, 1)
-            bl = self._corrected_token_scores(self._bucket_logits(g_shared, h_tok_flat, b))
+            bl = self._corrected_token_scores(self._bucket_logits(g, b))
             logits[:, :, members] = bl * confidence
         return logits
 
@@ -2760,7 +2765,7 @@ class BucketedCompositePITHead(nn.Module):
         """
         B, T, D = hidden.shape
         N = B * T
-        g_shared, h_tok_flat = self._prepare_hidden(hidden)
+        g = self._prepare_hidden(hidden)  # (B, T, D)
 
         # ── Level 1: bucket prediction ──
         router_logits = self._route(hidden)  # (B, T, K)
@@ -2773,8 +2778,7 @@ class BucketedCompositePITHead(nn.Module):
         # ── Level 2: within-bucket token prediction ──
         # Only need to compute logits for the target bucket of each position.
         # Group positions by their target bucket to vectorize.
-        g_flat = g_shared.reshape(N, g_shared.shape[2], g_shared.shape[3])
-        h_tok_2d = h_tok_flat.reshape(N, -1)
+        g_flat = g.reshape(N, D)
         token_loss_sum = torch.zeros(1, device=hidden.device, dtype=torch.float32)
 
         for b in range(self.n_buckets):
@@ -2782,23 +2786,8 @@ class BucketedCompositePITHead(nn.Module):
             if not in_bucket.any():
                 continue
 
-            bs = self._bucket_sizes_list[b]
-            members = self.bucket_members[b, :bs]
-            iface = self.interface
-
-            # Gather positions whose target is in this bucket
-            g_b = g_flat[in_bucket]          # (n_b, 16, shared)
-            h_b = h_tok_2d[in_bucket]        # (n_b, token_dim)
             local_idx = target_local[in_bucket]  # (n_b,)
-
-            patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
-            patterns = patterns.to(dtype=g_b.dtype)
-            bl_shared = torch.einsum('nsd,vsd->nv', g_b, patterns)
-
-            embeds = iface.token_embed.weight[members].to(dtype=h_b.dtype)
-            bl_tok = F.linear(h_b, embeds, iface.token_out_bias[members])
-
-            bl = (bl_shared + bl_tok).float()  # (n_b, bs)
+            bl = self._bucket_logits(g_flat[in_bucket], b).float()  # (n_b, bs)
             token_loss_sum += F.cross_entropy(bl, local_idx, reduction='sum')
 
         token_loss = token_loss_sum / N
@@ -2811,7 +2800,6 @@ class BucketedCompositePITHead(nn.Module):
             active_buckets = top_k_idx.unique().tolist()
             best_token = torch.zeros(N, device=hidden.device, dtype=torch.long)
             best_score = torch.full((N,), float('-inf'), device=hidden.device)
-            iface = self.interface
             for b in active_buckets:
                 bs = self._bucket_sizes_list[b]
                 members = self.bucket_members[b, :bs]
@@ -2819,12 +2807,8 @@ class BucketedCompositePITHead(nn.Module):
                 if not in_topk.any():
                     continue
                 confidence = bucket_scores[in_topk, b].unsqueeze(-1)  # (n, 1)
-                patterns = F.embedding(iface.token_bytes[members], iface.byte_memory)
-                patterns = patterns.to(dtype=g_flat.dtype)
-                bl_shared = torch.einsum('nsd,vsd->nv', g_flat[in_topk], patterns)
-                embeds = iface.token_embed.weight[members].to(dtype=h_tok_2d.dtype)
-                bl_tok = F.linear(h_tok_2d[in_topk], embeds, iface.token_out_bias[members])
-                bl = self._corrected_token_scores((bl_shared + bl_tok).float()) * confidence
+                bl = self._corrected_token_scores(self._bucket_logits(g_flat[in_topk], b).float())
+                bl = bl * confidence
                 top_val, top_idx = bl.max(dim=-1)
                 improved = top_val > best_score[in_topk]
                 idx_into_n = in_topk.nonzero(as_tuple=True)[0]
@@ -2875,7 +2859,6 @@ def _make_embed_head_pair():
             interface = CompositePITTokenInterface(
                 HP.vocab_size,
                 HP.d_model,
-                max_bytes=16,
                 token_per_byte=HP.composite_token_dims,
                 eps=HP.pit_eps,
                 min_diag=HP.pit_min_diag,
