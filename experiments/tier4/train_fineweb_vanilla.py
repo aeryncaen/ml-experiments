@@ -3114,13 +3114,14 @@ def _get_embed_weight(model: nn.Module) -> torch.Tensor | None:
 
 @torch.no_grad()
 def _std_cross_entropy(hidden: torch.Tensor, targets: torch.Tensor,
-                       embed_weight: torch.Tensor) -> float:
+                       embed_weight: torch.Tensor, temperature: float = 1.0) -> float:
     """Compute standard cross-entropy from hidden states and embedding weight.
 
     hidden: (B, T, D), targets: (B, T), embed_weight: (V, D).
+    temperature: scaling for logits (sqrt(d_model) for nGPT where hidden/embed are unit-normed).
     Returns scalar loss value.
     """
-    logits = F.linear(hidden.float(), embed_weight.float())
+    logits = F.linear(hidden.float(), embed_weight.float()) * temperature
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                            targets.reshape(-1)).item()
 
@@ -3987,7 +3988,8 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
+def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int,
+             std_temp: float = 1.0):
     """Returns (val_loss, val_acc, std_loss) where val_acc/std_loss may be None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
@@ -4021,7 +4023,7 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
             acc_sum += raw._last_acc
             has_acc = True
         if has_std and hasattr(raw, '_last_hidden'):
-            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w)
+            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w, std_temp)
     loss_sum /= HP.val_steps
     if has_acc:
         acc_sum /= HP.val_steps
@@ -4147,6 +4149,7 @@ def main():
 
     # Standard CE reference: extract raw embed weight for cross-model comparison
     _embed_w = _get_embed_weight(raw_model)
+    _std_temp = math.sqrt(HP.d_model) if _is_ngpt else 1.0  # nGPT: unit-normed → cosine sims need temperature
     _last_y = None  # stashed from last micro-batch for std_loss logging
 
     # Contraharmonic loss state
@@ -4175,7 +4178,7 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size)
+            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size, std_temp=_std_temp)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
             _std_str = f" | std_loss {val_std:.5f}" if val_std is not None else ""
             print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_std_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
@@ -4274,7 +4277,7 @@ def main():
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
             _train_std_str = ""
             if _embed_w is not None and hasattr(raw_model, '_last_hidden'):
-                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w):.5f}"
+                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w, _std_temp):.5f}"
             _phase = "warmup" if _in_warmup else "stable"
             print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
