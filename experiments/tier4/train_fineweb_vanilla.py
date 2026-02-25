@@ -4178,17 +4178,14 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 @torch.no_grad()
 def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
-    """Returns (val_loss, val_acc, std_loss, per_source_losses) where val_acc/std_loss may be None.
+    """Returns (val_loss, val_acc, per_source_losses) where val_acc may be None.
     per_source_losses is a dict {source_name: float} if val_stream is MixedShardStream, else None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
-    embed_w = _get_embed_weight(raw)
     model.eval()
     loss_sum = torch.zeros(1, device=device)
     acc_sum = torch.zeros(1, device=device)
-    std_loss_sum = torch.zeros(1, device=device)
     has_acc = False
-    has_std = embed_w is not None
     # Per-source val loss tracking
     _mixed = isinstance(val_stream, MixedShardStream)
     if _mixed:
@@ -4227,13 +4224,9 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
         if hasattr(raw, '_last_acc') and raw._last_acc is not None:
             acc_sum += raw._last_acc
             has_acc = True
-        if has_std and hasattr(raw, '_last_hidden'):
-            std_loss_sum += _std_cross_entropy(raw._last_hidden, y, embed_w)
     loss_sum /= HP.val_steps
     if has_acc:
         acc_sum /= HP.val_steps
-    if has_std:
-        std_loss_sum /= HP.val_steps
     per_source = None
     if _mixed:
         per_source = {}
@@ -4243,12 +4236,9 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
         dist.all_reduce(loss_sum, op=dist.ReduceOp.AVG)
         if has_acc:
             dist.all_reduce(acc_sum, op=dist.ReduceOp.AVG)
-        if has_std:
-            dist.all_reduce(std_loss_sum, op=dist.ReduceOp.AVG)
     model.train()
     return (float(loss_sum.item()),
             float(acc_sum.item()) if has_acc else None,
-            float(std_loss_sum.item()) if has_std else None,
             per_source)
 
 
@@ -4508,8 +4498,7 @@ def main():
         print0(rank, f"torch profiler enabled for {HP.torch_profile_steps} train steps")
 
     # Standard CE reference: extract raw embed weight for cross-model comparison
-    _embed_w = _get_embed_weight(raw_model)
-    _last_y = None  # stashed from last micro-batch for std_loss logging
+
 
     # Contraharmonic loss state
     _ch_on = HP.ch_loss and isinstance(train_stream, MixedShardStream)
@@ -4537,10 +4526,9 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc, val_std, val_per_src = evaluate(model, val_stream, device, world_size)
+            val_loss, val_acc, val_per_src = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
-            _std_str = f" | std_loss {val_std:.5f}" if val_std is not None else ""
-            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_std_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
             if val_per_src is not None:
                 _vps_parts = [f"{n}={v:.4f}" for n, v in val_per_src.items()]
                 print0(rank, f"  val_per_source: {' '.join(_vps_parts)}")
@@ -4598,7 +4586,7 @@ def main():
                         logits, loss = model(x, y)
                 else:
                     logits, loss = model(x, y)
-                _last_y = y
+
                 # Contraharmonic loss: reweight per-sequence losses by source
                 if _ch_active and logits is not None and src_ids is not None:
                     B, T, V = logits.shape
@@ -4647,14 +4635,11 @@ def main():
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
-            _train_std_str = ""
-            if _embed_w is not None and hasattr(raw_model, '_last_hidden'):
-                _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w):.5f}"
             _phase = "warmup" if _in_warmup else "stable"
-            _ch_std_str = ""
+            _ch_raw_str = ""
             if _ch_active:
-                _ch_std_str = f" | std_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_std_str}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+                _ch_raw_str = f" | raw_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_raw_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
