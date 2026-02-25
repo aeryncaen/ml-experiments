@@ -4178,7 +4178,8 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 @torch.no_grad()
 def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
-    """Returns (val_loss, val_acc, std_loss) where val_acc/std_loss may be None."""
+    """Returns (val_loss, val_acc, std_loss, per_source_losses) where val_acc/std_loss may be None.
+    per_source_losses is a dict {source_name: float} if val_stream is MixedShardStream, else None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
     embed_w = _get_embed_weight(raw)
@@ -4188,25 +4189,41 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     std_loss_sum = torch.zeros(1, device=device)
     has_acc = False
     has_std = embed_w is not None
+    # Per-source val loss tracking
+    _mixed = isinstance(val_stream, MixedShardStream)
+    if _mixed:
+        _n_src = val_stream.n_sources
+        _src_loss_sum = torch.zeros(_n_src, device=device)
+        _src_count = torch.zeros(_n_src, device=device)
     for _ in range(HP.val_steps):
         _vbatch = val_stream.next_batch(device)
         x, y = _vbatch[0], _vbatch[1]
+        src_ids = _vbatch[2] if len(_vbatch) > 2 else None
         if HP.llada:
             B, T = x.shape
             mask = torch.rand(B, T, device=device) < 0.5
             p_mask = torch.full((B,), 0.5, device=device)
             if device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, loss = model(x, mask, p_mask)
+                    logits, loss = model(x, mask, p_mask)
             else:
-                _, loss = model(x, mask, p_mask)
+                logits, loss = model(x, mask, p_mask)
         else:
             if device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, loss = model(x, y)
+                    logits, loss = model(x, y)
             else:
-                _, loss = model(x, y)
+                logits, loss = model(x, y)
         loss_sum += loss
+        if _mixed and logits is not None and src_ids is not None:
+            B, T, V = logits.shape
+            per_tok = F.cross_entropy(logits.view(-1, V), y.view(-1), reduction='none').view(B, T)
+            per_seq = per_tok.mean(dim=1)
+            for _si in range(_n_src):
+                _mask = src_ids == _si
+                if _mask.any():
+                    _src_loss_sum[_si] += per_seq[_mask].sum()
+                    _src_count[_si] += _mask.sum()
         if hasattr(raw, '_last_acc') and raw._last_acc is not None:
             acc_sum += raw._last_acc
             has_acc = True
@@ -4217,6 +4234,11 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
         acc_sum /= HP.val_steps
     if has_std:
         std_loss_sum /= HP.val_steps
+    per_source = None
+    if _mixed:
+        per_source = {}
+        for i, name in enumerate(val_stream.source_names):
+            per_source[name] = float(_src_loss_sum[i] / _src_count[i].clamp(min=1))
     if world_size > 1:
         dist.all_reduce(loss_sum, op=dist.ReduceOp.AVG)
         if has_acc:
@@ -4226,7 +4248,8 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     model.train()
     return (float(loss_sum.item()),
             float(acc_sum.item()) if has_acc else None,
-            float(std_loss_sum.item()) if has_std else None)
+            float(std_loss_sum.item()) if has_std else None,
+            per_source)
 
 
 def main():
@@ -4514,10 +4537,13 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc, val_std = evaluate(model, val_stream, device, world_size)
+            val_loss, val_acc, val_std, val_per_src = evaluate(model, val_stream, device, world_size)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
             _std_str = f" | std_loss {val_std:.5f}" if val_std is not None else ""
             print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_std_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            if val_per_src is not None:
+                _vps_parts = [f"{n}={v:.4f}" for n, v in val_per_src.items()]
+                print0(rank, f"  val_per_source: {' '.join(_vps_parts)}")
             # Save checkpoints
             if _ckpt_on:
                 _ckpt = {
