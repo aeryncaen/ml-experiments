@@ -4554,6 +4554,7 @@ def main():
         if _ch_active:
             _ch_src_loss_sum = torch.zeros(_ch_n_src, device=device)
             _ch_src_count = torch.zeros(_ch_n_src, device=device)
+            _ch_std_loss_sum = 0.0  # unweighted loss accumulator
         for _micro in range(_eff_accum):
             _tbatch = train_stream.next_batch(device)
             x, y = _tbatch[0], _tbatch[1]
@@ -4583,6 +4584,8 @@ def main():
                         if _mask.any():
                             _ch_src_loss_sum[_si] += per_seq[_mask].detach().sum()
                             _ch_src_count[_si] += _mask.sum()
+                    # Track unweighted (standard) loss for logging
+                    _ch_std_loss_sum += per_seq.detach().mean().item()
                     # Apply contraharmonic weights from previous step
                     seq_w = _ch_weights[src_ids]  # (B,)
                     loss = (per_seq * seq_w).sum() / seq_w.sum()
@@ -4622,7 +4625,10 @@ def main():
             if _embed_w is not None and hasattr(raw_model, '_last_hidden'):
                 _train_std_str = f" | std_loss {_std_cross_entropy(raw_model._last_hidden, _last_y, _embed_w):.5f}"
             _phase = "warmup" if _in_warmup else "stable"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+            _ch_std_str = ""
+            if _ch_active:
+                _ch_std_str = f" | std_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_std_str}{_train_std_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
