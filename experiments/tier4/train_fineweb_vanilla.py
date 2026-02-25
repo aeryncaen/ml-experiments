@@ -4499,8 +4499,12 @@ def main():
     # Token-based schedule: total tokens budget is fixed regardless of grad_accum changes
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
-    _warmup_tokens = int(_total_tokens * HP.warmup_frac)
-    print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
+    _no_warmup = HP.ngpt and HP.optimizer not in ("adamw", "geoadam")
+    _warmup_tokens = 0 if _no_warmup else int(_total_tokens * HP.warmup_frac)
+    if _no_warmup:
+        print0(rank, f"total_tokens={_total_tokens:,} warmup disabled (nGPT + {HP.optimizer})")
+    else:
+        print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     # Checkpoint saving
     _ckpt_on = bool(HP.ckpt_dir) and rank == 0
@@ -4540,15 +4544,9 @@ def main():
         _in_warmup = tokens_seen < _warmup_tokens
         _eff_accum = 1 if _in_warmup else HP.grad_accum
 
-        _lr_scheduled = lr_for_tokens(tokens_seen, _total_tokens)
-        _lr_factor = _lr_scheduled / max(HP.lr, 1e-12)
+        _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
         for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
-            _is_muon_group = pg.get("use_muon", False) or (HP.optimizer in ("geomuon", "geonormuon") and "adam_lr" in pg) or ("algorithm" in pg and pg["algorithm"] != "adamw") or (HP.optimizer in ("dion", "dion2") and "algorithm" not in pg)
-            if _is_muon_group:
-                # Muon groups: no warmup, full base_lr until decay phase
-                pg["lr"] = base_lr if tokens_seen < _warmup_tokens else base_lr * _lr_factor
-            else:
-                pg["lr"] = base_lr * _lr_factor
+            pg["lr"] = base_lr * _lr_factor
             if "adam_lr" in pg:
                 pg["adam_lr"] = HP.lr * _lr_factor
         lr = HP.lr * _lr_factor  # for logging
