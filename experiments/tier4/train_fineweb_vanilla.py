@@ -112,7 +112,7 @@ class HParams:
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
     # Optimizer selection
-    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | geoadam | geomuon | geonormuon
+    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | dion | dion2 | geoadam | geomuon | geonormuon
     muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     muon_warmup_frac: float = _env_float("MUON_WARMUP_FRAC", 0.05)  # Muon warmup as fraction of Adam warmup (0-1)
@@ -4304,7 +4304,43 @@ def main():
     def _is_embed_head(name: str) -> bool:
         return any(k in name for k in _embed_head_names)
 
-    if HP.optimizer in ("muon", "normuon"):
+    if HP.optimizer in ("dion", "dion2"):
+        # Dion/Dion2: param groups with 'algorithm' key; lazy import (CUDA-only)
+        _dion_params = []
+        _adamw_embed = []
+        _adamw_head = []
+        _adamw_other = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or getattr(p, "_no_weight_decay", False):
+                _adamw_other.append(p)
+            elif "lm_head" in name:
+                _adamw_head.append(p)
+            elif _is_embed_head(name):
+                _adamw_embed.append(p)
+            else:
+                _dion_params.append(p)
+        _head_lr = HP.muon_lr / math.sqrt(HP.d_model)
+        print0(rank, f"optimizer: {HP.optimizer} ({len(_dion_params)} ortho, {len(_adamw_embed)} embed, {len(_adamw_head)} head, {len(_adamw_other)} other, wd={_wd})")
+        param_groups = [
+            dict(params=_dion_params),
+            dict(params=_adamw_embed, algorithm="adamw"),
+            dict(params=_adamw_head, algorithm="adamw", lr=_head_lr),
+            dict(params=_adamw_other, algorithm="adamw", weight_decay=0.0),
+        ]
+        param_groups = [g for g in param_groups if g["params"]]
+        # Base LRs: ortho groups use muon_lr (dion scales internally), adamw use lr, head uses scaled lr
+        _base_lrs = []
+        for g in param_groups:
+            if g.get("algorithm") == "adamw":
+                _base_lrs.append(g["lr"] if "lr" in g else HP.lr)
+            else:
+                _base_lrs.append(HP.muon_lr)
+        decay_params = _dion_params + _adamw_embed + _adamw_head
+        no_decay_params = _adamw_other
+
+    elif HP.optimizer in ("muon", "normuon"):
         # Shared param split for Muon and NorMuon (both use Muon+AuxAdam pattern)
         _muon_params = []
         adam_decay_params = []
@@ -4385,7 +4421,17 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[device.index])
 
-    if HP.optimizer == "muon":
+    if HP.optimizer == "dion":
+        from dion import Dion
+        _dion_pg = model.process_group if hasattr(model, 'process_group') else None
+        optimizer = Dion(param_groups, lr=HP.muon_lr, weight_decay=_wd,
+                         **(dict(distributed_mesh=_dion_pg) if _dion_pg else {}))
+    elif HP.optimizer == "dion2":
+        from dion import Dion2
+        _dion_pg = model.process_group if hasattr(model, 'process_group') else None
+        optimizer = Dion2(param_groups, lr=HP.muon_lr, weight_decay=_wd,
+                          **(dict(distributed_mesh=_dion_pg) if _dion_pg else {}))
+    elif HP.optimizer == "muon":
         from muon import SingleDeviceMuonWithAuxAdam
         optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
     elif HP.optimizer == "normuon":
@@ -4420,6 +4466,10 @@ def main():
     else:
         _fused = device.type == "cuda"
         optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95), fused=_fused)
+
+    assert len(_base_lrs) == len(optimizer.param_groups), \
+        f"_base_lrs length {len(_base_lrs)} != optimizer.param_groups length {len(optimizer.param_groups)} — " \
+        f"optimizer may have restructured param groups internally"
 
     profiler = None
     if HP.torch_profile:
@@ -4502,7 +4552,7 @@ def main():
         else:
             _muon_lr_factor = _lr_factor  # follow the same decay schedule
         for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
-            _is_muon_group = pg.get("use_muon", False) or "adam_lr" in pg
+            _is_muon_group = pg.get("use_muon", False) or (HP.optimizer in ("geomuon", "geonormuon") and "adam_lr" in pg) or ("algorithm" in pg and pg["algorithm"] != "adamw") or (HP.optimizer in ("dion", "dion2") and "algorithm" not in pg)
             pg["lr"] = base_lr * (_muon_lr_factor if _is_muon_group else _lr_factor)
             if "adam_lr" in pg:
                 pg["adam_lr"] = HP.lr * _lr_factor
