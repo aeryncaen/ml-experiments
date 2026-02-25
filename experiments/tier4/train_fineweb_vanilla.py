@@ -4394,7 +4394,7 @@ def main():
         optimizer = GeodesicAdam(
             param_groups[0]["params"], lr=HP.lr, betas=(0.9, 0.95),
             spherical_params=spherical_ids, normalize_dim=1,
-            weight_decay=_wd,
+            weight_decay=_wd, adam_lr=HP.lr,
         )
         param_groups = optimizer.param_groups  # re-bind for LR scheduling
     elif HP.optimizer == "geomuon":
@@ -4403,6 +4403,7 @@ def main():
             momentum=HP.muon_momentum, ns_steps=HP.geomuon_ns_steps,
             betas=(0.9, 0.95), weight_decay=_wd,
             spherical_params=spherical_ids, normalize_dim=1,
+            adam_lr=HP.lr,
         )
         param_groups = optimizer.param_groups
     elif HP.optimizer == "geonormuon":
@@ -4412,6 +4413,7 @@ def main():
             ns_steps=HP.geomuon_ns_steps,
             betas=(0.9, 0.95), weight_decay=_wd,
             spherical_params=spherical_ids, normalize_dim=1,
+            adam_lr=HP.lr,
         )
         param_groups = optimizer.param_groups
     else:
@@ -4491,6 +4493,8 @@ def main():
         _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
         for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
             pg["lr"] = base_lr * _lr_factor
+            if "adam_lr" in pg:
+                pg["adam_lr"] = HP.lr * _lr_factor
         lr = HP.lr * _lr_factor  # for logging
 
         optimizer.zero_grad(set_to_none=True)

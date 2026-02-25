@@ -243,12 +243,14 @@ class GeodesicMuon(Optimizer):
         normalize_dim: int = 0,
         nesterov: bool = True,
         backend: str = "fused",
+        adam_lr: Optional[float] = None,
     ):
         if spherical_params is None:
             spherical_params = set()
 
         defaults = dict(
             lr=lr,
+            adam_lr=adam_lr if adam_lr is not None else lr,
             momentum=momentum,
             ns_steps=ns_steps,
             betas=betas,
@@ -399,7 +401,7 @@ class GeodesicMuon(Optimizer):
         """
         grad = p.grad
         dim = 0  # 1D: normalize along dim 0
-        lr = group["lr"]
+        lr = group["adam_lr"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
         M = self.manifold
@@ -442,7 +444,7 @@ class GeodesicMuon(Optimizer):
     def _step_adamw(self, p: torch.Tensor, group: Dict[str, Any]):
         """Standard AdamW for non-spherical parameters."""
         grad = p.grad
-        lr = group["lr"]
+        lr = group["adam_lr"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
         wd = group["weight_decay"]

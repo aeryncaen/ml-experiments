@@ -183,12 +183,14 @@ class GeodesicNorMuon(Optimizer):
         normalize_dim: int = 0,
         nesterov: bool = True,
         backend: str = "fused",
+        adam_lr: Optional[float] = None,
     ):
         if spherical_params is None:
             spherical_params = set()
 
         defaults = dict(
             lr=lr,
+            adam_lr=adam_lr if adam_lr is not None else lr,
             momentum=momentum,
             beta2=beta2,
             ns_steps=ns_steps,
@@ -344,7 +346,7 @@ class GeodesicNorMuon(Optimizer):
         """1D spherical parameter: tangent-space Adam."""
         grad = p.grad
         dim = 0
-        lr = group["lr"]
+        lr = group["adam_lr"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
         M = self.manifold
@@ -384,7 +386,7 @@ class GeodesicNorMuon(Optimizer):
     def _step_adamw(self, p: torch.Tensor, group: Dict[str, Any]):
         """Standard AdamW for non-spherical parameters."""
         grad = p.grad
-        lr = group["lr"]
+        lr = group["adam_lr"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
         wd = group["weight_decay"]

@@ -61,12 +61,14 @@ class GeodesicAdam(Optimizer):
         spherical_params: Optional[Set[int]] = None,
         normalize_dim: int = 0,
         weight_decay: float = 0.0,
+        adam_lr: Optional[float] = None,
     ):
         if spherical_params is None:
             spherical_params = set()
         
         defaults = dict(
             lr=lr,
+            adam_lr=adam_lr if adam_lr is not None else lr,
             betas=betas,
             eps=eps,
             spherical_params=spherical_params,
@@ -202,6 +204,7 @@ class GeodesicAdam(Optimizer):
         
         for group in self.param_groups:
             lr = group["lr"]
+            adam_lr = group["adam_lr"]
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             spherical_ids = group["spherical_params"]
@@ -234,7 +237,7 @@ class GeodesicAdam(Optimizer):
                     )
                 else:
                     self._step_euclidean(
-                        p, grad, m, v, state, lr, beta1, beta2, eps, wd
+                        p, grad, m, v, state, adam_lr, beta1, beta2, eps, wd
                     )
         
         return loss
@@ -319,9 +322,9 @@ class GeodesicAdam(Optimizer):
         """Standard Adam step for non-spherical parameters."""
         step = state["step"]
         
-        # Weight decay (decoupled, AdamW-style)
+        # Weight decay (decoupled, AdamW-style) — use adam_lr not lr
         if wd != 0:
-            p.data.add_(p.data, alpha=-lr * wd)
+            p.data.add_(p.data, alpha=-lr * wd)  # lr is already adam_lr from caller
         
         # Standard Adam
         m.mul_(beta1).add_(grad, alpha=1 - beta1)
