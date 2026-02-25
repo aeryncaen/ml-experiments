@@ -116,6 +116,7 @@ class HParams:
     muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
+    autonormuon_gnorm_beta: float = _env_float("AUTONORMUON_GNORM_BETA", 0.9)  # AutoNorMuon grad-norm EMA decay
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -4471,8 +4472,13 @@ def main():
             pg["lr"] = _auto_lr
         _base_lrs = [_auto_lr] * len(param_groups)
         _retract = not _is_ngpt
-        optimizer = AutoNorMuon(param_groups, total_steps=HP.train_steps, retract=_retract)
-        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_auto_lr:.6f} retract={_retract}")
+        optimizer = AutoNorMuon(
+            param_groups,
+            total_steps=HP.train_steps,
+            retract=_retract,
+            gnorm_beta=HP.autonormuon_gnorm_beta,
+        )
+        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_auto_lr:.6f} retract={_retract} gnorm_beta={HP.autonormuon_gnorm_beta}")
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
         _sf_warmup = int(HP.train_steps * HP.warmup_frac)
