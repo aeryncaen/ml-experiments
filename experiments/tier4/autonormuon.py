@@ -139,7 +139,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                     ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - ratio)))
                     ema_lr = group["lr"] * ema_factor
                     if cosine_lr < ema_lr:
-                        lr = math.sqrt(cosine_lr * ema_lr)
+                        lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
                     else:
                         lr = ema_lr
 
@@ -172,7 +172,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                 ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - med_ratio)))
                 ema_lr = group["lr"] * ema_factor
                 if cosine_lr < ema_lr:
-                    group["scheduled_lr"] = math.sqrt(cosine_lr * ema_lr)
+                    group["scheduled_lr"] = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
                 else:
                     group["scheduled_lr"] = ema_lr
 
@@ -201,7 +201,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                 ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - ratio)))
                 ema_lr = group["lr"] * ema_factor
                 if cosine_lr < ema_lr:
-                    lr = math.sqrt(cosine_lr * ema_lr)
+                    lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
                 else:
                     lr = ema_lr
                 group["scheduled_lr"] = lr
