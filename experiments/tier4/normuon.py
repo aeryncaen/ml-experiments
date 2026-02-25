@@ -43,7 +43,7 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
         update = update.reshape(original_shape)
     # NorMuon: per-row adaptive scaling with norm preservation
     vnorm = update.norm(dim=(-2,-1), keepdim=True)
-    v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+    v_mean = torch.mean(update * update, dim=-1, keepdim=True).to(second_momentum.dtype)
     second_momentum.lerp_(v_mean, 1 - beta2)
     step_size = 1 / second_momentum.sqrt().add_(1e-10)
     update.mul_(step_size)
