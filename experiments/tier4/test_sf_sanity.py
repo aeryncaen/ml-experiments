@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # Tiny GPT model
 # ---------------------------------------------------------------------------
 class TinyGPT(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=4, seq_len=32):
+    def __init__(self, vocab_size, d_model, n_head, n_layer, seq_len):
         super().__init__()
         self.seq_len = seq_len
         self.wte = nn.Embedding(vocab_size, d_model)
@@ -19,6 +19,25 @@ class TinyGPT(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # tie weights
         self.lm_head.weight = self.wte.weight
+        # Megatron-style init
+        self._megatron_init(d_model, n_layer)
+
+    def _megatron_init(self, d_model, n_layer):
+        """Megatron-style init: N(0, 1/sqrt(fan_in)), residual outputs scaled by 1/sqrt(2*n_layer)."""
+        import math
+        res_scale = 1.0 / math.sqrt(2 * n_layer)
+        # Embeddings: N(0, 1/sqrt(d_model))
+        nn.init.normal_(self.wte.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+        nn.init.normal_(self.wpe.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+        for block in self.blocks:
+            # Attention
+            fan_in = d_model
+            nn.init.normal_(block.attn.qkv.weight, mean=0.0, std=1.0 / math.sqrt(fan_in))
+            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=res_scale / math.sqrt(fan_in))
+            # MLP
+            nn.init.normal_(block.mlp.fc1.weight, mean=0.0, std=1.0 / math.sqrt(fan_in))
+            mlp_fan_in = 4 * d_model
+            nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=res_scale / math.sqrt(mlp_fan_in))
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -354,24 +373,66 @@ def train(variant, steps=5000, d_model=256, n_head=4, n_layer=4, seq_len=32,
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — comparison grid
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    variants = ["normuon", "normuon_cosine", "autonormuon"]
-    if len(sys.argv) > 1:
-        variants = sys.argv[1:]
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("variants", nargs="*", help="specific variants to run (overrides grid)")
+    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--n_layer", type=int, default=4)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--n_head", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--device", type=str, default=None)
+    args = parser.parse_args()
 
-    results = {}
-    for v in variants:
-        results[v] = train(v)
+    # Megatron-style LR: 0.1 / sqrt(R) where R = n_layer * 2
+    R = args.n_layer * 2
+    auto_lr = 0.1 / math.sqrt(R)
+
+    # Standard hand-tuned LRs
+    STD_MUON_LR = 0.02
+    STD_ADAM_LR = 2e-4
+
+    if args.variants:
+        # Manual mode: run exactly what's requested with default LRs
+        results = {}
+        for v in args.variants:
+            results[v] = train(v, steps=args.steps, n_layer=args.n_layer, d_model=args.d_model,
+                               n_head=args.n_head, seq_len=args.seq_len, batch_size=args.batch_size,
+                               device=args.device)
+    else:
+        # Grid mode: normuon baselines at standard LR vs autonormuon at derived LR
+        grid = [
+            # (label, variant, muon_lr, adam_lr)
+            ("normuon_static_std",  "normuon",        STD_MUON_LR, STD_ADAM_LR),
+            ("normuon_cosine_std",  "normuon_cosine", STD_MUON_LR, STD_ADAM_LR),
+            ("autonormuon_auto",    "autonormuon",    auto_lr,     auto_lr),
+        ]
+        results = {}
+        for label, variant, mlr, alr in grid:
+            results[label] = train(variant, steps=args.steps, n_layer=args.n_layer,
+                                   d_model=args.d_model, n_head=args.n_head, seq_len=args.seq_len,
+                                   batch_size=args.batch_size, muon_lr=mlr, adam_lr=alr,
+                                   device=args.device)
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print("  SUMMARY")
-    print(f"{'='*60}")
-    print(f"  {'variant':<20} {'final_val_loss':>15}")
-    print(f"  {'-'*20} {'-'*15}")
-    for v in variants:
-        final = results[v][-1][1]
-        print(f"  {v:<20} {final:>15.4f}")
+    if not args.variants:
+        print(f"  n_layer={args.n_layer} R={R} auto_lr={auto_lr:.6f}")
+        print(f"  std_muon_lr={STD_MUON_LR} std_adam_lr={STD_ADAM_LR}")
+    print(f"{'='*70}")
+    print(f"  {'variant':<25} {'muon_lr':>10} {'adam_lr':>10} {'final_val':>12}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*12}")
+    for label, vals in results.items():
+        final = vals[-1][1]
+        # Recover LRs from label or defaults
+        if not args.variants:
+            row = next(r for r in grid if r[0] == label)
+            print(f"  {label:<25} {row[2]:>10.6f} {row[3]:>10.6f} {final:>12.4f}")
+        else:
+            print(f"  {label:<25} {'':>10} {'':>10} {final:>12.4f}")
     print()

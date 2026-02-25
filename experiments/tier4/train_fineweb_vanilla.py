@@ -112,7 +112,7 @@ class HParams:
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
     # Optimizer selection
-    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | dion | dion2 | geoadam | geomuon | geonormuon
+    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | autonormuon | muon_sf | normuon_sf | dion | dion2 | geoadam | geomuon | geonormuon
     muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
@@ -4364,7 +4364,7 @@ def main():
         decay_params = _dion_params + _adamw_embed + _adamw_head
         no_decay_params = _adamw_other
 
-    elif HP.optimizer in ("muon", "normuon"):
+    elif HP.optimizer in ("muon", "normuon", "autonormuon", "muon_sf", "normuon_sf"):
         # Shared param split for Muon and NorMuon (both use Muon+AuxAdam pattern)
         _muon_params = []
         adam_decay_params = []
@@ -4381,7 +4381,7 @@ def main():
         _opt_name = HP.optimizer
         print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd})")
         _muon_group = dict(params=_muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True)
-        if HP.optimizer == "normuon":
+        if HP.optimizer in ("normuon", "autonormuon", "normuon_sf"):
             _muon_group["beta2"] = HP.normuon_beta2
         param_groups = [
             _muon_group,
@@ -4461,6 +4461,28 @@ def main():
     elif HP.optimizer == "normuon":
         from normuon import SingleDeviceNorMuonWithAuxAdam
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+    elif HP.optimizer == "autonormuon":
+        from autonormuon import AutoNorMuon
+        # Megatron-style LR: 0.1 / sqrt(R) where R = n_layer * 2 (attn + mlp residuals)
+        _n_residuals = HP.n_layer * 2
+        _auto_lr = 0.1 / math.sqrt(_n_residuals)
+        # Override LRs in param groups
+        for pg in param_groups:
+            pg["lr"] = _auto_lr
+        _base_lrs = [_auto_lr] * len(param_groups)
+        _retract = not _is_ngpt
+        optimizer = AutoNorMuon(param_groups, total_steps=HP.train_steps, retract=_retract)
+        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_auto_lr:.6f} retract={_retract}")
+    elif HP.optimizer == "muon_sf":
+        from muon_sf import ScheduleFreeMuon
+        _sf_warmup = int(HP.train_steps * HP.warmup_frac)
+        optimizer = ScheduleFreeMuon(param_groups, warmup_steps=_sf_warmup)
+        print0(rank, f"  schedule-free: warmup_steps={_sf_warmup} sf_momentum=0.9")
+    elif HP.optimizer == "normuon_sf":
+        from normuon_sf import ScheduleFreeNorMuon
+        _sf_warmup = int(HP.train_steps * HP.warmup_frac)
+        optimizer = ScheduleFreeNorMuon(param_groups, warmup_steps=_sf_warmup)
+        print0(rank, f"  schedule-free: warmup_steps={_sf_warmup} sf_momentum=0.9")
     elif HP.optimizer == "geoadam":
         optimizer = GeodesicAdam(
             param_groups[0]["params"], lr=HP.lr, betas=(0.9, 0.95),
@@ -4494,6 +4516,9 @@ def main():
     assert len(_base_lrs) == len(optimizer.param_groups), \
         f"_base_lrs length {len(_base_lrs)} != optimizer.param_groups length {len(optimizer.param_groups)} — " \
         f"optimizer may have restructured param groups internally"
+
+    _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
+    _is_auto = HP.optimizer == "autonormuon"  # autonormuon: handles its own LR schedule internally
 
     profiler = None
     if HP.torch_profile:
@@ -4538,6 +4563,8 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
+            if _is_sf:
+                optimizer.eval()  # switch params from y to x for evaluation
             _eval_ch_w = _ch_weights if _ch_on else None
             val_loss, val_acc, raw_val_loss, val_per_src = evaluate(model, val_stream, device, world_size, ch_weights=_eval_ch_w)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
@@ -4546,7 +4573,7 @@ def main():
             if val_per_src is not None:
                 _vps_parts = [f"{n}={v:.4f}" for n, v in val_per_src.items()]
                 print0(rank, f"  val_per_source: {' '.join(_vps_parts)}")
-            # Save checkpoints
+            # Save checkpoints (schedule-free already in eval mode — params hold x)
             if _ckpt_on:
                 _ckpt = {
                     "step": step,
@@ -4562,18 +4589,25 @@ def main():
                     torch.save(_ckpt, os.path.join(HP.ckpt_dir, "best.pt"))
                     print0(rank, f"  saved best checkpoint (val_loss={val_loss:.5f})")
             if tokens_seen >= _total_tokens:
-                break
+                break  # stay in eval mode (params = x, the averaged solution)
+            if _is_sf:
+                optimizer.train()  # switch params back from x to y for training
 
         # During warmup: no grad_accum (raw batch_size, faster steps)
-        _in_warmup = tokens_seen < _warmup_tokens
+        # AutoNorMuon: no external warmup — always use full grad_accum
+        _in_warmup = tokens_seen < _warmup_tokens and not _is_auto
         _eff_accum = 1 if _in_warmup else HP.grad_accum
 
-        _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
-        for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
-            pg["lr"] = base_lr * _lr_factor
-            if "adam_lr" in pg:
-                pg["adam_lr"] = HP.lr * _lr_factor
-        lr = HP.lr * _lr_factor  # for logging
+        if _is_sf or _is_auto:
+            # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
+            lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
+        else:
+            _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+            for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
+                pg["lr"] = base_lr * _lr_factor
+                if "adam_lr" in pg:
+                    pg["adam_lr"] = HP.lr * _lr_factor
+            lr = HP.lr * _lr_factor  # for logging
 
         optimizer.zero_grad(set_to_none=True)
         # Per-source loss accumulators for contraharmonic weighting
@@ -4637,6 +4671,8 @@ def main():
         else:
             grad_norm = torch.cat([p.grad.flatten() for p in _all_params if p.grad is not None]).norm()
         optimizer.step()
+        if _is_sf or _is_auto:
+            lr = optimizer.param_groups[0].get("scheduled_lr", lr)  # read actual LR after step
         if _is_ngpt:
             _ngpt_normalize_weights(raw_model)
             _ngpt_normalize_pit_memory(raw_model)
