@@ -4594,8 +4594,8 @@ def main():
                 optimizer.train()  # switch params back from x to y for training
 
         # During warmup: no grad_accum (raw batch_size, faster steps)
-        # AutoNorMuon: no external warmup — always use full grad_accum
-        _in_warmup = tokens_seen < _warmup_tokens and not _is_auto
+        # This is model/training warmup (independent of optimizer LR scheduling)
+        _in_warmup = tokens_seen < _warmup_tokens
         _eff_accum = 1 if _in_warmup else HP.grad_accum
 
         if _is_sf or _is_auto:

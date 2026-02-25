@@ -1,6 +1,6 @@
 # AutoNorMuon optimizer
 # NorMuon (zichongli5) + cosine LR ceiling
-# + dual-EMA gradient norm tracking for adaptive LR attenuation
+# + fast-EMA/max gradient norm tracking for adaptive LR attenuation
 # + row retraction to the product of spheres.
 import math
 import torch
@@ -66,7 +66,7 @@ class AutoNorMuon(torch.optim.Optimizer):
       cosine_lr = base_lr * 0.5 * (1 + cos(pi * k / total_steps))
       ratio     = fast_ema(gnorm) / max(gnorm)
       ema_lr    = base_lr * 0.5 * (1 + cos(pi * (1 - ratio)))
-      lr        = geomean(cosine_lr, ema_lr) if cosine < ema, else ema_lr
+      lr        = harmonic(cosine_lr, ema_lr) if cosine < ema, else ema_lr
 
     NorMuon groups: params, lr, momentum, beta2, weight_decay, use_muon=True
     Adam groups: params, lr, betas, eps, weight_decay, use_muon=False
@@ -74,7 +74,7 @@ class AutoNorMuon(torch.optim.Optimizer):
     Constructor args:
         total_steps: total training steps (required)
         retract: retract Muon params to product of spheres after each step (default True)
-        gnorm_beta: EMA decay for grad norm tracking (default 0.99)
+        gnorm_beta: EMA decay for grad norm tracking (default 0.9)
     """
     def __init__(self, param_groups, total_steps, retract=True,
                  gnorm_beta=0.9):
@@ -92,8 +92,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
             group["k"] = 0
             group["scheduled_lr"] = 0.0
-            group["gnorm_ema"] = 0.0
-            group["gnorm_max"] = 0.0
+            group["gnorm_ema"] = None
+            group["gnorm_max"] = None
         self.total_steps = total_steps
         self.retract = retract
         self.gnorm_beta = gnorm_beta
@@ -106,6 +106,13 @@ class AutoNorMuon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            is_compiling = torch.compiler.is_compiling()
+        elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "is_compiling"):
+            is_compiling = torch._dynamo.is_compiling()
+        else:
+            is_compiling = False
+
         for group in self.param_groups:
             decay = group["weight_decay"]
             k = group["k"]
@@ -113,8 +120,10 @@ class AutoNorMuon(torch.optim.Optimizer):
             cosine_factor = 0.5 * (1.0 + math.cos(math.pi * k / self.total_steps))
 
             if group["use_muon"]:
-                # --- Per-matrix: fast EMA / max gnorm ---
-                ratios = []
+                # --- Per-matrix: fast EMA / max gnorm (vectorized scalar math) ---
+                params = []
+                grads = []
+                states = []
                 for p in group["params"]:
                     if p.grad is None:
                         continue
@@ -122,116 +131,154 @@ class AutoNorMuon(torch.optim.Optimizer):
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
-                        state["gnorm_ema"] = 0.0
-                        state["gnorm_max"] = 0.0
+                        state["gnorm_ema"] = torch.zeros((), device=p.device, dtype=torch.float32)
+                        state["gnorm_max"] = torch.zeros((), device=p.device, dtype=torch.float32)
+                    params.append(p)
+                    grads.append(p.grad)
+                    states.append(state)
 
-                    gnorm = p.grad.norm().item()
+                if params:
+                    gnorms = torch.stack([g.norm().float() for g in grads])
+                    ema_prev = torch.stack([s["gnorm_ema"] for s in states]).to(gnorms.device)
+                    max_prev = torch.stack([s["gnorm_max"] for s in states]).to(gnorms.device)
+
                     if k == 0:
-                        state["gnorm_ema"] = gnorm
+                        ema = gnorms
                     else:
-                        state["gnorm_ema"] = beta * state["gnorm_ema"] + (1 - beta) * gnorm
-                    state["gnorm_max"] = max(state["gnorm_max"], gnorm)
-                    ratio = state["gnorm_ema"] / state["gnorm_max"] if state["gnorm_max"] > 0 else 1.0
-                    ratios.append(ratio)
+                        ema = beta * ema_prev + (1 - beta) * gnorms
+                    gmax = torch.maximum(max_prev, gnorms)
+                    ratio = ema / gmax.clamp(min=1e-12)
 
-                    # Per-matrix LR: ratio mapped through cosine curve
-                    cosine_lr = group["lr"] * cosine_factor
-                    ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - ratio)))
+                    cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
+                    ema_factor = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio)))
                     ema_lr = group["lr"] * ema_factor
-                    if cosine_lr < ema_lr:
-                        lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
+                    harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
+                    lr_vec = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+
+                    for s, e, m in zip(states, ema, gmax):
+                        s["gnorm_ema"] = e.detach()
+                        s["gnorm_max"] = m.detach()
+
+                    for p, state, g, lr_t in zip(params, states, grads, lr_vec):
+                        update = normuon_update(g, state["momentum_buffer"],
+                                                state["second_momentum_buffer"],
+                                                beta=group["momentum"],
+                                                beta2=group["beta2"])
+                        update = update.reshape(p.shape)
+
+                        if decay != 0:
+                            p.mul_(1 - lr_t * decay)
+                        update.mul_(lr_t)
+                        p.sub_(update)
+
+                        # Retract to product of spheres
+                        if self.retract:
+                            p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+
+                    # Group logging (median across Muon matrices)
+                    med_ratio_t = ratio.median()
+                    if is_compiling:
+                        group["gnorm_ratio"] = med_ratio_t.detach()
+                        group["gnorm_ratio_raw"] = med_ratio_t.detach()
+                        group["gnorm_median"] = gnorms.median().detach()
+                        group["gnorm_ema"] = ema.median().detach()
+                        group["gnorm_max"] = gmax.max().detach()
+                        group["scheduled_lr"] = lr_vec.median().detach()
                     else:
-                        lr = ema_lr
-
-                    update = normuon_update(p.grad, state["momentum_buffer"],
-                                            state["second_momentum_buffer"],
-                                            beta=group["momentum"],
-                                            beta2=group["beta2"])
-                    update = update.reshape(p.shape)
-
-                    if decay != 0:
-                        p.mul_(1 - lr * decay)
-                    p.add_(update, alpha=-lr)
-
-                    # Retract to product of spheres
-                    if self.retract:
-                        p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-
-                # Log median ratio for the group (for CSV/plotting)
-                if ratios:
-                    ratios.sort()
-                    n = len(ratios)
-                    med_ratio = ratios[n // 2] if n % 2 else (ratios[n // 2 - 1] + ratios[n // 2]) / 2
-                    group["gnorm_ratio"] = med_ratio
-                    group["gnorm_ratio_raw"] = med_ratio
-                    group["gnorm_median"] = 0.0
-                    group["gnorm_ema"] = 0.0
-                # Log the group-level effective LR (use median ratio)
-                med_ratio = group.get("gnorm_ratio", 1.0)
-                cosine_lr = group["lr"] * cosine_factor
-                ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - med_ratio)))
-                ema_lr = group["lr"] * ema_factor
-                if cosine_lr < ema_lr:
-                    group["scheduled_lr"] = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
-                else:
-                    group["scheduled_lr"] = ema_lr
+                        group["gnorm_ratio"] = med_ratio_t.item()
+                        group["gnorm_ratio_raw"] = group["gnorm_ratio"]
+                        group["gnorm_median"] = gnorms.median().item()
+                        group["gnorm_ema"] = ema.median().item()
+                        group["gnorm_max"] = gmax.max().item()
+                        group["scheduled_lr"] = lr_vec.median().item()
 
             else:
                 # --- Adam: per-group fast EMA / max gnorm ---
-                gnorms = []
-                for p in group["params"]:
-                    if p.grad is not None:
-                        gnorms.append(p.grad.norm().item())
-                if gnorms:
-                    gnorms.sort()
-                    n = len(gnorms)
-                    median_gnorm = gnorms[n // 2] if n % 2 else (gnorms[n // 2 - 1] + gnorms[n // 2]) / 2
-                    if k == 0:
-                        group["gnorm_ema"] = median_gnorm
-                    else:
-                        group["gnorm_ema"] = beta * group["gnorm_ema"] + (1 - beta) * median_gnorm
-                    group["gnorm_max"] = max(group["gnorm_max"], median_gnorm)
-                    ratio = group["gnorm_ema"] / group["gnorm_max"] if group["gnorm_max"] > 0 else 1.0
-                    group["gnorm_ratio"] = ratio
-                    group["gnorm_ratio_raw"] = ratio
-                    group["gnorm_median"] = median_gnorm
+                grads = [p.grad for p in group["params"] if p.grad is not None]
+                if grads:
+                    gnorms = torch.stack([g.norm().float() for g in grads])
+                    median_gnorm_t = gnorms.median()
 
-                cosine_lr = group["lr"] * cosine_factor
-                ratio = group.get("gnorm_ratio", 1.0)
-                ema_factor = 0.5 * (1.0 + math.cos(math.pi * (1.0 - ratio)))
-                ema_lr = group["lr"] * ema_factor
-                if cosine_lr < ema_lr:
-                    lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr)
+                    if group["gnorm_ema"] is None or k == 0:
+                        gnorm_ema_t = median_gnorm_t
+                        gnorm_max_t = median_gnorm_t
+                    else:
+                        gnorm_ema_t = beta * group["gnorm_ema"] + (1 - beta) * median_gnorm_t
+                        gnorm_max_t = torch.maximum(group["gnorm_max"], median_gnorm_t)
+
+                    ratio_t = gnorm_ema_t / gnorm_max_t.clamp(min=1e-12)
+                    cosine_lr_t = median_gnorm_t.new_full((), group["lr"] * cosine_factor)
+                    ema_factor_t = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio_t)))
+                    ema_lr_t = group["lr"] * ema_factor_t
+                    harmonic_t = 2.0 * cosine_lr_t * ema_lr_t / (cosine_lr_t + ema_lr_t).clamp(min=1e-20)
+                    lr_t = torch.where(cosine_lr_t < ema_lr_t, harmonic_t, ema_lr_t)
+
+                    group["gnorm_ema"] = gnorm_ema_t.detach()
+                    group["gnorm_max"] = gnorm_max_t.detach()
+                    if is_compiling:
+                        group["gnorm_ratio"] = ratio_t.detach()
+                        group["gnorm_ratio_raw"] = ratio_t.detach()
+                        group["gnorm_median"] = median_gnorm_t.detach()
+                        group["scheduled_lr"] = lr_t.detach()
+                    else:
+                        group["gnorm_ratio"] = ratio_t.item()
+                        group["gnorm_ratio_raw"] = group["gnorm_ratio"]
+                        group["gnorm_median"] = median_gnorm_t.item()
+                        group["scheduled_lr"] = lr_t.item()
+                    lr = lr_t
                 else:
-                    lr = ema_lr
-                group["scheduled_lr"] = lr
+                    lr = group["scheduled_lr"] if group["scheduled_lr"] is not None else group["lr"]
 
                 beta1, beta2_adam = group["betas"]
                 eps = group["eps"]
                 bias_correction1 = 1 - beta1 ** (k + 1)
                 bias_correction2 = 1 - beta2_adam ** (k + 1)
 
+                params = []
+                exp_avgs = []
+                exp_avg_sqs = []
+                grads2 = []
                 for p in group["params"]:
                     if p.grad is None:
                         continue
-                    grad = p.grad
                     state = self.state[p]
                     if "exp_avg" not in state:
                         state["exp_avg"] = torch.zeros_like(p)
                         state["exp_avg_sq"] = torch.zeros_like(p)
+                    params.append(p)
+                    grads2.append(p.grad)
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
 
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
+                use_foreach = (not is_compiling) and len(params) > 0 and params[0].device.type in ("cuda", "cpu")
+                if use_foreach:
+                    lr_val = float(lr)
+                    torch._foreach_mul_(exp_avgs, beta1)
+                    torch._foreach_add_(exp_avgs, grads2, alpha=1 - beta1)
+                    torch._foreach_mul_(exp_avg_sqs, beta2_adam)
+                    torch._foreach_addcmul_(exp_avg_sqs, grads2, grads2, value=1 - beta2_adam)
 
-                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                    exp_avg_sq.mul_(beta2_adam).addcmul_(grad, grad, value=1 - beta2_adam)
-
-                    step_val = exp_avg.div(bias_correction1)
-                    denom = exp_avg_sq.div(bias_correction2).sqrt_().add_(eps)
+                    step_vals = torch._foreach_div(exp_avgs, bias_correction1)
+                    denoms = torch._foreach_div(exp_avg_sqs, bias_correction2)
+                    denoms = torch._foreach_sqrt(denoms)
+                    torch._foreach_add_(denoms, eps)
 
                     if decay != 0:
-                        p.mul_(1 - lr * decay)
-                    p.addcdiv_(step_val, denom, value=-lr)
+                        torch._foreach_mul_(params, 1 - lr_val * decay)
+                    torch._foreach_addcdiv_(params, step_vals, denoms, value=-lr_val)
+                else:
+                    for p, grad, exp_avg, exp_avg_sq in zip(params, grads2, exp_avgs, exp_avg_sqs):
+                        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                        exp_avg_sq.mul_(beta2_adam).addcmul_(grad, grad, value=1 - beta2_adam)
+
+                        step_val = exp_avg.div(bias_correction1)
+                        denom = exp_avg_sq.div(bias_correction2).sqrt_().add_(eps)
+                        step_val = step_val.div(denom)
+                        step_val.mul_(lr)
+
+                        if decay != 0:
+                            p.mul_(1 - lr * decay)
+                        p.sub_(step_val)
 
             group["k"] = k + 1
 
