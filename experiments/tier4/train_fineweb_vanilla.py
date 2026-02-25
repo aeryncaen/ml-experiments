@@ -115,6 +115,7 @@ class HParams:
     optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | geoadam | geomuon | geonormuon
     muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
+    muon_warmup_frac: float = _env_float("MUON_WARMUP_FRAC", 0.05)  # Muon warmup as fraction of Adam warmup (0-1)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
@@ -4490,9 +4491,19 @@ def main():
         _in_warmup = tokens_seen < _warmup_tokens
         _eff_accum = 1 if _in_warmup else HP.grad_accum
 
-        _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+        _lr_scheduled = lr_for_tokens(tokens_seen, _total_tokens)
+        _lr_factor = _lr_scheduled / max(HP.lr, 1e-12)
+        # Muon uses a shorter warmup: reaches peak in muon_warmup_frac of Adam's warmup
+        _muon_warmup_tokens = int(_warmup_tokens * HP.muon_warmup_frac)
+        if tokens_seen < _muon_warmup_tokens:
+            _muon_lr_factor = tokens_seen / max(1, _muon_warmup_tokens)
+        elif tokens_seen < _warmup_tokens:
+            _muon_lr_factor = 1.0  # at peak while Adam is still warming up
+        else:
+            _muon_lr_factor = _lr_factor  # follow the same decay schedule
         for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
-            pg["lr"] = base_lr * _lr_factor
+            _is_muon_group = pg.get("use_muon", False) or "adam_lr" in pg
+            pg["lr"] = base_lr * (_muon_lr_factor if _is_muon_group else _lr_factor)
             if "adam_lr" in pg:
                 pg["adam_lr"] = HP.lr * _lr_factor
         lr = HP.lr * _lr_factor  # for logging
