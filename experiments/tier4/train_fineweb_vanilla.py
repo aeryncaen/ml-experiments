@@ -4549,6 +4549,7 @@ def main():
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
+    _warmup_ramp_start = _warmup_tokens // 2
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     # Checkpoint saving
@@ -4593,10 +4594,20 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # During warmup: no grad_accum (raw batch_size, faster steps)
-        # This is model/training warmup (independent of optimizer LR scheduling)
+        # During warmup: ramp grad_accum from 1 -> HP.grad_accum over second half.
+        # This is model/training warmup (independent of optimizer LR scheduling).
         _in_warmup = tokens_seen < _warmup_tokens
-        _eff_accum = 1 if _in_warmup else HP.grad_accum
+        _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
+        if _in_warmup:
+            if _in_accum_ramp:
+                _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
+                _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
+                _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+                _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
+            else:
+                _eff_accum = 1
+        else:
+            _eff_accum = HP.grad_accum
 
         if _is_sf or _is_auto:
             # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
@@ -4685,7 +4696,10 @@ def main():
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
-            _phase = "warmup" if _in_warmup else "stable"
+            if _in_warmup:
+                _phase = "warmup-ramp" if _in_accum_ramp else "warmup"
+            else:
+                _phase = "stable"
             _ch_raw_str = ""
             if _ch_active:
                 _ch_raw_str = f" | raw_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
