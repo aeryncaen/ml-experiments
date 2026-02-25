@@ -4594,8 +4594,12 @@ def main():
             for _si in range(_ch_n_src):
                 if _ch_src_count[_si] > 0:
                     _ch_source_losses[_si] = _ch_src_loss_sum[_si] / _ch_src_count[_si]
-            # CH weight: w_i = L_i / sum(L_j) — high-loss sources get upweighted
-            _ch_weights = _ch_source_losses / _ch_source_losses.sum().clamp(min=1e-8)
+            # Contraharmonic weight: w_i = L_i^2 / sum(L_j^2), floored at 1/n_sources
+            _ch_sq = _ch_source_losses ** 2
+            _ch_weights = _ch_sq / _ch_sq.sum().clamp(min=1e-8)
+            _ch_floor = 1.0 / _ch_n_src
+            _ch_weights = _ch_weights.clamp(min=_ch_floor)
+            _ch_weights = _ch_weights / _ch_weights.sum()
         _all_params = decay_params + no_decay_params
         if HP.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(_all_params, HP.grad_clip)
