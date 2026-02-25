@@ -1,9 +1,10 @@
 """
 Training loops:
-  1. baseline  — standard training with a single optimizer
-  2. threetier — micro-batch / batch / super-batch with EMA gradient accumulation
+  1. baseline   — standard training with a single optimizer (AdamW)
+  2. threetier  — legacy 3-tier with EMA gradient accumulation (pre-UltrOpt)
+  3. ultropt    — UltrOpt multi-timescale structure-preserving optimizer
 
-Budget is measured in TOKENS SEEN so that baseline and three-tier are
+Budget is measured in TOKENS SEEN so that baseline and UltrOpt are
 compared on exactly the same amount of data.
 
 Data: yamit tokenized shards (.bin/.idx).
@@ -13,7 +14,8 @@ Tokenizer metadata loaded from artifact_meta.json at runtime.
 import os
 import time
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -21,6 +23,8 @@ import torch.nn.functional as F
 
 from model import ShakespeareGPT, ShakespeareNGPT, ngpt_normalize_weights
 from data import load_tokenizer_meta, ShardStream
+from optimizer import UltrOpt, UltrOptConfig
+from slerp import GhostSLERPHooks
 
 
 # ---------------------------------------------------------------------------
@@ -420,5 +424,223 @@ def train_three_tier(cfg: ThreeTierConfig):
             running_loss = 0.0
             steps_since_log = 0
             next_eval_at += cfg.eval_every_tokens
+
+    return log, model, tok_meta
+
+
+# ---------------------------------------------------------------------------
+# UltrOpt training config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UltrOptTrainConfig(BaseConfig):
+    """Training config for UltrOpt.
+
+    Combines BaseConfig (model/data/budget) with UltrOptConfig (optimizer).
+    """
+    batch_size: int = 64                      # = micro-batch size
+
+    # --- UltrOpt optimizer hyperparameters ---
+    # Learning rates
+    lr: float = 3e-3
+    batch_lr_factor: float = 0.1
+    super_lr_factor: float = 0.01
+
+    # Tier cadence
+    micros_per_batch: int = 4
+    batches_per_super: int = 4
+
+    # EMA decays
+    ema_decay_batch: float = 0.95
+    ema_decay_super: float = 0.95
+
+    # Low-rank accumulator ranks
+    rank_batch: int = 32
+    rank_super: int = 16
+    error_feedback: bool = False
+
+    # Channel-wise adaptive scaling
+    channel_beta2: float = 0.999
+    channel_eps: float = 1e-8
+
+    # MARS variance reduction
+    mars: bool = True
+    mars_gamma: float = 0.025
+    mars_beta1: float = 0.95
+    mars_clip: Optional[float] = None
+
+    # Newton-Schulz (micro and batch tiers only; super tier is rank-deficient)
+    newton_schulz: bool = True
+    ns_steps_micro: int = 4
+    ns_steps_batch: int = 6
+    ns_delta: float = 0.3
+
+    # Cautious masking
+    cautious: bool = True
+
+    # Schedule-Free
+    schedule_free: bool = True
+    schedule_free_beta: float = 0.95
+    schedule_free_scope: str = 'all'
+
+    # Weight decay
+    weight_decay: float = 0.1
+
+    # Warmup
+    warmup_steps: int = 100
+
+    # Gradient clipping
+    grad_clip: Optional[float] = None
+
+    # SLERP gradient reduction
+    slerp_mode: str = 'ghost_slerp'
+    slerp_magnitude: str = 'mean'
+
+    # Accumulate signal
+    accumulate_signal: str = 'raw'
+
+    def to_ultropt_config(self) -> UltrOptConfig:
+        """Build UltrOptConfig from training config fields."""
+        return UltrOptConfig(
+            lr=self.lr,
+            batch_lr_factor=self.batch_lr_factor,
+            super_lr_factor=self.super_lr_factor,
+            micros_per_batch=self.micros_per_batch,
+            batches_per_super=self.batches_per_super,
+            ema_decay_batch=self.ema_decay_batch,
+            ema_decay_super=self.ema_decay_super,
+            rank_batch=self.rank_batch,
+            rank_super=self.rank_super,
+            error_feedback=self.error_feedback,
+            channel_beta2=self.channel_beta2,
+            channel_eps=self.channel_eps,
+            mars=self.mars,
+            mars_gamma=self.mars_gamma,
+            mars_beta1=self.mars_beta1,
+            mars_clip=self.mars_clip,
+            newton_schulz=self.newton_schulz,
+            ns_steps_micro=self.ns_steps_micro,
+            ns_steps_batch=self.ns_steps_batch,
+            ns_delta=self.ns_delta,
+            cautious=self.cautious,
+            schedule_free=self.schedule_free,
+            schedule_free_beta=self.schedule_free_beta,
+            schedule_free_scope=self.schedule_free_scope,
+            weight_decay=self.weight_decay,
+            warmup_steps=self.warmup_steps,
+            grad_clip=self.grad_clip,
+            accumulate_signal=self.accumulate_signal,
+            ngpt=self.ngpt,
+        )
+
+
+# ---------------------------------------------------------------------------
+# UltrOpt training loop
+# ---------------------------------------------------------------------------
+
+def train_ultropt(cfg: UltrOptTrainConfig):
+    """UltrOpt training loop.
+
+    Simple structure:
+      1. Forward pass
+      2. loss.backward()
+      3. slerp_hooks.apply(model)  — rewrite .grad with direction-preserving reduction
+      4. opt.micro_step()          — handles all three tiers internally
+
+    For eval: opt.eval_mode() before val, opt.train_mode() after.
+
+    Returns (log, model, tok_meta).
+    """
+    device = _resolve_device(cfg.device)
+    tok_meta = load_tokenizer_meta(cfg.tokenizer_dir)
+    vocab_size = tok_meta["vocab_size"]
+    eos_token_id = tok_meta["eos_token_id"]
+
+    train_stream, val_stream = _make_streams(cfg, cfg.batch_size, eos_token_id)
+
+    model = build_model(vocab_size, cfg).to(device)
+    model = _maybe_compile(model, device, cfg.compile)
+
+    # Build optimizer
+    opt_cfg = cfg.to_ultropt_config()
+    opt = UltrOpt(model, opt_cfg)
+
+    # Build SLERP hooks
+    slerp_hooks = GhostSLERPHooks(model, mode=cfg.slerp_mode, magnitude=cfg.slerp_magnitude)
+
+    tokens_per_micro = cfg.batch_size * cfg.seq_len
+
+    log = []
+    tokens_seen = 0
+    next_eval_at = cfg.eval_every_tokens
+    running_loss = 0.0
+    steps_since_log = 0
+    t0 = time.time()
+
+    # Memory report
+    mem = opt.memory_report()
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"  [ultropt] params: {param_count:,} | opt state: {mem['total_elements']:,} "
+          f"({mem['ratio_to_params']:.3f}x params)")
+
+    # Step-0 eval before any training
+    model.train()
+    opt.eval_mode()
+    val0 = estimate_val_loss(model, val_stream, device, cfg.eval_batches)
+    opt.train_mode()
+    x0, y0 = train_stream.next_batch(torch.device(device))
+    with torch.no_grad():
+        _, loss0 = model(x0, y0)
+    train_stream.pos -= train_stream.tokens_per_global_step
+    print(f"  [ultropt] step 0     | train {loss0.item():.4f} | val {val0:.4f}")
+
+    while tokens_seen < cfg.total_tokens:
+        x, y = train_stream.next_batch(torch.device(device))
+
+        # Forward + backward
+        _, loss = model(x, y)
+        opt.zero_grad()
+        loss.backward()
+
+        # SLERP: rewrite .grad with direction-preserving reduction
+        slerp_hooks.apply(model)
+
+        # Optimizer step (handles all three tiers)
+        opt.micro_step()
+
+        running_loss += loss.item()
+        steps_since_log += 1
+        tokens_seen += tokens_per_micro
+
+        # Logging
+        if tokens_seen >= next_eval_at or tokens_seen >= cfg.total_tokens:
+            opt.eval_mode()
+            val_loss = estimate_val_loss(model, val_stream, device, cfg.eval_batches)
+            opt.train_mode()
+            avg_train = running_loss / max(steps_since_log, 1)
+            elapsed = time.time() - t0
+            tok_per_sec = tokens_seen / max(1, elapsed)
+            counts = opt.tier_counts()
+            log.append({
+                "tokens_seen": tokens_seen,
+                "train_loss": avg_train,
+                "val_loss": val_loss,
+                "elapsed": elapsed,
+                "micro_steps": counts['micro'],
+                "batch_steps": counts['batch'],
+                "super_steps": counts['super'],
+            })
+            print(
+                f"  [ultropt] {tokens_seen/1e6:>5.2f}M tok | "
+                f"train {avg_train:.4f} | val {val_loss:.4f} | "
+                f"{elapsed:.1f}s | {tok_per_sec:,.0f} tok/s | "
+                f"tiers: {counts['micro']}/{counts['batch']}/{counts['super']}"
+            )
+            running_loss = 0.0
+            steps_since_log = 0
+            next_eval_at += cfg.eval_every_tokens
+
+    # Cleanup hooks
+    slerp_hooks.remove()
 
     return log, model, tok_meta

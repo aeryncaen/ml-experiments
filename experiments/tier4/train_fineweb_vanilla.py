@@ -4499,12 +4499,8 @@ def main():
     # Token-based schedule: total tokens budget is fixed regardless of grad_accum changes
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
-    _no_warmup = HP.ngpt and HP.optimizer not in ("adamw", "geoadam")
-    _warmup_tokens = 0 if _no_warmup else int(_total_tokens * HP.warmup_frac)
-    if _no_warmup:
-        print0(rank, f"total_tokens={_total_tokens:,} warmup disabled (nGPT + {HP.optimizer})")
-    else:
-        print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
+    _warmup_tokens = int(_total_tokens * HP.warmup_frac)
+    print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     # Checkpoint saving
     _ckpt_on = bool(HP.ckpt_dir) and rank == 0

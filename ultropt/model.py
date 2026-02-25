@@ -95,8 +95,8 @@ class ShakespeareGPT(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        # weight tying
-        self.tok_emb.weight = self.head.weight
+        # No weight tying — embedding and output head are separate parameters
+        # with different gradient distributions and different optimization needs.
 
         self.apply(self._init_weights)
         # scale residual projections
@@ -236,45 +236,84 @@ class NGPTSelfAttention(nn.Module):
         k = self.k(x).view(B, T, self.n_head, self.head_dim)
         v = self.v(x).view(B, T, self.n_head, self.head_dim)
 
-        # nGPT: unit-norm Q, K then scale
-        s_qk = _ngpt_actual(self.s_qk)
-        q = _unit_norm(q, dim=-1) * s_qk
-        k = _unit_norm(k, dim=-1) * s_qk
-
-        # RoPE
+        # RoPE (norm-preserving rotation)
         cos, sin = self.rotary(q)
         q = _apply_rotary(q, cos, sin)
         k = _apply_rotary(k, cos, sin)
 
-        # SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2).contiguous()
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        s_qk = _ngpt_actual(self.s_qk)
+
+        # Spherical attention: tangent project + exp map, no arccos
+        # q,k,v: [B, T, H, D] -> process as [B*H, T, D]
+        q = q.permute(0, 2, 1, 3).reshape(B * self.n_head, T, self.head_dim)
+        k = k.permute(0, 2, 1, 3).reshape(B * self.n_head, T, self.head_dim)
+        v = v.permute(0, 2, 1, 3).reshape(B * self.n_head, T, self.head_dim)
+
+        # Attention weights: cosine similarity scaled by s_qk
+        attn = torch.bmm(q * s_qk, (k * s_qk).transpose(1, 2))  # [BH, T, T]
+        causal = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        attn = attn.masked_fill(causal.unsqueeze(0), float('-inf'))
+        attn_weights = F.softmax(attn, dim=-1)  # [BH, T, T]
+
+        # Tangent-project all values to each query's tangent space
+        # dots[b,i,j] = v_j . q_i
+        dots = torch.bmm(v, q.transpose(1, 2))  # [BH, T_v, T_q] -> [BH, T, T]
+        # v_tan[b,i,j,d] = v[b,j,d] - dots[b,j,i] * q[b,i,d]
+        # Reshape for broadcast: v[BH,T,1,D] - dots[BH,T,T,1].permute * q[BH,1,T,D]
+        v_tan = v.unsqueeze(2) - dots.transpose(1, 2).unsqueeze(-1) * q.unsqueeze(1)  # [BH, T, T, D]
+
+        # Weighted sum in tangent space
+        t = torch.einsum('bij,bijd->bid', attn_weights, v_tan)  # [BH, T, D]
+
+        # Exp-map back to sphere
+        t_norm = t.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        y = torch.cos(t_norm) * q + torch.sin(t_norm) * (t / t_norm)  # [BH, T, D]
+        y = _unit_norm(y)  # safety clamp: fix numerical drift
+
+        # Reshape back
+        y = y.reshape(B, self.n_head, T, self.head_dim).permute(0, 2, 1, 3).reshape(B, T, C)
         return self.proj(y)
 
 
 class NGPTMLP(nn.Module):
-    """SwiGLU MLP for nGPT with s_u, s_v scaling."""
+    """Tangent-space MLP. Works in the tangent plane at x, then exp-maps back.
+
+    1. W1 projects x to hidden dim, tangent-project to remove radial component
+    2. SiLU is legal in tangent space (it's Euclidean)
+    3. W2 projects back to d, re-project to tangent space
+    4. Exp map: move along tangent direction to new point on sphere
+    """
 
     def __init__(self, n_embd):
         super().__init__()
         hidden = int(n_embd * 8 / 3)
-        # Snap to multiple of 8 for small models
         hidden = ((hidden + 7) // 8) * 8
-        self.gate_proj = nn.Linear(n_embd, hidden, bias=False)
+
         self.up_proj = nn.Linear(n_embd, hidden, bias=False)
+        self.gate_proj = nn.Linear(n_embd, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, n_embd, bias=False)
 
         self.s_u = _ngpt_scale_param((hidden,), 1.0, 1.0)
         self.s_v = _ngpt_scale_param((hidden,), 1.0, 1.0)
-        self._sqrt_d = math.sqrt(n_embd)
 
     def forward(self, x):
-        u = self.up_proj(x) * _ngpt_actual(self.s_u)
-        v = self.gate_proj(x) * _ngpt_actual(self.s_v) * self._sqrt_d
-        return self.down_proj(F.silu(v) * u)
+        # Up-project to hidden, tangent-project
+        h = self.up_proj(x) * _ngpt_actual(self.s_u)
+
+        # SiLU gating in tangent space (tangent space is Euclidean, SiLU is legal)
+        g = self.gate_proj(x) * _ngpt_actual(self.s_v)
+        h = F.silu(g) * h
+
+        # Down-project back to d
+        h = self.down_proj(h)
+
+        # Tangent-project: remove radial component at x
+        h = h - (h * x).sum(-1, keepdim=True) * x
+
+        # Exp map: move along tangent direction to new point on sphere
+        h_norm = h.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        out = torch.cos(h_norm) * x + torch.sin(h_norm) * (h / h_norm)
+        return _unit_norm(out)  # safety clamp: fix numerical drift
 
 
 class NGPTBlock(nn.Module):
@@ -295,15 +334,32 @@ class NGPTBlock(nn.Module):
         self.alpha_attn = _ngpt_scale_param((n_embd,), alpha_init, alpha_scale)
         self.alpha_mlp = _ngpt_scale_param((n_embd,), alpha_init, alpha_scale)
 
+    @staticmethod
+    def _geodesic_step(x, target, alpha):
+        """Geodesic residual: tangent-project target onto x, then exp-map.
+
+        First-order approximation of log map — stable, no arccos.
+        """
+        # Tangent projection: remove radial component of target at x
+        v = target - (target * x).sum(dim=-1, keepdim=True) * x
+
+        # Scale by alpha
+        v = alpha * v
+
+        # Exp map back to sphere
+        t_norm = v.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        out = torch.cos(t_norm) * x + torch.sin(t_norm) * (v / t_norm)
+        return _unit_norm(out)  # safety clamp: fix numerical drift
+
     def forward(self, x):
-        # Attention LERP
-        h_a = _unit_norm(self.attn(x))
+        # Attention: geodesic step toward attention output
+        h_a = self.attn(x)
         alpha_a = _ngpt_actual(self.alpha_attn).abs()
-        x = _unit_norm(x + alpha_a * (h_a - x))
-        # MLP LERP
-        h_m = _unit_norm(self.mlp(x))
+        x = self._geodesic_step(x, h_a, alpha_a)
+        # MLP: geodesic step toward MLP output
+        h_m = self.mlp(x)
         alpha_m = _ngpt_actual(self.alpha_mlp).abs()
-        x = _unit_norm(x + alpha_m * (h_m - x))
+        x = self._geodesic_step(x, h_m, alpha_m)
         return x
 
 
@@ -361,8 +417,7 @@ class ShakespeareNGPT(nn.Module):
         # No final LayerNorm — hidden state is already unit-norm
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        # Weight tying
-        self.tok_emb.weight = self.head.weight
+        # No weight tying — embedding and output head are separate parameters
 
         # s_z: per-token logit scaling
         s_z_scale = 1.0 / math.sqrt(n_embd)
