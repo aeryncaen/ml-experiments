@@ -1,0 +1,298 @@
+# Dataprep Pipeline Configuration
+# All datasets from experiments/yamit/data/registry.py
+
+[tokenizer]
+path = "experiments/yamit/tokenizer/artifacts/qwen3/tokenizer.json"
+eos_token_id = 149727
+
+[output]
+base_dir = "tokenized"
+train_dir = "tokenized/train"
+val_dir = "tokenized/val"
+sft_dir = "tokenized/sft"
+raw_dir = ".dataprep/raw"
+processed_dir = ".dataprep/processed"
+state_db = ".dataprep/state.db"
+hf_cache = ".dataprep/hf_cache"
+
+[defaults]
+target_tokens = 1_000_000_000
+val_fraction = 0.005
+shard_size = 67_108_864
+workers = 16
+script = "scripts/_default.lua"
+
+# ─── Web (English) ──────────────────────────────────────────────
+
+[[dataset]]
+name = "fineweb-edu"
+hf_path = "HuggingFaceFW/fineweb-edu"
+category = "web"
+target_tokens = 5_000_000_000
+
+[[dataset]]
+name = "dclm"
+hf_path = "mlfoundations/dclm-baseline-1.0"
+category = "web"
+target_tokens = 5_000_000_000
+
+# ─── Knowledge ──────────────────────────────────────────────────
+
+[[dataset]]
+name = "pes2o"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "pes2o"
+category = "knowledge"
+
+[[dataset]]
+name = "wiki"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "wiki"
+category = "knowledge"
+
+[[dataset]]
+name = "stackexchange"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "stackexchange"
+category = "knowledge"
+
+[[dataset]]
+name = "cosmopedia2"
+hf_path = "HuggingFaceTB/smollm-corpus"
+hf_subset = "cosmopedia-v2"
+category = "knowledge"
+
+[[dataset]]
+name = "multilingual-wiki"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "wiki"
+category = "knowledge"
+
+# ─── Web (Multilingual) ────────────────────────────────────────
+
+[[dataset]]
+name = "fw2-fra"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "fra_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-spa"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "spa_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-deu"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "deu_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-ita"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "ita_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-por"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "por_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-cmn"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "cmn_Hani"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-rus"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "rus_Cyrl"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-fas"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "fas_Arab"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-jpn"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "jpn_Jpan"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-kor"
+hf_path = "HuggingFaceFW/fineweb-2"
+hf_subset = "kor_Hang"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-hin"
+hf_path = "HuggingFaceFW/fineweb-2"
+hf_subset = "hin_Deva"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-tha"
+hf_path = "HuggingFaceFW/fineweb-2"
+hf_subset = "tha_Thai"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-vie"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "vie_Latn"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+[[dataset]]
+name = "fw2-ell"
+hf_path = "epfml/FineWeb2-HQ"
+hf_subset = "ell_Grek"
+category = "web_multilingual"
+script = "scripts/fw2-multilingual.lua"
+
+# ─── Math ───────────────────────────────────────────────────────
+
+[[dataset]]
+name = "infiwebmath"
+hf_path = "HuggingFaceTB/finemath"
+hf_subset = "infiwebmath-3plus"
+category = "math"
+
+[[dataset]]
+name = "finemath"
+hf_path = "HuggingFaceTB/finemath"
+hf_subset = "finemath-3plus"
+category = "math"
+
+[[dataset]]
+name = "infiwebmath-4plus"
+hf_path = "HuggingFaceTB/finemath"
+hf_subset = "infiwebmath-4plus"
+category = "math"
+
+[[dataset]]
+name = "finemath-4plus"
+hf_path = "HuggingFaceTB/finemath"
+hf_subset = "finemath-4plus"
+category = "math"
+
+[[dataset]]
+name = "megamath-web-pro"
+hf_path = "LLM360/MegaMath"
+hf_subset = "web-pro"
+category = "math"
+
+[[dataset]]
+name = "megamath-qa-qwen"
+hf_path = "LLM360/MegaMath"
+hf_subset = "qa-qwen"
+category = "math"
+
+[[dataset]]
+name = "megamath-text-code-block"
+hf_path = "LLM360/MegaMath"
+hf_subset = "text-code-block"
+category = "math"
+
+# ─── Code ───────────────────────────────────────────────────────
+
+[[dataset]]
+name = "starcoder"
+hf_path = "bigcode/starcoderdata"
+text_column = "content"
+category = "code"
+target_tokens = 3_000_000_000
+script = "scripts/starcoder.lua"
+
+[[dataset]]
+name = "kaggle"
+hf_path = "HuggingFaceTB/issues-kaggle-notebooks"
+hf_subset = "kaggle"
+category = "code"
+
+[[dataset]]
+name = "github-issues"
+hf_path = "HuggingFaceTB/issues-kaggle-notebooks"
+hf_subset = "issues"
+category = "code"
+
+# ─── Reasoning (SFT-capable) ───────────────────────────────────
+
+[[dataset]]
+name = "openmathinstruct-2"
+hf_path = "nvidia/OpenMathReasoning"
+hf_subset = "openmathinstruct-2"
+category = "reasoning"
+sft_capable = true
+script = "scripts/openmathinstruct-2.lua"
+
+[[dataset]]
+name = "openmathreasoning-4k"
+hf_path = "nvidia/OpenMathReasoning"
+category = "reasoning"
+sft_capable = true
+script = "scripts/openmathreasoning-4k.lua"
+
+[[dataset]]
+name = "opencodereasoning-4k"
+hf_path = "nvidia/OpenCodeReasoning"
+category = "reasoning"
+sft_capable = true
+script = "scripts/opencodereasoning-4k.lua"
+
+[[dataset]]
+name = "natural-reasoning"
+hf_path = "facebook/natural_reasoning"
+category = "reasoning"
+sft_capable = true
+script = "scripts/natural-reasoning.lua"
+
+[[dataset]]
+name = "tinygsm-problem-solving"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "tinygsm-problem-solving"
+category = "reasoning"
+sft_capable = true
+script = "scripts/tinygsm.lua"
+
+[[dataset]]
+name = "tinygsm-2students"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "tinygsm-2students"
+category = "reasoning"
+sft_capable = true
+script = "scripts/tinygsm.lua"
+
+[[dataset]]
+name = "dolmino-math-synth-gsm8k"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "math-synth-gsm8k"
+category = "reasoning"
+sft_capable = true
+script = "scripts/tinygsm.lua"
+
+[[dataset]]
+name = "dolmino-math-synth-basic"
+hf_path = "allenai/dolmino-mix-1124"
+hf_subset = "math-synth-basic"
+category = "reasoning"
+sft_capable = true
+script = "scripts/tinygsm.lua"
