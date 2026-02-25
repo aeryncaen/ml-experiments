@@ -4549,7 +4549,7 @@ def main():
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
-    _accum_ramp_steps = int(math.ceil(math.log2(max(1, HP.grad_accum))))
+    _warmup_ramp_start = _warmup_tokens // 2
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     # Checkpoint saving
@@ -4594,19 +4594,20 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # During warmup: ramp grad_accum in powers-of-two over log2(target) steps.
-        # Example: target=32 -> 1,2,4,8,16,32 over 5 warmup steps.
+        # During warmup: ramp grad_accum from 1 -> HP.grad_accum over second half.
         # This is model/training warmup (independent of optimizer LR scheduling).
         _in_warmup = tokens_seen < _warmup_tokens
+        _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
         if _in_warmup:
-            if HP.grad_accum > 1:
-                _ramp_k = min(step, _accum_ramp_steps)
-                _eff_accum = min(HP.grad_accum, 1 << _ramp_k)
+            if _in_accum_ramp:
+                _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
+                _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
+                _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+                _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
             else:
                 _eff_accum = 1
         else:
             _eff_accum = HP.grad_accum
-        _in_accum_ramp = _in_warmup and (_eff_accum < HP.grad_accum)
 
         if _is_sf or _is_auto:
             # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
