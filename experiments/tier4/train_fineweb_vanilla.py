@@ -4177,9 +4177,12 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int):
-    """Returns (val_loss, val_acc, per_source_losses) where val_acc may be None.
-    per_source_losses is a dict {source_name: float} if val_stream is MixedShardStream, else None."""
+def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, world_size: int,
+             ch_weights: torch.Tensor | None = None):
+    """Returns (val_loss, val_acc, raw_val_loss, per_source_losses).
+    val_loss: CH-weighted if ch_weights provided, else standard mean.
+    raw_val_loss: always unweighted mean (None if no CH).
+    per_source_losses: dict {source_name: float} if MixedShardStream, else None."""
     val_stream.reset()  # always evaluate the same data for deterministic val loss
     raw = model.module if hasattr(model, 'module') else model
     model.eval()
@@ -4228,10 +4231,18 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     if has_acc:
         acc_sum /= HP.val_steps
     per_source = None
+    raw_val_loss = None
     if _mixed:
         per_source = {}
+        _per_src_losses = torch.zeros(_n_src, device=device)
         for i, name in enumerate(val_stream.source_names):
-            per_source[name] = float(_src_loss_sum[i] / _src_count[i].clamp(min=1))
+            _per_src_losses[i] = _src_loss_sum[i] / _src_count[i].clamp(min=1)
+            per_source[name] = float(_per_src_losses[i])
+        if ch_weights is not None:
+            # CH-weighted val loss as main, unweighted as raw
+            raw_val_loss = float(loss_sum.item())
+            loss_sum = (_per_src_losses * ch_weights).sum() / ch_weights.sum()
+            loss_sum = loss_sum.unsqueeze(0)
     if world_size > 1:
         dist.all_reduce(loss_sum, op=dist.ReduceOp.AVG)
         if has_acc:
@@ -4239,6 +4250,7 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
     model.train()
     return (float(loss_sum.item()),
             float(acc_sum.item()) if has_acc else None,
+            raw_val_loss,
             per_source)
 
 
@@ -4526,9 +4538,11 @@ def main():
     step = 0
     while tokens_seen <= _total_tokens:
         if step % HP.val_every == 0 or tokens_seen >= _total_tokens:
-            val_loss, val_acc, val_per_src = evaluate(model, val_stream, device, world_size)
+            _eval_ch_w = _ch_weights if _ch_on else None
+            val_loss, val_acc, raw_val_loss, val_per_src = evaluate(model, val_stream, device, world_size, ch_weights=_eval_ch_w)
             _acc_str = f" | val_acc {val_acc:.4f}" if val_acc is not None else ""
-            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
+            _raw_val_str = f" | raw_loss {raw_val_loss:.5f}" if raw_val_loss is not None else ""
+            print0(rank, f"step {step:5d} | val_loss {val_loss:.5f}{_raw_val_str}{_acc_str} | tokens {tokens_seen:,}/{_total_tokens:,}")
             if val_per_src is not None:
                 _vps_parts = [f"{n}={v:.4f}" for n, v in val_per_src.items()]
                 print0(rank, f"  val_per_source: {' '.join(_vps_parts)}")
