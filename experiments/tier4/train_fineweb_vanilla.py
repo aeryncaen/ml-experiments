@@ -112,9 +112,10 @@ class HParams:
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
     # Optimizer selection
-    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | geoadam | geomuon
-    muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon LR for hidden 2D weights
+    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | geoadam | geomuon | geonormuon
+    muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
+    normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -4302,9 +4303,9 @@ def main():
     def _is_embed_head(name: str) -> bool:
         return any(k in name for k in _embed_head_names)
 
-    if HP.optimizer == "muon":
-        from muon import SingleDeviceMuonWithAuxAdam
-        muon_params = []
+    if HP.optimizer in ("muon", "normuon"):
+        # Shared param split for Muon and NorMuon (both use Muon+AuxAdam pattern)
+        _muon_params = []
         adam_decay_params = []
         adam_no_decay_params = []
         for name, p in model.named_parameters():
@@ -4315,19 +4316,23 @@ def main():
             elif _is_embed_head(name):
                 adam_decay_params.append(p)
             else:
-                muon_params.append(p)
-        print0(rank, f"optimizer: muon ({len(muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd})")
+                _muon_params.append(p)
+        _opt_name = HP.optimizer
+        print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd})")
+        _muon_group = dict(params=_muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True)
+        if HP.optimizer == "normuon":
+            _muon_group["beta2"] = HP.normuon_beta2
         param_groups = [
-            dict(params=muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True),
+            _muon_group,
             dict(params=adam_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=_wd, use_muon=False),
             dict(params=adam_no_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0, use_muon=False),
         ]
         param_groups = [g for g in param_groups if g["params"]]
         _base_lrs = [g["lr"] for g in param_groups]
-        decay_params = muon_params + adam_decay_params
+        decay_params = _muon_params + adam_decay_params
         no_decay_params = adam_no_decay_params
 
-    elif HP.optimizer in ("geoadam", "geomuon"):
+    elif HP.optimizer in ("geoadam", "geomuon", "geonormuon"):
         # Geodesic optimizers: 2D weights are spherical when running nGPT
         all_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
         spherical_ids: set[int] = set()
@@ -4345,9 +4350,14 @@ def main():
             print0(rank, f"optimizer: geoadam ({_n_sph} spherical, {_n_euc} euclidean, wd={_wd})")
             param_groups = [{"params": [p for _, p in all_params]}]
             _base_lrs = [HP.lr]
-        else:  # geomuon
+        elif HP.optimizer == "geomuon":
             from geomuon import GeodesicMuon
             print0(rank, f"optimizer: geomuon ({_n_sph} spherical, {_n_euc} euclidean, wd={_wd}, ns_steps={HP.geomuon_ns_steps})")
+            param_groups = [{"params": [p for _, p in all_params]}]
+            _base_lrs = [HP.muon_lr if _is_ngpt else HP.lr]
+        else:  # geonormuon
+            from geonormuon import GeodesicNorMuon
+            print0(rank, f"optimizer: geonormuon ({_n_sph} spherical, {_n_euc} euclidean, wd={_wd}, ns_steps={HP.geomuon_ns_steps}, beta2={HP.normuon_beta2})")
             param_groups = [{"params": [p for _, p in all_params]}]
             _base_lrs = [HP.muon_lr if _is_ngpt else HP.lr]
 
@@ -4375,7 +4385,11 @@ def main():
         model = DDP(model, device_ids=[device.index])
 
     if HP.optimizer == "muon":
+        from muon import SingleDeviceMuonWithAuxAdam
         optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+    elif HP.optimizer == "normuon":
+        from normuon import SingleDeviceNorMuonWithAuxAdam
+        optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif HP.optimizer == "geoadam":
         optimizer = GeodesicAdam(
             param_groups[0]["params"], lr=HP.lr, betas=(0.9, 0.95),
@@ -4387,6 +4401,15 @@ def main():
         optimizer = GeodesicMuon(
             param_groups[0]["params"], lr=_base_lrs[0],
             momentum=HP.muon_momentum, ns_steps=HP.geomuon_ns_steps,
+            betas=(0.9, 0.95), weight_decay=_wd,
+            spherical_params=spherical_ids, normalize_dim=1,
+        )
+        param_groups = optimizer.param_groups
+    elif HP.optimizer == "geonormuon":
+        optimizer = GeodesicNorMuon(
+            param_groups[0]["params"], lr=_base_lrs[0],
+            momentum=HP.muon_momentum, beta2=HP.normuon_beta2,
+            ns_steps=HP.geomuon_ns_steps,
             betas=(0.9, 0.95), weight_decay=_wd,
             spherical_params=spherical_ids, normalize_dim=1,
         )

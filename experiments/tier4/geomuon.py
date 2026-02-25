@@ -108,44 +108,35 @@ def newton_schulz_polar(
 
 @torch.no_grad()
 def newton_schulz_polar_fused(
-    M: torch.Tensor,
+    G: torch.Tensor,
     steps: int = 5,
     eps: float = 1e-7,
 ) -> torch.Tensor:
     """
-    Fused Newton-Schulz that avoids materializing intermediate [m,m] matrices.
+    Fused Newton-Schulz quintic iteration, aligned with Keller Jordan's Muon.
 
-    Uses the Zhu et al. (2020) variant with better numerical stability:
-        a, b, c coefficients tuned for faster convergence.
+    Operates in bfloat16 for speed.  Transposes so the iteration always runs
+    on the short side, computing a min(m,n) x min(m,n) gram matrix.
 
-    For Muon-style optimizers, this is the hot path.
+    Produces US'V^T where S' ~ Uniform(0.5, 1.5) — an approximate polar factor
+    that works well in practice (exact UV^T is unnecessary).
     """
-    m, n = M.shape
-    transposed = False
-
-    if m < n:
-        M = M.t()
-        m, n = n, m
-        transposed = True
-
-    norm = M.norm()
-    if norm < eps:
-        return torch.zeros_like(M.t() if transposed else M)
-
-    X = M / norm
-
-    # Quintic coefficients from Muon paper for faster convergence
-    # These are optimized for the spectral distribution of NN gradients
+    assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
 
-    I = torch.eye(n, device=M.device, dtype=M.dtype)
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    # Perform the NS iterations
     for _ in range(steps):
-        A = X.t() @ X
-        X = X @ (a * I + b * A + c * A @ A)
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
 
-    if transposed:
-        X = X.t()
-
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     return X
 
 
@@ -365,41 +356,37 @@ class GeodesicMuon(Optimizer):
         # --- 1. Tangent projection ---
         g_tan = M.tangent_project(grad, curr_point, dim)
 
-        # --- 2. Newton-Schulz whitening in tangent space ---
-        # Reshape to 2D if needed for NS (handles multi-head etc.)
-        shape = g_tan.shape
-        if g_tan.dim() > 2:
-            g_2d = g_tan.reshape(shape[0], -1) if dim == 0 else g_tan.reshape(-1, shape[-1])
+        # --- 2. Parallel transport momentum, then blend (in-place lerp) ---
+        if state["step"] > 1:
+            mom.copy_(M.parallel_transport(mom, prev_point, curr_point, dim))
+
+        # mom = mu * mom + (1 - mu) * g_tan  (in-place)
+        mom.lerp_(g_tan, 1 - mu)
+
+        # Nesterov lookahead: update = mu * mom + (1 - mu) * g_tan (mutates g_tan)
+        if nesterov:
+            update = g_tan.lerp_(mom, mu)
         else:
-            g_2d = g_tan
+            update = mom
 
-        # Apply polar decomposition to tangent gradient
+        # --- 3. Newton-Schulz whitening of momentum-blended update ---
+        shape = update.shape
+        if update.dim() > 2:
+            u_2d = update.reshape(shape[0], -1) if dim == 0 else update.reshape(-1, shape[-1])
+        else:
+            u_2d = update
+
         ns_fn = newton_schulz_polar_fused if backend == "fused" else newton_schulz_polar
-        g_white = ns_fn(g_2d, steps=ns_steps)
+        u_white = ns_fn(u_2d, steps=ns_steps)
 
-        if g_tan.dim() > 2:
-            g_white = g_white.reshape(shape)
+        if update.dim() > 2:
+            u_white = u_white.reshape(shape)
+
+        # Aspect ratio scaling (match Muon)
+        u_white = u_white * max(1, u_white.size(-2) / u_white.size(-1)) ** 0.5
 
         # Re-project to tangent space (NS may introduce tiny radial component)
-        g_white = M.tangent_project(g_white, curr_point, dim)
-
-        # --- 3. Momentum with parallel transport ---
-        if state["step"] > 1:
-            mom_transported = M.parallel_transport(mom, prev_point, curr_point, dim)
-        else:
-            mom_transported = mom
-
-        # Update momentum
-        mom.copy_(mu * mom_transported + g_white)
-
-        # Nesterov lookahead
-        if nesterov:
-            update = mu * mom + g_white
-        else:
-            update = mom.clone()
-
-        # Ensure update is tangent
-        update = M.tangent_project(update, curr_point, dim)
+        update = M.tangent_project(u_white.to(dtype=curr_point.dtype), curr_point, dim)
 
         # --- 4. Save position, then geodesic step ---
         state["prev_point"] = curr_point.clone()
