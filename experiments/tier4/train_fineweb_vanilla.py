@@ -4549,7 +4549,7 @@ def main():
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
-    _warmup_ramp_start = _warmup_tokens // 2
+    _warmup_ramp_start = _warmup_tokens // 4
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     # Checkpoint saving
