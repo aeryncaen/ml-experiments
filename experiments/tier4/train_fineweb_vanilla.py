@@ -4323,6 +4323,10 @@ def main():
     # Build optimizer param groups before compile/DDP wrap
     _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
     _wd = 0.0 if _is_ngpt else HP.weight_decay
+    _muon_like_opts = ("muon", "normuon", "autonormuon", "muon_sf", "normuon_sf")
+    _use_muon_formula_lr = HP.optimizer in _muon_like_opts
+    _n_residuals = HP.n_layer * 2
+    _muon_formula_lr = 0.1 / math.sqrt(_n_residuals)
     # Names that identify embedding/head params (should not get Muon-style whitening)
     _embed_head_names = {"wte", "lm_head", "embed", "query_bank", "queries", "memory", "byte_memory", "token_embed", "token_params", "byte_embed"}
 
@@ -4365,7 +4369,7 @@ def main():
         decay_params = _dion_params + _adamw_embed + _adamw_head
         no_decay_params = _adamw_other
 
-    elif HP.optimizer in ("muon", "normuon", "autonormuon", "muon_sf", "normuon_sf"):
+    elif HP.optimizer in _muon_like_opts:
         # Shared param split for Muon and NorMuon (both use Muon+AuxAdam pattern)
         _muon_params = []
         adam_decay_params = []
@@ -4380,14 +4384,15 @@ def main():
             else:
                 _muon_params.append(p)
         _opt_name = HP.optimizer
-        print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd})")
-        _muon_group = dict(params=_muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True)
+        _base_lr_muon_like = _muon_formula_lr if _use_muon_formula_lr else HP.muon_lr
+        print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd}, formula_lr={_base_lr_muon_like:.6f})")
+        _muon_group = dict(params=_muon_params, lr=_base_lr_muon_like, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True)
         if HP.optimizer in ("normuon", "autonormuon", "normuon_sf"):
             _muon_group["beta2"] = HP.normuon_beta2
         param_groups = [
             _muon_group,
-            dict(params=adam_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=_wd, use_muon=False),
-            dict(params=adam_no_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0, use_muon=False),
+            dict(params=adam_decay_params, lr=_base_lr_muon_like, betas=(0.9, 0.95), eps=1e-10, weight_decay=_wd, use_muon=False),
+            dict(params=adam_no_decay_params, lr=_base_lr_muon_like, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0, use_muon=False),
         ]
         param_groups = [g for g in param_groups if g["params"]]
         _base_lrs = [g["lr"] for g in param_groups]
@@ -4464,13 +4469,7 @@ def main():
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif HP.optimizer == "autonormuon":
         from autonormuon import AutoNorMuon
-        # Megatron-style LR: 0.1 / sqrt(R) where R = n_layer * 2 (attn + mlp residuals)
-        _n_residuals = HP.n_layer * 2
-        _auto_lr = 0.1 / math.sqrt(_n_residuals)
-        # Override LRs in param groups
-        for pg in param_groups:
-            pg["lr"] = _auto_lr
-        _base_lrs = [_auto_lr] * len(param_groups)
+        # LR already set by formula for all muon-like optimizers: 0.1 / sqrt(R), R = 2 * n_layer
         _retract = not _is_ngpt
         optimizer = AutoNorMuon(
             param_groups,
@@ -4478,15 +4477,15 @@ def main():
             retract=_retract,
             gnorm_beta=HP.autonormuon_gnorm_beta,
         )
-        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_auto_lr:.6f} retract={_retract} gnorm_beta={HP.autonormuon_gnorm_beta}")
+        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} gnorm_beta={HP.autonormuon_gnorm_beta}")
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
-        _sf_warmup = int(HP.train_steps * HP.warmup_frac)
+        _sf_warmup = 0
         optimizer = ScheduleFreeMuon(param_groups, warmup_steps=_sf_warmup)
         print0(rank, f"  schedule-free: warmup_steps={_sf_warmup} sf_momentum=0.9")
     elif HP.optimizer == "normuon_sf":
         from normuon_sf import ScheduleFreeNorMuon
-        _sf_warmup = int(HP.train_steps * HP.warmup_frac)
+        _sf_warmup = 0
         optimizer = ScheduleFreeNorMuon(param_groups, warmup_steps=_sf_warmup)
         print0(rank, f"  schedule-free: warmup_steps={_sf_warmup} sf_momentum=0.9")
     elif HP.optimizer == "geoadam":
@@ -4525,6 +4524,7 @@ def main():
 
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
     _is_auto = HP.optimizer == "autonormuon"  # autonormuon: handles its own LR schedule internally
+    _is_plain_muon = HP.optimizer in ("muon", "normuon")
 
     profiler = None
     if HP.torch_profile:
@@ -4619,12 +4619,26 @@ def main():
             # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
         else:
-            _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+            if _is_plain_muon:
+                # Muon/NorMuon: no LR warmup, only schedule shape
+                if HP.lr_schedule == "wsd":
+                    _decay_tokens = int(_total_tokens * HP.wsd_decay_frac)
+                    _stable_end = _total_tokens - _decay_tokens
+                    if tokens_seen <= _stable_end:
+                        _lr_factor = 1.0
+                    else:
+                        _t = (tokens_seen - _stable_end) / max(1, _decay_tokens)
+                        _lr_factor = 0.5 * (1.0 + math.cos(math.pi * min(1.0, _t)))
+                else:
+                    _t = tokens_seen / max(1, _total_tokens)
+                    _lr_factor = 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, _t))))
+            else:
+                _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
             for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
                 pg["lr"] = base_lr * _lr_factor
                 if "adam_lr" in pg:
                     pg["adam_lr"] = HP.lr * _lr_factor
-            lr = HP.lr * _lr_factor  # for logging
+            lr = _base_lrs[0] * _lr_factor  # for logging
 
         optimizer.zero_grad(set_to_none=True)
         # Per-source loss accumulators for contraharmonic weighting
