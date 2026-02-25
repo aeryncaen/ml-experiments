@@ -111,6 +111,12 @@ class HParams:
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
 
+    # Optimizer selection
+    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | geoadam | geomuon
+    muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon LR for hidden 2D weights
+    muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
+    geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
+
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
     ngpt: bool = _env_bool("NGPT", False)
     ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.0)    # 0 = auto -> 1/n_layers
@@ -1799,60 +1805,14 @@ class NGPTMoEBlock(nn.Module):
 
 
 def _ngpt_normalize_weights(model: nn.Module):
-    """Post-optimizer-step: normalize all weight matrices along embedding dim.
-
-    nn.Linear weight is (out, in) — normalize along dim=1 (input/embedding dim).
-    nn.Embedding weight is (vocab, dim) — normalize along dim=1 (embedding dim).
-    MoEMLP expert weights (E, out, in) — normalize along dim=2 (input dim) for
-    gate/up, dim=1 (output/hidden dim) for down.
-    This keeps all dot products interpretable as cosine similarities.
-    """
-    # Collect bare Parameters that should NOT be normalized (e.g. diff attn lambda vectors)
-    _skip_ids: set[int] = set()
-    for m in model.modules():
-        for p in m.parameters(recurse=False):
-            if getattr(p, '_ngpt_skip_normalize', False):
-                _skip_ids.add(id(p))
-
-    with torch.no_grad():
-        for m in model.modules():
-            if isinstance(m, nn.Linear):
-                if id(m.weight) in _skip_ids:
-                    continue
-                m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
-            elif isinstance(m, nn.Embedding):
-                m.weight.div_(m.weight.norm(dim=1, keepdim=True).clamp(min=1e-8))
-            elif isinstance(m, MoEMLP):
-                # gate_expert, up_expert: (E, hidden, d_model) — normalize along input dim=2
-                m.gate_expert.div_(m.gate_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
-                m.up_expert.div_(m.up_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
-                # down_expert: (E, d_model, hidden) — normalize along input dim=2
-                m.down_expert.div_(m.down_expert.norm(dim=2, keepdim=True).clamp(min=1e-8))
-                # Shared weights if present
-                if m.shared_hidden > 0:
-                    m.gate_shared.div_(m.gate_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
-                    m.up_shared.div_(m.up_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
-                    m.down_shared.div_(m.down_shared.norm(dim=1, keepdim=True).clamp(min=1e-8))
-            elif isinstance(m, DSMoEMLP):
-                # gate_up_proj: (E, 2*hidden, d_model) — normalize along input dim=2
-                m.gate_up_proj.div_(m.gate_up_proj.norm(dim=2, keepdim=True).clamp(min=1e-8))
-                # down_proj: (E, d_model, hidden) — normalize along input dim=2
-                m.down_proj.div_(m.down_proj.norm(dim=2, keepdim=True).clamp(min=1e-8))
-                # Shared expert Linear weights handled by the nn.Linear branch above
+    """No-op: weight normalization removed. Embedding unit-norm is handled
+    inside CompositeEmbedding / the model forward pass instead."""
+    pass
 
 
 def _ngpt_normalize_pit_memory(model: nn.Module):
-    """Post-optimizer-step: normalize PIT bare Parameter memories to unit norm.
-
-    nn.Embedding weights are already handled by _ngpt_normalize_weights.
-    This catches bare nn.Parameter tensors like memory and byte_memory.
-    """
-    with torch.no_grad():
-        for m in model.modules():
-            if isinstance(m, PITTokenInterface):
-                m.memory.div_(m.memory.norm(dim=1, keepdim=True).clamp(min=1e-8))
-            elif isinstance(m, CompositePITTokenInterface):
-                m.byte_memory.div_(m.byte_memory.norm(dim=1, keepdim=True).clamp(min=1e-8))
+    """No-op: PIT memory normalization removed."""
+    pass
 
 
 class TransformerFeatureAttnBlock(nn.Module):
@@ -2602,7 +2562,8 @@ class CompositeEmbedding(nn.Module):
         all_parts = torch.cat(parts, dim=0)                         # (M, D)
         all_order = torch.cat(order, dim=0)
         _, restore = all_order.sort()
-        return all_parts[restore].view(*shape, D)
+        out = all_parts[restore].view(*shape, D)
+        return _unit_norm(out)
 
 
 class DecoderHead(nn.Module):
@@ -2880,7 +2841,6 @@ class CompositePITTokenInterface(nn.Module):
         # Full d_model Cholesky factor
         self.chol_raw = nn.Parameter(torch.zeros(d_model, d_model))
         self.token_out_bias = nn.Parameter(torch.zeros(vocab_size))
-        self.embed_out_norm = RMSNorm(d_model)
 
         token_bytes_table = _build_token_byte_table(vocab_size, self.max_bytes, self.pad_idx)
         n_bytes = (token_bytes_table != self.pad_idx).sum(dim=1).clamp(min=1)
@@ -2969,7 +2929,7 @@ class CompositePITTokenInterface(nn.Module):
         L = self._chol_factor(torch.float32, z.device)
         x_t = torch.cholesky_solve(flat.to(torch.float32).T, L)
         x = x_t.T.reshape_as(z).to(dtype=z.dtype)
-        return self.embed_out_norm(x)
+        return _unit_norm(x)
 
     def project(self, hidden: torch.Tensor) -> torch.Tensor:
         B, T, D = hidden.shape
@@ -3403,8 +3363,6 @@ class GPTTransformer(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.wte(idx)
-        if HP.ngpt:
-            x = _unit_norm(x)  # project onto hypersphere before entering nGPT blocks
         x = _run_blocks(self.blocks, x)
         x = self.ln_f(x)
         self._last_hidden = x.detach()
@@ -4021,7 +3979,7 @@ class GPTNGPTMoE(nn.Module):
             print("\n".join(["[GPTNGPTMoE] Per-layer config:"] + _cfg_parts))
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = _unit_norm(self.wte(idx))
+        x = self.wte(idx)
         # Store x0 for embed-gate blocks
         for blk in self.blocks:
             if blk.embed_gate:
@@ -4336,22 +4294,79 @@ def main():
     print0(rank, f"parameters={n_params:,} dtype={HP.dtype} weight_mem={_weight_mb:.0f}MB")
 
     # Build optimizer param groups before compile/DDP wrap
-    decay_params = []
-    no_decay_params = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim <= 1 or getattr(p, "_no_weight_decay", False):
-            no_decay_params.append(p)
-        else:
-            decay_params.append(p)
     _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
     _wd = 0.0 if _is_ngpt else HP.weight_decay
-    print0(rank, f"optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params (wd={_wd})")
-    param_groups = [
-        {"params": decay_params, "weight_decay": _wd},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
+    # Names that identify embedding/head params (should not get Muon-style whitening)
+    _embed_head_names = {"wte", "lm_head", "embed", "query_bank", "queries", "memory", "byte_memory", "token_embed", "token_params", "byte_embed"}
+
+    def _is_embed_head(name: str) -> bool:
+        return any(k in name for k in _embed_head_names)
+
+    if HP.optimizer == "muon":
+        from muon import SingleDeviceMuonWithAuxAdam
+        muon_params = []
+        adam_decay_params = []
+        adam_no_decay_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or getattr(p, "_no_weight_decay", False):
+                adam_no_decay_params.append(p)
+            elif _is_embed_head(name):
+                adam_decay_params.append(p)
+            else:
+                muon_params.append(p)
+        print0(rank, f"optimizer: muon ({len(muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd})")
+        param_groups = [
+            dict(params=muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True),
+            dict(params=adam_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=_wd, use_muon=False),
+            dict(params=adam_no_decay_params, lr=HP.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0, use_muon=False),
+        ]
+        param_groups = [g for g in param_groups if g["params"]]
+        _base_lrs = [g["lr"] for g in param_groups]
+        decay_params = muon_params + adam_decay_params
+        no_decay_params = adam_no_decay_params
+
+    elif HP.optimizer in ("geoadam", "geomuon"):
+        # Geodesic optimizers: 2D weights are spherical when running nGPT
+        all_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+        spherical_ids: set[int] = set()
+        if _is_ngpt:
+            for name, p in all_params:
+                if p.ndim >= 2:
+                    spherical_ids.add(id(p))
+        _n_sph = len(spherical_ids)
+        _n_euc = len(all_params) - _n_sph
+        decay_params = [p for _, p in all_params if p.ndim > 1 and not getattr(p, "_no_weight_decay", False)]
+        no_decay_params = [p for _, p in all_params if p.ndim <= 1 or getattr(p, "_no_weight_decay", False)]
+
+        if HP.optimizer == "geoadam":
+            from geoadam import GeodesicAdam
+            print0(rank, f"optimizer: geoadam ({_n_sph} spherical, {_n_euc} euclidean, wd={_wd})")
+            param_groups = [{"params": [p for _, p in all_params]}]
+            _base_lrs = [HP.lr]
+        else:  # geomuon
+            from geomuon import GeodesicMuon
+            print0(rank, f"optimizer: geomuon ({_n_sph} spherical, {_n_euc} euclidean, wd={_wd}, ns_steps={HP.geomuon_ns_steps})")
+            param_groups = [{"params": [p for _, p in all_params]}]
+            _base_lrs = [HP.muon_lr if _is_ngpt else HP.lr]
+
+    else:  # adamw (default)
+        decay_params = []
+        no_decay_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or getattr(p, "_no_weight_decay", False):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        print0(rank, f"optimizer: adamw ({len(decay_params)} decay, {len(no_decay_params)} nodecay, wd={_wd})")
+        param_groups = [
+            {"params": decay_params, "weight_decay": _wd},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        _base_lrs = [HP.lr] * len(param_groups)
 
     raw_model = model  # keep ref before compile/DDP wrapping
     if HP.compile:
@@ -4359,8 +4374,26 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[device.index])
 
-    _fused = device.type == "cuda"
-    optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95), fused=_fused)
+    if HP.optimizer == "muon":
+        optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+    elif HP.optimizer == "geoadam":
+        optimizer = GeodesicAdam(
+            param_groups[0]["params"], lr=HP.lr, betas=(0.9, 0.95),
+            spherical_params=spherical_ids, normalize_dim=1,
+            weight_decay=_wd,
+        )
+        param_groups = optimizer.param_groups  # re-bind for LR scheduling
+    elif HP.optimizer == "geomuon":
+        optimizer = GeodesicMuon(
+            param_groups[0]["params"], lr=_base_lrs[0],
+            momentum=HP.muon_momentum, ns_steps=HP.geomuon_ns_steps,
+            betas=(0.9, 0.95), weight_decay=_wd,
+            spherical_params=spherical_ids, normalize_dim=1,
+        )
+        param_groups = optimizer.param_groups
+    else:
+        _fused = device.type == "cuda"
+        optimizer = torch.optim.AdamW(param_groups, lr=HP.lr, betas=(0.9, 0.95), fused=_fused)
 
     profiler = None
     if HP.torch_profile:
@@ -4432,9 +4465,10 @@ def main():
         _in_warmup = tokens_seen < _warmup_tokens
         _eff_accum = 1 if _in_warmup else HP.grad_accum
 
-        lr = lr_for_tokens(tokens_seen, _total_tokens)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+        for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
+            pg["lr"] = base_lr * _lr_factor
+        lr = HP.lr * _lr_factor  # for logging
 
         optimizer.zero_grad(set_to_none=True)
         # Per-source loss accumulators for contraharmonic weighting
