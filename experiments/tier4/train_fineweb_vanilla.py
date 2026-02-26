@@ -125,7 +125,7 @@ class HParams:
 
     # Optimizer selection
     optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | autonormuon | muon_sf | normuon_sf | dion | dion2 | geoadam | geomuon | geonormuon
-    muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
+    muon_lr: float = _env_float("MUON_LR", 0.0)            # Muon/NorMuon LR for hidden 2D weights; 0 = auto (0.1/sqrt(2*n_layer))
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     autonormuon_beta: float = _env_float("AUTONORMUON_BETA", 0.55)  # AutoNorMuon grad-norm EMA decay
@@ -4499,7 +4499,6 @@ def main():
     _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
     _wd = 0.0 if _is_ngpt else HP.weight_decay
     _muon_like_opts = ("muon", "normuon", "autonormuon", "muon_sf", "normuon_sf")
-    _use_muon_formula_lr = HP.optimizer in _muon_like_opts
     _n_residuals = HP.n_layer * 2
     _muon_formula_lr = 0.1 / math.sqrt(_n_residuals)
     # Names that identify embedding/head params (should not get Muon-style whitening)
@@ -4559,8 +4558,9 @@ def main():
             else:
                 _muon_params.append(p)
         _opt_name = HP.optimizer
-        _base_lr_muon_like = _muon_formula_lr if _use_muon_formula_lr else HP.muon_lr
-        print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd}, formula_lr={_base_lr_muon_like:.6f})")
+        _base_lr_muon_like = HP.muon_lr if HP.muon_lr > 0 else _muon_formula_lr
+        _lr_source = "override" if HP.muon_lr > 0 else f"auto(0.1/sqrt({_n_residuals}))"
+        print0(rank, f"optimizer: {_opt_name} ({len(_muon_params)} muon, {len(adam_decay_params)} adam-decay, {len(adam_no_decay_params)} adam-nodecay, wd={_wd}, muon_lr={_base_lr_muon_like:.6f} [{_lr_source}])")
         _muon_group = dict(params=_muon_params, lr=_base_lr_muon_like, momentum=HP.muon_momentum, weight_decay=_wd, use_muon=True)
         if HP.optimizer in ("normuon", "autonormuon", "normuon_sf"):
             _muon_group["beta2"] = HP.normuon_beta2
