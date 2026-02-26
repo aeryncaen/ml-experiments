@@ -202,6 +202,67 @@ def _pearson(x: list[float], y: list[float]) -> float | None:
     return num / den
 
 
+def _is_scalar_option(v) -> bool:
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+
+def _option_value(v):
+    if isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        if math.isfinite(v):
+            return float(v)
+        return None
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def _eval_milestones(eval_events: list[dict]) -> dict:
+    vals = []
+    for e in eval_events:
+        vl = _as_float(e.get("val_loss"))
+        if vl is None:
+            continue
+        vals.append(
+            {
+                "loss": vl,
+                "step": _as_int(e.get("step")),
+                "tokens": _as_int(e.get("tokens_seen")),
+            }
+        )
+    if not vals:
+        return {
+            "first_eval_loss": None,
+            "mid_eval_loss": None,
+            "last_eval_loss": None,
+            "first_eval_step": None,
+            "mid_eval_step": None,
+            "last_eval_step": None,
+            "first_eval_tokens": None,
+            "mid_eval_tokens": None,
+            "last_eval_tokens": None,
+        }
+
+    mid_i = (len(vals) - 1) // 2
+    first = vals[0]
+    mid = vals[mid_i]
+    last = vals[-1]
+    return {
+        "first_eval_loss": first["loss"],
+        "mid_eval_loss": mid["loss"],
+        "last_eval_loss": last["loss"],
+        "first_eval_step": first["step"],
+        "mid_eval_step": mid["step"],
+        "last_eval_step": last["step"],
+        "first_eval_tokens": first["tokens"],
+        "mid_eval_tokens": mid["tokens"],
+        "last_eval_tokens": last["tokens"],
+    }
+
+
 def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict:
     if not train_events:
         return {}
@@ -306,6 +367,7 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
 
     train_events = _read_jsonl(run_dir / "train_events.jsonl")
     eval_events = _read_jsonl(run_dir / "eval_events.jsonl")
+    eval_ms = _eval_milestones(eval_events)
 
     train_rows = []
     for e in train_events:
@@ -412,7 +474,7 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         return elapsed[i] if i is not None and 0 <= i < len(elapsed) else None
 
     best_val = _as_float(summary.get("best_val_loss"))
-    final_val = None
+    final_val = eval_ms["last_eval_loss"]
     if isinstance(summary.get("last_eval"), dict):
         final_val = _as_float(summary["last_eval"].get("val_loss"))
 
@@ -447,6 +509,15 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "d_model": _as_int(hparams.get("d_model")),
         "best_val_loss": best_val,
         "final_val_loss": final_val,
+        "first_eval_loss": eval_ms["first_eval_loss"],
+        "mid_eval_loss": eval_ms["mid_eval_loss"],
+        "last_eval_loss": eval_ms["last_eval_loss"],
+        "first_eval_step": eval_ms["first_eval_step"],
+        "mid_eval_step": eval_ms["mid_eval_step"],
+        "last_eval_step": eval_ms["last_eval_step"],
+        "first_eval_tokens": eval_ms["first_eval_tokens"],
+        "mid_eval_tokens": eval_ms["mid_eval_tokens"],
+        "last_eval_tokens": eval_ms["last_eval_tokens"],
         "elapsed_s": _elapsed,
         "throughput_tok_s": _throughput,
         "random_loss_ref": random_ref,
@@ -476,6 +547,7 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "non_finite_eval_loss": nonfinite_eval,
         "unstable": unstable,
         "autonormuon_diag": auto_diag,
+        "option_values": {k: _option_value(v) for k, v in hparams.items() if _is_scalar_option(v)},
     }
     return rec
 
@@ -502,6 +574,9 @@ def _group_aggregate(rows: list[dict], group_fields: list[str]) -> list[dict]:
         rec.update(
             {
                 "n_runs": len(rs),
+                "first_eval_loss_mean": _mean([r.get("first_eval_loss") for r in rs]),
+                "mid_eval_loss_mean": _mean([r.get("mid_eval_loss") for r in rs]),
+                "last_eval_loss_mean": _mean([r.get("last_eval_loss") for r in rs]),
                 "best_val_loss_mean": _mean([r.get("best_val_loss") for r in rs]),
                 "best_val_loss_std": _std([r.get("best_val_loss") for r in rs]),
                 "final_val_loss_mean": _mean([r.get("final_val_loss") for r in rs]),
@@ -528,14 +603,174 @@ def _group_aggregate(rows: list[dict], group_fields: list[str]) -> list[dict]:
     return out
 
 
-def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str]) -> str:
+def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]) -> list[dict]:
+    effects = []
+    for key in option_keys:
+        by_val: dict[str, list[dict]] = {}
+        for r in rows:
+            opts = r.get("option_values")
+            if not isinstance(opts, dict):
+                continue
+            if key not in opts:
+                continue
+            v = opts.get(key)
+            if v is None:
+                continue
+            by_val.setdefault(str(v), []).append(r)
+        if len(by_val) < 2:
+            continue
+
+        value_stats = {}
+        spreads = {}
+        winners = {}
+        for m in metrics:
+            means = []
+            for v, rs in by_val.items():
+                vals = []
+                for r in rs:
+                    rv = r.get(m)
+                    if isinstance(rv, (int, float)) and math.isfinite(float(rv)):
+                        vals.append(float(rv))
+                mean_v = statistics.fmean(vals) if vals else None
+                std_v = statistics.pstdev(vals) if len(vals) > 1 else (0.0 if vals else None)
+                value_stats.setdefault(v, {})[m] = {
+                    "n": len(vals),
+                    "mean": mean_v,
+                    "std": std_v,
+                }
+                if mean_v is not None:
+                    means.append((v, mean_v))
+            if means:
+                means.sort(key=lambda x: x[1])
+                winners[m] = means[0][0]
+                spreads[m] = means[-1][1] - means[0][1] if len(means) > 1 else 0.0
+            else:
+                winners[m] = None
+                spreads[m] = None
+
+        # Numeric correlation against each metric if option is numeric-ish
+        num_x = []
+        y_map = {m: [] for m in metrics}
+        numeric_ok = True
+        for r in rows:
+            opts = r.get("option_values")
+            if not isinstance(opts, dict) or key not in opts:
+                continue
+            v = opts.get(key)
+            if isinstance(v, bool):
+                xv = 1.0 if v else 0.0
+            elif isinstance(v, (int, float)) and math.isfinite(float(v)):
+                xv = float(v)
+            else:
+                numeric_ok = False
+                break
+            num_x.append(xv)
+            for m in metrics:
+                ym = r.get(m)
+                y_map[m].append(float(ym) if isinstance(ym, (int, float)) and math.isfinite(float(ym)) else float("nan"))
+
+        corrs = {}
+        if numeric_ok and len(num_x) >= 3:
+            for m in metrics:
+                pairs = [(x, y) for x, y in zip(num_x, y_map[m]) if math.isfinite(y)]
+                if len(pairs) >= 3:
+                    xx, yy = zip(*pairs)
+                    corrs[m] = _pearson(list(xx), list(yy))
+                else:
+                    corrs[m] = None
+        else:
+            for m in metrics:
+                corrs[m] = None
+
+        score = 0.0
+        for m in metrics:
+            s = spreads.get(m)
+            if isinstance(s, (int, float)):
+                score = max(score, float(abs(s)))
+
+        effects.append(
+            {
+                "option": key,
+                "n_values": len(by_val),
+                "n_runs": sum(len(v) for v in by_val.values()),
+                "winners": winners,
+                "spreads": spreads,
+                "correlations": corrs,
+                "by_value": value_stats,
+                "impact_score": score,
+            }
+        )
+
+    effects.sort(key=lambda e: e.get("impact_score", 0.0), reverse=True)
+    return effects
+
+
+def _milestone_leaders(rows: list[dict]) -> dict:
+    out = {}
+    for m in ("first_eval_loss", "mid_eval_loss", "last_eval_loss"):
+        cands = [r for r in rows if isinstance(r.get(m), (int, float))]
+        if not cands:
+            out[m] = None
+            continue
+        best = min(cands, key=lambda r: float(r[m]))
+        out[m] = {
+            "run_name": best.get("run_name"),
+            "optimizer": best.get("optimizer"),
+            "adapt_mode": best.get("adapt_mode"),
+            "value": best.get(m),
+        }
+    return out
+
+
+def _select_option_keys(rows: list[dict], option_keys_arg: str, exclude_keys: set[str]) -> list[str]:
+    if option_keys_arg.strip().lower() != "auto":
+        return [k.strip() for k in option_keys_arg.split(",") if k.strip()]
+
+    values: dict[str, set[str]] = {}
+    for r in rows:
+        opts = r.get("option_values")
+        if not isinstance(opts, dict):
+            continue
+        for k, v in opts.items():
+            if k in exclude_keys:
+                continue
+            if v is None:
+                continue
+            values.setdefault(k, set()).add(str(v))
+    keys = [k for k, vv in values.items() if len(vv) > 1]
+    keys.sort()
+    return keys
+
+
+def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str], option_effects: list[dict], milestone_leaders: dict) -> str:
     lines = [
         "# FineWeb Dynamics Report",
         "",
         f"Generated: {datetime.now().isoformat()}",
         "",
-        "| Rank | Run | Opt | Mode | Best Val | Final Val | Rand Exit | Stable(drop) | Stable(slope) | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
-        "|------|-----|-----|------|----------|-----------|-----------|--------------|---------------|------------|-----------|------------|-------|-------|----------|",
+    ]
+
+    if milestone_leaders:
+        lines += [
+            "## Milestone Leaders",
+            "",
+            "| Metric | Run | Optimizer | Mode | Value |",
+            "|--------|-----|-----------|------|-------|",
+        ]
+        for m in ("first_eval_loss", "mid_eval_loss", "last_eval_loss"):
+            rec = milestone_leaders.get(m)
+            if rec is None:
+                continue
+            lines.append(
+                f"| {m} | {rec.get('run_name')} | {rec.get('optimizer') or '-'} | {rec.get('adapt_mode') or '-'} | {_fmt(rec.get('value'))} |"
+            )
+        lines += [""]
+
+    lines += [
+        "## Per-Run",
+        "",
+        "| Rank | Run | Opt | Mode | First Eval | Mid Eval | Last Eval | Best Val | Rand Exit | Stable(drop) | Stable(slope) | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
+        "|------|-----|-----|------|------------|----------|-----------|----------|-----------|--------------|---------------|------------|-----------|------------|-------|-------|----------|",
     ]
     for i, r in enumerate(rows, start=1):
         _eg = r.get("end_gain_frac_total")
@@ -543,7 +778,7 @@ def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str]) -> 
         lines.append(
             "| "
             f"{i} | {r.get('run_name')} | {r.get('optimizer') or '-'} | {r.get('adapt_mode') or '-'} | "
-            f"{_fmt(r.get('best_val_loss'))} | {_fmt(r.get('final_val_loss'))} | {_fmt(r.get('random_exit_step'), nd=0)} | "
+            f"{_fmt(r.get('first_eval_loss'))} | {_fmt(r.get('mid_eval_loss'))} | {_fmt(r.get('last_eval_loss'))} | {_fmt(r.get('best_val_loss'))} | {_fmt(r.get('random_exit_step'), nd=0)} | "
             f"{_fmt(r.get('stable_step_drop'), nd=0)} | {_fmt(r.get('stable_step_slope'), nd=0)} | "
             f"{_fmt(_eg_pct)} | "
             f"{_fmt(r.get('mid_slope_per_mtok'))} | {_fmt(r.get('tail_slope_per_mtok'))} | {_fmt(r.get('taper_ratio_tail_mid'))} | "
@@ -554,8 +789,8 @@ def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str]) -> 
         "",
         "## Grouped Summary",
         "",
-        "| Rank | " + " | ".join(group_fields) + " | Runs | Best Mean | Stable(drop) | Stable(slope) | Rand Exit | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
-        "|------|" + "------|" * len(group_fields) + "------|----------|--------------|---------------|-----------|------------|-----------|------------|-------|-------|----------|",
+        "| Rank | " + " | ".join(group_fields) + " | Runs | First Mean | Mid Mean | Last Mean | Best Mean | Stable(drop) | Stable(slope) | Rand Exit | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
+        "|------|" + "------|" * len(group_fields) + "------|------------|----------|-----------|----------|--------------|---------------|-----------|------------|-----------|------------|-------|-------|----------|",
     ]
     for i, g in enumerate(groups, start=1):
         gp = " | ".join(str(g.get(f, "-")) for f in group_fields)
@@ -563,12 +798,31 @@ def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str]) -> 
         end_gain_pct = (end_gain_pct * 100.0) if isinstance(end_gain_pct, (int, float)) else None
         lines.append(
             "| "
-            f"{i} | {gp} | {_fmt(g.get('n_runs'), nd=0)} | {_fmt(g.get('best_val_loss_mean'))} | "
+            f"{i} | {gp} | {_fmt(g.get('n_runs'), nd=0)} | {_fmt(g.get('first_eval_loss_mean'))} | {_fmt(g.get('mid_eval_loss_mean'))} | {_fmt(g.get('last_eval_loss_mean'))} | {_fmt(g.get('best_val_loss_mean'))} | "
             f"{_fmt(g.get('stable_step_drop_mean'), nd=0)} | {_fmt(g.get('stable_step_slope_mean'), nd=0)} | "
             f"{_fmt(g.get('random_exit_step_mean'), nd=0)} | {_fmt(end_gain_pct)} | {_fmt(g.get('mid_slope_per_mtok_mean'))} | "
             f"{_fmt(g.get('tail_slope_per_mtok_mean'))} | {_fmt(g.get('taper_ratio_tail_mid_mean'))} | "
             f"{_fmt(g.get('throughput_tok_s_mean'), nd=1)} | {_fmt(g.get('unstable_runs'), nd=0)} |"
         )
+
+    if option_effects:
+        lines += [
+            "",
+            "## Option Effects (First/Mid/Last Eval)",
+            "",
+            "| Option | Best@First | Best@Mid | Best@Last | Spread@First | Spread@Mid | Spread@Last | Corr@First | Corr@Mid | Corr@Last |",
+            "|--------|------------|----------|-----------|--------------|------------|-------------|------------|----------|-----------|",
+        ]
+        for e in option_effects:
+            w = e.get("winners", {})
+            s = e.get("spreads", {})
+            c = e.get("correlations", {})
+            lines.append(
+                "| "
+                f"{e.get('option')} | {w.get('first_eval_loss')} | {w.get('mid_eval_loss')} | {w.get('last_eval_loss')} | "
+                f"{_fmt(s.get('first_eval_loss'))} | {_fmt(s.get('mid_eval_loss'))} | {_fmt(s.get('last_eval_loss'))} | "
+                f"{_fmt(c.get('first_eval_loss'))} | {_fmt(c.get('mid_eval_loss'))} | {_fmt(c.get('last_eval_loss'))} |"
+            )
 
     auto_rows = [r for r in rows if r.get("optimizer") == "autonormuon" and isinstance(r.get("autonormuon_diag"), dict)]
     if auto_rows:
@@ -635,6 +889,18 @@ def main() -> None:
         default="optimizer,adapt_mode,lr_scope,gnorm_source,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
+    ap.add_argument(
+        "--option-keys",
+        type=str,
+        default="auto",
+        help="Comma-separated option keys for effect analysis, or 'auto'",
+    )
+    ap.add_argument(
+        "--option-exclude",
+        type=str,
+        default="seed,metrics_enabled,metrics_dir,metrics_run_name,metrics_every,metrics_flush_every,run_group,run_config_hash",
+        help="Comma-separated option keys to exclude from auto option effect analysis",
+    )
 
     args = ap.parse_args()
 
@@ -660,6 +926,12 @@ def main() -> None:
 
     group_fields = [x.strip() for x in args.group_by.split(",") if x.strip()]
     groups = _group_aggregate(rows, group_fields)
+
+    metrics_for_options = ["first_eval_loss", "mid_eval_loss", "last_eval_loss"]
+    exclude_keys = {x.strip() for x in args.option_exclude.split(",") if x.strip()}
+    option_keys = _select_option_keys(rows, args.option_keys, exclude_keys)
+    option_effects = _option_effects(rows, option_keys, metrics_for_options)
+    milestone_leaders = _milestone_leaders(rows)
 
     report = {
         "generated_at": datetime.now().isoformat(),
@@ -694,12 +966,15 @@ def main() -> None:
         "runs": rows,
         "group_by": group_fields,
         "groups": groups,
+        "option_keys": option_keys,
+        "option_effects": option_effects,
+        "milestone_leaders": milestone_leaders,
     }
 
     out_json = Path(args.out_json) if args.out_json else runs_dir / "leaderboard.json"
     out_md = Path(args.out_md) if args.out_md else runs_dir / "leaderboard.md"
     out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    out_md.write_text(_markdown(rows, groups, group_fields), encoding="utf-8")
+    out_md.write_text(_markdown(rows, groups, group_fields, option_effects, milestone_leaders), encoding="utf-8")
 
     print(f"Analyzed runs: {len(rows)}")
     if rows:
