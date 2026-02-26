@@ -37,14 +37,33 @@ def _is_finite_number(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
 
 
-def _count_relative_spikes(vals: list[float], factor: float, warmup: int = 10) -> int:
+def _as_float(x) -> float | None:
+    if _is_finite_number(x):
+        return float(x)
+    return None
+
+
+def _as_int(x) -> int | None:
+    if isinstance(x, int):
+        return x
+    if _is_finite_number(x):
+        return int(float(x))
+    return None
+
+
+def _count_relative_spikes(
+    vals: list[float],
+    factor: float,
+    warmup: int = 10,
+    min_abs_delta: float = 0.0,
+) -> int:
     if len(vals) < max(2, warmup + 1):
         return 0
     c = 0
     for i in range(warmup, len(vals)):
         prev = vals[i - 1]
         cur = vals[i]
-        if prev > 0 and cur > prev * factor:
+        if prev > 0 and cur > prev * factor and (cur - prev) >= min_abs_delta:
             c += 1
     return c
 
@@ -99,7 +118,16 @@ class RunStats:
         }
 
 
-def _extract_run_stats(run_dir: Path, spike_factor: float) -> RunStats | None:
+def _extract_run_stats(
+    run_dir: Path,
+    loss_spike_factor: float,
+    grad_spike_factor: float,
+    spike_warmup: int,
+    loss_spike_min_abs: float,
+    grad_spike_min_abs: float,
+    max_loss_spikes: int,
+    max_grad_spikes: int,
+) -> RunStats | None:
     summary = _read_json(run_dir / "run_summary.json")
     if summary is None:
         return None
@@ -118,8 +146,18 @@ def _extract_run_stats(run_dir: Path, spike_factor: float) -> RunStats | None:
     non_finite_grad_norm = sum(1 for e in train_events if not _is_finite_number(e.get("grad_norm")))
     non_finite_eval_loss = sum(1 for e in eval_events if not _is_finite_number(e.get("val_loss")))
 
-    train_loss_spikes = _count_relative_spikes(train_losses, factor=spike_factor)
-    grad_norm_spikes = _count_relative_spikes(grad_norms, factor=spike_factor)
+    train_loss_spikes = _count_relative_spikes(
+        train_losses,
+        factor=loss_spike_factor,
+        warmup=spike_warmup,
+        min_abs_delta=loss_spike_min_abs,
+    )
+    grad_norm_spikes = _count_relative_spikes(
+        grad_norms,
+        factor=grad_spike_factor,
+        warmup=spike_warmup,
+        min_abs_delta=grad_spike_min_abs,
+    )
 
     best_val_loss = summary.get("best_val_loss")
     final_val_loss = None
@@ -138,18 +176,18 @@ def _extract_run_stats(run_dir: Path, spike_factor: float) -> RunStats | None:
     if not _is_finite_number(final_val_loss) and eval_losses:
         final_val_loss = eval_losses[-1]
 
-    elapsed_s = summary.get("elapsed_s")
-    tokens_seen = summary.get("tokens_seen")
+    elapsed_s = _as_float(summary.get("elapsed_s"))
+    tokens_seen = _as_int(summary.get("tokens_seen"))
     throughput_tok_s = None
-    if _is_finite_number(elapsed_s) and _is_finite_number(tokens_seen) and float(elapsed_s) > 0:
-        throughput_tok_s = float(tokens_seen) / float(elapsed_s)
+    if elapsed_s is not None and tokens_seen is not None and elapsed_s > 0:
+        throughput_tok_s = float(tokens_seen) / elapsed_s
 
     unstable = (
         non_finite_train_loss > 0
         or non_finite_grad_norm > 0
         or non_finite_eval_loss > 0
-        or train_loss_spikes > 3
-        or grad_norm_spikes > 3
+        or train_loss_spikes > max_loss_spikes
+        or grad_norm_spikes > max_grad_spikes
     )
 
     return RunStats(
@@ -157,14 +195,14 @@ def _extract_run_stats(run_dir: Path, spike_factor: float) -> RunStats | None:
         run_dir=str(run_dir),
         optimizer=hparams.get("optimizer"),
         model_type=hparams.get("model_type"),
-        best_val_loss=float(best_val_loss) if _is_finite_number(best_val_loss) else None,
-        final_val_loss=float(final_val_loss) if _is_finite_number(final_val_loss) else None,
-        final_train_loss=float(final_train_loss) if _is_finite_number(final_train_loss) else None,
-        final_lr=float(final_lr) if _is_finite_number(final_lr) else None,
-        final_grad_norm=float(final_grad_norm) if _is_finite_number(final_grad_norm) else None,
-        tokens_seen=int(tokens_seen) if isinstance(tokens_seen, int) else None,
-        total_tokens=int(summary["total_tokens"]) if isinstance(summary.get("total_tokens"), int) else None,
-        elapsed_s=float(elapsed_s) if _is_finite_number(elapsed_s) else None,
+        best_val_loss=_as_float(best_val_loss),
+        final_val_loss=_as_float(final_val_loss),
+        final_train_loss=_as_float(final_train_loss),
+        final_lr=_as_float(final_lr),
+        final_grad_norm=_as_float(final_grad_norm),
+        tokens_seen=tokens_seen,
+        total_tokens=_as_int(summary.get("total_tokens")),
+        elapsed_s=elapsed_s,
         throughput_tok_s=throughput_tok_s,
         train_events=len(train_events),
         eval_events=len(eval_events),
@@ -211,7 +249,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze JSON metrics runs from train_fineweb_vanilla.py")
     ap.add_argument("--runs-dir", type=str, default="experiments/tier4/runs")
     ap.add_argument("--pattern", type=str, default="*", help="subdir glob under runs-dir")
-    ap.add_argument("--spike-factor", type=float, default=1.25)
+    ap.add_argument("--loss-spike-factor", type=float, default=1.25)
+    ap.add_argument("--grad-spike-factor", type=float, default=2.0)
+    ap.add_argument("--spike-warmup", type=int, default=25)
+    ap.add_argument("--loss-spike-min-abs", type=float, default=0.05)
+    ap.add_argument("--grad-spike-min-abs", type=float, default=0.2)
+    ap.add_argument("--max-loss-spikes", type=int, default=5)
+    ap.add_argument("--max-grad-spikes", type=int, default=40)
     ap.add_argument("--out-json", type=str, default="")
     ap.add_argument("--out-md", type=str, default="")
     args = ap.parse_args()
@@ -223,7 +267,16 @@ def main() -> None:
     run_dirs = [p for p in sorted(runs_dir.glob(args.pattern)) if p.is_dir()]
     stats: list[RunStats] = []
     for rd in run_dirs:
-        st = _extract_run_stats(rd, spike_factor=args.spike_factor)
+        st = _extract_run_stats(
+            rd,
+            loss_spike_factor=args.loss_spike_factor,
+            grad_spike_factor=args.grad_spike_factor,
+            spike_warmup=args.spike_warmup,
+            loss_spike_min_abs=args.loss_spike_min_abs,
+            grad_spike_min_abs=args.grad_spike_min_abs,
+            max_loss_spikes=args.max_loss_spikes,
+            max_grad_spikes=args.max_grad_spikes,
+        )
         if st is not None:
             stats.append(st)
 
@@ -238,7 +291,15 @@ def main() -> None:
         "generated_at": datetime.now().isoformat(),
         "runs_dir": str(runs_dir),
         "pattern": args.pattern,
-        "spike_factor": args.spike_factor,
+        "spike_rules": {
+            "loss_spike_factor": args.loss_spike_factor,
+            "grad_spike_factor": args.grad_spike_factor,
+            "spike_warmup": args.spike_warmup,
+            "loss_spike_min_abs": args.loss_spike_min_abs,
+            "grad_spike_min_abs": args.grad_spike_min_abs,
+            "max_loss_spikes": args.max_loss_spikes,
+            "max_grad_spikes": args.max_grad_spikes,
+        },
         "n_runs": len(stats),
         "runs": [s.as_dict() for s in stats],
     }
