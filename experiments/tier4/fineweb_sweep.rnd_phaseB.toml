@@ -6,14 +6,14 @@ skip_existing = true
 continue_on_error = true
 
 [base]
-# ~20M tokens at seq_len=1024: 2441 * 8 * 1 * 1024 = 19,996,672
-train_steps = 2441
+# ~5M tokens at seq_len=1024: 611 * 8 * 1 * 1024 = 5,005,312
+train_steps = 611
 batch_size = 8
 grad_accum = 1
 seq_len = 1024
 
 metrics_every = 1
-val_every = 400
+val_every = 100
 
 train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
 val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
@@ -31,11 +31,6 @@ autonormuon_min_ratio = [0.0]
 autonormuon_grad_schedule = ["off"]
 
 # Weight schedule ablation — both directions:
-#   off / always                = controls
-#   hard_off:<step>             = on early, off after step (weights on then off)
-#   hard_on:<step>              = off early, on after step (delayed retraction)
-#   ramp_down:<s>-<e>           = smooth 1→0
-#   ramp_up:<s>-<e>             = smooth 0→1
 autonormuon_weight_schedule = [
     "off",
     "always",
@@ -44,17 +39,13 @@ autonormuon_weight_schedule = [
     "hard_off:160",
     "hard_off:320",
     "hard_off:600",
-    "hard_off:1200",
     "hard_on:40",
     "hard_on:80",
     "hard_on:160",
     "hard_on:320",
     "hard_on:600",
-    "hard_on:1200",
     "ramp_down:0-160",
     "ramp_down:0-600",
-    "ramp_down:0-1200",
     "ramp_up:0-160",
     "ramp_up:0-600",
-    "ramp_up:0-1200",
 ]

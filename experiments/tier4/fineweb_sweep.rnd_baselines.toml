@@ -1,0 +1,23 @@
+[runner]
+# Baselines at seq_len=1024 for comparison with schedule ablations.
+metrics_dir = "experiments/tier4/runs"
+run_prefix = "rnd_sched_base"
+skip_existing = true
+continue_on_error = true
+
+[base]
+# ~5M tokens at seq_len=1024: 611 * 8 * 1 * 1024 = 5,005,312
+train_steps = 611
+batch_size = 8
+grad_accum = 1
+seq_len = 1024
+
+metrics_every = 1
+val_every = 100
+
+train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
+val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
+
+[sweep]
+optimizer = ["normuon", "muon"]
+seed = [42]
