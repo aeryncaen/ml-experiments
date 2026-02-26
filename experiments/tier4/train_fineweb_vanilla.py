@@ -135,7 +135,7 @@ class HParams:
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
-    sphere_init: bool = _env_bool("SPHERE_INIT", False)  # normalize all 2D weight rows to unit norm at init
+    init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
     ngpt: bool = _env_bool("NGPT", False)
@@ -4511,15 +4511,24 @@ def main():
     _pt_dtype = torch.bfloat16 if HP.dtype == "bf16" else torch.float32
     model = build_model_maybe_llada().to(device=device, dtype=_pt_dtype)
 
-    # Optionally normalize all 2D weight rows to unit norm at init (product of spheres).
-    if HP.sphere_init:
-        _sphere_count = 0
+    # Optional weight initialization normalization.
+    if HP.init_mode == "sphere":
+        _init_count = 0
         with torch.no_grad():
             for name, p in model.named_parameters():
                 if p.ndim >= 2:
                     p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-                    _sphere_count += 1
-        print0(rank, f"sphere_init: normalized {_sphere_count} weight matrices to unit row norm")
+                    _init_count += 1
+        print0(rank, f"init_mode=sphere: normalized {_init_count} weight matrices to unit row norm")
+    elif HP.init_mode == "ns5":
+        from autonormuon import zeropower_via_newtonschulz5
+        _init_count = 0
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.ndim >= 2:
+                    p.copy_(zeropower_via_newtonschulz5(p.float(), steps=5).to(p.dtype))
+                    _init_count += 1
+        print0(rank, f"init_mode=ns5: orthogonalized {_init_count} weight matrices via Newton-Schulz")
 
     n_params = sum(p.numel() for p in model.parameters())
     _mem_per_param = 2 if HP.dtype == "bf16" else 4
