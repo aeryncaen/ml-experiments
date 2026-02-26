@@ -1,0 +1,32 @@
+[runner]
+# R&D sweep orchestration (not "production").
+metrics_dir = "experiments/tier4/runs"
+run_prefix = "rnd_fineweb10m"
+skip_existing = true
+continue_on_error = true
+
+[base]
+# ~10M tokens with defaults: 611 * 8 * 1 * 2048 = 10,010,624
+train_steps = 611
+batch_size = 8
+grad_accum = 1
+seq_len = 2048
+
+# keep trainer logging dense for analysis
+metrics_every = 1
+val_every = 100
+
+# set these to your actual shard globs
+train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
+val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
+
+[sweep]
+optimizer = ["normuon", "muon", "autonormuon"]
+seed = [1, 2, 3]
+
+# AutoNorMuon-only knobs; ignored for non-autonormuon optimizers by runner normalization.
+autonormuon_adapt_mode = ["gnorm", "mu_var"]
+autonormuon_gnorm_beta = [0.9]
+autonormuon_ratio_pow = [1.0]
+autonormuon_min_ratio = [0.0]
+autonormuon_var_eps = [1.0e-12]
