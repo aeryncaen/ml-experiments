@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=1.24",
     "safetensors>=0.4",
     "tqdm>=4.60",
+    "einops>=0.7",
+    "huggingface_hub>=0.20",
 ]
 
 [project.optional-dependencies]
