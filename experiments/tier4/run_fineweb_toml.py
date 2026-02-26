@@ -49,6 +49,31 @@ def _hash_hparams(hparams: dict) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _hash_view(hparams: dict) -> dict:
+    out = dict(hparams)
+
+    # Logging/housekeeping fields should not create new experiment identities.
+    for k in (
+        "metrics_enabled",
+        "metrics_dir",
+        "metrics_run_name",
+        "metrics_every",
+        "metrics_flush_every",
+        "run_group",
+        "run_config_hash",
+    ):
+        out.pop(k, None)
+
+    # Autonormuon knobs are irrelevant for other optimizers.
+    opt = str(out.get("optimizer", ""))
+    if opt != "autonormuon":
+        for k in list(out.keys()):
+            if k.startswith("autonormuon_"):
+                out.pop(k, None)
+
+    return out
+
+
 def _scan_existing_hashes(metrics_dir: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if not metrics_dir.exists():
@@ -64,9 +89,13 @@ def _scan_existing_hashes(metrics_dir: Path) -> dict[str, str]:
             hparams = data.get("hparams", {}) if isinstance(data, dict) else {}
             if not isinstance(hparams, dict):
                 continue
-            h = hparams.get("run_config_hash") or _hash_hparams(hparams)
-            if isinstance(h, str) and h:
-                out[h] = str(run_dir)
+            h_compat = _hash_hparams(_hash_view(hparams))
+            out[h_compat] = str(run_dir)
+
+            # Backward compatibility with prior hash styles, if present.
+            h_stored = hparams.get("run_config_hash")
+            if isinstance(h_stored, str) and h_stored:
+                out[h_stored] = str(run_dir)
         except Exception:
             continue
     return out
@@ -139,7 +168,7 @@ def main() -> None:
 
         hp_obj = trainer.resolve_hparams(ov)
         hp = asdict(hp_obj)
-        cfg_hash = _hash_hparams(hp)
+        cfg_hash = _hash_hparams(_hash_view(hp))
         ov["run_config_hash"] = cfg_hash
 
         run_name = str(ov.get("metrics_run_name", "")).strip()
