@@ -27,8 +27,8 @@ autonormuon_adaptation_scope = ["neuron"]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
 
-# Weight retraction locked on for all Phase A runs.
-autonormuon_weight_schedule = ["always"]
+# Weight retraction OFF for all Phase A runs — isolate grad effect.
+autonormuon_weight_schedule = ["off"]
 
 # Grad schedule ablation:
 #   off / always       = controls
