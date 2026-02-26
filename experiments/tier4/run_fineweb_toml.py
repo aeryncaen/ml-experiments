@@ -71,6 +71,9 @@ def _hash_view(hparams: dict) -> dict:
     ):
         out.pop(k, None)
 
+    # sphere_init defaults to false for hash stability with pre-existing runs.
+    out.setdefault("sphere_init", False)
+
     # Autonormuon knobs are irrelevant for other optimizers.
     opt = str(out.get("optimizer", ""))
     if opt != "autonormuon":
