@@ -134,10 +134,11 @@ class HParams:
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
     autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
-    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "matrix")  # matrix | group | neuron
+    autonormuon_geometry_mode: str = os.environ.get("AUTONORMUON_GEOMETRY_MODE", "tangent_after")  # tangent_after | tangent_pre_post | legacy
+    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
     autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
-    autonormuon_gnorm_scope: str = os.environ.get("AUTONORMUON_GNORM_SCOPE", "matrix")  # matrix | neuron
-    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "global")  # global | matrix | neuron
+    autonormuon_gnorm_scope: str = os.environ.get("AUTONORMUON_GNORM_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
+    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
     autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "none")  # compatibility knob; AutoNorMuon hardcodes none
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
@@ -295,6 +296,7 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "beta2",
             "weight_decay",
             "adapt_mode",
+            "geometry_mode",
             "lr_scope",
             "gnorm_source",
             "gnorm_scope",
@@ -321,6 +323,8 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "ratio_cv",
             "ratio_surge",
             "conflict_frac",
+            "radial_frac_pre",
+            "radial_frac_post",
         ):
             if k in pg:
                 rec[k] = _to_json_scalar(pg[k])
@@ -4673,6 +4677,7 @@ def main():
             min_ratio=HP.autonormuon_min_ratio,
             var_eps=HP.autonormuon_var_eps,
             conflict_proj=HP.autonormuon_conflict_proj,
+            geometry_mode=HP.autonormuon_geometry_mode,
             lr_scope=HP.autonormuon_lr_scope,
             gnorm_source=HP.autonormuon_gnorm_source,
             gnorm_scope=HP.autonormuon_gnorm_scope,
@@ -4684,6 +4689,7 @@ def main():
             f"gnorm_beta={HP.autonormuon_gnorm_beta} adapt_mode={HP.autonormuon_adapt_mode} "
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
             f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj} "
+            f"geometry_mode={HP.autonormuon_geometry_mode} "
             f"lr_scope={HP.autonormuon_lr_scope} gnorm_source={HP.autonormuon_gnorm_source} "
             f"gnorm_scope={HP.autonormuon_gnorm_scope} gmax_scope={HP.autonormuon_gmax_scope} "
             f"second_moment_mode={HP.autonormuon_second_moment_mode}"

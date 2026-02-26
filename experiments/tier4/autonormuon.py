@@ -45,7 +45,7 @@ def normuon_update(
     gnorm_scope="matrix",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = torch.lerp(grad, momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:  # for the case of conv filters
         original_shape = update.shape
@@ -104,11 +104,24 @@ def _flatten_rows(x: torch.Tensor) -> torch.Tensor:
 
 def _unit_norms(x: torch.Tensor, scope: str) -> torch.Tensor:
     rows = _flatten_rows(x)
+    if scope == "group":
+        return rows.norm().float().reshape(())
     if scope == "matrix":
         return rows.norm().float().reshape(())
     if scope == "neuron":
         return rows.norm(dim=-1).float()
-    raise ValueError(f"Unsupported gnorm_scope={scope}; expected 'matrix' or 'neuron'")
+    raise ValueError(f"Unsupported gnorm_scope={scope}; expected 'group' | 'matrix' | 'neuron'")
+
+
+def _project_to_row_tangent(update: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    u = _flatten_rows(update)
+    w = _flatten_rows(weight)
+    ww = (w * w).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    coeff = (u * w).sum(dim=-1, keepdim=True) / ww
+    radial = coeff * w
+    tangent = u - radial
+    radial_frac = radial.norm(dim=-1) / u.norm(dim=-1).clamp(min=1e-12)
+    return tangent.reshape_as(update), radial_frac
 
 
 class AutoNorMuon(torch.optim.Optimizer):
@@ -137,11 +150,15 @@ class AutoNorMuon(torch.optim.Optimizer):
         min_ratio: lower clamp for adaptation ratio
         var_eps: epsilon used in mu/var ratio denominator
         conflict_proj: if True, project update to avoid update/grad conflict
-        lr_scope: for Muon groups, apply adaptive LR per matrix ("matrix"),
-            per neuron/row ("neuron"), or one scalar per group ("group")
+        geometry_mode: tangent projection schedule for Muon-style update:
+            tangent_after | tangent_pre_post | legacy
+        lr_scope: retained for compatibility; AutoNorMuon now hardcodes
+            per-neuron LR application ("neuron")
         gnorm_source: Muon gnorm source for adaptation: "grad" | "post_ortho"
-        gnorm_scope: Muon gnorm tracking scope: "matrix" | "neuron"
-        gmax_scope: Muon gnorm-max tracking scope: "global" | "matrix" | "neuron"
+        gnorm_scope: retained for compatibility; AutoNorMuon now hardcodes
+            neuron-scoped gnorm tracking ("neuron")
+        gmax_scope: retained for compatibility; AutoNorMuon now hardcodes
+            neuron-scoped gmax tracking ("neuron")
         second_moment_mode: retained for compatibility; AutoNorMuon now hard-disables
             NorMuon second-moment scaling and always uses "none"
     """
@@ -152,22 +169,32 @@ class AutoNorMuon(torch.optim.Optimizer):
                  min_ratio=0.0,
                  var_eps=1e-12,
                  conflict_proj=False,
-                 lr_scope="matrix",
+                 geometry_mode="tangent_after",
+                 lr_scope="neuron",
                  gnorm_source="grad",
-                 gnorm_scope="matrix",
-                 gmax_scope="global",
+                 gnorm_scope="neuron",
+                 gmax_scope="neuron",
                  second_moment_mode="none"):
         valid_modes = ("gnorm", "mu_var", "hybrid", "cv", "surge")
         if adapt_mode not in valid_modes:
             raise ValueError(f"Unsupported adapt_mode={adapt_mode}; expected one of {valid_modes}")
+        if geometry_mode not in ("tangent_after", "tangent_pre_post", "legacy"):
+            raise ValueError(
+                f"Unsupported geometry_mode={geometry_mode}; expected 'tangent_after' | 'tangent_pre_post' | 'legacy'"
+            )
         if lr_scope not in ("matrix", "group", "neuron"):
             raise ValueError(f"Unsupported lr_scope={lr_scope}; expected 'matrix' | 'group' | 'neuron'")
         if gnorm_source not in ("grad", "post_ortho"):
             raise ValueError(f"Unsupported gnorm_source={gnorm_source}; expected 'grad' or 'post_ortho'")
-        if gnorm_scope not in ("matrix", "neuron"):
-            raise ValueError(f"Unsupported gnorm_scope={gnorm_scope}; expected 'matrix' or 'neuron'")
-        if gmax_scope not in ("global", "matrix", "neuron"):
-            raise ValueError(f"Unsupported gmax_scope={gmax_scope}; expected 'global' | 'matrix' | 'neuron'")
+        if gnorm_scope not in ("group", "matrix", "neuron"):
+            raise ValueError(f"Unsupported gnorm_scope={gnorm_scope}; expected 'group' | 'matrix' | 'neuron'")
+        if gmax_scope not in ("group", "global", "matrix", "neuron"):
+            raise ValueError(f"Unsupported gmax_scope={gmax_scope}; expected 'group' | 'matrix' | 'neuron' (or legacy 'global')")
+
+        # Hard-code neuron granularity across the full adaptation stack.
+        lr_scope = "neuron"
+        gnorm_scope = "neuron"
+        gmax_scope = "neuron"
         # Hard-disable NorMuon second-moment scaling in AutoNorMuon.
         # Keep the argument for config/backward compatibility, but ignore it.
         second_moment_mode = "none"
@@ -192,6 +219,7 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["signal_ratio"] = None
             group["lr_mult"] = None
             group["adapt_mode"] = adapt_mode
+            group["geometry_mode"] = geometry_mode
             group["lr_scope"] = lr_scope
             group["gnorm_source"] = gnorm_source
             group["gnorm_scope"] = gnorm_scope
@@ -209,6 +237,8 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["ratio_cv"] = None
             group["ratio_surge"] = None
             group["conflict_frac"] = None
+            group["radial_frac_pre"] = None
+            group["radial_frac_post"] = None
         self.total_steps = total_steps
         self.retract = retract
         self.gnorm_beta = gnorm_beta
@@ -217,6 +247,7 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.min_ratio = min_ratio
         self.var_eps = var_eps
         self.conflict_proj = conflict_proj
+        self.geometry_mode = geometry_mode
         self.lr_scope = lr_scope
         self.gnorm_source = gnorm_source
         self.gnorm_scope = gnorm_scope
@@ -265,24 +296,49 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                 if params:
                     updates = []
-                    gnorm_units = []
+                    radial_pre_vals = []
+                    radial_post_vals = []
                     for p, state, g in zip(params, states, grads):
-                        update, post_ortho_units = normuon_update(
-                            g,
+                        grad_for_update = g
+                        if self.geometry_mode == "tangent_pre_post":
+                            grad_for_update, radial_pre = _project_to_row_tangent(grad_for_update, p)
+                            radial_pre_vals.append(radial_pre.mean())
+
+                        update, _ = normuon_update(
+                            grad_for_update,
                             state["momentum_buffer"],
                             state["second_momentum_buffer"],
                             beta=group["momentum"],
                             beta2=group["beta2"],
                             second_moment_mode=self.second_moment_mode,
-                            gnorm_scope=self.gnorm_scope,
+                            gnorm_scope="matrix",
                         )
+
+                        if self.geometry_mode in ("tangent_after", "tangent_pre_post"):
+                            update, radial_post = _project_to_row_tangent(update, p)
+                            radial_post_vals.append(radial_post.mean())
+
                         update = update.reshape(p.shape)
                         updates.append(update)
 
-                        if self.gnorm_source == "post_ortho":
-                            gnorm_units.append(post_ortho_units)
-                        else:
-                            gnorm_units.append(_unit_norms(g, self.gnorm_scope))
+                    if self.gnorm_scope == "group":
+                        source_tensors = updates if self.gnorm_source == "post_ortho" else grads
+                        sq_sum = None
+                        for t in source_tensors:
+                            cur = (t.float() * t.float()).sum()
+                            sq_sum = cur if sq_sum is None else (sq_sum + cur)
+                        assert sq_sum is not None
+                        group_norm = sq_sum.clamp(min=0.0).sqrt()
+                        gnorm_units = [group_norm for _ in updates]
+                    else:
+                        gnorm_units = []
+                        for update, g in zip(updates, grads):
+                            if self.geometry_mode in ("tangent_after", "tangent_pre_post"):
+                                gnorm_units.append(_unit_norms(update, self.gnorm_scope))
+                            elif self.gnorm_source == "post_ortho":
+                                gnorm_units.append(_unit_norms(update, self.gnorm_scope))
+                            else:
+                                gnorm_units.append(_unit_norms(g, self.gnorm_scope))
 
                     flat_units = torch.cat([u.reshape(-1) for u in gnorm_units])
                     median_gnorm_t = flat_units.median()
@@ -310,7 +366,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                         var_ema_t = beta * group["var_ema"] + (1 - beta) * var_t
 
                     gmax_global = flat_units.new_zeros(())
-                    if self.gmax_scope == "global":
+                    if self.gmax_scope == "group":
                         cur_global_max = flat_units.max()
                         if group["gnorm_max"] is None or k == 0:
                             gmax_global = cur_global_max
@@ -328,7 +384,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                             prev_ema = torch.zeros_like(units)
                         ema_u = units if k == 0 else (beta * prev_ema + (1 - beta) * units)
 
-                        if self.gmax_scope == "global":
+                        if self.gmax_scope == "group":
                             gmax_u = torch.ones_like(units) * gmax_global
                             gmax_state = gmax_global
                         elif self.gmax_scope == "matrix":
@@ -414,6 +470,8 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                     signal_ratio_t = ratio_active.clamp(min=self.min_ratio, max=1.0)
                     lr_mult_t = signal_ratio_t.pow(self.ratio_pow)
+                    radial_pre_t = torch.stack(radial_pre_vals).mean() if radial_pre_vals else flat_units.new_zeros(())
+                    radial_post_t = torch.stack(radial_post_vals).mean() if radial_post_vals else flat_units.new_zeros(())
 
                     conflict_hits = flat_units.new_zeros(())
                     conflict_total = 0
@@ -465,6 +523,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                     group["ratio_cv"] = ratio_cv_t.detach()
                     group["ratio_surge"] = ratio_surge_t.detach()
                     group["conflict_frac"] = conflict_frac_t.detach()
+                    group["radial_frac_pre"] = radial_pre_t.detach()
+                    group["radial_frac_post"] = radial_post_t.detach()
                     if is_compiling:
                         group["gnorm_ratio"] = signal_ratio_t.detach()
                         group["gnorm_ratio_raw"] = signal_ratio_t.detach()
@@ -495,6 +555,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["ratio_cv"] = _safe_item(ratio_cv_t)
                         group["ratio_surge"] = _safe_item(ratio_surge_t)
                         group["conflict_frac"] = _safe_item(conflict_frac_t)
+                        group["radial_frac_pre"] = _safe_item(radial_pre_t)
+                        group["radial_frac_post"] = _safe_item(radial_post_t)
 
             else:
                 # --- Adam: per-group fast EMA / max gnorm ---

@@ -49,6 +49,15 @@ def _hash_hparams(hparams: dict) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _canonical_autonormuon_scopes(out: dict) -> dict:
+    d = dict(out)
+    d.setdefault("autonormuon_geometry_mode", "tangent_after")
+    d["autonormuon_lr_scope"] = "neuron"
+    d["autonormuon_gnorm_scope"] = "neuron"
+    d["autonormuon_gmax_scope"] = "neuron"
+    return d
+
+
 def _hash_view(hparams: dict) -> dict:
     out = dict(hparams)
 
@@ -75,21 +84,22 @@ def _hash_view(hparams: dict) -> dict:
         # Older runs may not have recorded newly introduced knobs; map those
         # missing fields to their historical effective defaults so hashes align.
         out.setdefault("autonormuon_adapt_mode", "gnorm")
+        out.setdefault("autonormuon_geometry_mode", "tangent_after")
         out.setdefault("autonormuon_gnorm_beta", 0.9)
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
         out.setdefault("autonormuon_var_eps", 1e-12)
         out.setdefault("autonormuon_conflict_proj", False)
-        out.setdefault("autonormuon_lr_scope", "matrix")
+        out.setdefault("autonormuon_lr_scope", "neuron")
         out.setdefault("autonormuon_gnorm_source", "grad")
-        out.setdefault("autonormuon_gnorm_scope", "matrix")
+        out.setdefault("autonormuon_gnorm_scope", "neuron")
         out["autonormuon_second_moment_mode"] = "none"
 
-        # Important: runs created before gmax-scope was introduced used matrix-
-        # local gmax behavior. Treat missing field as "matrix" to avoid reruns.
-        out.setdefault("autonormuon_gmax_scope", "matrix")
+        out.setdefault("autonormuon_gmax_scope", "neuron")
         if out.get("autonormuon_gmax_scope") in (None, ""):
-            out["autonormuon_gmax_scope"] = "matrix"
+            out["autonormuon_gmax_scope"] = "neuron"
+
+        out = _canonical_autonormuon_scopes(out)
 
     return out
 
@@ -134,6 +144,7 @@ def _normalize_overrides(ov: dict) -> dict:
     opt = str(out.get("optimizer", ""))
     if opt != "autonormuon":
         out.pop("autonormuon_adapt_mode", None)
+        out.pop("autonormuon_geometry_mode", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
         out.pop("autonormuon_var_eps", None)
@@ -144,6 +155,9 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_gnorm_scope", None)
         out.pop("autonormuon_gmax_scope", None)
         out.pop("autonormuon_second_moment_mode", None)
+    else:
+        out = _canonical_autonormuon_scopes(out)
+        out["autonormuon_second_moment_mode"] = "none"
     return out
 
 
