@@ -515,8 +515,7 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "run_dir": str(run_dir),
         "optimizer": optimizer,
         "adapt_mode": adapt_mode,
-        "adam_matrixify": hparams.get("autonormuon_adam_matrixify") if optimizer == "autonormuon" else None,
-        "adam_second_moment_mode": hparams.get("autonormuon_adam_second_moment_mode") if optimizer == "autonormuon" else None,
+        "geometry_mode": hparams.get("autonormuon_geometry_mode") if optimizer == "autonormuon" else None,
         "lr_scope": hparams.get("autonormuon_lr_scope") if optimizer == "autonormuon" else None,
         "gnorm_source": hparams.get("autonormuon_gnorm_source") if optimizer == "autonormuon" else None,
         "gnorm_scope": hparams.get("autonormuon_gnorm_scope") if optimizer == "autonormuon" else None,
@@ -1050,7 +1049,7 @@ def main() -> None:
     ap.add_argument(
         "--group-by",
         type=str,
-        default="optimizer,adapt_mode,adam_matrixify,adam_second_moment_mode,lr_scope,gnorm_source,gnorm_scope,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
+        default="optimizer,adapt_mode,geometry_mode,lr_scope,gnorm_source,gnorm_scope,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
     ap.add_argument(

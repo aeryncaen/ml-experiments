@@ -113,47 +113,15 @@ def _unit_norms(x: torch.Tensor, scope: str) -> torch.Tensor:
     raise ValueError(f"Unsupported gnorm_scope={scope}; expected 'group' | 'matrix' | 'neuron'")
 
 
-def _matrix_rows_for_shape(shape: tuple[int, ...]) -> int:
-    if len(shape) == 0:
-        return 1
-    n = 1
-    for s in shape:
-        n *= int(s)
-    if n <= 1:
-        return 1
-
-    # Heuristic squarification for matrixified Adam params:
-    # prefer fewer rows / longer channels, but avoid extremely skinny layouts.
-    # We target rows near n^(1/3), with a tie-break toward fewer rows.
-    target = max(2, int(round(float(n) ** (1.0 / 3.0))))
-
-    cands = set()
-    lim = int(math.sqrt(float(n)))
-    for d in range(2, lim + 1):
-        if n % d != 0:
-            continue
-        a = d
-        b = n // d
-        if a <= b:
-            cands.add(a)
-        if b <= a:
-            cands.add(b)
-
-    if not cands:
-        return 1
-
-    def _score(r: int) -> tuple[float, int]:
-        return (abs(math.log((r + 1e-12) / float(target))), r)
-
-    return min(cands, key=_score)
-
-
-def _view_as_matrix(x: torch.Tensor, rows: int) -> torch.Tensor:
-    return x.reshape(rows, -1)
-
-
-def _restore_from_matrix(xm: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
-    return xm.reshape(shape)
+def _project_to_row_tangent(update: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    u = _flatten_rows(update)
+    w = _flatten_rows(weight)
+    ww = (w * w).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    coeff = (u * w).sum(dim=-1, keepdim=True) / ww
+    radial = coeff * w
+    tangent = u - radial
+    radial_frac = radial.norm(dim=-1) / u.norm(dim=-1).clamp(min=1e-12)
+    return tangent.reshape_as(update), radial_frac
 
 
 class AutoNorMuon(torch.optim.Optimizer):
@@ -182,6 +150,8 @@ class AutoNorMuon(torch.optim.Optimizer):
         min_ratio: lower clamp for adaptation ratio
         var_eps: epsilon used in mu/var ratio denominator
         conflict_proj: if True, project update to avoid update/grad conflict
+        geometry_mode: tangent projection schedule for Muon-style update:
+            tangent_after | tangent_pre_post | legacy
         lr_scope: retained for compatibility; AutoNorMuon now hardcodes
             per-neuron LR application ("neuron")
         gnorm_source: Muon gnorm source for adaptation: "grad" | "post_ortho"
@@ -191,11 +161,6 @@ class AutoNorMuon(torch.optim.Optimizer):
             neuron-scoped gmax tracking ("neuron")
         second_moment_mode: retained for compatibility; AutoNorMuon now hard-disables
             NorMuon second-moment scaling and always uses "none"
-        adam_matrixify: if True, non-scalar Adam params run through
-            Muon-style orthogonalized update in matrix view + row retraction;
-            reshape heuristic favors fewer longer channels over many short ones
-        adam_second_moment_mode: second-moment handling for Adam-side params:
-            adam | none
     """
     def __init__(self, param_groups, total_steps, retract=True,
                  gnorm_beta=0.9,
@@ -204,16 +169,19 @@ class AutoNorMuon(torch.optim.Optimizer):
                  min_ratio=0.0,
                  var_eps=1e-12,
                  conflict_proj=False,
+                 geometry_mode="tangent_after",
                  lr_scope="neuron",
                  gnorm_source="grad",
                  gnorm_scope="neuron",
                  gmax_scope="neuron",
-                 second_moment_mode="none",
-                 adam_matrixify=True,
-                 adam_second_moment_mode="adam"):
+                 second_moment_mode="none"):
         valid_modes = ("gnorm", "mu_var", "hybrid", "cv", "surge")
         if adapt_mode not in valid_modes:
             raise ValueError(f"Unsupported adapt_mode={adapt_mode}; expected one of {valid_modes}")
+        if geometry_mode not in ("tangent_after", "tangent_pre_post", "legacy"):
+            raise ValueError(
+                f"Unsupported geometry_mode={geometry_mode}; expected 'tangent_after' | 'tangent_pre_post' | 'legacy'"
+            )
         if lr_scope not in ("matrix", "group", "neuron"):
             raise ValueError(f"Unsupported lr_scope={lr_scope}; expected 'matrix' | 'group' | 'neuron'")
         if gnorm_source not in ("grad", "post_ortho"):
@@ -222,12 +190,6 @@ class AutoNorMuon(torch.optim.Optimizer):
             raise ValueError(f"Unsupported gnorm_scope={gnorm_scope}; expected 'group' | 'matrix' | 'neuron'")
         if gmax_scope not in ("group", "global", "matrix", "neuron"):
             raise ValueError(f"Unsupported gmax_scope={gmax_scope}; expected 'group' | 'matrix' | 'neuron' (or legacy 'global')")
-        if not isinstance(adam_matrixify, bool):
-            raise ValueError(f"Unsupported adam_matrixify={adam_matrixify}; expected bool")
-        if adam_second_moment_mode not in ("adam", "none"):
-            raise ValueError(
-                f"Unsupported adam_second_moment_mode={adam_second_moment_mode}; expected 'adam' or 'none'"
-            )
 
         # Hard-code neuron granularity across the full adaptation stack.
         lr_scope = "neuron"
@@ -257,13 +219,12 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["signal_ratio"] = None
             group["lr_mult"] = None
             group["adapt_mode"] = adapt_mode
+            group["geometry_mode"] = geometry_mode
             group["lr_scope"] = lr_scope
             group["gnorm_source"] = gnorm_source
             group["gnorm_scope"] = gnorm_scope
             group["gmax_scope"] = gmax_scope
             group["second_moment_mode"] = second_moment_mode
-            group["adam_matrixify"] = adam_matrixify
-            group["adam_second_moment_mode"] = adam_second_moment_mode
             group["gnorm_mean"] = None
             group["gnorm_std"] = None
             group["gnorm_cv"] = None
@@ -276,6 +237,8 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["ratio_cv"] = None
             group["ratio_surge"] = None
             group["conflict_frac"] = None
+            group["radial_frac_pre"] = None
+            group["radial_frac_post"] = None
         self.total_steps = total_steps
         self.retract = retract
         self.gnorm_beta = gnorm_beta
@@ -284,13 +247,12 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.min_ratio = min_ratio
         self.var_eps = var_eps
         self.conflict_proj = conflict_proj
+        self.geometry_mode = geometry_mode
         self.lr_scope = lr_scope
         self.gnorm_source = gnorm_source
         self.gnorm_scope = gnorm_scope
         self.gmax_scope = gmax_scope
         self.second_moment_mode = second_moment_mode
-        self.adam_matrixify = adam_matrixify
-        self.adam_second_moment_mode = adam_second_moment_mode
         super().__init__(param_groups, dict())
 
     @torch.no_grad()
@@ -334,9 +296,16 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                 if params:
                     updates = []
+                    radial_pre_vals = []
+                    radial_post_vals = []
                     for p, state, g in zip(params, states, grads):
+                        grad_for_update = g
+                        if self.geometry_mode == "tangent_pre_post":
+                            grad_for_update, radial_pre = _project_to_row_tangent(grad_for_update, p)
+                            radial_pre_vals.append(radial_pre.mean())
+
                         update, _ = normuon_update(
-                            g,
+                            grad_for_update,
                             state["momentum_buffer"],
                             state["second_momentum_buffer"],
                             beta=group["momentum"],
@@ -344,6 +313,10 @@ class AutoNorMuon(torch.optim.Optimizer):
                             second_moment_mode=self.second_moment_mode,
                             gnorm_scope="matrix",
                         )
+
+                        if self.geometry_mode in ("tangent_after", "tangent_pre_post"):
+                            update, radial_post = _project_to_row_tangent(update, p)
+                            radial_post_vals.append(radial_post.mean())
 
                         update = update.reshape(p.shape)
                         updates.append(update)
@@ -360,7 +333,9 @@ class AutoNorMuon(torch.optim.Optimizer):
                     else:
                         gnorm_units = []
                         for update, g in zip(updates, grads):
-                            if self.gnorm_source == "post_ortho":
+                            if self.geometry_mode in ("tangent_after", "tangent_pre_post"):
+                                gnorm_units.append(_unit_norms(update, self.gnorm_scope))
+                            elif self.gnorm_source == "post_ortho":
                                 gnorm_units.append(_unit_norms(update, self.gnorm_scope))
                             else:
                                 gnorm_units.append(_unit_norms(g, self.gnorm_scope))
@@ -495,6 +470,8 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                     signal_ratio_t = ratio_active.clamp(min=self.min_ratio, max=1.0)
                     lr_mult_t = signal_ratio_t.pow(self.ratio_pow)
+                    radial_pre_t = torch.stack(radial_pre_vals).mean() if radial_pre_vals else flat_units.new_zeros(())
+                    radial_post_t = torch.stack(radial_post_vals).mean() if radial_post_vals else flat_units.new_zeros(())
 
                     conflict_hits = flat_units.new_zeros(())
                     conflict_total = 0
@@ -546,6 +523,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                     group["ratio_cv"] = ratio_cv_t.detach()
                     group["ratio_surge"] = ratio_surge_t.detach()
                     group["conflict_frac"] = conflict_frac_t.detach()
+                    group["radial_frac_pre"] = radial_pre_t.detach()
+                    group["radial_frac_post"] = radial_post_t.detach()
                     if is_compiling:
                         group["gnorm_ratio"] = signal_ratio_t.detach()
                         group["gnorm_ratio_raw"] = signal_ratio_t.detach()
@@ -576,84 +555,17 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["ratio_cv"] = _safe_item(ratio_cv_t)
                         group["ratio_surge"] = _safe_item(ratio_surge_t)
                         group["conflict_frac"] = _safe_item(conflict_frac_t)
+                        group["radial_frac_pre"] = _safe_item(radial_pre_t)
+                        group["radial_frac_post"] = _safe_item(radial_post_t)
 
             else:
-                # --- Adam component: scalar params stay Adam; matrix-like params can run Muon path ---
-                beta1, beta2_adam = group["betas"]
-                eps = group["eps"]
-                adam2_mode = str(group.get("adam_second_moment_mode", self.adam_second_moment_mode))
-                use_adam_second_moment = adam2_mode == "adam"
-                use_matrixify = bool(group.get("adam_matrixify", self.adam_matrixify))
-
-                matrix_entries = []
-                scalar_entries = []
-                all_entries = []
-
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    state = self.state[p]
-                    if "gnorm_ema_adam" not in state:
-                        state["gnorm_ema_adam"] = torch.zeros((), device=p.device, dtype=torch.float32)
-                        state["gnorm_max_adam"] = torch.zeros((), device=p.device, dtype=torch.float32)
-                        state["gnorm_max_matrix_adam"] = torch.zeros((), device=p.device, dtype=torch.float32)
-                        state["gnorm_max_neuron_adam"] = torch.zeros((), device=p.device, dtype=torch.float32)
-
-                    is_matrix = use_matrixify and p.numel() > 1
-                    if is_matrix:
-                        rows = int(state.get("matrix_rows", _matrix_rows_for_shape(tuple(p.shape))))
-                        if rows < 1:
-                            rows = 1
-                        if p.numel() % rows != 0:
-                            rows = 1
-                        state["matrix_rows"] = rows
-                        grad_m = _view_as_matrix(p.grad, rows)
-                        if "momentum_buffer_matrix" not in state or state["momentum_buffer_matrix"].shape != grad_m.shape:
-                            state["momentum_buffer_matrix"] = torch.zeros_like(grad_m)
-                            state["second_momentum_buffer_matrix"] = torch.zeros_like(grad_m[:, :1])
-                        update_m, _ = normuon_update(
-                            grad_m,
-                            state["momentum_buffer_matrix"],
-                            state["second_momentum_buffer_matrix"],
-                            beta=beta1,
-                            beta2=beta2_adam,
-                            second_moment_mode="none",
-                            gnorm_scope="matrix",
-                        )
-                        units = _unit_norms(update_m if self.gnorm_source == "post_ortho" else grad_m, self.gnorm_scope)
-                        ent = {
-                            "kind": "matrix",
-                            "p": p,
-                            "state": state,
-                            "grad": grad_m,
-                            "update": update_m,
-                            "rows": rows,
-                            "units": units,
-                        }
-                        matrix_entries.append(ent)
-                        all_entries.append(ent)
-                    else:
-                        if "exp_avg" not in state:
-                            state["exp_avg"] = torch.zeros_like(p)
-                            state["exp_avg_sq"] = torch.zeros_like(p)
-                        grad = p.grad
-                        units = _unit_norms(grad, self.gnorm_scope)
-                        ent = {
-                            "kind": "scalar",
-                            "p": p,
-                            "state": state,
-                            "grad": grad,
-                            "units": units,
-                        }
-                        scalar_entries.append(ent)
-                        all_entries.append(ent)
-
-                if all_entries:
-                    gnorm_units = [e["units"] for e in all_entries]
-                    flat_units = torch.cat([u.reshape(-1) for u in gnorm_units])
-                    median_gnorm_t = flat_units.median()
-                    mean_t = flat_units.mean()
-                    std_t = flat_units.std(unbiased=False)
+                # --- Adam: per-group fast EMA / max gnorm ---
+                grads = [p.grad for p in group["params"] if p.grad is not None]
+                if grads:
+                    gnorms = torch.stack([g.norm().float() for g in grads])
+                    median_gnorm_t = gnorms.median()
+                    mean_t = gnorms.mean()
+                    std_t = gnorms.std(unbiased=False)
                     cv_t = std_t / mean_t.clamp(min=1e-12)
                     if group["gnorm_mean_ema"] is None or k == 0:
                         mean_ema_t = mean_t
@@ -665,8 +577,16 @@ class AutoNorMuon(torch.optim.Optimizer):
                         cv_ema_t = beta * group["gnorm_cv_ema"] + (1 - beta) * cv_t
                     surge_t = (mean_t - mean_ema_t).clamp(min=0.0) / mean_ema_t.clamp(min=1e-12)
 
+                    if group["gnorm_ema"] is None or k == 0:
+                        gnorm_ema_t = median_gnorm_t
+                        gnorm_max_t = median_gnorm_t
+                    else:
+                        gnorm_ema_t = beta * group["gnorm_ema"] + (1 - beta) * median_gnorm_t
+                        gnorm_max_t = torch.maximum(group["gnorm_max"], median_gnorm_t)
+                    ratio_gnorm_t = (gnorm_ema_t / gnorm_max_t.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
+
                     mu2_t = mean_t * mean_t
-                    second_t = (flat_units * flat_units).mean()
+                    second_t = (gnorms * gnorms).mean()
                     var_t = (second_t - mu2_t).clamp(min=0.0)
                     if group["mu2_ema"] is None or k == 0:
                         mu2_ema_t = mu2_t
@@ -674,60 +594,6 @@ class AutoNorMuon(torch.optim.Optimizer):
                     else:
                         mu2_ema_t = beta * group["mu2_ema"] + (1 - beta) * mu2_t
                         var_ema_t = beta * group["var_ema"] + (1 - beta) * var_t
-
-                    gmax_global = flat_units.new_zeros(())
-                    if self.gmax_scope == "group":
-                        cur_global_max = flat_units.max()
-                        if group["gnorm_max"] is None or k == 0:
-                            gmax_global = cur_global_max
-                        else:
-                            gprev = torch.as_tensor(group["gnorm_max"], device=flat_units.device, dtype=flat_units.dtype)
-                            gmax_global = torch.maximum(gprev, cur_global_max)
-
-                    ema_units = []
-                    gmax_units = []
-                    ratio_units = []
-                    for e in all_entries:
-                        state = e["state"]
-                        units = e["units"]
-                        gmax_state = units.new_zeros(())
-                        prev_ema = state.get("gnorm_ema_adam")
-                        if not isinstance(prev_ema, torch.Tensor) or prev_ema.shape != units.shape:
-                            prev_ema = torch.zeros_like(units)
-                        ema_u = units if k == 0 else (beta * prev_ema + (1 - beta) * units)
-
-                        if self.gmax_scope == "group":
-                            gmax_u = torch.ones_like(units) * gmax_global
-                            gmax_state = gmax_global
-                        elif self.gmax_scope == "matrix":
-                            prev_mat = state.get("gnorm_max_matrix_adam")
-                            if not isinstance(prev_mat, torch.Tensor) or prev_mat.numel() != 1:
-                                prev_mat = units.new_zeros(())
-                            cur_mat = units.max()
-                            gmax_mat = cur_mat if k == 0 else torch.maximum(prev_mat.to(cur_mat), cur_mat)
-                            gmax_u = torch.ones_like(units) * gmax_mat
-                            state["gnorm_max_matrix_adam"] = gmax_mat.detach()
-                            gmax_state = gmax_mat
-                        else:
-                            prev_neuron = state.get("gnorm_max_neuron_adam")
-                            if not isinstance(prev_neuron, torch.Tensor) or prev_neuron.shape != units.shape:
-                                prev_neuron = torch.zeros_like(units)
-                            gmax_u = units if k == 0 else torch.maximum(prev_neuron, units)
-                            state["gnorm_max_neuron_adam"] = gmax_u.detach()
-                            gmax_state = gmax_u
-
-                        ratio_u = (ema_u / gmax_u.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
-                        state["gnorm_ema_adam"] = ema_u.detach()
-                        state["gnorm_max_adam"] = gmax_state.detach()
-                        ema_units.append(ema_u)
-                        gmax_units.append(gmax_u)
-                        ratio_units.append(ratio_u)
-
-                    flat_ema = torch.cat([u.reshape(-1) for u in ema_units])
-                    flat_gmax = torch.cat([u.reshape(-1) for u in gmax_units])
-                    flat_ratio = torch.cat([u.reshape(-1) for u in ratio_units])
-
-                    ratio_gnorm_t = flat_ratio.median()
                     ratio_muvar_t = (mu2_ema_t / (mu2_ema_t + var_ema_t + self.var_eps)).clamp(min=0.0, max=1.0)
                     ratio_cv_t = (1.0 / (1.0 + cv_ema_t)).clamp(min=0.0, max=1.0)
                     ratio_surge_t = (1.0 / (1.0 + surge_t)).clamp(min=0.0, max=1.0)
@@ -757,8 +623,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                     signal_ratio_t = ratio_active.clamp(min=self.min_ratio, max=1.0)
                     lr_mult_t = signal_ratio_t.pow(self.ratio_pow)
 
-                    group["gnorm_ema"] = flat_ema.median().detach()
-                    group["gnorm_max"] = flat_gmax.max().detach()
+                    group["gnorm_ema"] = gnorm_ema_t.detach()
+                    group["gnorm_max"] = gnorm_max_t.detach()
                     group["gnorm_mean"] = mean_t.detach()
                     group["gnorm_std"] = std_t.detach()
                     group["gnorm_cv"] = cv_t.detach()
@@ -804,60 +670,67 @@ class AutoNorMuon(torch.optim.Optimizer):
                 else:
                     lr = group["scheduled_lr"] if group["scheduled_lr"] is not None else group["lr"]
 
+                beta1, beta2_adam = group["betas"]
+                eps = group["eps"]
                 bias_correction1 = 1 - beta1 ** (k + 1)
-                bias_correction2 = 1 - beta2_adam ** (k + 1) if use_adam_second_moment else 1.0
+                bias_correction2 = 1 - beta2_adam ** (k + 1)
+
+                params = []
+                exp_avgs = []
+                exp_avg_sqs = []
+                grads2 = []
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                    params.append(p)
+                    grads2.append(p.grad)
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+
+                use_foreach = (not is_compiling) and (not self.conflict_proj) and len(params) > 0 and params[0].device.type in ("cuda", "cpu")
                 conflict_hits = 0.0
                 conflict_total = 0
+                if use_foreach:
+                    lr_val = float(lr)
+                    torch._foreach_mul_(exp_avgs, beta1)
+                    torch._foreach_add_(exp_avgs, grads2, alpha=1 - beta1)
+                    torch._foreach_mul_(exp_avg_sqs, beta2_adam)
+                    torch._foreach_addcmul_(exp_avg_sqs, grads2, grads2, value=1 - beta2_adam)
 
-                for e in matrix_entries:
-                    p = e["p"]
-                    grad_m = e["grad"]
-                    update_m = e["update"]
-                    rows = int(e["rows"])
-
-                    if self.conflict_proj:
-                        dot = (update_m * grad_m).sum()
-                        denom_g = grad_m.pow(2).sum().clamp(min=1e-12)
-                        coeff = torch.minimum(dot / denom_g, torch.zeros_like(dot))
-                        update_m = update_m - coeff * grad_m
-                        conflict_hits += float((dot < 0).item())
-                        conflict_total += 1
+                    step_vals = torch._foreach_div(exp_avgs, bias_correction1)
+                    denoms = torch._foreach_div(exp_avg_sqs, bias_correction2)
+                    denoms = torch._foreach_sqrt(denoms)
+                    torch._foreach_add_(denoms, eps)
 
                     if decay != 0:
-                        p.mul_(1 - lr * decay)
-
-                    p_m = _view_as_matrix(p, rows)
-                    p_m.sub_(update_m * lr)
-                    if self.retract:
-                        p_m.div_(p_m.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-
-                for e in scalar_entries:
-                    p = e["p"]
-                    grad = e["grad"]
-                    state = e["state"]
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
-
-                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                    step_val = exp_avg.div(bias_correction1)
-
-                    if use_adam_second_moment:
+                        torch._foreach_mul_(params, 1 - lr_val * decay)
+                    torch._foreach_addcdiv_(params, step_vals, denoms, value=-lr_val)
+                else:
+                    for p, grad, exp_avg, exp_avg_sq in zip(params, grads2, exp_avgs, exp_avg_sqs):
+                        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                         exp_avg_sq.mul_(beta2_adam).addcmul_(grad, grad, value=1 - beta2_adam)
+
+                        step_val = exp_avg.div(bias_correction1)
                         denom = exp_avg_sq.div(bias_correction2).sqrt_().add_(eps)
                         step_val = step_val.div(denom)
 
-                    if self.conflict_proj:
-                        dot = (step_val * grad).sum()
-                        denom_g = grad.pow(2).sum().clamp(min=1e-12)
-                        coeff = torch.minimum(dot / denom_g, torch.zeros_like(dot))
-                        step_val = step_val - coeff * grad
-                        conflict_hits += float((dot < 0).item())
-                        conflict_total += 1
+                        if self.conflict_proj:
+                            dot = (step_val * grad).sum()
+                            denom_g = grad.pow(2).sum().clamp(min=1e-12)
+                            coeff = torch.minimum(dot / denom_g, torch.zeros_like(dot))
+                            step_val = step_val - coeff * grad
+                            conflict_hits += float((dot < 0).item())
+                            conflict_total += 1
 
-                    step_val.mul_(lr)
-                    if decay != 0:
-                        p.mul_(1 - lr * decay)
-                    p.sub_(step_val)
+                        step_val.mul_(lr)
+
+                        if decay != 0:
+                            p.mul_(1 - lr * decay)
+                        p.sub_(step_val)
 
                 if conflict_total > 0:
                     group["conflict_frac"] = conflict_hits / conflict_total
