@@ -51,7 +51,6 @@ def _hash_hparams(hparams: dict) -> str:
 
 def _canonical_autonormuon_scopes(out: dict) -> dict:
     d = dict(out)
-    d.setdefault("autonormuon_geometry_mode", "tangent_after")
     d["autonormuon_lr_scope"] = "neuron"
     d["autonormuon_gnorm_scope"] = "neuron"
     d["autonormuon_gmax_scope"] = "neuron"
@@ -83,13 +82,15 @@ def _hash_view(hparams: dict) -> dict:
         # Canonicalize AutoNorMuon hash fields for backward compatibility.
         # Older runs may not have recorded newly introduced knobs; map those
         # missing fields to their historical effective defaults so hashes align.
+        out.pop("autonormuon_geometry_mode", None)
         out.setdefault("autonormuon_adapt_mode", "gnorm")
-        out.setdefault("autonormuon_geometry_mode", "tangent_after")
         out.setdefault("autonormuon_gnorm_beta", 0.9)
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
         out.setdefault("autonormuon_var_eps", 1e-12)
         out.setdefault("autonormuon_conflict_proj", False)
+        out.setdefault("autonormuon_adam_matrixify", True)
+        out.setdefault("autonormuon_adam_second_moment_mode", "adam")
         out.setdefault("autonormuon_lr_scope", "neuron")
         out.setdefault("autonormuon_gnorm_source", "grad")
         out.setdefault("autonormuon_gnorm_scope", "neuron")
@@ -150,14 +151,19 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_var_eps", None)
         out.pop("autonormuon_gnorm_beta", None)
         out.pop("autonormuon_conflict_proj", None)
+        out.pop("autonormuon_adam_matrixify", None)
+        out.pop("autonormuon_adam_second_moment_mode", None)
         out.pop("autonormuon_lr_scope", None)
         out.pop("autonormuon_gnorm_source", None)
         out.pop("autonormuon_gnorm_scope", None)
         out.pop("autonormuon_gmax_scope", None)
         out.pop("autonormuon_second_moment_mode", None)
     else:
+        out.pop("autonormuon_geometry_mode", None)
         out = _canonical_autonormuon_scopes(out)
         out["autonormuon_second_moment_mode"] = "none"
+        out.setdefault("autonormuon_adam_matrixify", True)
+        out.setdefault("autonormuon_adam_second_moment_mode", "adam")
     return out
 
 
