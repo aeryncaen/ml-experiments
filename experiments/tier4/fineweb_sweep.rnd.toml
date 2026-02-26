@@ -25,17 +25,8 @@ optimizer = ["normuon", "autonormuon"]
 seed = [42]
 
 # AutoNorMuon-only knobs; ignored for non-autonormuon optimizers by runner normalization.
-# Focused gnorm debugging grid + interaction ablations.
-autonormuon_adapt_mode = ["gnorm"]
-autonormuon_geometry_mode = ["tangent_after", "tangent_pre_post"]
-autonormuon_gnorm_beta = [0.55]
+autonormuon_beta = [0.55]
+autonormuon_adaptation_scope = ["neuron"]
+autonormuon_retract = ["weights", "update", "off"]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
-autonormuon_var_eps = [1.0e-12]
-# Hard-pruned from search space: conflict_proj=true, gnorm_source=grad; scopes hardcoded to neuron
-autonormuon_conflict_proj = [false]
-autonormuon_lr_scope = ["neuron"]
-autonormuon_gnorm_source = ["post_ortho"]
-autonormuon_gnorm_scope = ["neuron"]
-autonormuon_gmax_scope = ["neuron"]
-autonormuon_second_moment_mode = ["none"]

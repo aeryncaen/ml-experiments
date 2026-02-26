@@ -49,12 +49,10 @@ def _hash_hparams(hparams: dict) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def _canonical_autonormuon_scopes(out: dict) -> dict:
+def _canonical_autonormuon(out: dict) -> dict:
+    """Ensure AutoNorMuon defaults are present and canonical."""
     d = dict(out)
-    d.setdefault("autonormuon_geometry_mode", "tangent_after")
-    d["autonormuon_lr_scope"] = "neuron"
-    d["autonormuon_gnorm_scope"] = "neuron"
-    d["autonormuon_gmax_scope"] = "neuron"
+    d.setdefault("autonormuon_adaptation_scope", "neuron")
     return d
 
 
@@ -80,26 +78,12 @@ def _hash_view(hparams: dict) -> dict:
             if k.startswith("autonormuon_"):
                 out.pop(k, None)
     else:
-        # Canonicalize AutoNorMuon hash fields for backward compatibility.
-        # Older runs may not have recorded newly introduced knobs; map those
-        # missing fields to their historical effective defaults so hashes align.
-        out.setdefault("autonormuon_adapt_mode", "gnorm")
-        out.setdefault("autonormuon_geometry_mode", "tangent_after")
-        out.setdefault("autonormuon_gnorm_beta", 0.9)
+        out.setdefault("autonormuon_beta", 0.55)
+        out.setdefault("autonormuon_adaptation_scope", "neuron")
+        out.setdefault("autonormuon_retract", "weights")
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
-        out.setdefault("autonormuon_var_eps", 1e-12)
-        out.setdefault("autonormuon_conflict_proj", False)
-        out.setdefault("autonormuon_lr_scope", "neuron")
-        out.setdefault("autonormuon_gnorm_source", "grad")
-        out.setdefault("autonormuon_gnorm_scope", "neuron")
-        out["autonormuon_second_moment_mode"] = "none"
-
-        out.setdefault("autonormuon_gmax_scope", "neuron")
-        if out.get("autonormuon_gmax_scope") in (None, ""):
-            out["autonormuon_gmax_scope"] = "neuron"
-
-        out = _canonical_autonormuon_scopes(out)
+        out = _canonical_autonormuon(out)
 
     return out
 
@@ -134,30 +118,20 @@ def _scan_existing_hashes(metrics_dir: Path) -> dict[str, str]:
 def _run_name(prefix: str, hp: dict, cfg_hash: str) -> str:
     opt = str(hp.get("optimizer", "opt"))
     seed = hp.get("seed", "na")
-    mode = hp.get("autonormuon_adapt_mode") if opt == "autonormuon" else None
-    mode_part = f"_m{mode}" if mode else ""
-    return f"{prefix}_{opt}{mode_part}_s{seed}_{cfg_hash}"
+    return f"{prefix}_{opt}_s{seed}_{cfg_hash}"
 
 
 def _normalize_overrides(ov: dict) -> dict:
     out = dict(ov)
     opt = str(out.get("optimizer", ""))
     if opt != "autonormuon":
-        out.pop("autonormuon_adapt_mode", None)
-        out.pop("autonormuon_geometry_mode", None)
+        out.pop("autonormuon_beta", None)
+        out.pop("autonormuon_adaptation_scope", None)
+        out.pop("autonormuon_retract", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
-        out.pop("autonormuon_var_eps", None)
-        out.pop("autonormuon_gnorm_beta", None)
-        out.pop("autonormuon_conflict_proj", None)
-        out.pop("autonormuon_lr_scope", None)
-        out.pop("autonormuon_gnorm_source", None)
-        out.pop("autonormuon_gnorm_scope", None)
-        out.pop("autonormuon_gmax_scope", None)
-        out.pop("autonormuon_second_moment_mode", None)
     else:
-        out = _canonical_autonormuon_scopes(out)
-        out["autonormuon_second_moment_mode"] = "none"
+        out = _canonical_autonormuon(out)
     return out
 
 

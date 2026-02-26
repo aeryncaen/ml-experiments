@@ -283,7 +283,7 @@ def _eval_milestones(eval_events: list[dict]) -> dict:
     }
 
 
-def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict:
+def _auto_summary(train_events: list[dict], min_ratio: float) -> dict:
     if not train_events:
         return {}
 
@@ -304,14 +304,7 @@ def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict
             return None
         return statistics.fmean(vals)
 
-    ratio_key_map = {
-        "gnorm": "ratio_gnorm",
-        "mu_var": "ratio_muvar",
-        "hybrid": "ratio_hybrid",
-        "cv": "ratio_cv",
-        "surge": "ratio_surge",
-    }
-    active_key = ratio_key_map.get(mode, "signal_ratio")
+    active_key = "ratio_gnorm"
 
     fields = [
         "scheduled_lr",
@@ -319,13 +312,7 @@ def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict
         "lr_mult",
         "gnorm_mean",
         "gnorm_std",
-        "gnorm_cv",
-        "gnorm_surge",
         "ratio_gnorm",
-        "ratio_muvar",
-        "ratio_cv",
-        "ratio_surge",
-        "conflict_frac",
     ]
     series: dict[str, list[float]] = {k: [] for k in fields}
     for ev in train_events:
@@ -342,15 +329,11 @@ def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict
     ratio_vals = _clean(active_key if active_key in series else "signal_ratio")
     lr_mult_vals = _clean("lr_mult")
     sched_vals = _clean("scheduled_lr")
-    cv_vals = _clean("gnorm_cv")
-    surge_vals = _clean("gnorm_surge")
-    conflict_vals = _clean("conflict_frac")
 
     ratio_floor_hits = sum(1 for v in ratio_vals if v <= (min_ratio + 1e-6))
     ratio_ceiling_hits = sum(1 for v in ratio_vals if v >= 0.999)
     ratio_jumps = sum(1 for i in range(1, len(ratio_vals)) if abs(ratio_vals[i] - ratio_vals[i - 1]) > 0.2)
     lr_jumps = sum(1 for i in range(1, len(sched_vals)) if sched_vals[i - 1] > 0 and (sched_vals[i] / sched_vals[i - 1] > 1.5 or sched_vals[i] / sched_vals[i - 1] < 0.67))
-    conflict_spikes = sum(1 for v in conflict_vals if v > 0.05)
 
     return {
         "active_ratio_key": active_key,
@@ -361,15 +344,9 @@ def _auto_summary(train_events: list[dict], mode: str, min_ratio: float) -> dict
         "ratio_ceiling_hit_frac": (ratio_ceiling_hits / len(ratio_vals)) if ratio_vals else None,
         "lr_mult_mean": statistics.fmean(lr_mult_vals) if lr_mult_vals else None,
         "scheduled_lr_mean": statistics.fmean(sched_vals) if sched_vals else None,
-        "gnorm_cv_mean": statistics.fmean(cv_vals) if cv_vals else None,
-        "gnorm_surge_mean": statistics.fmean(surge_vals) if surge_vals else None,
-        "conflict_frac_mean": statistics.fmean(conflict_vals) if conflict_vals else None,
-        "corr_ratio_cv": _pearson(ratio_vals[: len(cv_vals)], cv_vals[: len(ratio_vals)]) if ratio_vals and cv_vals else None,
-        "corr_ratio_surge": _pearson(ratio_vals[: len(surge_vals)], surge_vals[: len(ratio_vals)]) if ratio_vals and surge_vals else None,
         "decision_anomalies": {
             "ratio_jump_count": ratio_jumps,
             "lr_jump_count": lr_jumps,
-            "conflict_spike_count": conflict_spikes,
         },
     }
 
@@ -479,10 +456,9 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
 
     # Optimizer decision diagnostics (autonormuon)
     optimizer = hparams.get("optimizer")
-    adapt_mode = hparams.get("autonormuon_adapt_mode") if optimizer == "autonormuon" else None
     auto_diag = {}
     if optimizer == "autonormuon":
-        auto_diag = _auto_summary(train_events, str(adapt_mode or "gnorm"), _as_float(hparams.get("autonormuon_min_ratio")) or 0.0)
+        auto_diag = _auto_summary(train_events, _as_float(hparams.get("autonormuon_min_ratio")) or 0.0)
 
     def _idx_to_step(i: int | None) -> int | None:
         return steps[i] if i is not None and 0 <= i < len(steps) else None
@@ -514,13 +490,9 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "run_name": run_dir.name,
         "run_dir": str(run_dir),
         "optimizer": optimizer,
-        "adapt_mode": adapt_mode,
-        "geometry_mode": hparams.get("autonormuon_geometry_mode") if optimizer == "autonormuon" else None,
-        "lr_scope": hparams.get("autonormuon_lr_scope") if optimizer == "autonormuon" else None,
-        "gnorm_source": hparams.get("autonormuon_gnorm_source") if optimizer == "autonormuon" else None,
-        "gnorm_scope": hparams.get("autonormuon_gnorm_scope") if optimizer == "autonormuon" else None,
-        "gmax_scope": hparams.get("autonormuon_gmax_scope") if optimizer == "autonormuon" else None,
-        "second_moment_mode": hparams.get("autonormuon_second_moment_mode") if optimizer == "autonormuon" else None,
+        "adaptation_scope": hparams.get("autonormuon_adaptation_scope") if optimizer == "autonormuon" else None,
+        "retract": hparams.get("autonormuon_retract") if optimizer == "autonormuon" else None,
+        "beta": _as_float(hparams.get("autonormuon_beta")) if optimizer == "autonormuon" else None,
         "seed": _as_int(hparams.get("seed")),
         "config_hash": config_hash,
         "train_steps": _as_int(hparams.get("train_steps")),
@@ -840,7 +812,6 @@ def _milestone_leaders(rows: list[dict]) -> dict:
         out[m] = {
             "run_name": best.get("run_name"),
             "optimizer": best.get("optimizer"),
-            "adapt_mode": best.get("adapt_mode"),
             "value": best.get(m),
         }
     return out
@@ -885,30 +856,30 @@ def _markdown(
         lines += [
             "## Milestone Leaders",
             "",
-            "| Metric | Run | Optimizer | Mode | Value |",
-            "|--------|-----|-----------|------|-------|",
+            "| Metric | Run | Optimizer | Value |",
+            "|--------|-----|-----------|-------|",
         ]
         for m in ("first_eval_loss", "mid_eval_loss", "last_eval_loss"):
             rec = milestone_leaders.get(m)
             if rec is None:
                 continue
             lines.append(
-                f"| {m} | {rec.get('run_name')} | {rec.get('optimizer') or '-'} | {rec.get('adapt_mode') or '-'} | {_fmt(rec.get('value'))} |"
+                f"| {m} | {rec.get('run_name')} | {rec.get('optimizer') or '-'} | {_fmt(rec.get('value'))} |"
             )
         lines += [""]
 
     lines += [
         "## Per-Run",
         "",
-        "| Rank | Run | Opt | Mode | First Eval | Mid Eval | Last Eval | Best Val | Rand Exit | Stable(drop) | Stable(slope) | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
-        "|------|-----|-----|------|------------|----------|-----------|----------|-----------|--------------|---------------|------------|-----------|------------|-------|-------|----------|",
+        "| Rank | Run | Opt | First Eval | Mid Eval | Last Eval | Best Val | Rand Exit | Stable(drop) | Stable(slope) | End Gain % | Mid Slope | Tail Slope | Taper | tok/s | Unstable |",
+        "|------|-----|-----|------------|----------|-----------|----------|-----------|--------------|---------------|------------|-----------|------------|-------|-------|----------|",
     ]
     for i, r in enumerate(rows, start=1):
         _eg = r.get("end_gain_frac_total")
         _eg_pct = (_eg * 100.0) if isinstance(_eg, (int, float)) else None
         lines.append(
             "| "
-            f"{i} | {r.get('run_name')} | {r.get('optimizer') or '-'} | {r.get('adapt_mode') or '-'} | "
+            f"{i} | {r.get('run_name')} | {r.get('optimizer') or '-'} | "
             f"{_fmt(r.get('first_eval_loss'))} | {_fmt(r.get('mid_eval_loss'))} | {_fmt(r.get('last_eval_loss'))} | {_fmt(r.get('best_val_loss'))} | {_fmt(r.get('random_exit_step'), nd=0)} | "
             f"{_fmt(r.get('stable_step_drop'), nd=0)} | {_fmt(r.get('stable_step_slope'), nd=0)} | "
             f"{_fmt(_eg_pct)} | "
@@ -993,8 +964,8 @@ def _markdown(
             "",
             "## AutoNorMuon Decisions",
             "",
-            "| Run | Mode | Ratio Key | Ratio Mean | Floor Hit % | Ceiling Hit % | CV Mean | Surge Mean | Conflict Mean | Ratio Jumps | LR Jumps | Conflict Spikes | Corr(ratio,cv) | Corr(ratio,surge) |",
-            "|-----|------|-----------|------------|-------------|---------------|---------|------------|---------------|------------|----------|-----------------|----------------|-------------------|",
+            "| Run | Ratio Mean | Floor Hit % | Ceiling Hit % | Ratio Jumps | LR Jumps | LR Mean | LR Mult Mean |",
+            "|-----|------------|-------------|---------------|-------------|----------|---------|--------------|",
         ]
         for r in auto_rows:
             d = r.get("autonormuon_diag", {})
@@ -1005,10 +976,10 @@ def _markdown(
             ceil_pct = (ceil_pct * 100.0) if isinstance(ceil_pct, (int, float)) else None
             lines.append(
                 "| "
-                f"{r.get('run_name')} | {r.get('adapt_mode') or '-'} | {d.get('active_ratio_key', '-')} | {_fmt(d.get('ratio_mean'))} | "
-                f"{_fmt(floor_pct)} | {_fmt(ceil_pct)} | {_fmt(d.get('gnorm_cv_mean'))} | {_fmt(d.get('gnorm_surge_mean'))} | "
-                f"{_fmt(d.get('conflict_frac_mean'))} | {_fmt(an.get('ratio_jump_count'), nd=0)} | {_fmt(an.get('lr_jump_count'), nd=0)} | "
-                f"{_fmt(an.get('conflict_spike_count'), nd=0)} | {_fmt(d.get('corr_ratio_cv'))} | {_fmt(d.get('corr_ratio_surge'))} |"
+                f"{r.get('run_name')} | {_fmt(d.get('ratio_mean'))} | "
+                f"{_fmt(floor_pct)} | {_fmt(ceil_pct)} | "
+                f"{_fmt(an.get('ratio_jump_count'), nd=0)} | {_fmt(an.get('lr_jump_count'), nd=0)} | "
+                f"{_fmt(d.get('scheduled_lr_mean'))} | {_fmt(d.get('lr_mult_mean'))} |"
             )
     lines.append("")
     return "\n".join(lines)
@@ -1049,7 +1020,7 @@ def main() -> None:
     ap.add_argument(
         "--group-by",
         type=str,
-        default="optimizer,adapt_mode,geometry_mode,lr_scope,gnorm_source,gnorm_scope,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
+        default="optimizer,adaptation_scope,retract,beta,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
     ap.add_argument(

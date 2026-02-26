@@ -128,18 +128,11 @@ class HParams:
     muon_lr: float = _env_float("MUON_LR", 0.02)          # Muon/NorMuon LR for hidden 2D weights
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
-    autonormuon_gnorm_beta: float = _env_float("AUTONORMUON_GNORM_BETA", 0.9)  # AutoNorMuon grad-norm EMA decay
-    autonormuon_adapt_mode: str = os.environ.get("AUTONORMUON_ADAPT_MODE", "gnorm")  # gnorm | mu_var | hybrid | cv | surge
+    autonormuon_beta: float = _env_float("AUTONORMUON_BETA", 0.55)  # AutoNorMuon grad-norm EMA decay
+    autonormuon_adaptation_scope: str = os.environ.get("AUTONORMUON_ADAPTATION_SCOPE", "neuron")  # neuron | matrix
+    autonormuon_retract: str = os.environ.get("AUTONORMUON_RETRACT", "weights")  # weights | update | off
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
-    autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
-    autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
-    autonormuon_geometry_mode: str = os.environ.get("AUTONORMUON_GEOMETRY_MODE", "tangent_after")  # tangent_after | tangent_pre_post | legacy
-    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
-    autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
-    autonormuon_gnorm_scope: str = os.environ.get("AUTONORMUON_GNORM_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
-    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "neuron")  # compatibility knob; AutoNorMuon hardcodes neuron
-    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "none")  # compatibility knob; AutoNorMuon hardcodes none
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -293,38 +286,17 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "lr",
             "scheduled_lr",
             "momentum",
-            "beta2",
             "weight_decay",
-            "adapt_mode",
-            "geometry_mode",
-            "lr_scope",
-            "gnorm_source",
-            "gnorm_scope",
-            "gmax_scope",
-            "second_moment_mode",
             "gnorm_ratio",
             "gnorm_ratio_raw",
             "gnorm_median",
             "gnorm_ema",
             "gnorm_max",
-            "mu2_ema",
-            "var_ema",
             "signal_ratio",
             "lr_mult",
             "gnorm_mean",
             "gnorm_std",
-            "gnorm_cv",
-            "gnorm_cv_ema",
-            "gnorm_mean_ema",
-            "gnorm_surge",
             "ratio_gnorm",
-            "ratio_muvar",
-            "ratio_hybrid",
-            "ratio_cv",
-            "ratio_surge",
-            "conflict_frac",
-            "radial_frac_pre",
-            "radial_frac_post",
         ):
             if k in pg:
                 rec[k] = _to_json_scalar(pg[k])
@@ -4666,33 +4638,21 @@ def main():
     elif HP.optimizer == "autonormuon":
         from autonormuon import AutoNorMuon
         # LR already set by formula for all muon-like optimizers: 0.1 / sqrt(R), R = 2 * n_layer
-        _retract = not _is_ngpt
+        # nGPT does its own retraction, so force off; otherwise use config
+        _retract = "off" if _is_ngpt else HP.autonormuon_retract
         optimizer = AutoNorMuon(
             param_groups,
             total_steps=HP.train_steps,
+            beta=HP.autonormuon_beta,
+            adaptation_scope=HP.autonormuon_adaptation_scope,
             retract=_retract,
-            gnorm_beta=HP.autonormuon_gnorm_beta,
-            adapt_mode=HP.autonormuon_adapt_mode,
             ratio_pow=HP.autonormuon_ratio_pow,
             min_ratio=HP.autonormuon_min_ratio,
-            var_eps=HP.autonormuon_var_eps,
-            conflict_proj=HP.autonormuon_conflict_proj,
-            geometry_mode=HP.autonormuon_geometry_mode,
-            lr_scope=HP.autonormuon_lr_scope,
-            gnorm_source=HP.autonormuon_gnorm_source,
-            gnorm_scope=HP.autonormuon_gnorm_scope,
-            gmax_scope=HP.autonormuon_gmax_scope,
-            second_moment_mode=HP.autonormuon_second_moment_mode,
         )
         print0(rank, (
             f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
-            f"gnorm_beta={HP.autonormuon_gnorm_beta} adapt_mode={HP.autonormuon_adapt_mode} "
-            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
-            f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj} "
-            f"geometry_mode={HP.autonormuon_geometry_mode} "
-            f"lr_scope={HP.autonormuon_lr_scope} gnorm_source={HP.autonormuon_gnorm_source} "
-            f"gnorm_scope={HP.autonormuon_gnorm_scope} gmax_scope={HP.autonormuon_gmax_scope} "
-            f"second_moment_mode={HP.autonormuon_second_moment_mode}"
+            f"beta={HP.autonormuon_beta} adaptation_scope={HP.autonormuon_adaptation_scope} "
+            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio}"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
