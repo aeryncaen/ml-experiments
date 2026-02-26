@@ -129,10 +129,11 @@ class HParams:
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     autonormuon_gnorm_beta: float = _env_float("AUTONORMUON_GNORM_BETA", 0.9)  # AutoNorMuon grad-norm EMA decay
-    autonormuon_adapt_mode: str = os.environ.get("AUTONORMUON_ADAPT_MODE", "gnorm")  # gnorm | mu_var
+    autonormuon_adapt_mode: str = os.environ.get("AUTONORMUON_ADAPT_MODE", "gnorm")  # gnorm | mu_var | hybrid | cv | surge
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
+    autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -298,6 +299,18 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "var_ema",
             "signal_ratio",
             "lr_mult",
+            "gnorm_mean",
+            "gnorm_std",
+            "gnorm_cv",
+            "gnorm_cv_ema",
+            "gnorm_mean_ema",
+            "gnorm_surge",
+            "ratio_gnorm",
+            "ratio_muvar",
+            "ratio_hybrid",
+            "ratio_cv",
+            "ratio_surge",
+            "conflict_frac",
         ):
             if k in pg:
                 rec[k] = _to_json_scalar(pg[k])
@@ -4649,11 +4662,13 @@ def main():
             ratio_pow=HP.autonormuon_ratio_pow,
             min_ratio=HP.autonormuon_min_ratio,
             var_eps=HP.autonormuon_var_eps,
+            conflict_proj=HP.autonormuon_conflict_proj,
         )
         print0(rank, (
             f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
             f"gnorm_beta={HP.autonormuon_gnorm_beta} adapt_mode={HP.autonormuon_adapt_mode} "
-            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} var_eps={HP.autonormuon_var_eps}"
+            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
+            f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj}"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
