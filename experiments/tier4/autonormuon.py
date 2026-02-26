@@ -115,13 +115,14 @@ class AutoNorMuon(torch.optim.Optimizer):
         adaptation_scope: granularity for gnorm tracking & LR application:
             "neuron" (per output-neuron) | "matrix" (per weight matrix)
         retract: what to normalize to the product of spheres (row-norm = 1):
-            "weights"          — normalize W rows after each step (nGPT-style)
-            "grad_pre_ortho"   — normalize raw grad rows before momentum/NS5
-            "grad_post_ortho"  — normalize post-ortho update rows after NS5
-            "off"              — no normalization
-            True               — same as "weights" (backward compat)
-            False              — same as "off" (backward compat)
-            Both grad modes normalize before gnorm tracking sees the norms.
+            "weights"              — normalize W rows after each step (nGPT-style)
+            "grad_pre_ortho"       — normalize raw grad rows before momentum/NS5
+            "grad_post_ortho"      — normalize post-ortho update rows after NS5
+            "weights+grad_pre"     — both: normalize grad rows pre-ortho AND W rows after step
+            "off"                  — no normalization
+            True                   — same as "weights" (backward compat)
+            False                  — same as "off" (backward compat)
+            Grad modes normalize before gnorm tracking sees the norms.
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
     """
@@ -140,9 +141,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             retract = "weights"
         elif retract is False:
             retract = "off"
-        if retract not in ("weights", "grad_pre_ortho", "grad_post_ortho", "off"):
+        if retract not in ("weights", "grad_pre_ortho", "grad_post_ortho", "weights+grad_pre", "off"):
             raise ValueError(
-                f"Unsupported retract={retract!r}; expected 'weights' | 'grad_pre_ortho' | 'grad_post_ortho' | 'off' (or bool)"
+                f"Unsupported retract={retract!r}; expected 'weights' | 'grad_pre_ortho' | 'grad_post_ortho' | 'weights+grad_pre' | 'off' (or bool)"
             )
 
         for group in param_groups:
@@ -214,7 +215,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                     updates = []
                     for p, state, g in zip(params, states, grads):
                         # Normalize raw grad rows before momentum/NS5
-                        if self.retract == "grad_pre_ortho":
+                        if self.retract in ("grad_pre_ortho", "weights+grad_pre"):
                             g = g / g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
                         update = normuon_update(
@@ -326,7 +327,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                         p.sub_(update)
 
                         # Normalize weight rows to unit norm after step
-                        if self.retract == "weights":
+                        if self.retract in ("weights", "weights+grad_pre"):
                             p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
 
                     # --- Group logging ---
