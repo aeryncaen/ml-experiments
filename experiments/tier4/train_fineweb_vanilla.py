@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
@@ -117,6 +118,8 @@ class HParams:
     metrics_enabled: bool = _env_bool("METRICS_ENABLED", True)
     metrics_dir: str = os.environ.get("METRICS_DIR", str(Path(__file__).resolve().parent / "runs"))
     metrics_run_name: str = os.environ.get("METRICS_RUN_NAME", "")
+    run_group: str = os.environ.get("RUN_GROUP", "")
+    run_config_hash: str = os.environ.get("RUN_CONFIG_HASH", "")
     metrics_every: int = _env_int("METRICS_EVERY", 1)
     metrics_flush_every: int = _env_int("METRICS_FLUSH_EVERY", 20)
 
@@ -202,6 +205,43 @@ class HParams:
 
 
 HP = HParams()
+
+
+def _coerce_like(current: Any, value: Any) -> Any:
+    if isinstance(current, bool):
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    if isinstance(current, str):
+        return str(value)
+    return value
+
+
+def resolve_hparams(overrides: dict[str, Any] | None = None) -> HParams:
+    hp = HParams()
+    if overrides:
+        fields = hp.__dataclass_fields__
+        for k, v in overrides.items():
+            if k not in fields:
+                raise KeyError(f"Unknown hparam override: {k}")
+            cur = getattr(hp, k)
+            setattr(hp, k, _coerce_like(cur, v))
+    return hp
+
+
+def set_hparams(overrides: dict[str, Any] | None = None) -> HParams:
+    global HP
+    HP = resolve_hparams(overrides)
+    return HP
+
+
+def run_training(overrides: dict[str, Any] | None = None) -> None:
+    set_hparams(overrides)
+    main()
 
 
 def setup_dist():

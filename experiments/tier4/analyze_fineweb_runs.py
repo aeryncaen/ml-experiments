@@ -154,7 +154,10 @@ def _extract_run_stats(
 
     cfg = _read_json(run_dir / "run_config.json") or {}
     hparams = cfg.get("hparams", {}) if isinstance(cfg, dict) else {}
-    config_hash = hashlib.sha1(json.dumps(hparams, sort_keys=True).encode("utf-8")).hexdigest()[:12] if hparams else "-"
+    if isinstance(hparams.get("run_config_hash"), str) and hparams.get("run_config_hash"):
+        config_hash = hparams["run_config_hash"]
+    else:
+        config_hash = hashlib.sha1(json.dumps(hparams, sort_keys=True).encode("utf-8")).hexdigest()[:12] if hparams else "-"
 
     train_events = _read_jsonl(run_dir / "train_events.jsonl")
     eval_events = _read_jsonl(run_dir / "eval_events.jsonl")
