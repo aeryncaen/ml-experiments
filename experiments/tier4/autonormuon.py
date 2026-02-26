@@ -93,12 +93,77 @@ def _unit_norms(x: torch.Tensor, scope: str) -> torch.Tensor:
     raise ValueError(f"Unsupported adaptation_scope={scope}; expected 'matrix' | 'neuron'")
 
 
+def _parse_schedule(spec: str) -> dict:
+    """Parse a schedule spec string into a dict.
+
+    Formats:
+        "always"              → {"mode": "always"}
+        "off"                 → {"mode": "off"}
+        "hard_off:<step>"     → 1→0 at step (on before, off after)
+        "hard_on:<step>"      → 0→1 at step (off before, on after)
+        "ramp_down:<s1>-<s2>" → linear 1→0 between s1 and s2
+        "ramp_up:<s1>-<s2>"   → linear 0→1 between s1 and s2
+        "ppl"                 → ppl_ratio^1.0  (1 at random → 0 as loss drops)
+        "ppl:<power>"         → ppl_ratio^power
+    """
+    spec = spec.strip().lower()
+    if spec in ("always", "on", "1"):
+        return {"mode": "always"}
+    if spec in ("off", "none", "0"):
+        return {"mode": "off"}
+    if spec.startswith("hard_off:"):
+        return {"mode": "hard_off", "step": int(spec.split(":")[1])}
+    if spec.startswith("hard_on:"):
+        return {"mode": "hard_on", "step": int(spec.split(":")[1])}
+    if spec.startswith("ramp_down:"):
+        parts = spec.split(":")[1].split("-")
+        return {"mode": "ramp_down", "start": int(parts[0]), "end": int(parts[1])}
+    if spec.startswith("ramp_up:"):
+        parts = spec.split(":")[1].split("-")
+        return {"mode": "ramp_up", "start": int(parts[0]), "end": int(parts[1])}
+    if spec.startswith("ppl"):
+        if ":" in spec:
+            return {"mode": "ppl", "power": float(spec.split(":")[1])}
+        return {"mode": "ppl", "power": 1.0}
+    raise ValueError(f"Unknown schedule spec: {spec!r}")
+
+
+def _eval_schedule(sched: dict, k: int, ppl_ratio: float) -> float:
+    """Evaluate a parsed schedule at step k, returning gate value in [0, 1]."""
+    mode = sched["mode"]
+    if mode == "always":
+        return 1.0
+    if mode == "off":
+        return 0.0
+    if mode == "hard_off":
+        return 1.0 if k < sched["step"] else 0.0
+    if mode == "hard_on":
+        return 0.0 if k < sched["step"] else 1.0
+    if mode == "ramp_down":
+        s, e = sched["start"], sched["end"]
+        if k <= s:
+            return 1.0
+        if k >= e:
+            return 0.0
+        return 1.0 - (k - s) / (e - s)
+    if mode == "ramp_up":
+        s, e = sched["start"], sched["end"]
+        if k <= s:
+            return 0.0
+        if k >= e:
+            return 1.0
+        return (k - s) / (e - s)
+    if mode == "ppl":
+        return max(0.0, min(1.0, ppl_ratio ** sched["power"]))
+    return 1.0
+
+
 class AutoNorMuon(torch.optim.Optimizer):
     """
     AutoNorMuon: NorMuon+AdamW with:
       - Cosine LR ceiling (decays base_lr to 0 over total_steps)
       - Grad norm tracking: fast EMA / max → cosine-mapped attenuation
-      - Optional row-normalization of weights or updates (Muon params only)
+      - Independent grad-norm and weight-retraction schedules (Muon params only)
 
     The effective LR each step uses:
       cosine_lr = base_lr * 0.5 * (1 + cos(pi * k / total_steps))
@@ -114,47 +179,33 @@ class AutoNorMuon(torch.optim.Optimizer):
         beta: EMA decay for grad norm tracking (default 0.55)
         adaptation_scope: granularity for gnorm tracking & LR application:
             "neuron" (per output-neuron) | "matrix" (per weight matrix)
-        retract: what to normalize to the product of spheres (row-norm = 1):
-            "weights"              — normalize W rows after each step (nGPT-style)
-            "grad_pre_ortho"       — normalize raw grad rows before momentum/NS5
-            "grad_post_ortho"      — normalize post-ortho update rows after NS5
-            "weights+grad_pre"     — both: normalize grad rows pre-ortho AND W rows after step
-            "anneal"               — weights ALWAYS retracted (100%); grad normalization
-                                     gated by perplexity ratio = exp(loss_ema - loss_ref).
-                                     At init (ppl_ratio≈1) grads fully normalized; as loss
-                                     drops the grad norm fades to zero.
-                                     Requires set_train_loss() call before each step().
-            "off"                  — no normalization
-            True                   — same as "weights" (backward compat)
-            False                  — same as "off" (backward compat)
-            Grad modes normalize before gnorm tracking sees the norms.
+        grad_schedule: when/how to normalize raw grad rows (pre-momentum/NS5).
+            "always"         — normalize every step
+            "off"            — never normalize
+            "hard:<step>"    — normalize until <step>, then stop
+            "ramp:<s1>-<s2>" — full norm until s1, linear fade to 0 by s2
+            "ppl" / "ppl:<p>"— gate = ppl_ratio^p (needs set_train_loss)
+        weight_schedule: when/how to retract weight rows to unit sphere.
+            Same format as grad_schedule.
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
-        anneal_power: exponent on perplexity ratio for grad gate (only retract="anneal"):
-            1.0 = gate tracks raw perplexity ratio (exponential decay)
-            >1  = grad normalization drops off faster
-            <1  = grad normalization persists longer
     """
     def __init__(self, param_groups, total_steps,
                  beta=0.55,
                  adaptation_scope="neuron",
-                 retract=True,
+                 grad_schedule="off",
+                 weight_schedule="always",
                  ratio_pow=1.0,
-                 min_ratio=0.0,
-                 anneal_power=1.0):
+                 min_ratio=0.0):
         if adaptation_scope not in ("neuron", "matrix"):
             raise ValueError(
                 f"Unsupported adaptation_scope={adaptation_scope}; expected 'neuron' | 'matrix'"
             )
-        # Normalize retract to string form
-        if retract is True:
-            retract = "weights"
-        elif retract is False:
-            retract = "off"
-        if retract not in ("weights", "grad_pre_ortho", "grad_post_ortho", "weights+grad_pre", "anneal", "off"):
-            raise ValueError(
-                f"Unsupported retract={retract!r}; expected 'weights' | 'grad_pre_ortho' | 'grad_post_ortho' | 'weights+grad_pre' | 'anneal' | 'off' (or bool)"
-            )
+
+        self._grad_sched = _parse_schedule(grad_schedule)
+        self._weight_sched = _parse_schedule(weight_schedule)
+        self._grad_schedule_str = grad_schedule
+        self._weight_schedule_str = weight_schedule
 
         for group in param_groups:
             assert "use_muon" in group
@@ -175,27 +226,25 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["lr_mult"] = None
 
         self.total_steps = total_steps
-        self.retract = retract
         self.gnorm_beta = beta
         self.adaptation_scope = adaptation_scope
         self.ratio_pow = ratio_pow
         self.min_ratio = min_ratio
 
-        # Anneal gate state (grad normalization strength; weights always retracted)
-        self.anneal_power = anneal_power
-        self._random_loss_ref = None   # captured from first set_train_loss call
-        self._loss_ema = None          # smoothed loss for gate (avoids step-to-step noise)
-        self._grad_gate = 1.0          # current grad normalization strength [0, 1]
+        # Loss tracking for ppl-based schedules
+        self._random_loss_ref = None
+        self._loss_ema = None
+        self._ppl_ratio = 1.0    # exp(loss_ema - ref), updated by set_train_loss
+        self._grad_gate = 1.0 if self._grad_sched["mode"] != "off" else 0.0
+        self._weight_gate = 1.0 if self._weight_sched["mode"] != "off" else 0.0
 
         super().__init__(param_groups, dict())
 
     def set_train_loss(self, loss: float):
-        """Call before step() with current training loss to drive anneal gate.
+        """Call before step() with current training loss to drive ppl-based schedules.
 
         First call captures the random-init loss as reference.
-        Gate uses perplexity ratio (exp-space) so it responds to the true scale
-        of learning progress rather than the compressed log-loss scale.
-        ppl_ratio = exp(loss_ema) / exp(ref) = exp(loss_ema - ref), clamped to [0, 1].
+        ppl_ratio = exp(loss_ema - ref), clamped to [0, 1].
         """
         if not math.isfinite(loss):
             return
@@ -203,12 +252,8 @@ class AutoNorMuon(torch.optim.Optimizer):
             self._random_loss_ref = loss
             self._loss_ema = loss
         else:
-            # EMA with beta=0.95 to smooth out step-to-step noise
             self._loss_ema = 0.95 * self._loss_ema + 0.05 * loss
-
-        # Perplexity ratio: exp(ema - ref). When ema == ref → 1.0; as loss drops → 0.
-        ppl_ratio = min(math.exp(self._loss_ema - self._random_loss_ref), 1.0)
-        self._grad_gate = ppl_ratio ** self.anneal_power  # 1.0 at random, → 0 as loss drops
+        self._ppl_ratio = min(math.exp(self._loss_ema - self._random_loss_ref), 1.0)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -249,19 +294,23 @@ class AutoNorMuon(torch.optim.Optimizer):
                     states.append(state)
 
                 if params:
+                    # --- Evaluate schedule gates for this step ---
+                    self._grad_gate = _eval_schedule(self._grad_sched, k, self._ppl_ratio)
+                    self._weight_gate = _eval_schedule(self._weight_sched, k, self._ppl_ratio)
+
                     # --- Compute updates via NorMuon (post-ortho) ---
                     updates = []
                     grad_row_norm_sum = 0.0
                     grad_row_norm_count = 0
                     for p, state, g in zip(params, states, grads):
                         # Normalize raw grad rows before momentum/NS5
-                        if self.retract in ("grad_pre_ortho", "weights+grad_pre"):
-                            g = g / g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                        elif self.retract == "anneal" and self._grad_gate > 0:
+                        if self._grad_gate > 0:
                             row_norms = g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                             g_normed = g / row_norms
-                            g = torch.lerp(g, g_normed, self._grad_gate)
-                            # Track raw grad row norms for logging
+                            if self._grad_gate >= 1.0:
+                                g = g_normed
+                            else:
+                                g = torch.lerp(g, g_normed, self._grad_gate)
                             grad_row_norm_sum += row_norms.sum().item()
                             grad_row_norm_count += row_norms.numel()
 
@@ -271,11 +320,6 @@ class AutoNorMuon(torch.optim.Optimizer):
                             beta=group["momentum"],
                         )
                         update = update.reshape(p.shape)
-
-                        # Normalize post-ortho update rows after NS5
-                        if self.retract == "grad_post_ortho":
-                            update = update / update.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-
                         updates.append(update)
 
                     # --- Per-unit gradient norms (post-ortho, post-retract) ---
@@ -373,9 +417,13 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                         p.sub_(update)
 
-                        # Normalize weight rows to unit norm after step
-                        if self.retract in ("weights", "weights+grad_pre", "anneal"):
-                            p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+                        # Retract weight rows to unit sphere
+                        if self._weight_gate > 0:
+                            p_normed = p / p.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                            if self._weight_gate >= 1.0:
+                                p.copy_(p_normed)
+                            else:
+                                p.lerp_(p_normed, self._weight_gate)
 
                     # --- Group logging ---
                     group["gnorm_mean"] = mean_t.detach()
@@ -402,8 +450,10 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["signal_ratio"] = signal_ratio_t.item()
                         group["lr_mult"] = lr_mult_t.item()
                         group["ratio_gnorm"] = _safe_item(ratio_gnorm_t)
-                        # Anneal gate diagnostics
+                        # Schedule diagnostics
                         group["grad_gate"] = self._grad_gate
+                        group["weight_gate"] = self._weight_gate
+                        group["ppl_ratio"] = self._ppl_ratio
                         group["loss_ema"] = self._loss_ema if self._loss_ema is not None else 0.0
                         group["random_loss_ref"] = self._random_loss_ref if self._random_loss_ref is not None else 0.0
                         if grad_row_norm_count > 0:

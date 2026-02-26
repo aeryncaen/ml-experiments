@@ -1,0 +1,49 @@
+[runner]
+# Phase B: find ideal weight-retraction schedule (grad norm OFF).
+metrics_dir = "experiments/tier4/runs"
+run_prefix = "rnd_sched_wt"
+skip_existing = true
+continue_on_error = true
+
+[base]
+# ~20M tokens at seq_len=1024: 2441 * 8 * 1 * 1024 = 19,996,672
+train_steps = 2441
+batch_size = 8
+grad_accum = 1
+seq_len = 1024
+
+metrics_every = 1
+val_every = 400
+
+train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
+val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
+
+[sweep]
+optimizer = ["autonormuon"]
+seed = [42]
+
+autonormuon_beta = [0.55]
+autonormuon_adaptation_scope = ["neuron"]
+autonormuon_ratio_pow = [1.0]
+autonormuon_min_ratio = [0.0]
+
+# Grad norm locked off for all Phase B runs.
+autonormuon_grad_schedule = ["off"]
+
+# Weight schedule ablation:
+#   off / always       = controls (floor / ceiling)
+#   hard_on:<step>     = no retraction until step, then full retraction
+#   ramp_up:<s>-<e>    = linear fade from 0→1
+autonormuon_weight_schedule = [
+    "off",
+    "always",
+    "hard_on:40",
+    "hard_on:80",
+    "hard_on:160",
+    "hard_on:320",
+    "hard_on:600",
+    "hard_on:1200",
+    "ramp_up:0-160",
+    "ramp_up:0-600",
+    "ramp_up:0-1200",
+]

@@ -491,7 +491,8 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "run_dir": str(run_dir),
         "optimizer": optimizer,
         "adaptation_scope": hparams.get("autonormuon_adaptation_scope") if optimizer == "autonormuon" else None,
-        "retract": hparams.get("autonormuon_retract") if optimizer == "autonormuon" else None,
+        "grad_schedule": hparams.get("autonormuon_grad_schedule") if optimizer == "autonormuon" else None,
+        "weight_schedule": hparams.get("autonormuon_weight_schedule") if optimizer == "autonormuon" else None,
         "beta": _as_float(hparams.get("autonormuon_beta")) if optimizer == "autonormuon" else None,
         "seed": _as_int(hparams.get("seed")),
         "config_hash": config_hash,
@@ -1020,7 +1021,7 @@ def main() -> None:
     ap.add_argument(
         "--group-by",
         type=str,
-        default="optimizer,adaptation_scope,retract,beta,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
+        default="optimizer,adaptation_scope,grad_schedule,weight_schedule,beta,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
     ap.add_argument(

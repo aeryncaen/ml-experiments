@@ -130,10 +130,10 @@ class HParams:
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     autonormuon_beta: float = _env_float("AUTONORMUON_BETA", 0.55)  # AutoNorMuon grad-norm EMA decay
     autonormuon_adaptation_scope: str = os.environ.get("AUTONORMUON_ADAPTATION_SCOPE", "neuron")  # neuron | matrix
-    autonormuon_retract: str = os.environ.get("AUTONORMUON_RETRACT", "weights")  # weights | update | off
+    autonormuon_grad_schedule: str = os.environ.get("AUTONORMUON_GRAD_SCHEDULE", "off")  # always|off|hard:<step>|ramp:<s1>-<s2>|ppl[:<power>]
+    autonormuon_weight_schedule: str = os.environ.get("AUTONORMUON_WEIGHT_SCHEDULE", "always")  # same format
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
-    autonormuon_anneal_power: float = _env_float("AUTONORMUON_ANNEAL_POWER", 1.0)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -299,6 +299,8 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "gnorm_std",
             "ratio_gnorm",
             "grad_gate",
+            "weight_gate",
+            "ppl_ratio",
             "loss_ema",
             "random_loss_ref",
             "raw_grad_row_norm_mean",
@@ -4644,22 +4646,23 @@ def main():
         from autonormuon import AutoNorMuon
         # LR already set by formula for all muon-like optimizers: 0.1 / sqrt(R), R = 2 * n_layer
         # nGPT does its own retraction, so force off; otherwise use config
-        _retract = "off" if _is_ngpt else HP.autonormuon_retract
+        _grad_sched = "off" if _is_ngpt else HP.autonormuon_grad_schedule
+        _weight_sched = "off" if _is_ngpt else HP.autonormuon_weight_schedule
         optimizer = AutoNorMuon(
             param_groups,
             total_steps=HP.train_steps,
             beta=HP.autonormuon_beta,
             adaptation_scope=HP.autonormuon_adaptation_scope,
-            retract=_retract,
+            grad_schedule=_grad_sched,
+            weight_schedule=_weight_sched,
             ratio_pow=HP.autonormuon_ratio_pow,
             min_ratio=HP.autonormuon_min_ratio,
-            anneal_power=HP.autonormuon_anneal_power,
         )
         print0(rank, (
-            f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
+            f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} "
+            f"grad_schedule={_grad_sched} weight_schedule={_weight_sched} "
             f"beta={HP.autonormuon_beta} adaptation_scope={HP.autonormuon_adaptation_scope} "
-            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
-            f"anneal_power={HP.autonormuon_anneal_power}"
+            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio}"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon

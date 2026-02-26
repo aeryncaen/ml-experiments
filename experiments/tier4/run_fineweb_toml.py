@@ -80,15 +80,11 @@ def _hash_view(hparams: dict) -> dict:
     else:
         out.setdefault("autonormuon_beta", 0.55)
         out.setdefault("autonormuon_adaptation_scope", "neuron")
-        out.setdefault("autonormuon_retract", "weights")
+        out.setdefault("autonormuon_grad_schedule", "off")
+        out.setdefault("autonormuon_weight_schedule", "always")
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
-        out.setdefault("autonormuon_anneal_power", 1.0)
         out = _canonical_autonormuon(out)
-        # anneal_power is only meaningful for retract="anneal"; drop it
-        # for other modes so different power values don't create duplicate runs.
-        if str(out.get("autonormuon_retract", "")) != "anneal":
-            out.pop("autonormuon_anneal_power", None)
 
     return out
 
@@ -132,10 +128,10 @@ def _normalize_overrides(ov: dict) -> dict:
     if opt != "autonormuon":
         out.pop("autonormuon_beta", None)
         out.pop("autonormuon_adaptation_scope", None)
-        out.pop("autonormuon_retract", None)
+        out.pop("autonormuon_grad_schedule", None)
+        out.pop("autonormuon_weight_schedule", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
-        out.pop("autonormuon_anneal_power", None)
     else:
         out = _canonical_autonormuon(out)
     return out
