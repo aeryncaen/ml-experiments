@@ -27,6 +27,6 @@ seed = [42]
 # AutoNorMuon-only knobs; ignored for non-autonormuon optimizers by runner normalization.
 autonormuon_beta = [0.55]
 autonormuon_adaptation_scope = ["neuron"]
-autonormuon_retract = ["weights", "weights+grad_pre"]
+autonormuon_retract = ["weights", "anneal"]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]

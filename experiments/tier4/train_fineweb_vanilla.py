@@ -297,6 +297,11 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "gnorm_mean",
             "gnorm_std",
             "ratio_gnorm",
+            "grad_gate",
+            "weight_gate",
+            "loss_ema",
+            "random_loss_ref",
+            "raw_grad_row_norm_mean",
         ):
             if k in pg:
                 rec[k] = _to_json_scalar(pg[k])
@@ -4932,6 +4937,9 @@ def main():
             grad_norm = torch.nn.utils.clip_grad_norm_(_all_params, HP.grad_clip)
         else:
             grad_norm = torch.cat([p.grad.flatten() for p in _all_params if p.grad is not None]).norm()
+        # Feed loss to optimizer for anneal gate (no-op if optimizer doesn't support it)
+        if hasattr(optimizer, "set_train_loss"):
+            optimizer.set_train_loss(float(loss.detach().item()) * _eff_accum)
         optimizer.step()
         if _is_sf or _is_auto:
             lr = optimizer.param_groups[0].get("scheduled_lr", lr)  # read actual LR after step
