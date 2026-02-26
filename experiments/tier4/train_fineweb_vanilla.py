@@ -133,6 +133,7 @@ class HParams:
     autonormuon_grad_schedule: str = os.environ.get("AUTONORMUON_GRAD_SCHEDULE", "off")  # always|off|hard:<step>|ramp:<s1>-<s2>|ppl[:<power>]
     autonormuon_weight_schedule: str = os.environ.get("AUTONORMUON_WEIGHT_SCHEDULE", "always")  # same format
     autonormuon_weight_mode: str = os.environ.get("AUTONORMUON_WEIGHT_MODE", "sphere")  # sphere | ns5
+    autonormuon_gnorm_mode: str = os.environ.get("AUTONORMUON_GNORM_MODE", "ema")  # ema | accumulate
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
@@ -4701,13 +4702,14 @@ def main():
             grad_schedule=_grad_sched,
             weight_schedule=_weight_sched,
             weight_mode=_weight_mode,
+            gnorm_mode=HP.autonormuon_gnorm_mode,
             ratio_pow=HP.autonormuon_ratio_pow,
             min_ratio=HP.autonormuon_min_ratio,
         )
         print0(rank, (
             f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} "
             f"grad_schedule={_grad_sched} weight_schedule={_weight_sched} "
-            f"weight_mode={_weight_mode} "
+            f"weight_mode={_weight_mode} gnorm_mode={HP.autonormuon_gnorm_mode} "
             f"beta={HP.autonormuon_beta} adaptation_scope={HP.autonormuon_adaptation_scope} "
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio}"
         ))

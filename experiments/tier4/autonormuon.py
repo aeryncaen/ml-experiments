@@ -187,6 +187,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             "ppl" / "ppl:<p>"— gate = ppl_ratio^p (needs set_train_loss)
         weight_schedule: when/how to retract weight rows to unit sphere.
             Same format as grad_schedule.
+        gnorm_mode: how to track gradient norms for adaptive LR:
+            "ema"        — EMA(gnorm) / max(gnorm)  (original)
+            "accumulate" — sum(gnorm) / (k * max(gnorm))  (coherence measure)
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
     """
@@ -196,11 +199,16 @@ class AutoNorMuon(torch.optim.Optimizer):
                  grad_schedule="off",
                  weight_schedule="always",
                  weight_mode="sphere",
+                 gnorm_mode="ema",
                  ratio_pow=1.0,
                  min_ratio=0.0):
         if adaptation_scope not in ("neuron", "matrix"):
             raise ValueError(
                 f"Unsupported adaptation_scope={adaptation_scope}; expected 'neuron' | 'matrix'"
+            )
+        if gnorm_mode not in ("ema", "accumulate"):
+            raise ValueError(
+                f"Unsupported gnorm_mode={gnorm_mode!r}; expected 'ema' | 'accumulate'"
             )
 
         self._grad_sched = _parse_schedule(grad_schedule)
@@ -233,6 +241,7 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.gnorm_beta = beta
         self.adaptation_scope = adaptation_scope
         self.weight_mode = weight_mode
+        self.gnorm_mode = gnorm_mode
         self.ratio_pow = ratio_pow
         self.min_ratio = min_ratio
 
@@ -337,16 +346,29 @@ class AutoNorMuon(torch.optim.Optimizer):
                     mean_t = flat_units.mean()
                     std_t = flat_units.std(unbiased=False)
 
-                    # --- Per-unit EMA / max tracking ---
+                    # --- Per-unit tracking (EMA or accumulate mode) ---
                     ema_units = []
                     gmax_units = []
                     ratio_units = []
                     for state, units in zip(states, gnorm_units):
-                        prev_ema = state.get("gnorm_ema")
-                        if not isinstance(prev_ema, torch.Tensor) or prev_ema.shape != units.shape:
-                            prev_ema = torch.zeros_like(units)
-                        ema_u = units if k == 0 else (beta * prev_ema + (1 - beta) * units)
+                        if self.gnorm_mode == "accumulate":
+                            # Raw accumulation: acc += gnorm each step
+                            prev_acc = state.get("gnorm_acc")
+                            if not isinstance(prev_acc, torch.Tensor) or prev_acc.shape != units.shape:
+                                prev_acc = torch.zeros_like(units)
+                            acc_u = prev_acc + units
+                            state["gnorm_acc"] = acc_u.detach()
+                            # Signal value is the accumulator
+                            signal_u = acc_u
+                        else:
+                            # EMA mode (original)
+                            prev_ema = state.get("gnorm_ema")
+                            if not isinstance(prev_ema, torch.Tensor) or prev_ema.shape != units.shape:
+                                prev_ema = torch.zeros_like(units)
+                            signal_u = units if k == 0 else (beta * prev_ema + (1 - beta) * units)
+                            state["gnorm_ema"] = signal_u.detach()
 
+                        # Max tracking (single-step max, same for both modes)
                         if self.adaptation_scope == "matrix":
                             prev_mat = state.get("gnorm_max_matrix")
                             if not isinstance(prev_mat, torch.Tensor) or prev_mat.numel() != 1:
@@ -363,12 +385,16 @@ class AutoNorMuon(torch.optim.Optimizer):
                             gmax_u = units if k == 0 else torch.maximum(prev_neuron, units)
                             state["gnorm_max_neuron"] = gmax_u.detach()
 
-                        ratio_u = (ema_u / gmax_u.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
+                        # Ratio: accumulate uses k*gmax as denominator, EMA uses gmax
+                        if self.gnorm_mode == "accumulate":
+                            effective_max = gmax_u * max(k + 1, 1)
+                            ratio_u = (signal_u / effective_max.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
+                        else:
+                            ratio_u = (signal_u / gmax_u.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
 
-                        state["gnorm_ema"] = ema_u.detach()
                         state["gnorm_max"] = gmax_u.detach()
 
-                        ema_units.append(ema_u)
+                        ema_units.append(signal_u)
                         gmax_units.append(gmax_u)
                         ratio_units.append(ratio_u)
 

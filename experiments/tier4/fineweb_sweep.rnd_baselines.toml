@@ -30,3 +30,6 @@ init_mode = ["default", "sphere", "ns5"]
 
 # Weight retraction mode (only affects autonormuon, stripped for others)
 autonormuon_weight_mode = ["sphere", "ns5"]
+
+# Gnorm tracking mode (only affects autonormuon)
+autonormuon_gnorm_mode = ["ema", "accumulate"]
