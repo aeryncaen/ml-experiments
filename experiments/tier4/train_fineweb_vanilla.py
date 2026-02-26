@@ -1,8 +1,10 @@
 import glob
+import json
 import math
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -110,6 +112,11 @@ class HParams:
     compile: bool = _env_bool("TORCH_COMPILE", True)
     torch_profile: bool = _env_bool("TORCH_PROFILE", False)
     torch_profile_steps: int = _env_int("TORCH_PROFILE_STEPS", 50)
+    metrics_enabled: bool = _env_bool("METRICS_ENABLED", True)
+    metrics_dir: str = os.environ.get("METRICS_DIR", str(Path(__file__).resolve().parent / "runs"))
+    metrics_run_name: str = os.environ.get("METRICS_RUN_NAME", "")
+    metrics_every: int = _env_int("METRICS_EVERY", 1)
+    metrics_flush_every: int = _env_int("METRICS_FLUSH_EVERY", 20)
 
     # Optimizer selection
     optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | autonormuon | muon_sf | normuon_sf | dion | dion2 | geoadam | geomuon | geonormuon
@@ -205,6 +212,108 @@ def setup_dist():
 def print0(rank: int, s: str):
     if rank == 0:
         print(s, flush=True)
+
+
+def _to_json_scalar(x):
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return x.detach().float().item()
+        return x.detach().float().cpu().tolist()
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    if isinstance(x, (list, tuple)):
+        return [_to_json_scalar(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): _to_json_scalar(v) for k, v in x.items()}
+    return str(x)
+
+
+def _optimizer_group_metrics(optimizer) -> list[dict]:
+    out = []
+    for gi, pg in enumerate(optimizer.param_groups):
+        rec = {
+            "group_idx": gi,
+            "use_muon": bool(pg.get("use_muon", False)),
+        }
+        for k in (
+            "k",
+            "lr",
+            "scheduled_lr",
+            "momentum",
+            "beta2",
+            "weight_decay",
+            "gnorm_ratio",
+            "gnorm_ratio_raw",
+            "gnorm_median",
+            "gnorm_ema",
+            "gnorm_max",
+        ):
+            if k in pg:
+                rec[k] = _to_json_scalar(pg[k])
+        if "betas" in pg:
+            rec["betas"] = [float(pg["betas"][0]), float(pg["betas"][1])]
+        out.append(rec)
+    return out
+
+
+def _open_metrics_run(rank: int, run_base: str, run_name: str, config: dict):
+    if rank != 0:
+        return None
+    base = Path(run_base)
+    base.mkdir(parents=True, exist_ok=True)
+    desired = base / run_name
+    run_dir = desired
+    if run_dir.exists():
+        for i in range(1, 10000):
+            candidate = base / f"{run_name}_{i:03d}"
+            if not candidate.exists():
+                run_dir = candidate
+                break
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = run_dir / "train_events.jsonl"
+    eval_path = run_dir / "eval_events.jsonl"
+    config_path = run_dir / "run_config.json"
+    summary_path = run_dir / "run_summary.json"
+
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(_to_json_scalar(config), f, indent=2)
+
+    return {
+        "run_dir": run_dir,
+        "train_file": train_path.open("w", encoding="utf-8"),
+        "eval_file": eval_path.open("w", encoding="utf-8"),
+        "config_path": config_path,
+        "summary_path": summary_path,
+        "train_path": train_path,
+        "eval_path": eval_path,
+        "pending": 0,
+        "best_val_loss": float("inf"),
+        "best_step": None,
+        "best_tokens_seen": None,
+        "eval_count": 0,
+        "train_count": 0,
+        "last_train": None,
+        "last_eval": None,
+    }
+
+
+def _write_metrics_event(metrics_state, which: str, event: dict, flush_every: int):
+    if metrics_state is None:
+        return
+    fh = metrics_state[f"{which}_file"]
+    fh.write(json.dumps(_to_json_scalar(event), sort_keys=True) + "\n")
+    metrics_state["pending"] += 1
+    if which == "train":
+        metrics_state["train_count"] += 1
+        metrics_state["last_train"] = event
+    else:
+        metrics_state["eval_count"] += 1
+        metrics_state["last_eval"] = event
+    if metrics_state["pending"] >= max(1, flush_every):
+        metrics_state["train_file"].flush()
+        metrics_state["eval_file"].flush()
+        metrics_state["pending"] = 0
 
 
 # Replacement map: token IDs whose byte sequences exceed 16 bytes.
@@ -4558,6 +4667,38 @@ def main():
     _warmup_ramp_start = _warmup_tokens // 4
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
+    _metrics = None
+    if HP.metrics_enabled:
+        _hparams = {f.name: getattr(HP, f.name) for f in HP.__dataclass_fields__.values()}
+        _run_name = HP.metrics_run_name.strip()
+        if not _run_name:
+            _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _run_name = f"{_stamp}_{HP.model_type}_{HP.optimizer}_L{HP.n_layer}_D{HP.d_model}_T{HP.seq_len}"
+        _metrics_cfg = {
+            "hparams": _hparams,
+            "derived": {
+                "rank": rank,
+                "world_size": world_size,
+                "device": str(device),
+                "hostname": os.uname().nodename,
+                "total_tokens": _total_tokens,
+                "warmup_tokens": _warmup_tokens,
+                "warmup_ramp_start_tokens": _warmup_ramp_start,
+                "tokens_per_microbatch": _tok_per_micro,
+                "muon_formula_lr": _muon_formula_lr,
+                "n_residuals": _n_residuals,
+                "n_params": n_params,
+                "weight_mem_mb": _weight_mb,
+                "base_lrs": _base_lrs,
+                "ckpt_enabled": bool(HP.ckpt_dir),
+                "val_every": HP.val_every,
+                "val_steps": HP.val_steps,
+            },
+        }
+        _metrics = _open_metrics_run(rank, HP.metrics_dir, _run_name, _metrics_cfg)
+        if _metrics is not None:
+            print0(rank, f"metrics: writing JSON artifacts to {_metrics['run_dir']}")
+
     # Checkpoint saving
     _ckpt_on = bool(HP.ckpt_dir) and rank == 0
     _best_val_loss = float("inf")
@@ -4566,6 +4707,8 @@ def main():
         print0(rank, f"checkpoints → {HP.ckpt_dir}")
 
     t0 = time.time()
+    _run_start_time = t0
+    _last_step_wall = t0
     tokens_seen = 0
     step = 0
     while tokens_seen <= _total_tokens:
@@ -4580,6 +4723,27 @@ def main():
             if val_per_src is not None:
                 _vps_parts = [f"{n}={v:.4f}" for n, v in val_per_src.items()]
                 print0(rank, f"  val_per_source: {' '.join(_vps_parts)}")
+
+            if _metrics is not None:
+                _eval_event = {
+                    "event": "eval",
+                    "step": step,
+                    "tokens_seen": tokens_seen,
+                    "total_tokens": _total_tokens,
+                    "timestamp": time.time(),
+                    "elapsed_s": time.time() - _run_start_time,
+                    "val_loss": val_loss,
+                    "raw_val_loss": raw_val_loss,
+                    "val_acc": val_acc,
+                    "val_per_source": val_per_src,
+                    "optimizer_groups": _optimizer_group_metrics(optimizer),
+                }
+                _write_metrics_event(_metrics, "eval", _eval_event, HP.metrics_flush_every)
+                if val_loss < _metrics["best_val_loss"]:
+                    _metrics["best_val_loss"] = float(val_loss)
+                    _metrics["best_step"] = int(step)
+                    _metrics["best_tokens_seen"] = int(tokens_seen)
+
             # Save checkpoints (schedule-free already in eval mode — params hold x)
             if _ckpt_on:
                 _ckpt = {
@@ -4708,6 +4872,43 @@ def main():
             _ngpt_normalize_weights(raw_model)
             _ngpt_normalize_pit_memory(raw_model)
 
+        _train_loss_local = float((loss.detach() * _eff_accum).item())
+        _train_acc_local = None
+        if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
+            _train_acc_local = _to_json_scalar(raw_model._last_acc)
+        _phase = "warmup-ramp" if _in_warmup and _in_accum_ramp else ("warmup" if _in_warmup else "stable")
+
+        if _metrics is not None and step % max(1, HP.metrics_every) == 0:
+            _now = time.time()
+            _elapsed = _now - _run_start_time
+            _step_wall = _now - _last_step_wall
+            _tokens_per_sec = tokens_seen / max(_elapsed, 1e-12)
+            _train_event = {
+                "event": "train",
+                "step": step,
+                "tokens_seen": tokens_seen,
+                "total_tokens": _total_tokens,
+                "timestamp": _now,
+                "elapsed_s": _elapsed,
+                "step_wall_s": _step_wall,
+                "throughput_tok_s": _tokens_per_sec,
+                "phase": _phase,
+                "in_warmup": _in_warmup,
+                "in_accum_ramp": _in_accum_ramp,
+                "eff_accum": _eff_accum,
+                "lr": _to_json_scalar(lr),
+                "grad_norm": _to_json_scalar(grad_norm),
+                "train_loss": _train_loss_local,
+                "train_acc": _train_acc_local,
+                "raw_ch_loss": (_ch_std_loss_sum / max(1, _eff_accum)) if _ch_active else None,
+                "ch_source_losses": _ch_source_losses.detach().float().cpu().tolist() if _ch_active else None,
+                "ch_weights": _ch_weights.detach().float().cpu().tolist() if _ch_active else None,
+                "optimizer_groups": _optimizer_group_metrics(optimizer),
+            }
+            _write_metrics_event(_metrics, "train", _train_event, HP.metrics_flush_every)
+
+        _last_step_wall = time.time()
+
         if step % 20 == 0:
             loss_t = loss.detach() * _eff_accum
             if world_size > 1:
@@ -4716,10 +4917,6 @@ def main():
             _train_acc_str = ""
             if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
                 _train_acc_str = f" | train_acc {float(raw_model._last_acc):.4f}"
-            if _in_warmup:
-                _phase = "warmup-ramp" if _in_accum_ramp else "warmup"
-            else:
-                _phase = "stable"
             _ch_raw_str = ""
             if _ch_active:
                 _ch_raw_str = f" | raw_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
@@ -4740,6 +4937,34 @@ def main():
                     print("\n=== Torch Profile: CUDA Memory ===", flush=True)
                     print(profiler.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=40), flush=True)
                 profiler = None
+
+    if _metrics is not None:
+        _metrics["train_file"].flush()
+        _metrics["eval_file"].flush()
+        _summary = {
+            "run_dir": str(_metrics["run_dir"]),
+            "config_path": str(_metrics["config_path"]),
+            "train_events_path": str(_metrics["train_path"]),
+            "eval_events_path": str(_metrics["eval_path"]),
+            "started_at": datetime.fromtimestamp(_run_start_time).isoformat(),
+            "finished_at": datetime.now().isoformat(),
+            "elapsed_s": time.time() - _run_start_time,
+            "tokens_seen": int(tokens_seen),
+            "total_tokens": int(_total_tokens),
+            "steps_completed": int(step),
+            "train_event_count": int(_metrics["train_count"]),
+            "eval_event_count": int(_metrics["eval_count"]),
+            "best_val_loss": _metrics["best_val_loss"],
+            "best_step": _metrics["best_step"],
+            "best_tokens_seen": _metrics["best_tokens_seen"],
+            "last_train": _metrics["last_train"],
+            "last_eval": _metrics["last_eval"],
+        }
+        with _metrics["summary_path"].open("w", encoding="utf-8") as f:
+            json.dump(_to_json_scalar(_summary), f, indent=2)
+        _metrics["train_file"].close()
+        _metrics["eval_file"].close()
+        print0(rank, f"metrics summary: {_metrics['summary_path']}")
 
     if world_size > 1:
         dist.barrier()
