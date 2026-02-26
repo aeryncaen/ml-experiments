@@ -27,3 +27,6 @@ muon_lr = [0.023]
 
 # Test all optimizers with different weight init modes
 init_mode = ["default", "sphere", "ns5"]
+
+# Weight retraction mode (only affects autonormuon, stripped for others)
+autonormuon_weight_mode = ["sphere", "ns5"]

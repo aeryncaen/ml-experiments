@@ -195,6 +195,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                  adaptation_scope="neuron",
                  grad_schedule="off",
                  weight_schedule="always",
+                 weight_mode="sphere",
                  ratio_pow=1.0,
                  min_ratio=0.0):
         if adaptation_scope not in ("neuron", "matrix"):
@@ -225,9 +226,13 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["signal_ratio"] = None
             group["lr_mult"] = None
 
+        if weight_mode not in ("sphere", "ns5"):
+            raise ValueError(f"Unsupported weight_mode={weight_mode!r}; expected 'sphere' | 'ns5'")
+
         self.total_steps = total_steps
         self.gnorm_beta = beta
         self.adaptation_scope = adaptation_scope
+        self.weight_mode = weight_mode
         self.ratio_pow = ratio_pow
         self.min_ratio = min_ratio
 
@@ -417,13 +422,16 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                         p.sub_(update)
 
-                        # Retract weight rows to unit sphere
+                        # Retract weights (sphere = unit row norm, ns5 = orthogonalize)
                         if self._weight_gate > 0:
-                            p_normed = p / p.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                            if self._weight_gate >= 1.0:
-                                p.copy_(p_normed)
+                            if self.weight_mode == "ns5":
+                                p_target = zeropower_via_newtonschulz5(p.float(), steps=5).to(p.dtype)
                             else:
-                                p.lerp_(p_normed, self._weight_gate)
+                                p_target = p / p.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                            if self._weight_gate >= 1.0:
+                                p.copy_(p_target)
+                            else:
+                                p.lerp_(p_target, self._weight_gate)
 
                     # --- Group logging ---
                     group["gnorm_mean"] = mean_t.detach()

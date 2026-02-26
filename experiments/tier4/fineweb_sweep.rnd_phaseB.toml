@@ -31,6 +31,9 @@ muon_lr = [0.023]
 # Grad norm OFF — isolate weight effect.
 autonormuon_grad_schedule = ["off"]
 
+# Weight retraction mode: row-norm (sphere) vs orthogonalization (ns5)
+autonormuon_weight_mode = ["sphere", "ns5"]
+
 # Weight schedule ablation — both directions:
 autonormuon_weight_schedule = [
     "off",

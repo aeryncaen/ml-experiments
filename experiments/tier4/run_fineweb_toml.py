@@ -72,6 +72,13 @@ def _hash_view(hparams: dict) -> dict:
         out.pop(k, None)
 
     # init_mode defaults to "default" for hash stability with pre-existing runs.
+    # Normalize old sphere_init bool to init_mode string.
+    si = out.pop("sphere_init", None)
+    if si is not None and "init_mode" not in out:
+        if si is True or (isinstance(si, str) and si.lower() in ("1", "true", "yes")):
+            out["init_mode"] = "sphere"
+        else:
+            out["init_mode"] = "default"
     out.setdefault("init_mode", "default")
 
     # Autonormuon knobs are irrelevant for other optimizers.
@@ -85,6 +92,7 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_adaptation_scope", "neuron")
         out.setdefault("autonormuon_grad_schedule", "off")
         out.setdefault("autonormuon_weight_schedule", "always")
+        out.setdefault("autonormuon_weight_mode", "sphere")
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
         out = _canonical_autonormuon(out)
@@ -133,6 +141,7 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_adaptation_scope", None)
         out.pop("autonormuon_grad_schedule", None)
         out.pop("autonormuon_weight_schedule", None)
+        out.pop("autonormuon_weight_mode", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
     else:
