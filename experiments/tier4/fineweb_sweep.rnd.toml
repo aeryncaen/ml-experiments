@@ -6,9 +6,9 @@ skip_existing = true
 continue_on_error = true
 
 [base]
-# ~80M tokens with defaults: 611 * 32 * 1 * 4096 = 80,084,992
+# ~20M tokens with defaults: 611 * 8 * 1 * 4096 = 20,021,248
 train_steps = 611
-batch_size = 32
+batch_size = 8
 grad_accum = 1
 seq_len = 4096
 
