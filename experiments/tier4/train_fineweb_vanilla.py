@@ -299,7 +299,6 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "gnorm_std",
             "ratio_gnorm",
             "grad_gate",
-            "weight_gate",
             "loss_ema",
             "random_loss_ref",
             "raw_grad_row_norm_mean",

@@ -119,9 +119,10 @@ class AutoNorMuon(torch.optim.Optimizer):
             "grad_pre_ortho"       — normalize raw grad rows before momentum/NS5
             "grad_post_ortho"      — normalize post-ortho update rows after NS5
             "weights+grad_pre"     — both: normalize grad rows pre-ortho AND W rows after step
-            "anneal"               — loss-driven smooth gate: near random loss →
-                                     heavy grad normalization, light weight retraction;
-                                     far from random → light grad norm, heavy weight retraction.
+            "anneal"               — weights ALWAYS retracted (100%); grad normalization
+                                     gated by perplexity ratio = exp(loss_ema - loss_ref).
+                                     At init (ppl_ratio≈1) grads fully normalized; as loss
+                                     drops the grad norm fades to zero.
                                      Requires set_train_loss() call before each step().
             "off"                  — no normalization
             True                   — same as "weights" (backward compat)
@@ -129,10 +130,10 @@ class AutoNorMuon(torch.optim.Optimizer):
             Grad modes normalize before gnorm tracking sees the norms.
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
-        anneal_power: shape of the anneal gate curve (only used with retract="anneal"):
-            1.0 = linear (equal transition across loss range)
-            >1  = grad normalization drops off faster (favors weight retraction earlier)
-            <1  = grad normalization persists longer into training
+        anneal_power: exponent on perplexity ratio for grad gate (only retract="anneal"):
+            1.0 = gate tracks raw perplexity ratio (exponential decay)
+            >1  = grad normalization drops off faster
+            <1  = grad normalization persists longer
     """
     def __init__(self, param_groups, total_steps,
                  beta=0.55,
@@ -180,12 +181,11 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.ratio_pow = ratio_pow
         self.min_ratio = min_ratio
 
-        # Anneal gate state
+        # Anneal gate state (grad normalization strength; weights always retracted)
         self.anneal_power = anneal_power
         self._random_loss_ref = None   # captured from first set_train_loss call
         self._loss_ema = None          # smoothed loss for gate (avoids step-to-step noise)
-        self._grad_gate = 0.0          # current grad normalization strength [0, 1]
-        self._weight_gate = 1.0        # current weight retraction strength [0, 1]
+        self._grad_gate = 1.0          # current grad normalization strength [0, 1]
 
         super().__init__(param_groups, dict())
 
@@ -208,9 +208,7 @@ class AutoNorMuon(torch.optim.Optimizer):
 
         # Perplexity ratio: exp(ema - ref). When ema == ref → 1.0; as loss drops → 0.
         ppl_ratio = min(math.exp(self._loss_ema - self._random_loss_ref), 1.0)
-        shaped = ppl_ratio ** self.anneal_power  # power > 1 favors weights earlier
-        self._grad_gate = shaped           # 1.0 at random, → 0 as loss drops
-        self._weight_gate = 1.0 - shaped   # 0.0 at random, → 1 as loss drops
+        self._grad_gate = ppl_ratio ** self.anneal_power  # 1.0 at random, → 0 as loss drops
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -376,11 +374,8 @@ class AutoNorMuon(torch.optim.Optimizer):
                         p.sub_(update)
 
                         # Normalize weight rows to unit norm after step
-                        if self.retract in ("weights", "weights+grad_pre"):
+                        if self.retract in ("weights", "weights+grad_pre", "anneal"):
                             p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-                        elif self.retract == "anneal" and self._weight_gate > 0:
-                            p_normed = p / p.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                            p.lerp_(p_normed, self._weight_gate)
 
                     # --- Group logging ---
                     group["gnorm_mean"] = mean_t.detach()
@@ -409,7 +404,6 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["ratio_gnorm"] = _safe_item(ratio_gnorm_t)
                         # Anneal gate diagnostics
                         group["grad_gate"] = self._grad_gate
-                        group["weight_gate"] = self._weight_gate
                         group["loss_ema"] = self._loss_ema if self._loss_ema is not None else 0.0
                         group["random_loss_ref"] = self._random_loss_ref if self._random_loss_ref is not None else 0.0
                         if grad_row_norm_count > 0:
