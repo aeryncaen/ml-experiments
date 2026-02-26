@@ -124,7 +124,7 @@ class HParams:
     metrics_flush_every: int = _env_int("METRICS_FLUSH_EVERY", 20)
 
     # Optimizer selection
-    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | autonormuon | muon_sf | normuon_sf | dion | dion2 | geoadam | geomuon | geonormuon
+    optimizer: str = os.environ.get("OPTIMIZER", "adamw")  # adamw | muon | normuon | autonormuon | orion | muon_sf | normuon_sf | dion | dion2 | geoadam | geomuon | geonormuon
     muon_lr: float = _env_float("MUON_LR", 0.0)            # Muon/NorMuon LR for hidden 2D weights; 0 = auto (0.1/sqrt(2*n_layer))
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
@@ -4539,7 +4539,7 @@ def main():
     # Build optimizer param groups before compile/DDP wrap
     _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
     _wd = 0.0 if _is_ngpt else HP.weight_decay
-    _muon_like_opts = ("muon", "normuon", "autonormuon", "muon_sf", "normuon_sf")
+    _muon_like_opts = ("muon", "normuon", "autonormuon", "orion", "muon_sf", "normuon_sf")
     _n_residuals = HP.n_layer * 2
     _muon_formula_lr = 0.1 / math.sqrt(_n_residuals)
     # Names that identify embedding/head params (should not get Muon-style whitening)
@@ -4680,6 +4680,9 @@ def main():
     elif HP.optimizer == "muon":
         from muon import SingleDeviceMuonWithAuxAdam
         optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+    elif HP.optimizer == "orion":
+        from orion import SingleDeviceOrionWithAuxAdam
+        optimizer = SingleDeviceOrionWithAuxAdam(param_groups)
     elif HP.optimizer == "normuon":
         from normuon import SingleDeviceNorMuonWithAuxAdam
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
