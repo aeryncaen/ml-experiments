@@ -235,28 +235,41 @@ def _eval_milestones(eval_events: list[dict]) -> dict:
         )
     if not vals:
         return {
+            "start_eval_loss": None,
             "first_eval_loss": None,
             "mid_eval_loss": None,
             "last_eval_loss": None,
+            "start_eval_step": None,
             "first_eval_step": None,
             "mid_eval_step": None,
             "last_eval_step": None,
+            "start_eval_tokens": None,
             "first_eval_tokens": None,
             "mid_eval_tokens": None,
             "last_eval_tokens": None,
         }
 
-    mid_i = (len(vals) - 1) // 2
-    first = vals[0]
-    mid = vals[mid_i]
-    last = vals[-1]
+    # "start" = eval at step 0 (random-init quality).
+    start = vals[0]
+
+    # "first/mid/last" should describe training behavior, so skip step-0 eval.
+    trained = [v for v in vals if ((v.get("step") or 0) > 0) or ((v.get("tokens") or 0) > 0)]
+    core = trained if trained else vals
+
+    mid_i = (len(core) - 1) // 2
+    first = core[0]
+    mid = core[mid_i]
+    last = core[-1]
     return {
+        "start_eval_loss": start["loss"],
         "first_eval_loss": first["loss"],
         "mid_eval_loss": mid["loss"],
         "last_eval_loss": last["loss"],
+        "start_eval_step": start["step"],
         "first_eval_step": first["step"],
         "mid_eval_step": mid["step"],
         "last_eval_step": last["step"],
+        "start_eval_tokens": start["tokens"],
         "first_eval_tokens": first["tokens"],
         "mid_eval_tokens": mid["tokens"],
         "last_eval_tokens": last["tokens"],
@@ -509,12 +522,15 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "d_model": _as_int(hparams.get("d_model")),
         "best_val_loss": best_val,
         "final_val_loss": final_val,
+        "start_eval_loss": eval_ms["start_eval_loss"],
         "first_eval_loss": eval_ms["first_eval_loss"],
         "mid_eval_loss": eval_ms["mid_eval_loss"],
         "last_eval_loss": eval_ms["last_eval_loss"],
+        "start_eval_step": eval_ms["start_eval_step"],
         "first_eval_step": eval_ms["first_eval_step"],
         "mid_eval_step": eval_ms["mid_eval_step"],
         "last_eval_step": eval_ms["last_eval_step"],
+        "start_eval_tokens": eval_ms["start_eval_tokens"],
         "first_eval_tokens": eval_ms["first_eval_tokens"],
         "mid_eval_tokens": eval_ms["mid_eval_tokens"],
         "last_eval_tokens": eval_ms["last_eval_tokens"],

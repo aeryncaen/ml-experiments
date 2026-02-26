@@ -178,6 +178,7 @@ def main() -> None:
     existing_hashes = _scan_existing_hashes(metrics_dir)
 
     report_runs: list[dict] = []
+    counts_by_opt: dict[str, dict[str, int]] = {}
     for i, overrides in enumerate(combos, start=1):
         if not isinstance(overrides, dict):
             continue
@@ -208,12 +209,20 @@ def main() -> None:
         rec = {
             "index": i,
             "run_name": run_name,
+            "optimizer": str(hp.get("optimizer", "")),
             "config_hash": cfg_hash,
             "status": status,
             "skip_reason": skip_reason,
             "overrides": ov,
         }
         report_runs.append(rec)
+        _opt = rec["optimizer"] or "unknown"
+        counts_by_opt.setdefault(_opt, {"planned": 0, "skipped": 0, "run": 0, "ok": 0, "error": 0})
+        counts_by_opt[_opt]["planned"] += 1
+        if status == "skipped":
+            counts_by_opt[_opt]["skipped"] += 1
+        else:
+            counts_by_opt[_opt]["run"] += 1
 
         if status == "skipped" or args.dry_run:
             print(f"[{status}] {run_name} {skip_reason}")
@@ -224,9 +233,11 @@ def main() -> None:
             trainer.run_training(ov)
             rec["status"] = "ok"
             rec["run_dir"] = str(metrics_dir / run_name)
+            counts_by_opt[_opt]["ok"] += 1
         except Exception as e:
             rec["status"] = "error"
             rec["error"] = str(e)
+            counts_by_opt[_opt]["error"] += 1
             if not continue_on_error:
                 raise
         finally:
@@ -248,10 +259,17 @@ def main() -> None:
         "continue_on_error": continue_on_error,
         "dry_run": args.dry_run,
         "n_planned": len(combos),
+        "counts_by_optimizer": counts_by_opt,
         "runs": report_runs,
     }
     out_path = metrics_dir / f"{run_prefix}_toml_sweep_summary.json"
     out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print("Plan/Result summary by optimizer:")
+    for opt in sorted(counts_by_opt):
+        c = counts_by_opt[opt]
+        print(
+            f"  {opt}: planned={c['planned']} skipped={c['skipped']} run={c['run']} ok={c['ok']} error={c['error']}"
+        )
     print(f"Wrote summary: {out_path}")
 
 
