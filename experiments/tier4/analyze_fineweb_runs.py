@@ -202,6 +202,13 @@ def _pearson(x: list[float], y: list[float]) -> float | None:
     return num / den
 
 
+def _metric_good_sign(metric: str) -> float:
+    m = (metric or "").lower()
+    # Lower-is-better metrics should flip sign so positive means "good".
+    lower_better_tokens = ("loss", "error", "latency", "time", "wer", "ppl", "perplex")
+    return -1.0 if any(tok in m for tok in lower_better_tokens) else 1.0
+
+
 def _is_scalar_option(v) -> bool:
     return isinstance(v, (str, int, float, bool)) or v is None
 
@@ -510,6 +517,7 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "adapt_mode": adapt_mode,
         "lr_scope": hparams.get("autonormuon_lr_scope") if optimizer == "autonormuon" else None,
         "gnorm_source": hparams.get("autonormuon_gnorm_source") if optimizer == "autonormuon" else None,
+        "gnorm_scope": hparams.get("autonormuon_gnorm_scope") if optimizer == "autonormuon" else None,
         "gmax_scope": hparams.get("autonormuon_gmax_scope") if optimizer == "autonormuon" else None,
         "second_moment_mode": hparams.get("autonormuon_second_moment_mode") if optimizer == "autonormuon" else None,
         "seed": _as_int(hparams.get("seed")),
@@ -688,18 +696,74 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
                 ym = r.get(m)
                 y_map[m].append(float(ym) if isinstance(ym, (int, float)) and math.isfinite(float(ym)) else float("nan"))
 
-        corrs = {}
+        direct_corrs = {}
         if numeric_ok and len(num_x) >= 3:
             for m in metrics:
                 pairs = [(x, y) for x, y in zip(num_x, y_map[m]) if math.isfinite(y)]
                 if len(pairs) >= 3:
                     xx, yy = zip(*pairs)
-                    corrs[m] = _pearson(list(xx), list(yy))
+                    direct_corrs[m] = _pearson(list(xx), list(yy))
                 else:
-                    corrs[m] = None
+                    direct_corrs[m] = None
         else:
             for m in metrics:
-                corrs[m] = None
+                direct_corrs[m] = None
+
+        # One-vs-rest value correlation for ALL option types (including strings)
+        # Positive corr => option value tends to increase loss; negative => tends to decrease loss.
+        value_corrs: dict[str, list[dict]] = {m: [] for m in metrics}
+        for v in sorted(by_val.keys()):
+            for m in metrics:
+                xx = []
+                yy = []
+                for r in rows:
+                    opts = r.get("option_values")
+                    if not isinstance(opts, dict) or key not in opts:
+                        continue
+                    cur = opts.get(key)
+                    if cur is None:
+                        continue
+                    ym = r.get(m)
+                    if not (isinstance(ym, (int, float)) and math.isfinite(float(ym))):
+                        continue
+                    xx.append(1.0 if str(cur) == v else 0.0)
+                    yy.append(float(ym))
+
+                corr_v = None
+                if len(xx) >= 3 and min(xx) < max(xx):
+                    corr_v = _pearson(xx, yy)
+
+                value_corrs[m].append(
+                    {
+                        "value": v,
+                        "corr": corr_v,
+                        "n": len(yy),
+                        "n_value": int(sum(xx)),
+                    }
+                )
+
+        # Single summary corr per option/metric:
+        # - numeric options: direct pearson(option_value, metric)
+        # - categorical options: strongest (max |corr|) one-vs-rest value corr
+        corrs = {}
+        good_corrs = {}
+        for m in metrics:
+            dc = direct_corrs.get(m)
+            if isinstance(dc, (int, float)) and math.isfinite(float(dc)):
+                corrs[m] = float(dc)
+                good_corrs[m] = _metric_good_sign(m) * float(dc)
+                continue
+
+            best_abs_corr = None
+            for rec in value_corrs.get(m, []):
+                c = rec.get("corr")
+                if not (isinstance(c, (int, float)) and math.isfinite(float(c))):
+                    continue
+                c = float(c)
+                if best_abs_corr is None or abs(c) > abs(best_abs_corr):
+                    best_abs_corr = c
+            corrs[m] = best_abs_corr
+            good_corrs[m] = (_metric_good_sign(m) * best_abs_corr) if isinstance(best_abs_corr, (int, float)) else None
 
         score = 0.0
         for m in metrics:
@@ -716,6 +780,9 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
                 "losers": losers,
                 "spreads": spreads,
                 "correlations": corrs,
+                "good_correlations": good_corrs,
+                "direct_correlations": direct_corrs,
+                "value_correlations": value_corrs,
                 "by_value": value_stats,
                 "impact_score": score,
             }
@@ -729,15 +796,35 @@ def _corr_rankings(option_effects: list[dict], metrics: list[str], top_k: int) -
     out = {}
     k = max(1, int(top_k))
     for m in metrics:
+        good_sign = _metric_good_sign(m)
         vals = []
         for e in option_effects:
-            c = e.get("correlations", {}).get(m) if isinstance(e.get("correlations"), dict) else None
-            if isinstance(c, (int, float)) and math.isfinite(float(c)):
-                vals.append((e.get("option"), float(c)))
-        vals.sort(key=lambda x: x[1])
-        anti = [{"option": o, "corr": c} for o, c in vals[:k]]
-        corr = [{"option": o, "corr": c} for o, c in vals[-k:]][::-1]
-        out[m] = {"correlated": corr, "anticorrelated": anti}
+            vc = e.get("value_correlations", {}).get(m) if isinstance(e.get("value_correlations"), dict) else None
+            if not isinstance(vc, list):
+                continue
+            for rec in vc:
+                c = rec.get("corr") if isinstance(rec, dict) else None
+                if isinstance(c, (int, float)) and math.isfinite(float(c)):
+                    c_raw = float(c)
+                    vals.append(
+                        {
+                            "option": e.get("option"),
+                            "value": rec.get("value"),
+                            "corr": good_sign * c_raw,
+                            "corr_raw": c_raw,
+                            "n": rec.get("n"),
+                            "n_value": rec.get("n_value"),
+                        }
+                    )
+
+        vals.sort(key=lambda x: x.get("corr", 0.0))
+        anti = vals[:k]
+        corr = vals[-k:][::-1]
+        out[m] = {
+            "objective": "minimize" if good_sign < 0 else "maximize",
+            "correlated": corr,
+            "anticorrelated": anti,
+        }
     return out
 
 
@@ -853,8 +940,8 @@ def _markdown(
             "",
             "## Option Effects (First/Mid/Last Eval)",
             "",
-            "| Option | Best@First | Worst@First | Best@Mid | Worst@Mid | Best@Last | Worst@Last | Spread@First | Spread@Mid | Spread@Last | Corr@First | Corr@Mid | Corr@Last |",
-            "|--------|------------|-------------|----------|-----------|-----------|------------|--------------|------------|-------------|------------|----------|-----------|",
+            "| Option | Best@First | Worst@First | Best@Mid | Worst@Mid | Best@Last | Worst@Last | Spread@First | Spread@Mid | Spread@Last | CorrRaw@First | CorrRaw@Mid | CorrRaw@Last |",
+            "|--------|------------|-------------|----------|-----------|-----------|------------|--------------|------------|-------------|--------------|------------|-------------|",
         ]
         for e in option_effects:
             w = e.get("winners", {})
@@ -871,23 +958,32 @@ def _markdown(
     if corr_rankings:
         lines += [
             "",
-            "## Correlation vs Anti-Correlation (Numeric Options)",
+            "## Correlation vs Anti-Correlation (Good-Oriented)",
             "",
         ]
         for metric in ("first_eval_loss", "mid_eval_loss", "last_eval_loss"):
             block = corr_rankings.get(metric, {}) if isinstance(corr_rankings, dict) else {}
             corr = block.get("correlated", []) if isinstance(block, dict) else []
             anti = block.get("anticorrelated", []) if isinstance(block, dict) else []
+            objective = block.get("objective") if isinstance(block, dict) else None
             lines += [
                 f"### {metric}",
                 "",
-                "| Direction | Option | Corr |",
-                "|-----------|--------|------|",
+                f"Metric objective: {objective or '-'} (positive Corr(good) means better)",
+                "",
+                "| Direction | Option | Value | Corr(good) | Corr(raw) | N | N(value) |",
+                "|-----------|--------|-------|------------|-----------|---|----------|",
             ]
             for r in corr:
-                lines.append(f"| correlated | {r.get('option')} | {_fmt(r.get('corr'))} |")
+                lines.append(
+                    "| "
+                    f"correlated | {r.get('option')} | {r.get('value')} | {_fmt(r.get('corr'))} | {_fmt(r.get('corr_raw'))} | {_fmt(r.get('n'), nd=0)} | {_fmt(r.get('n_value'), nd=0)} |"
+                )
             for r in anti:
-                lines.append(f"| anticorrelated | {r.get('option')} | {_fmt(r.get('corr'))} |")
+                lines.append(
+                    "| "
+                    f"anticorrelated | {r.get('option')} | {r.get('value')} | {_fmt(r.get('corr'))} | {_fmt(r.get('corr_raw'))} | {_fmt(r.get('n'), nd=0)} | {_fmt(r.get('n_value'), nd=0)} |"
+                )
             lines.append("")
 
     auto_rows = [r for r in rows if r.get("optimizer") == "autonormuon" and isinstance(r.get("autonormuon_diag"), dict)]
@@ -952,7 +1048,7 @@ def main() -> None:
     ap.add_argument(
         "--group-by",
         type=str,
-        default="optimizer,adapt_mode,lr_scope,gnorm_source,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
+        default="optimizer,adapt_mode,lr_scope,gnorm_source,gnorm_scope,gmax_scope,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
     ap.add_argument(

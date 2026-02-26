@@ -134,10 +134,11 @@ class HParams:
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
     autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
-    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "matrix")  # matrix | group
+    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "matrix")  # matrix | group | neuron
     autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
-    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "global")  # global | matrix
-    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "row_mean")  # row_mean | matrix_mean_square | matrix_norm_square
+    autonormuon_gnorm_scope: str = os.environ.get("AUTONORMUON_GNORM_SCOPE", "matrix")  # matrix | neuron
+    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "global")  # global | matrix | neuron
+    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "row_mean")  # none | row_mean | matrix_mean_square | matrix_norm_square
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -296,6 +297,7 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "adapt_mode",
             "lr_scope",
             "gnorm_source",
+            "gnorm_scope",
             "gmax_scope",
             "second_moment_mode",
             "gnorm_ratio",
@@ -4673,6 +4675,7 @@ def main():
             conflict_proj=HP.autonormuon_conflict_proj,
             lr_scope=HP.autonormuon_lr_scope,
             gnorm_source=HP.autonormuon_gnorm_source,
+            gnorm_scope=HP.autonormuon_gnorm_scope,
             gmax_scope=HP.autonormuon_gmax_scope,
             second_moment_mode=HP.autonormuon_second_moment_mode,
         )
@@ -4682,7 +4685,7 @@ def main():
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
             f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj} "
             f"lr_scope={HP.autonormuon_lr_scope} gnorm_source={HP.autonormuon_gnorm_source} "
-            f"gmax_scope={HP.autonormuon_gmax_scope} "
+            f"gnorm_scope={HP.autonormuon_gnorm_scope} gmax_scope={HP.autonormuon_gmax_scope} "
             f"second_moment_mode={HP.autonormuon_second_moment_mode}"
         ))
     elif HP.optimizer == "muon_sf":

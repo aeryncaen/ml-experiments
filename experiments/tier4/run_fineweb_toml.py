@@ -82,6 +82,7 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_conflict_proj", False)
         out.setdefault("autonormuon_lr_scope", "matrix")
         out.setdefault("autonormuon_gnorm_source", "grad")
+        out.setdefault("autonormuon_gnorm_scope", "matrix")
         out.setdefault("autonormuon_second_moment_mode", "row_mean")
 
         # Important: runs created before gmax-scope was introduced used matrix-
@@ -140,6 +141,7 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_conflict_proj", None)
         out.pop("autonormuon_lr_scope", None)
         out.pop("autonormuon_gnorm_source", None)
+        out.pop("autonormuon_gnorm_scope", None)
         out.pop("autonormuon_gmax_scope", None)
         out.pop("autonormuon_second_moment_mode", None)
     return out

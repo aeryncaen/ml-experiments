@@ -6,11 +6,11 @@ skip_existing = true
 continue_on_error = true
 
 [base]
-# ~10M tokens with defaults: 611 * 8 * 1 * 2048 = 10,010,624
+# ~80M tokens with defaults: 611 * 32 * 1 * 4096 = 80,084,992
 train_steps = 611
-batch_size = 8
+batch_size = 32
 grad_accum = 1
-seq_len = 2048
+seq_len = 4096
 
 # keep trainer logging dense for analysis
 metrics_every = 1
@@ -27,13 +27,14 @@ seed = [1, 2, 3]
 # AutoNorMuon-only knobs; ignored for non-autonormuon optimizers by runner normalization.
 # Focused gnorm debugging grid + interaction ablations.
 autonormuon_adapt_mode = ["gnorm"]
-autonormuon_gnorm_beta = [0.9]
+autonormuon_gnorm_beta = [0.85, 0.9, 0.95, 0.98, 0.99]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
 autonormuon_var_eps = [1.0e-12]
-# Keep conflict projection off for this pass (true mode is slower and underperforming).
+# Hard-pruned from search space: conflict_proj=true, gnorm_source=grad, gmax_scope=global
 autonormuon_conflict_proj = [false]
-autonormuon_lr_scope = ["matrix", "group"]
-autonormuon_gnorm_source = ["grad", "post_ortho"]
-autonormuon_gmax_scope = ["global", "matrix"]
-autonormuon_second_moment_mode = ["row_mean", "matrix_mean_square", "matrix_norm_square"]
+autonormuon_lr_scope = ["matrix", "group", "neuron"]
+autonormuon_gnorm_source = ["post_ortho"]
+autonormuon_gnorm_scope = ["matrix", "neuron"]
+autonormuon_gmax_scope = ["matrix", "neuron"]
+autonormuon_second_moment_mode = ["none", "row_mean", "matrix_mean_square", "matrix_norm_square"]
