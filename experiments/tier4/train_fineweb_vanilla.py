@@ -318,26 +318,26 @@ def _open_metrics_run(rank: int, run_base: str, run_name: str, config: dict):
         return None
     base = Path(run_base)
     base.mkdir(parents=True, exist_ok=True)
-    desired = base / run_name
-    run_dir = desired
-    if run_dir.exists():
-        for i in range(1, 10000):
-            candidate = base / f"{run_name}_{i:03d}"
-            if not candidate.exists():
-                run_dir = candidate
-                break
-    run_dir.mkdir(parents=True, exist_ok=True)
+    final_dir = base / run_name
+    # Write to a temp dir during training; atomic rename on success.
+    # If we crash or get killed, the _tmp dir won't match skip_existing checks.
+    tmp_dir = base / f".{run_name}_tmp"
+    if tmp_dir.exists():
+        import shutil
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    train_path = run_dir / "train_events.jsonl"
-    eval_path = run_dir / "eval_events.jsonl"
-    config_path = run_dir / "run_config.json"
-    summary_path = run_dir / "run_summary.json"
+    train_path = tmp_dir / "train_events.jsonl"
+    eval_path = tmp_dir / "eval_events.jsonl"
+    config_path = tmp_dir / "run_config.json"
+    summary_path = tmp_dir / "run_summary.json"
 
     with config_path.open("w", encoding="utf-8") as f:
         json.dump(_to_json_scalar(config), f, indent=2)
 
     return {
-        "run_dir": run_dir,
+        "run_dir": tmp_dir,
+        "final_dir": final_dir,
         "train_file": train_path.open("w", encoding="utf-8"),
         "eval_file": eval_path.open("w", encoding="utf-8"),
         "config_path": config_path,
@@ -353,6 +353,25 @@ def _open_metrics_run(rank: int, run_base: str, run_name: str, config: dict):
         "last_train": None,
         "last_eval": None,
     }
+
+
+def _finalize_metrics_run(metrics_state):
+    """Atomic rename from temp dir to final dir. Called only on successful completion."""
+    if metrics_state is None:
+        return
+    metrics_state["train_file"].close()
+    metrics_state["eval_file"].close()
+    tmp_dir = metrics_state["run_dir"]
+    final_dir = metrics_state["final_dir"]
+    if final_dir.exists():
+        # Collision — append suffix
+        for i in range(1, 10000):
+            candidate = final_dir.parent / f"{final_dir.name}_{i:03d}"
+            if not candidate.exists():
+                final_dir = candidate
+                break
+    tmp_dir.rename(final_dir)
+    metrics_state["run_dir"] = final_dir
 
 
 def _write_metrics_event(metrics_state, which: str, event: dict, flush_every: int):
