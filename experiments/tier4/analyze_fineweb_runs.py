@@ -623,6 +623,7 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
         value_stats = {}
         spreads = {}
         winners = {}
+        losers = {}
         for m in metrics:
             means = []
             for v, rs in by_val.items():
@@ -643,9 +644,11 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
             if means:
                 means.sort(key=lambda x: x[1])
                 winners[m] = means[0][0]
+                losers[m] = means[-1][0]
                 spreads[m] = means[-1][1] - means[0][1] if len(means) > 1 else 0.0
             else:
                 winners[m] = None
+                losers[m] = None
                 spreads[m] = None
 
         # Numeric correlation against each metric if option is numeric-ish
@@ -694,6 +697,7 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
                 "n_values": len(by_val),
                 "n_runs": sum(len(v) for v in by_val.values()),
                 "winners": winners,
+                "losers": losers,
                 "spreads": spreads,
                 "correlations": corrs,
                 "by_value": value_stats,
@@ -703,6 +707,22 @@ def _option_effects(rows: list[dict], option_keys: list[str], metrics: list[str]
 
     effects.sort(key=lambda e: e.get("impact_score", 0.0), reverse=True)
     return effects
+
+
+def _corr_rankings(option_effects: list[dict], metrics: list[str], top_k: int) -> dict:
+    out = {}
+    k = max(1, int(top_k))
+    for m in metrics:
+        vals = []
+        for e in option_effects:
+            c = e.get("correlations", {}).get(m) if isinstance(e.get("correlations"), dict) else None
+            if isinstance(c, (int, float)) and math.isfinite(float(c)):
+                vals.append((e.get("option"), float(c)))
+        vals.sort(key=lambda x: x[1])
+        anti = [{"option": o, "corr": c} for o, c in vals[:k]]
+        corr = [{"option": o, "corr": c} for o, c in vals[-k:]][::-1]
+        out[m] = {"correlated": corr, "anticorrelated": anti}
+    return out
 
 
 def _milestone_leaders(rows: list[dict]) -> dict:
@@ -742,7 +762,14 @@ def _select_option_keys(rows: list[dict], option_keys_arg: str, exclude_keys: se
     return keys
 
 
-def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str], option_effects: list[dict], milestone_leaders: dict) -> str:
+def _markdown(
+    rows: list[dict],
+    groups: list[dict],
+    group_fields: list[str],
+    option_effects: list[dict],
+    milestone_leaders: dict,
+    corr_rankings: dict,
+) -> str:
     lines = [
         "# FineWeb Dynamics Report",
         "",
@@ -810,19 +837,42 @@ def _markdown(rows: list[dict], groups: list[dict], group_fields: list[str], opt
             "",
             "## Option Effects (First/Mid/Last Eval)",
             "",
-            "| Option | Best@First | Best@Mid | Best@Last | Spread@First | Spread@Mid | Spread@Last | Corr@First | Corr@Mid | Corr@Last |",
-            "|--------|------------|----------|-----------|--------------|------------|-------------|------------|----------|-----------|",
+            "| Option | Best@First | Worst@First | Best@Mid | Worst@Mid | Best@Last | Worst@Last | Spread@First | Spread@Mid | Spread@Last | Corr@First | Corr@Mid | Corr@Last |",
+            "|--------|------------|-------------|----------|-----------|-----------|------------|--------------|------------|-------------|------------|----------|-----------|",
         ]
         for e in option_effects:
             w = e.get("winners", {})
+            l = e.get("losers", {})
             s = e.get("spreads", {})
             c = e.get("correlations", {})
             lines.append(
                 "| "
-                f"{e.get('option')} | {w.get('first_eval_loss')} | {w.get('mid_eval_loss')} | {w.get('last_eval_loss')} | "
+                f"{e.get('option')} | {w.get('first_eval_loss')} | {l.get('first_eval_loss')} | {w.get('mid_eval_loss')} | {l.get('mid_eval_loss')} | {w.get('last_eval_loss')} | {l.get('last_eval_loss')} | "
                 f"{_fmt(s.get('first_eval_loss'))} | {_fmt(s.get('mid_eval_loss'))} | {_fmt(s.get('last_eval_loss'))} | "
                 f"{_fmt(c.get('first_eval_loss'))} | {_fmt(c.get('mid_eval_loss'))} | {_fmt(c.get('last_eval_loss'))} |"
             )
+
+    if corr_rankings:
+        lines += [
+            "",
+            "## Correlation vs Anti-Correlation (Numeric Options)",
+            "",
+        ]
+        for metric in ("first_eval_loss", "mid_eval_loss", "last_eval_loss"):
+            block = corr_rankings.get(metric, {}) if isinstance(corr_rankings, dict) else {}
+            corr = block.get("correlated", []) if isinstance(block, dict) else []
+            anti = block.get("anticorrelated", []) if isinstance(block, dict) else []
+            lines += [
+                f"### {metric}",
+                "",
+                "| Direction | Option | Corr |",
+                "|-----------|--------|------|",
+            ]
+            for r in corr:
+                lines.append(f"| correlated | {r.get('option')} | {_fmt(r.get('corr'))} |")
+            for r in anti:
+                lines.append(f"| anticorrelated | {r.get('option')} | {_fmt(r.get('corr'))} |")
+            lines.append("")
 
     auto_rows = [r for r in rows if r.get("optimizer") == "autonormuon" and isinstance(r.get("autonormuon_diag"), dict)]
     if auto_rows:
@@ -901,6 +951,12 @@ def main() -> None:
         default="seed,metrics_enabled,metrics_dir,metrics_run_name,metrics_every,metrics_flush_every,run_group,run_config_hash",
         help="Comma-separated option keys to exclude from auto option effect analysis",
     )
+    ap.add_argument(
+        "--corr-top-k",
+        type=int,
+        default=5,
+        help="Top-k options to show for correlation and anti-correlation per milestone",
+    )
 
     args = ap.parse_args()
 
@@ -931,6 +987,7 @@ def main() -> None:
     exclude_keys = {x.strip() for x in args.option_exclude.split(",") if x.strip()}
     option_keys = _select_option_keys(rows, args.option_keys, exclude_keys)
     option_effects = _option_effects(rows, option_keys, metrics_for_options)
+    corr_rankings = _corr_rankings(option_effects, metrics_for_options, top_k=args.corr_top_k)
     milestone_leaders = _milestone_leaders(rows)
 
     report = {
@@ -968,13 +1025,14 @@ def main() -> None:
         "groups": groups,
         "option_keys": option_keys,
         "option_effects": option_effects,
+        "corr_rankings": corr_rankings,
         "milestone_leaders": milestone_leaders,
     }
 
     out_json = Path(args.out_json) if args.out_json else runs_dir / "leaderboard.json"
     out_md = Path(args.out_md) if args.out_md else runs_dir / "leaderboard.md"
     out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    out_md.write_text(_markdown(rows, groups, group_fields, option_effects, milestone_leaders), encoding="utf-8")
+    out_md.write_text(_markdown(rows, groups, group_fields, option_effects, milestone_leaders, corr_rankings), encoding="utf-8")
 
     print(f"Analyzed runs: {len(rows)}")
     if rows:
