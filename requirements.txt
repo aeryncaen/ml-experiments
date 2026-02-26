@@ -4,3 +4,5 @@ numpy>=1.24
 safetensors>=0.4
 tqdm>=4.60
 Pillow>=9.0
+einops>=0.7
+huggingface_hub>=0.20

@@ -115,11 +115,13 @@ class AutoNorMuon(torch.optim.Optimizer):
         adaptation_scope: granularity for gnorm tracking & LR application:
             "neuron" (per output-neuron) | "matrix" (per weight matrix)
         retract: what to normalize to the product of spheres (row-norm = 1):
-            "weights" — normalize W rows after each step (nGPT-style)
-            "update"  — normalize the update rows before applying (MUON+ style)
-            "off"     — no normalization
-            True      — same as "weights" (backward compat)
-            False     — same as "off" (backward compat)
+            "weights"          — normalize W rows after each step (nGPT-style)
+            "grad_pre_ortho"   — normalize raw grad rows before momentum/NS5
+            "grad_post_ortho"  — normalize post-ortho update rows after NS5
+            "off"              — no normalization
+            True               — same as "weights" (backward compat)
+            False              — same as "off" (backward compat)
+            Both grad modes normalize before gnorm tracking sees the norms.
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
     """
@@ -138,9 +140,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             retract = "weights"
         elif retract is False:
             retract = "off"
-        if retract not in ("weights", "update", "off"):
+        if retract not in ("weights", "grad_pre_ortho", "grad_post_ortho", "off"):
             raise ValueError(
-                f"Unsupported retract={retract!r}; expected 'weights' | 'update' | 'off' (or bool)"
+                f"Unsupported retract={retract!r}; expected 'weights' | 'grad_pre_ortho' | 'grad_post_ortho' | 'off' (or bool)"
             )
 
         for group in param_groups:
@@ -211,15 +213,24 @@ class AutoNorMuon(torch.optim.Optimizer):
                     # --- Compute updates via NorMuon (post-ortho) ---
                     updates = []
                     for p, state, g in zip(params, states, grads):
+                        # Normalize raw grad rows before momentum/NS5
+                        if self.retract == "grad_pre_ortho":
+                            g = g / g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
                         update = normuon_update(
                             g,
                             state["momentum_buffer"],
                             beta=group["momentum"],
                         )
                         update = update.reshape(p.shape)
+
+                        # Normalize post-ortho update rows after NS5
+                        if self.retract == "grad_post_ortho":
+                            update = update / update.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
                         updates.append(update)
 
-                    # --- Per-unit gradient norms (post-ortho) ---
+                    # --- Per-unit gradient norms (post-ortho, post-retract) ---
                     gnorm_units = [
                         _unit_norms(u, self.adaptation_scope) for u in updates
                     ]
@@ -305,10 +316,6 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                         if decay != 0:
                             p.mul_(1 - lr_decay * decay)
-
-                        # Normalize update rows to unit norm before applying
-                        if self.retract == "update":
-                            update.div_(update.norm(dim=-1, keepdim=True).clamp(min=1e-8))
 
                         if isinstance(lr_t, torch.Tensor) and lr_t.ndim > 0:
                             view_shape = (lr_t.shape[0],) + (1,) * (update.ndim - 1)
