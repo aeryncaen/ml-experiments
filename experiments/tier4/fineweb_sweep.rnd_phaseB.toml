@@ -27,22 +27,33 @@ autonormuon_adaptation_scope = ["neuron"]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
 
-# Grad norm locked off for all Phase B runs.
+# Grad norm OFF — isolate weight effect.
 autonormuon_grad_schedule = ["off"]
 
-# Weight schedule ablation:
-#   off / always       = controls (floor / ceiling)
-#   hard_on:<step>     = no retraction until step, then full retraction
-#   ramp_up:<s>-<e>    = linear fade from 0→1
+# Weight schedule ablation — both directions:
+#   off / always                = controls
+#   hard_off:<step>             = on early, off after step (weights on then off)
+#   hard_on:<step>              = off early, on after step (delayed retraction)
+#   ramp_down:<s>-<e>           = smooth 1→0
+#   ramp_up:<s>-<e>             = smooth 0→1
 autonormuon_weight_schedule = [
     "off",
     "always",
+    "hard_off:40",
+    "hard_off:80",
+    "hard_off:160",
+    "hard_off:320",
+    "hard_off:600",
+    "hard_off:1200",
     "hard_on:40",
     "hard_on:80",
     "hard_on:160",
     "hard_on:320",
     "hard_on:600",
     "hard_on:1200",
+    "ramp_down:0-160",
+    "ramp_down:0-600",
+    "ramp_down:0-1200",
     "ramp_up:0-160",
     "ramp_up:0-600",
     "ramp_up:0-1200",
