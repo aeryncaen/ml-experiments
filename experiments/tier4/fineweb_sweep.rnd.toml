@@ -26,6 +26,7 @@ autonormuon_beta = [0.55]
 autonormuon_adaptation_scope = ["neuron"]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
+muon_lr = [0.023]
 
 # Weight retraction OFF — isolate grad effect.
 autonormuon_weight_schedule = ["off"]
