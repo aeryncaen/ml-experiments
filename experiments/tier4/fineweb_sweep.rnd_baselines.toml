@@ -19,7 +19,7 @@ train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
 val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
 
 [sweep]
-optimizer = ["adamw", "muon", "normuon"]
+optimizer = ["adamw", "muon", "normuon", "autonormuon"]
 seed = [42]
 
 # modded-nanogpt tuned LR for muon family; 0 = auto formula for autonormuon
