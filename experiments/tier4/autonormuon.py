@@ -33,7 +33,16 @@ def zeropower_via_newtonschulz5(G, steps=5):
     return X
 
 
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+def normuon_update(
+    grad,
+    momentum,
+    second_momentum,
+    beta=0.95,
+    beta2=0.95,
+    ns_steps=5,
+    nesterov=True,
+    second_moment_mode="row_mean",
+):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
@@ -45,7 +54,19 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
         update = update.reshape(original_shape)
     # NorMuon: per-row adaptive scaling with norm preservation
     vnorm = update.norm(dim=(-2,-1), keepdim=True)
-    v_mean = torch.mean(update * update, dim=-1, keepdim=True).to(second_momentum.dtype)
+    if second_moment_mode == "row_mean":
+        v_mean = torch.mean(update * update, dim=-1, keepdim=True).to(second_momentum.dtype)
+    elif second_moment_mode == "matrix_mean_square":
+        msq = torch.mean(update * update).to(second_momentum.dtype)
+        v_mean = torch.ones_like(second_momentum) * msq
+    elif second_moment_mode == "matrix_norm_square":
+        nsq = torch.sum(update * update).to(second_momentum.dtype)
+        v_mean = torch.ones_like(second_momentum) * nsq
+    else:
+        raise ValueError(
+            f"Unsupported second_moment_mode={second_moment_mode}; "
+            "expected row_mean | matrix_mean_square | matrix_norm_square"
+        )
     second_momentum.lerp_(v_mean, 1 - beta2)
     step_size = 1 / second_momentum.sqrt().add_(1e-10)
     update.mul_(step_size)
@@ -94,6 +115,10 @@ class AutoNorMuon(torch.optim.Optimizer):
         min_ratio: lower clamp for adaptation ratio
         var_eps: epsilon used in mu/var ratio denominator
         conflict_proj: if True, project update to avoid update/grad conflict
+        lr_scope: for Muon groups, apply adaptive LR per matrix ("matrix") or one scalar per group ("group")
+        gnorm_source: Muon gnorm source for adaptation: "grad" | "post_ortho"
+        second_moment_mode: NorMuon second moment source:
+            row_mean | matrix_mean_square | matrix_norm_square
     """
     def __init__(self, param_groups, total_steps, retract=True,
                  gnorm_beta=0.9,
@@ -101,10 +126,20 @@ class AutoNorMuon(torch.optim.Optimizer):
                  ratio_pow=1.0,
                  min_ratio=0.0,
                  var_eps=1e-12,
-                 conflict_proj=False):
+                 conflict_proj=False,
+                 lr_scope="matrix",
+                 gnorm_source="grad",
+                 second_moment_mode="row_mean"):
         valid_modes = ("gnorm", "mu_var", "hybrid", "cv", "surge")
         if adapt_mode not in valid_modes:
             raise ValueError(f"Unsupported adapt_mode={adapt_mode}; expected one of {valid_modes}")
+        if lr_scope not in ("matrix", "group"):
+            raise ValueError(f"Unsupported lr_scope={lr_scope}; expected 'matrix' or 'group'")
+        if gnorm_source not in ("grad", "post_ortho"):
+            raise ValueError(f"Unsupported gnorm_source={gnorm_source}; expected 'grad' or 'post_ortho'")
+        sm_modes = ("row_mean", "matrix_mean_square", "matrix_norm_square")
+        if second_moment_mode not in sm_modes:
+            raise ValueError(f"Unsupported second_moment_mode={second_moment_mode}; expected one of {sm_modes}")
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -126,6 +161,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["signal_ratio"] = None
             group["lr_mult"] = None
             group["adapt_mode"] = adapt_mode
+            group["lr_scope"] = lr_scope
+            group["gnorm_source"] = gnorm_source
+            group["second_moment_mode"] = second_moment_mode
             group["gnorm_mean"] = None
             group["gnorm_std"] = None
             group["gnorm_cv"] = None
@@ -146,6 +184,9 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.min_ratio = min_ratio
         self.var_eps = var_eps
         self.conflict_proj = conflict_proj
+        self.lr_scope = lr_scope
+        self.gnorm_source = gnorm_source
+        self.second_moment_mode = second_moment_mode
         super().__init__(param_groups, dict())
 
     @torch.no_grad()
@@ -187,7 +228,25 @@ class AutoNorMuon(torch.optim.Optimizer):
                     states.append(state)
 
                 if params:
-                    gnorms = torch.stack([g.norm().float() for g in grads])
+                    updates = []
+                    post_ortho_norms = []
+                    for p, state, g in zip(params, states, grads):
+                        update = normuon_update(
+                            g,
+                            state["momentum_buffer"],
+                            state["second_momentum_buffer"],
+                            beta=group["momentum"],
+                            beta2=group["beta2"],
+                            second_moment_mode=self.second_moment_mode,
+                        )
+                        update = update.reshape(p.shape)
+                        updates.append(update)
+                        post_ortho_norms.append(update.norm().float())
+
+                    if self.gnorm_source == "post_ortho":
+                        gnorms = torch.stack(post_ortho_norms)
+                    else:
+                        gnorms = torch.stack([g.norm().float() for g in grads])
                     mean_t = gnorms.mean()
                     std_t = gnorms.std(unbiased=False)
                     cv_t = std_t / mean_t.clamp(min=1e-12)
@@ -227,11 +286,15 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                     if self.adapt_mode == "gnorm":
                         ratio_active = ratio_gnorm_t
-                        cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
-                        ema_factor = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio_vec)))
-                        ema_lr = group["lr"] * ema_factor
-                        harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
-                        lr_vec = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+                        if self.lr_scope == "matrix":
+                            cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
+                            ema_factor = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio_vec)))
+                            ema_lr = group["lr"] * ema_factor
+                            harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
+                            lr_vec = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+                        else:
+                            lr_scalar = _blend_with_cosine(gnorms.new_full((), group["lr"]), cosine_factor, ratio_active)
+                            lr_vec = torch.ones_like(gnorms) * lr_scalar
                     else:
                         if self.adapt_mode == "mu_var":
                             ratio_active = ratio_muvar_t
@@ -256,12 +319,7 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                     conflict_hits = gnorms.new_zeros(())
                     conflict_total = 0
-                    for p, state, g, lr_t in zip(params, states, grads, lr_vec):
-                        update = normuon_update(g, state["momentum_buffer"],
-                                                state["second_momentum_buffer"],
-                                                beta=group["momentum"],
-                                                beta2=group["beta2"])
-                        update = update.reshape(p.shape)
+                    for p, state, g, update, lr_t in zip(params, states, grads, updates, lr_vec):
 
                         if self.conflict_proj:
                             dot = (update * g).sum()

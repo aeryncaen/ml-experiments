@@ -433,6 +433,9 @@ def _analyze_run(run_dir: Path, args) -> dict | None:
         "run_dir": str(run_dir),
         "optimizer": optimizer,
         "adapt_mode": adapt_mode,
+        "lr_scope": hparams.get("autonormuon_lr_scope") if optimizer == "autonormuon" else None,
+        "gnorm_source": hparams.get("autonormuon_gnorm_source") if optimizer == "autonormuon" else None,
+        "second_moment_mode": hparams.get("autonormuon_second_moment_mode") if optimizer == "autonormuon" else None,
         "seed": _as_int(hparams.get("seed")),
         "config_hash": config_hash,
         "train_steps": _as_int(hparams.get("train_steps")),
@@ -628,7 +631,7 @@ def main() -> None:
     ap.add_argument(
         "--group-by",
         type=str,
-        default="optimizer,adapt_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
+        default="optimizer,adapt_mode,lr_scope,gnorm_source,second_moment_mode,train_steps,batch_size,grad_accum,seq_len,n_layer,d_model",
         help="Comma-separated keys used for grouped summary",
     )
 

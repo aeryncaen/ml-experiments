@@ -89,6 +89,10 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_min_ratio", None)
         out.pop("autonormuon_var_eps", None)
         out.pop("autonormuon_gnorm_beta", None)
+        out.pop("autonormuon_conflict_proj", None)
+        out.pop("autonormuon_lr_scope", None)
+        out.pop("autonormuon_gnorm_source", None)
+        out.pop("autonormuon_second_moment_mode", None)
     return out
 
 

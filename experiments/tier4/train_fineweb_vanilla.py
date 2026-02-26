@@ -134,6 +134,9 @@ class HParams:
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
     autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
     autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
+    autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "matrix")  # matrix | group
+    autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
+    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "row_mean")  # row_mean | matrix_mean_square | matrix_norm_square
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -290,6 +293,9 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "beta2",
             "weight_decay",
             "adapt_mode",
+            "lr_scope",
+            "gnorm_source",
+            "second_moment_mode",
             "gnorm_ratio",
             "gnorm_ratio_raw",
             "gnorm_median",
@@ -4663,12 +4669,17 @@ def main():
             min_ratio=HP.autonormuon_min_ratio,
             var_eps=HP.autonormuon_var_eps,
             conflict_proj=HP.autonormuon_conflict_proj,
+            lr_scope=HP.autonormuon_lr_scope,
+            gnorm_source=HP.autonormuon_gnorm_source,
+            second_moment_mode=HP.autonormuon_second_moment_mode,
         )
         print0(rank, (
             f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
             f"gnorm_beta={HP.autonormuon_gnorm_beta} adapt_mode={HP.autonormuon_adapt_mode} "
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
-            f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj}"
+            f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj} "
+            f"lr_scope={HP.autonormuon_lr_scope} gnorm_source={HP.autonormuon_gnorm_source} "
+            f"second_moment_mode={HP.autonormuon_second_moment_mode}"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon

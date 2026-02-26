@@ -21,13 +21,17 @@ train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
 val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
 
 [sweep]
-optimizer = ["normuon", "muon", "autonormuon"]
+optimizer = ["normuon", "autonormuon"]
 seed = [1, 2, 3]
 
 # AutoNorMuon-only knobs; ignored for non-autonormuon optimizers by runner normalization.
-autonormuon_adapt_mode = ["gnorm", "mu_var", "hybrid", "cv", "surge"]
+# Focused gnorm debugging grid + interaction ablations.
+autonormuon_adapt_mode = ["gnorm"]
 autonormuon_gnorm_beta = [0.9]
 autonormuon_ratio_pow = [1.0]
 autonormuon_min_ratio = [0.0]
 autonormuon_var_eps = [1.0e-12]
-autonormuon_conflict_proj = [false]
+autonormuon_conflict_proj = [false, true]
+autonormuon_lr_scope = ["matrix", "group"]
+autonormuon_gnorm_source = ["grad", "post_ortho"]
+autonormuon_second_moment_mode = ["row_mean", "matrix_mean_square", "matrix_norm_square"]
