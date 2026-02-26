@@ -85,6 +85,10 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_min_ratio", 0.0)
         out.setdefault("autonormuon_anneal_power", 1.0)
         out = _canonical_autonormuon(out)
+        # anneal_power is only meaningful for retract="anneal"; drop it
+        # for other modes so different power values don't create duplicate runs.
+        if str(out.get("autonormuon_retract", "")) != "anneal":
+            out.pop("autonormuon_anneal_power", None)
 
     return out
 
@@ -171,6 +175,7 @@ def main() -> None:
 
     report_runs: list[dict] = []
     counts_by_opt: dict[str, dict[str, int]] = {}
+    seen_hashes: set[str] = set()  # dedup identical combos within this sweep
     for i, overrides in enumerate(combos, start=1):
         if not isinstance(overrides, dict):
             continue
@@ -191,12 +196,16 @@ def main() -> None:
 
         status = "pending"
         skip_reason = ""
-        if skip_existing and cfg_hash in existing_hashes:
+        if cfg_hash in seen_hashes:
+            status = "skipped"
+            skip_reason = "dedup:same_sweep"
+        elif skip_existing and cfg_hash in existing_hashes:
             status = "skipped"
             skip_reason = f"hash_exists:{existing_hashes[cfg_hash]}"
-        if (metrics_dir / run_name).exists() and skip_existing:
+        elif (metrics_dir / run_name).exists() and skip_existing:
             status = "skipped"
             skip_reason = f"run_exists:{metrics_dir / run_name}"
+        seen_hashes.add(cfg_hash)
 
         rec = {
             "index": i,
