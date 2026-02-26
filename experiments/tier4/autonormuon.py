@@ -193,7 +193,9 @@ class AutoNorMuon(torch.optim.Optimizer):
         """Call before step() with current training loss to drive anneal gate.
 
         First call captures the random-init loss as reference.
-        Gate uses EMA-smoothed loss ratio: grad_gate = smoothed(loss / random_loss).
+        Gate uses perplexity ratio (exp-space) so it responds to the true scale
+        of learning progress rather than the compressed log-loss scale.
+        ppl_ratio = exp(loss_ema) / exp(ref) = exp(loss_ema - ref), clamped to [0, 1].
         """
         if not math.isfinite(loss):
             return
@@ -204,8 +206,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             # EMA with beta=0.95 to smooth out step-to-step noise
             self._loss_ema = 0.95 * self._loss_ema + 0.05 * loss
 
-        loss_ratio = min(self._loss_ema / self._random_loss_ref, 1.0)
-        shaped = loss_ratio ** self.anneal_power  # power > 1 favors weights earlier
+        # Perplexity ratio: exp(ema - ref). When ema == ref → 1.0; as loss drops → 0.
+        ppl_ratio = min(math.exp(self._loss_ema - self._random_loss_ref), 1.0)
+        shaped = ppl_ratio ** self.anneal_power  # power > 1 favors weights earlier
         self._grad_gate = shaped           # 1.0 at random, → 0 as loss drops
         self._weight_gate = 1.0 - shaped   # 0.0 at random, → 1 as loss drops
 
