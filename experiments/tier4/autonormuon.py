@@ -117,6 +117,7 @@ class AutoNorMuon(torch.optim.Optimizer):
         conflict_proj: if True, project update to avoid update/grad conflict
         lr_scope: for Muon groups, apply adaptive LR per matrix ("matrix") or one scalar per group ("group")
         gnorm_source: Muon gnorm source for adaptation: "grad" | "post_ortho"
+        gmax_scope: Muon gnorm-max tracking scope: "global" (per-optimizer-group) | "matrix"
         second_moment_mode: NorMuon second moment source:
             row_mean | matrix_mean_square | matrix_norm_square
     """
@@ -129,6 +130,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                  conflict_proj=False,
                  lr_scope="matrix",
                  gnorm_source="grad",
+                 gmax_scope="global",
                  second_moment_mode="row_mean"):
         valid_modes = ("gnorm", "mu_var", "hybrid", "cv", "surge")
         if adapt_mode not in valid_modes:
@@ -137,6 +139,8 @@ class AutoNorMuon(torch.optim.Optimizer):
             raise ValueError(f"Unsupported lr_scope={lr_scope}; expected 'matrix' or 'group'")
         if gnorm_source not in ("grad", "post_ortho"):
             raise ValueError(f"Unsupported gnorm_source={gnorm_source}; expected 'grad' or 'post_ortho'")
+        if gmax_scope not in ("global", "matrix"):
+            raise ValueError(f"Unsupported gmax_scope={gmax_scope}; expected 'global' or 'matrix'")
         sm_modes = ("row_mean", "matrix_mean_square", "matrix_norm_square")
         if second_moment_mode not in sm_modes:
             raise ValueError(f"Unsupported second_moment_mode={second_moment_mode}; expected one of {sm_modes}")
@@ -163,6 +167,7 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["adapt_mode"] = adapt_mode
             group["lr_scope"] = lr_scope
             group["gnorm_source"] = gnorm_source
+            group["gmax_scope"] = gmax_scope
             group["second_moment_mode"] = second_moment_mode
             group["gnorm_mean"] = None
             group["gnorm_std"] = None
@@ -186,6 +191,7 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.conflict_proj = conflict_proj
         self.lr_scope = lr_scope
         self.gnorm_source = gnorm_source
+        self.gmax_scope = gmax_scope
         self.second_moment_mode = second_moment_mode
         super().__init__(param_groups, dict())
 
@@ -276,7 +282,16 @@ class AutoNorMuon(torch.optim.Optimizer):
                         ema = gnorms
                     else:
                         ema = beta * ema_prev + (1 - beta) * gnorms
-                    gmax = torch.maximum(max_prev, gnorms)
+
+                    if self.gmax_scope == "global":
+                        if group["gnorm_max"] is None or k == 0:
+                            gmax_global = gnorms.max()
+                        else:
+                            gprev = torch.as_tensor(group["gnorm_max"], device=gnorms.device, dtype=gnorms.dtype)
+                            gmax_global = torch.maximum(gprev, gnorms.max())
+                        gmax = torch.ones_like(gnorms) * gmax_global
+                    else:
+                        gmax = torch.maximum(max_prev, gnorms)
                     ratio_vec = ema / gmax.clamp(min=1e-12)
                     ratio_gnorm_t = ratio_vec.median()
                     ratio_muvar_t = (mu2_ema_t / (mu2_ema_t + var_ema_t + self.var_eps)).clamp(min=0.0, max=1.0)

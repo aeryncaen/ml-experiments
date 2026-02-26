@@ -136,6 +136,7 @@ class HParams:
     autonormuon_conflict_proj: bool = _env_bool("AUTONORMUON_CONFLICT_PROJ", False)
     autonormuon_lr_scope: str = os.environ.get("AUTONORMUON_LR_SCOPE", "matrix")  # matrix | group
     autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
+    autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "global")  # global | matrix
     autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "row_mean")  # row_mean | matrix_mean_square | matrix_norm_square
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
@@ -295,6 +296,7 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "adapt_mode",
             "lr_scope",
             "gnorm_source",
+            "gmax_scope",
             "second_moment_mode",
             "gnorm_ratio",
             "gnorm_ratio_raw",
@@ -4671,6 +4673,7 @@ def main():
             conflict_proj=HP.autonormuon_conflict_proj,
             lr_scope=HP.autonormuon_lr_scope,
             gnorm_source=HP.autonormuon_gnorm_source,
+            gmax_scope=HP.autonormuon_gmax_scope,
             second_moment_mode=HP.autonormuon_second_moment_mode,
         )
         print0(rank, (
@@ -4679,6 +4682,7 @@ def main():
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
             f"var_eps={HP.autonormuon_var_eps} conflict_proj={HP.autonormuon_conflict_proj} "
             f"lr_scope={HP.autonormuon_lr_scope} gnorm_source={HP.autonormuon_gnorm_source} "
+            f"gmax_scope={HP.autonormuon_gmax_scope} "
             f"second_moment_mode={HP.autonormuon_second_moment_mode}"
         ))
     elif HP.optimizer == "muon_sf":
