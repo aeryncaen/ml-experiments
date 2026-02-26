@@ -24,3 +24,6 @@ seed = [42]
 
 # modded-nanogpt tuned LR for muon family; 0 = auto formula for autonormuon
 muon_lr = [0.023]
+
+# Test all optimizers with and without hypersphere init
+sphere_init = [false, true]
