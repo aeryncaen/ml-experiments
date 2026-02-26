@@ -73,6 +73,7 @@ class RunStats:
     run_name: str
     run_dir: str
     optimizer: str | None
+    adapt_mode: str | None
     model_type: str | None
     best_val_loss: float | None
     final_val_loss: float | None
@@ -97,6 +98,7 @@ class RunStats:
             "run_name": self.run_name,
             "run_dir": self.run_dir,
             "optimizer": self.optimizer,
+            "adapt_mode": self.adapt_mode,
             "model_type": self.model_type,
             "best_val_loss": self.best_val_loss,
             "final_val_loss": self.final_val_loss,
@@ -194,6 +196,7 @@ def _extract_run_stats(
         run_name=run_dir.name,
         run_dir=str(run_dir),
         optimizer=hparams.get("optimizer"),
+        adapt_mode=hparams.get("autonormuon_adapt_mode") if hparams.get("optimizer") == "autonormuon" else None,
         model_type=hparams.get("model_type"),
         best_val_loss=_as_float(best_val_loss),
         final_val_loss=_as_float(final_val_loss),
@@ -231,13 +234,13 @@ def _to_markdown(stats: list[RunStats]) -> str:
         "",
         f"Generated: {datetime.now().isoformat()}",
         "",
-        "| Rank | Run | Optimizer | Best Val | Final Val | Final Train | tok/s | Unstable | Spikes (loss/grad) |",
-        "|------|-----|-----------|----------|-----------|-------------|-------|----------|--------------------|",
+        "| Rank | Run | Optimizer | Mode | Best Val | Final Val | Final Train | tok/s | Unstable | Spikes (loss/grad) |",
+        "|------|-----|-----------|------|----------|-----------|-------------|-------|----------|--------------------|",
     ]
     for i, s in enumerate(stats, start=1):
         lines.append(
             "| "
-            f"{i} | {s.run_name} | {s.optimizer or '-'} | {_fmt(s.best_val_loss)} | {_fmt(s.final_val_loss)} | "
+            f"{i} | {s.run_name} | {s.optimizer or '-'} | {s.adapt_mode or '-'} | {_fmt(s.best_val_loss)} | {_fmt(s.final_val_loss)} | "
             f"{_fmt(s.final_train_loss)} | {_fmt(s.throughput_tok_s, nd=1)} | {s.unstable} | "
             f"{s.train_loss_spikes}/{s.grad_norm_spikes} |"
         )

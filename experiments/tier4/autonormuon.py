@@ -75,9 +75,19 @@ class AutoNorMuon(torch.optim.Optimizer):
         total_steps: total training steps (required)
         retract: retract Muon params to product of spheres after each step (default True)
         gnorm_beta: EMA decay for grad norm tracking (default 0.9)
+        adapt_mode: LR adaptation mode: "gnorm" (default) or "mu_var"
+        ratio_pow: exponent applied to adaptation ratio before LR scaling
+        min_ratio: lower clamp for adaptation ratio
+        var_eps: epsilon used in mu/var ratio denominator
     """
     def __init__(self, param_groups, total_steps, retract=True,
-                 gnorm_beta=0.9):
+                 gnorm_beta=0.9,
+                 adapt_mode="gnorm",
+                 ratio_pow=1.0,
+                 min_ratio=0.0,
+                 var_eps=1e-12):
+        if adapt_mode not in ("gnorm", "mu_var"):
+            raise ValueError(f"Unsupported adapt_mode={adapt_mode}; expected 'gnorm' or 'mu_var'")
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -94,9 +104,18 @@ class AutoNorMuon(torch.optim.Optimizer):
             group["scheduled_lr"] = 0.0
             group["gnorm_ema"] = None
             group["gnorm_max"] = None
+            group["mu2_ema"] = None
+            group["var_ema"] = None
+            group["signal_ratio"] = None
+            group["lr_mult"] = None
+            group["adapt_mode"] = adapt_mode
         self.total_steps = total_steps
         self.retract = retract
         self.gnorm_beta = gnorm_beta
+        self.adapt_mode = adapt_mode
+        self.ratio_pow = ratio_pow
+        self.min_ratio = min_ratio
+        self.var_eps = var_eps
         super().__init__(param_groups, dict())
 
     @torch.no_grad()
@@ -139,25 +158,58 @@ class AutoNorMuon(torch.optim.Optimizer):
 
                 if params:
                     gnorms = torch.stack([g.norm().float() for g in grads])
-                    ema_prev = torch.stack([s["gnorm_ema"] for s in states]).to(gnorms.device)
-                    max_prev = torch.stack([s["gnorm_max"] for s in states]).to(gnorms.device)
+                    if self.adapt_mode == "gnorm":
+                        ema_prev = torch.stack([s["gnorm_ema"] for s in states]).to(gnorms.device)
+                        max_prev = torch.stack([s["gnorm_max"] for s in states]).to(gnorms.device)
 
-                    if k == 0:
-                        ema = gnorms
+                        if k == 0:
+                            ema = gnorms
+                        else:
+                            ema = beta * ema_prev + (1 - beta) * gnorms
+                        gmax = torch.maximum(max_prev, gnorms)
+                        ratio = ema / gmax.clamp(min=1e-12)
+
+                        cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
+                        ema_factor = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio)))
+                        ema_lr = group["lr"] * ema_factor
+                        harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
+                        lr_vec = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+
+                        for s, e, m in zip(states, ema, gmax):
+                            s["gnorm_ema"] = e.detach()
+                            s["gnorm_max"] = m.detach()
+
+                        med_ratio_t = ratio.median()
+                        signal_ratio_t = med_ratio_t
+                        lr_mult_t = med_ratio_t.clamp(min=self.min_ratio, max=1.0).pow(self.ratio_pow)
+                        mu2_ema_t = (gnorms * gnorms).mean()
+                        var_ema_t = torch.zeros_like(mu2_ema_t)
                     else:
-                        ema = beta * ema_prev + (1 - beta) * gnorms
-                    gmax = torch.maximum(max_prev, gnorms)
-                    ratio = ema / gmax.clamp(min=1e-12)
+                        mean_t = gnorms.mean()
+                        mu2_t = mean_t * mean_t
+                        second_t = (gnorms * gnorms).mean()
+                        var_t = (second_t - mu2_t).clamp(min=0.0)
 
-                    cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
-                    ema_factor = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio)))
-                    ema_lr = group["lr"] * ema_factor
-                    harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
-                    lr_vec = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+                        if group["mu2_ema"] is None or k == 0:
+                            mu2_ema_t = mu2_t
+                            var_ema_t = var_t
+                        else:
+                            mu2_ema_t = beta * group["mu2_ema"] + (1 - beta) * mu2_t
+                            var_ema_t = beta * group["var_ema"] + (1 - beta) * var_t
 
-                    for s, e, m in zip(states, ema, gmax):
-                        s["gnorm_ema"] = e.detach()
-                        s["gnorm_max"] = m.detach()
+                        signal_ratio_t = mu2_ema_t / (mu2_ema_t + var_ema_t + self.var_eps)
+                        signal_ratio_t = signal_ratio_t.clamp(min=self.min_ratio, max=1.0)
+                        lr_mult_t = signal_ratio_t.pow(self.ratio_pow)
+
+                        cosine_lr = gnorms.new_full((), group["lr"] * cosine_factor)
+                        ema_lr = group["lr"] * lr_mult_t
+                        harmonic_lr = 2.0 * cosine_lr * ema_lr / (cosine_lr + ema_lr).clamp(min=1e-20)
+                        lr_scalar = torch.where(cosine_lr < ema_lr, harmonic_lr, ema_lr)
+                        lr_vec = torch.full_like(gnorms, lr_scalar)
+
+                        med_ratio_t = signal_ratio_t
+                        ema = torch.full_like(gnorms, mean_t)
+                        gmax = torch.full_like(gnorms, gnorms.max())
 
                     for p, state, g, lr_t in zip(params, states, grads, lr_vec):
                         update = normuon_update(g, state["momentum_buffer"],
@@ -176,7 +228,10 @@ class AutoNorMuon(torch.optim.Optimizer):
                             p.div_(p.norm(dim=-1, keepdim=True).clamp(min=1e-8))
 
                     # Group logging (median across Muon matrices)
-                    med_ratio_t = ratio.median()
+                    group["mu2_ema"] = mu2_ema_t.detach()
+                    group["var_ema"] = var_ema_t.detach()
+                    group["signal_ratio"] = signal_ratio_t.detach()
+                    group["lr_mult"] = lr_mult_t.detach()
                     if is_compiling:
                         group["gnorm_ratio"] = med_ratio_t.detach()
                         group["gnorm_ratio_raw"] = med_ratio_t.detach()
@@ -191,6 +246,10 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["gnorm_ema"] = ema.median().item()
                         group["gnorm_max"] = gmax.max().item()
                         group["scheduled_lr"] = lr_vec.median().item()
+                        group["mu2_ema"] = mu2_ema_t.item()
+                        group["var_ema"] = var_ema_t.item()
+                        group["signal_ratio"] = signal_ratio_t.item()
+                        group["lr_mult"] = lr_mult_t.item()
 
             else:
                 # --- Adam: per-group fast EMA / max gnorm ---
@@ -199,22 +258,58 @@ class AutoNorMuon(torch.optim.Optimizer):
                     gnorms = torch.stack([g.norm().float() for g in grads])
                     median_gnorm_t = gnorms.median()
 
-                    if group["gnorm_ema"] is None or k == 0:
-                        gnorm_ema_t = median_gnorm_t
-                        gnorm_max_t = median_gnorm_t
+                    if self.adapt_mode == "gnorm":
+                        if group["gnorm_ema"] is None or k == 0:
+                            gnorm_ema_t = median_gnorm_t
+                            gnorm_max_t = median_gnorm_t
+                        else:
+                            gnorm_ema_t = beta * group["gnorm_ema"] + (1 - beta) * median_gnorm_t
+                            gnorm_max_t = torch.maximum(group["gnorm_max"], median_gnorm_t)
+
+                        ratio_t = gnorm_ema_t / gnorm_max_t.clamp(min=1e-12)
+                        cosine_lr_t = median_gnorm_t.new_full((), group["lr"] * cosine_factor)
+                        ema_factor_t = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio_t)))
+                        ema_lr_t = group["lr"] * ema_factor_t
+                        harmonic_t = 2.0 * cosine_lr_t * ema_lr_t / (cosine_lr_t + ema_lr_t).clamp(min=1e-20)
+                        lr_t = torch.where(cosine_lr_t < ema_lr_t, harmonic_t, ema_lr_t)
+                        lr_mult_t = ratio_t.clamp(min=self.min_ratio, max=1.0).pow(self.ratio_pow)
+                        mu2_ema_t = (gnorms * gnorms).mean()
+                        var_ema_t = torch.zeros_like(mu2_ema_t)
+                        signal_ratio_t = ratio_t
+
+                        group["gnorm_ema"] = gnorm_ema_t.detach()
+                        group["gnorm_max"] = gnorm_max_t.detach()
                     else:
-                        gnorm_ema_t = beta * group["gnorm_ema"] + (1 - beta) * median_gnorm_t
-                        gnorm_max_t = torch.maximum(group["gnorm_max"], median_gnorm_t)
+                        mean_t = gnorms.mean()
+                        mu2_t = mean_t * mean_t
+                        second_t = (gnorms * gnorms).mean()
+                        var_t = (second_t - mu2_t).clamp(min=0.0)
 
-                    ratio_t = gnorm_ema_t / gnorm_max_t.clamp(min=1e-12)
-                    cosine_lr_t = median_gnorm_t.new_full((), group["lr"] * cosine_factor)
-                    ema_factor_t = 0.5 * (1.0 + torch.cos(math.pi * (1.0 - ratio_t)))
-                    ema_lr_t = group["lr"] * ema_factor_t
-                    harmonic_t = 2.0 * cosine_lr_t * ema_lr_t / (cosine_lr_t + ema_lr_t).clamp(min=1e-20)
-                    lr_t = torch.where(cosine_lr_t < ema_lr_t, harmonic_t, ema_lr_t)
+                        if group["mu2_ema"] is None or k == 0:
+                            mu2_ema_t = mu2_t
+                            var_ema_t = var_t
+                        else:
+                            mu2_ema_t = beta * group["mu2_ema"] + (1 - beta) * mu2_t
+                            var_ema_t = beta * group["var_ema"] + (1 - beta) * var_t
 
-                    group["gnorm_ema"] = gnorm_ema_t.detach()
-                    group["gnorm_max"] = gnorm_max_t.detach()
+                        signal_ratio_t = mu2_ema_t / (mu2_ema_t + var_ema_t + self.var_eps)
+                        signal_ratio_t = signal_ratio_t.clamp(min=self.min_ratio, max=1.0)
+                        lr_mult_t = signal_ratio_t.pow(self.ratio_pow)
+                        cosine_lr_t = median_gnorm_t.new_full((), group["lr"] * cosine_factor)
+                        ema_lr_t = group["lr"] * lr_mult_t
+                        harmonic_t = 2.0 * cosine_lr_t * ema_lr_t / (cosine_lr_t + ema_lr_t).clamp(min=1e-20)
+                        lr_t = torch.where(cosine_lr_t < ema_lr_t, harmonic_t, ema_lr_t)
+                        gnorm_ema_t = mean_t
+                        gnorm_max_t = gnorms.max()
+                        ratio_t = signal_ratio_t
+
+                        group["gnorm_ema"] = gnorm_ema_t.detach()
+                        group["gnorm_max"] = gnorm_max_t.detach()
+
+                    group["mu2_ema"] = mu2_ema_t.detach()
+                    group["var_ema"] = var_ema_t.detach()
+                    group["signal_ratio"] = signal_ratio_t.detach()
+                    group["lr_mult"] = lr_mult_t.detach()
                     if is_compiling:
                         group["gnorm_ratio"] = ratio_t.detach()
                         group["gnorm_ratio_raw"] = ratio_t.detach()
@@ -225,6 +320,10 @@ class AutoNorMuon(torch.optim.Optimizer):
                         group["gnorm_ratio_raw"] = group["gnorm_ratio"]
                         group["gnorm_median"] = median_gnorm_t.item()
                         group["scheduled_lr"] = lr_t.item()
+                        group["mu2_ema"] = mu2_ema_t.item()
+                        group["var_ema"] = var_ema_t.item()
+                        group["signal_ratio"] = signal_ratio_t.item()
+                        group["lr_mult"] = lr_mult_t.item()
                     lr = lr_t
                 else:
                     lr = group["scheduled_lr"] if group["scheduled_lr"] is not None else group["lr"]

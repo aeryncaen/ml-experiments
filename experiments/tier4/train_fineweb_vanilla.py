@@ -2,6 +2,7 @@ import glob
 import json
 import math
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -95,6 +96,7 @@ class HParams:
     s6_scan_state_modes: str = os.environ.get("S6_SCAN_STATE_MODES", "elementwise,elementwise,elementwise")
 
     train_steps: int = _env_int("TRAIN_STEPS", 2000)
+    seed: int = _env_int("SEED", 1337)
     batch_size: int = _env_int("BATCH_SIZE", 8)
     grad_accum: int = _env_int("GRAD_ACCUM", 1)
     val_steps: int = _env_int("VAL_STEPS", 32)
@@ -124,6 +126,10 @@ class HParams:
     muon_momentum: float = _env_float("MUON_MOMENTUM", 0.95)
     normuon_beta2: float = _env_float("NORMUON_BETA2", 0.95)  # NorMuon per-row second moment EMA
     autonormuon_gnorm_beta: float = _env_float("AUTONORMUON_GNORM_BETA", 0.9)  # AutoNorMuon grad-norm EMA decay
+    autonormuon_adapt_mode: str = os.environ.get("AUTONORMUON_ADAPT_MODE", "gnorm")  # gnorm | mu_var
+    autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
+    autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
+    autonormuon_var_eps: float = _env_float("AUTONORMUON_VAR_EPS", 1e-12)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -242,11 +248,16 @@ def _optimizer_group_metrics(optimizer) -> list[dict]:
             "momentum",
             "beta2",
             "weight_decay",
+            "adapt_mode",
             "gnorm_ratio",
             "gnorm_ratio_raw",
             "gnorm_median",
             "gnorm_ema",
             "gnorm_max",
+            "mu2_ema",
+            "var_ema",
+            "signal_ratio",
+            "lr_mult",
         ):
             if k in pg:
                 rec[k] = _to_json_scalar(pg[k])
@@ -4366,7 +4377,16 @@ def evaluate(model: nn.Module, val_stream: ShardStream, device: torch.device, wo
 
 def main():
     rank, world_size, device = setup_dist()
-    torch.manual_seed(1337 + rank)
+    _rank_seed = int(HP.seed) + rank
+    random.seed(_rank_seed)
+    torch.manual_seed(_rank_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_rank_seed)
+    try:
+        import numpy as np
+        np.random.seed(_rank_seed)
+    except Exception:
+        pass
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -4380,7 +4400,7 @@ def main():
             import numpy as np
             HP.vocab_size = int(np.load(HP.token_bytes_path, mmap_mode="r").shape[0])
 
-    print0(rank, f"rank={rank} world_size={world_size} device={device}")
+    print0(rank, f"rank={rank} world_size={world_size} device={device} seed={_rank_seed}")
     _extra = f" n_features={HP.n_features} desc_dim={HP.desc_dim}" if HP.n_features > 0 and HP.desc_dim > 0 else ""
     if HP.model_type == "feat_attn" or HP.feat_attn_mlp:
         hidden = ((int(HP.d_model * 8 / 3) + 255) // 256) * 256
@@ -4413,8 +4433,8 @@ def main():
         print0(rank, _llada_feats)
 
     if HP.data_format == "yamit":
-        train_stream = MixedShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size, seed=42)
-        val_stream = MixedShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size, seed=1337)
+        train_stream = MixedShardStream(HP.train_files, rank, world_size, HP.seq_len, HP.batch_size, seed=HP.seed + 1)
+        val_stream = MixedShardStream(HP.val_files, rank, world_size, HP.seq_len, HP.batch_size, seed=HP.seed + 2)
         print0(rank, f"train: {train_stream.source_summary()}")
         print0(rank, f"val:   {val_stream.source_summary()}")
     else:
@@ -4585,8 +4605,16 @@ def main():
             total_steps=HP.train_steps,
             retract=_retract,
             gnorm_beta=HP.autonormuon_gnorm_beta,
+            adapt_mode=HP.autonormuon_adapt_mode,
+            ratio_pow=HP.autonormuon_ratio_pow,
+            min_ratio=HP.autonormuon_min_ratio,
+            var_eps=HP.autonormuon_var_eps,
         )
-        print0(rank, f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} gnorm_beta={HP.autonormuon_gnorm_beta}")
+        print0(rank, (
+            f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
+            f"gnorm_beta={HP.autonormuon_gnorm_beta} adapt_mode={HP.autonormuon_adapt_mode} "
+            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} var_eps={HP.autonormuon_var_eps}"
+        ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
         _sf_warmup = 0
