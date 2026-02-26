@@ -41,7 +41,7 @@ def normuon_update(
     beta2=0.95,
     ns_steps=5,
     nesterov=True,
-    second_moment_mode="row_mean",
+    second_moment_mode="none",
     gnorm_scope="matrix",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     momentum.lerp_(grad, 1 - beta)
@@ -142,8 +142,8 @@ class AutoNorMuon(torch.optim.Optimizer):
         gnorm_source: Muon gnorm source for adaptation: "grad" | "post_ortho"
         gnorm_scope: Muon gnorm tracking scope: "matrix" | "neuron"
         gmax_scope: Muon gnorm-max tracking scope: "global" | "matrix" | "neuron"
-        second_moment_mode: NorMuon second moment source:
-            none | row_mean | matrix_mean_square | matrix_norm_square
+        second_moment_mode: retained for compatibility; AutoNorMuon now hard-disables
+            NorMuon second-moment scaling and always uses "none"
     """
     def __init__(self, param_groups, total_steps, retract=True,
                  gnorm_beta=0.9,
@@ -156,7 +156,7 @@ class AutoNorMuon(torch.optim.Optimizer):
                  gnorm_source="grad",
                  gnorm_scope="matrix",
                  gmax_scope="global",
-                 second_moment_mode="row_mean"):
+                 second_moment_mode="none"):
         valid_modes = ("gnorm", "mu_var", "hybrid", "cv", "surge")
         if adapt_mode not in valid_modes:
             raise ValueError(f"Unsupported adapt_mode={adapt_mode}; expected one of {valid_modes}")
@@ -168,9 +168,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             raise ValueError(f"Unsupported gnorm_scope={gnorm_scope}; expected 'matrix' or 'neuron'")
         if gmax_scope not in ("global", "matrix", "neuron"):
             raise ValueError(f"Unsupported gmax_scope={gmax_scope}; expected 'global' | 'matrix' | 'neuron'")
-        sm_modes = ("none", "row_mean", "matrix_mean_square", "matrix_norm_square")
-        if second_moment_mode not in sm_modes:
-            raise ValueError(f"Unsupported second_moment_mode={second_moment_mode}; expected one of {sm_modes}")
+        # Hard-disable NorMuon second-moment scaling in AutoNorMuon.
+        # Keep the argument for config/backward compatibility, but ignore it.
+        second_moment_mode = "none"
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:

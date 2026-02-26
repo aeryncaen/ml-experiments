@@ -83,7 +83,7 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_lr_scope", "matrix")
         out.setdefault("autonormuon_gnorm_source", "grad")
         out.setdefault("autonormuon_gnorm_scope", "matrix")
-        out.setdefault("autonormuon_second_moment_mode", "row_mean")
+        out["autonormuon_second_moment_mode"] = "none"
 
         # Important: runs created before gmax-scope was introduced used matrix-
         # local gmax behavior. Treat missing field as "matrix" to avoid reruns.

@@ -138,7 +138,7 @@ class HParams:
     autonormuon_gnorm_source: str = os.environ.get("AUTONORMUON_GNORM_SOURCE", "grad")  # grad | post_ortho
     autonormuon_gnorm_scope: str = os.environ.get("AUTONORMUON_GNORM_SCOPE", "matrix")  # matrix | neuron
     autonormuon_gmax_scope: str = os.environ.get("AUTONORMUON_GMAX_SCOPE", "global")  # global | matrix | neuron
-    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "row_mean")  # none | row_mean | matrix_mean_square | matrix_norm_square
+    autonormuon_second_moment_mode: str = os.environ.get("AUTONORMUON_SECOND_MOMENT_MODE", "none")  # compatibility knob; AutoNorMuon hardcodes none
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
