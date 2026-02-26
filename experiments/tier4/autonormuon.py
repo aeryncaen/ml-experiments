@@ -129,13 +129,18 @@ class AutoNorMuon(torch.optim.Optimizer):
             Grad modes normalize before gnorm tracking sees the norms.
         ratio_pow: exponent applied to adaptation ratio before LR scaling
         min_ratio: lower clamp for adaptation ratio
+        anneal_power: shape of the anneal gate curve (only used with retract="anneal"):
+            1.0 = linear (equal transition across loss range)
+            >1  = grad normalization drops off faster (favors weight retraction earlier)
+            <1  = grad normalization persists longer into training
     """
     def __init__(self, param_groups, total_steps,
                  beta=0.55,
                  adaptation_scope="neuron",
                  retract=True,
                  ratio_pow=1.0,
-                 min_ratio=0.0):
+                 min_ratio=0.0,
+                 anneal_power=1.0):
         if adaptation_scope not in ("neuron", "matrix"):
             raise ValueError(
                 f"Unsupported adaptation_scope={adaptation_scope}; expected 'neuron' | 'matrix'"
@@ -176,6 +181,7 @@ class AutoNorMuon(torch.optim.Optimizer):
         self.min_ratio = min_ratio
 
         # Anneal gate state
+        self.anneal_power = anneal_power
         self._random_loss_ref = None   # captured from first set_train_loss call
         self._loss_ema = None          # smoothed loss for gate (avoids step-to-step noise)
         self._grad_gate = 0.0          # current grad normalization strength [0, 1]
@@ -199,8 +205,9 @@ class AutoNorMuon(torch.optim.Optimizer):
             self._loss_ema = 0.95 * self._loss_ema + 0.05 * loss
 
         loss_ratio = min(self._loss_ema / self._random_loss_ref, 1.0)
-        self._grad_gate = loss_ratio           # 1.0 at random, → 0 as loss drops
-        self._weight_gate = 1.0 - loss_ratio   # 0.0 at random, → 1 as loss drops
+        shaped = loss_ratio ** self.anneal_power  # power > 1 favors weights earlier
+        self._grad_gate = shaped           # 1.0 at random, → 0 as loss drops
+        self._weight_gate = 1.0 - shaped   # 0.0 at random, → 1 as loss drops
 
     @torch.no_grad()
     def step(self, closure=None):

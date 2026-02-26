@@ -133,6 +133,7 @@ class HParams:
     autonormuon_retract: str = os.environ.get("AUTONORMUON_RETRACT", "weights")  # weights | update | off
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
+    autonormuon_anneal_power: float = _env_float("AUTONORMUON_ANNEAL_POWER", 1.0)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
 
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
@@ -4653,11 +4654,13 @@ def main():
             retract=_retract,
             ratio_pow=HP.autonormuon_ratio_pow,
             min_ratio=HP.autonormuon_min_ratio,
+            anneal_power=HP.autonormuon_anneal_power,
         )
         print0(rank, (
             f"  autonormuon: R={_n_residuals} auto_lr={_muon_formula_lr:.6f} retract={_retract} "
             f"beta={HP.autonormuon_beta} adaptation_scope={HP.autonormuon_adaptation_scope} "
-            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio}"
+            f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio} "
+            f"anneal_power={HP.autonormuon_anneal_power}"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon

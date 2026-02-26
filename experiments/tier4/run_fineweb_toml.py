@@ -83,6 +83,7 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_retract", "weights")
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
+        out.setdefault("autonormuon_anneal_power", 1.0)
         out = _canonical_autonormuon(out)
 
     return out
@@ -130,6 +131,7 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_retract", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
+        out.pop("autonormuon_anneal_power", None)
     else:
         out = _canonical_autonormuon(out)
     return out
