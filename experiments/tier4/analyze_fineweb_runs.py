@@ -70,6 +70,55 @@ def _count_relative_spikes(
     return c
 
 
+def _smooth_series(vals: list[float], window: int) -> list[float]:
+    n = len(vals)
+    if n == 0 or window <= 1:
+        return vals[:]
+    w = max(1, int(window))
+    out = []
+    for i in range(n):
+        lo = max(0, i - w // 2)
+        hi = min(n, i + w // 2 + 1)
+        out.append(statistics.fmean(vals[lo:hi]))
+    return out
+
+
+def _segment_bounds(n: int, start_frac: float, end_frac: float) -> tuple[int, int]:
+    if n < 2:
+        return 0, n
+    a = int(max(0.0, min(1.0, start_frac)) * n)
+    b = int(max(0.0, min(1.0, end_frac)) * n)
+    if b <= a:
+        b = min(n, a + 2)
+    if b - a < 2:
+        a = max(0, b - 2)
+    return a, b
+
+
+def _linear_slope(x: list[float], y: list[float]) -> float | None:
+    n = min(len(x), len(y))
+    if n < 2:
+        return None
+    mx = statistics.fmean(x)
+    my = statistics.fmean(y)
+    num = 0.0
+    den = 0.0
+    for xi, yi in zip(x, y):
+        dx = xi - mx
+        num += dx * (yi - my)
+        den += dx * dx
+    if den <= 0:
+        return None
+    return num / den
+
+
+def _first_idx_leq(vals: list[float], threshold: float) -> int | None:
+    for i, v in enumerate(vals):
+        if v <= threshold:
+            return i
+    return None
+
+
 @dataclass
 class RunStats:
     run_name: str
@@ -94,6 +143,18 @@ class RunStats:
     total_tokens: int | None
     elapsed_s: float | None
     throughput_tok_s: float | None
+    random_loss_ref: float | None
+    random_exit_step: int | None
+    random_exit_tokens: int | None
+    stable_step: int | None
+    stable_tokens: int | None
+    stable_elapsed_s: float | None
+    early_slope_per_mtok: float | None
+    mid_slope_per_mtok: float | None
+    tail_slope_per_mtok: float | None
+    taper_ratio_tail_mid: float | None
+    mid_loss_std: float | None
+    tail_loss_std: float | None
     train_events: int
     eval_events: int
     train_loss_spikes: int
@@ -127,6 +188,18 @@ class RunStats:
             "total_tokens": self.total_tokens,
             "elapsed_s": self.elapsed_s,
             "throughput_tok_s": self.throughput_tok_s,
+            "random_loss_ref": self.random_loss_ref,
+            "random_exit_step": self.random_exit_step,
+            "random_exit_tokens": self.random_exit_tokens,
+            "stable_step": self.stable_step,
+            "stable_tokens": self.stable_tokens,
+            "stable_elapsed_s": self.stable_elapsed_s,
+            "early_slope_per_mtok": self.early_slope_per_mtok,
+            "mid_slope_per_mtok": self.mid_slope_per_mtok,
+            "tail_slope_per_mtok": self.tail_slope_per_mtok,
+            "taper_ratio_tail_mid": self.taper_ratio_tail_mid,
+            "mid_loss_std": self.mid_loss_std,
+            "tail_loss_std": self.tail_loss_std,
             "train_events": self.train_events,
             "eval_events": self.eval_events,
             "train_loss_spikes": self.train_loss_spikes,
@@ -147,6 +220,13 @@ def _extract_run_stats(
     grad_spike_min_abs: float,
     max_loss_spikes: int,
     max_grad_spikes: int,
+    smooth_window: int,
+    random_margin: float,
+    stable_drop_frac: float,
+    early_frac: float,
+    mid_start_frac: float,
+    mid_end_frac: float,
+    tail_frac: float,
 ) -> RunStats | None:
     summary = _read_json(run_dir / "run_summary.json")
     if summary is None:
@@ -165,6 +245,24 @@ def _extract_run_stats(
     train_losses = [float(e["train_loss"]) for e in train_events if _is_finite_number(e.get("train_loss"))]
     grad_norms = [float(e["grad_norm"]) for e in train_events if _is_finite_number(e.get("grad_norm"))]
     eval_losses = [float(e["val_loss"]) for e in eval_events if _is_finite_number(e.get("val_loss"))]
+
+    train_steps_axis: list[int] = []
+    train_tokens_axis: list[float] = []
+    train_elapsed_axis: list[float | None] = []
+    _n = 0
+    for e in train_events:
+        if not _is_finite_number(e.get("train_loss")):
+            continue
+        st = _as_int(e.get("step"))
+        if st is None:
+            st = _n
+        tok = _as_float(e.get("tokens_seen"))
+        if tok is None:
+            tok = float(st)
+        train_steps_axis.append(st)
+        train_tokens_axis.append(tok)
+        train_elapsed_axis.append(_as_float(e.get("elapsed_s")))
+        _n += 1
 
     non_finite_train_loss = sum(1 for e in train_events if not _is_finite_number(e.get("train_loss")))
     non_finite_grad_norm = sum(1 for e in train_events if not _is_finite_number(e.get("grad_norm")))
@@ -206,6 +304,60 @@ def _extract_run_stats(
     if elapsed_s is not None and tokens_seen is not None and elapsed_s > 0:
         throughput_tok_s = float(tokens_seen) / elapsed_s
 
+    smooth_losses = _smooth_series(train_losses, smooth_window)
+    x_mtok = [t / 1_000_000.0 for t in train_tokens_axis]
+
+    random_loss_ref = None
+    random_exit_step = None
+    random_exit_tokens = None
+    _vocab = _as_int(hparams.get("vocab_size"))
+    if _vocab is not None and _vocab > 1 and smooth_losses:
+        random_loss_ref = math.log(float(_vocab))
+        random_threshold = random_loss_ref * (1.0 - random_margin)
+        ridx = _first_idx_leq(smooth_losses, random_threshold)
+        if ridx is not None:
+            random_exit_step = train_steps_axis[ridx] if ridx < len(train_steps_axis) else None
+            random_exit_tokens = int(train_tokens_axis[ridx]) if ridx < len(train_tokens_axis) else None
+
+    stable_step = None
+    stable_tokens = None
+    stable_elapsed_s = None
+    if smooth_losses:
+        init_loss = smooth_losses[0]
+        end_loss = smooth_losses[-1]
+        total_drop = init_loss - end_loss
+        if total_drop > 0:
+            stable_target = init_loss - stable_drop_frac * total_drop
+            sidx = _first_idx_leq(smooth_losses, stable_target)
+            if sidx is not None:
+                stable_step = train_steps_axis[sidx] if sidx < len(train_steps_axis) else None
+                stable_tokens = int(train_tokens_axis[sidx]) if sidx < len(train_tokens_axis) else None
+                stable_elapsed_s = train_elapsed_axis[sidx] if sidx < len(train_elapsed_axis) else None
+
+    npts = len(smooth_losses)
+    early_slope = None
+    mid_slope = None
+    tail_slope = None
+    mid_loss_std = None
+    tail_loss_std = None
+    taper_ratio = None
+    if npts >= 2:
+        e0, e1 = _segment_bounds(npts, 0.0, early_frac)
+        m0, m1 = _segment_bounds(npts, mid_start_frac, mid_end_frac)
+        t0, t1 = _segment_bounds(npts, max(0.0, 1.0 - tail_frac), 1.0)
+
+        early_slope = _linear_slope(x_mtok[e0:e1], smooth_losses[e0:e1])
+        mid_slope = _linear_slope(x_mtok[m0:m1], smooth_losses[m0:m1])
+        tail_slope = _linear_slope(x_mtok[t0:t1], smooth_losses[t0:t1])
+
+        mid_seg = smooth_losses[m0:m1]
+        tail_seg = smooth_losses[t0:t1]
+        mid_loss_std = statistics.pstdev(mid_seg) if len(mid_seg) > 1 else (0.0 if mid_seg else None)
+        tail_loss_std = statistics.pstdev(tail_seg) if len(tail_seg) > 1 else (0.0 if tail_seg else None)
+
+        if mid_slope is not None and tail_slope is not None:
+            taper_ratio = abs(tail_slope) / max(abs(mid_slope), 1e-12)
+
     unstable = (
         non_finite_train_loss > 0
         or non_finite_grad_norm > 0
@@ -237,6 +389,18 @@ def _extract_run_stats(
         total_tokens=_as_int(summary.get("total_tokens")),
         elapsed_s=elapsed_s,
         throughput_tok_s=throughput_tok_s,
+        random_loss_ref=random_loss_ref,
+        random_exit_step=random_exit_step,
+        random_exit_tokens=random_exit_tokens,
+        stable_step=stable_step,
+        stable_tokens=stable_tokens,
+        stable_elapsed_s=stable_elapsed_s,
+        early_slope_per_mtok=early_slope,
+        mid_slope_per_mtok=mid_slope,
+        tail_slope_per_mtok=tail_slope,
+        taper_ratio_tail_mid=taper_ratio,
+        mid_loss_std=mid_loss_std,
+        tail_loss_std=tail_loss_std,
         train_events=len(train_events),
         eval_events=len(eval_events),
         train_loss_spikes=train_loss_spikes,
@@ -264,14 +428,15 @@ def _to_markdown(stats: list[RunStats]) -> str:
         "",
         f"Generated: {datetime.now().isoformat()}",
         "",
-        "| Rank | Run | Optimizer | Mode | Best Val | Final Val | Final Train | tok/s | Unstable | Spikes (loss/grad) |",
-        "|------|-----|-----------|------|----------|-----------|-------------|-------|----------|--------------------|",
+        "| Rank | Run | Optimizer | Mode | Best Val | Final Val | Stable Step | Rand Exit | Mid Slope | Tail Slope | Taper | tok/s | Unstable | Spikes (loss/grad) |",
+        "|------|-----|-----------|------|----------|-----------|-------------|-----------|-----------|------------|-------|-------|----------|--------------------|",
     ]
     for i, s in enumerate(stats, start=1):
         lines.append(
             "| "
             f"{i} | {s.run_name} | {s.optimizer or '-'} | {s.adapt_mode or '-'} | {_fmt(s.best_val_loss)} | {_fmt(s.final_val_loss)} | "
-            f"{_fmt(s.final_train_loss)} | {_fmt(s.throughput_tok_s, nd=1)} | {s.unstable} | "
+            f"{_fmt(s.stable_step, nd=0)} | {_fmt(s.random_exit_step, nd=0)} | {_fmt(s.mid_slope_per_mtok)} | {_fmt(s.tail_slope_per_mtok)} | "
+            f"{_fmt(s.taper_ratio_tail_mid)} | {_fmt(s.throughput_tok_s, nd=1)} | {s.unstable} | "
             f"{s.train_loss_spikes}/{s.grad_norm_spikes} |"
         )
     lines.append("")
@@ -289,6 +454,11 @@ def _group_aggregate(stats: list[RunStats], group_fields: list[str]) -> list[dic
         best_vals = [r.best_val_loss for r in rows if r.best_val_loss is not None]
         final_vals = [r.final_val_loss for r in rows if r.final_val_loss is not None]
         throughputs = [r.throughput_tok_s for r in rows if r.throughput_tok_s is not None]
+        stable_steps = [float(r.stable_step) for r in rows if r.stable_step is not None]
+        rand_steps = [float(r.random_exit_step) for r in rows if r.random_exit_step is not None]
+        mid_slopes = [r.mid_slope_per_mtok for r in rows if r.mid_slope_per_mtok is not None]
+        tail_slopes = [r.tail_slope_per_mtok for r in rows if r.tail_slope_per_mtok is not None]
+        taper_ratios = [r.taper_ratio_tail_mid for r in rows if r.taper_ratio_tail_mid is not None]
         unstable_n = sum(1 for r in rows if r.unstable)
         rec = {f: v for f, v in zip(group_fields, key)}
         rec.update(
@@ -300,6 +470,11 @@ def _group_aggregate(stats: list[RunStats], group_fields: list[str]) -> list[dic
                 "final_val_loss_std": statistics.pstdev(final_vals) if len(final_vals) > 1 else (0.0 if final_vals else None),
                 "throughput_tok_s_mean": statistics.fmean(throughputs) if throughputs else None,
                 "throughput_tok_s_std": statistics.pstdev(throughputs) if len(throughputs) > 1 else (0.0 if throughputs else None),
+                "stable_step_mean": statistics.fmean(stable_steps) if stable_steps else None,
+                "random_exit_step_mean": statistics.fmean(rand_steps) if rand_steps else None,
+                "mid_slope_per_mtok_mean": statistics.fmean(mid_slopes) if mid_slopes else None,
+                "tail_slope_per_mtok_mean": statistics.fmean(tail_slopes) if tail_slopes else None,
+                "taper_ratio_tail_mid_mean": statistics.fmean(taper_ratios) if taper_ratios else None,
                 "unstable_runs": unstable_n,
             }
         )
@@ -316,7 +491,20 @@ def _group_aggregate(stats: list[RunStats], group_fields: list[str]) -> list[dic
 
 
 def _group_markdown(groups: list[dict], group_fields: list[str]) -> str:
-    hdr = ["Rank", *group_fields, "Runs", "Best Mean", "Best Std", "Final Mean", "Final Std", "tok/s Mean", "Unstable"]
+    hdr = [
+        "Rank",
+        *group_fields,
+        "Runs",
+        "Best Mean",
+        "Final Mean",
+        "Stable Step",
+        "Rand Exit",
+        "Mid Slope",
+        "Tail Slope",
+        "Taper",
+        "tok/s Mean",
+        "Unstable",
+    ]
     sep = ["------"] * len(hdr)
     lines = ["## Grouped Summary", "", "| " + " | ".join(hdr) + " |", "| " + " | ".join(sep) + " |"]
     for i, g in enumerate(groups, start=1):
@@ -325,9 +513,12 @@ def _group_markdown(groups: list[dict], group_fields: list[str]) -> str:
             *[str(g.get(f, "-")) for f in group_fields],
             _fmt(g.get("n_runs"), nd=0),
             _fmt(g.get("best_val_loss_mean")),
-            _fmt(g.get("best_val_loss_std")),
             _fmt(g.get("final_val_loss_mean")),
-            _fmt(g.get("final_val_loss_std")),
+            _fmt(g.get("stable_step_mean"), nd=0),
+            _fmt(g.get("random_exit_step_mean"), nd=0),
+            _fmt(g.get("mid_slope_per_mtok_mean")),
+            _fmt(g.get("tail_slope_per_mtok_mean")),
+            _fmt(g.get("taper_ratio_tail_mid_mean")),
             _fmt(g.get("throughput_tok_s_mean"), nd=1),
             _fmt(g.get("unstable_runs"), nd=0),
         ]
@@ -347,6 +538,13 @@ def main() -> None:
     ap.add_argument("--grad-spike-min-abs", type=float, default=0.2)
     ap.add_argument("--max-loss-spikes", type=int, default=5)
     ap.add_argument("--max-grad-spikes", type=int, default=40)
+    ap.add_argument("--smooth-window", type=int, default=11)
+    ap.add_argument("--random-margin", type=float, default=0.2)
+    ap.add_argument("--stable-drop-frac", type=float, default=0.8)
+    ap.add_argument("--early-frac", type=float, default=0.2)
+    ap.add_argument("--mid-start-frac", type=float, default=0.4)
+    ap.add_argument("--mid-end-frac", type=float, default=0.6)
+    ap.add_argument("--tail-frac", type=float, default=0.2)
     ap.add_argument(
         "--group-by",
         type=str,
@@ -373,6 +571,13 @@ def main() -> None:
             grad_spike_min_abs=args.grad_spike_min_abs,
             max_loss_spikes=args.max_loss_spikes,
             max_grad_spikes=args.max_grad_spikes,
+            smooth_window=args.smooth_window,
+            random_margin=args.random_margin,
+            stable_drop_frac=args.stable_drop_frac,
+            early_frac=args.early_frac,
+            mid_start_frac=args.mid_start_frac,
+            mid_end_frac=args.mid_end_frac,
+            tail_frac=args.tail_frac,
         )
         if st is not None:
             stats.append(st)
@@ -398,6 +603,15 @@ def main() -> None:
             "grad_spike_min_abs": args.grad_spike_min_abs,
             "max_loss_spikes": args.max_loss_spikes,
             "max_grad_spikes": args.max_grad_spikes,
+        },
+        "dynamics_rules": {
+            "smooth_window": args.smooth_window,
+            "random_margin": args.random_margin,
+            "stable_drop_frac": args.stable_drop_frac,
+            "early_frac": args.early_frac,
+            "mid_start_frac": args.mid_start_frac,
+            "mid_end_frac": args.mid_end_frac,
+            "tail_frac": args.tail_frac,
         },
         "n_runs": len(stats),
         "runs": [s.as_dict() for s in stats],
