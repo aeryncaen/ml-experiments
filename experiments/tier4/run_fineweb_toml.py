@@ -70,6 +70,25 @@ def _hash_view(hparams: dict) -> dict:
         for k in list(out.keys()):
             if k.startswith("autonormuon_"):
                 out.pop(k, None)
+    else:
+        # Canonicalize AutoNorMuon hash fields for backward compatibility.
+        # Older runs may not have recorded newly introduced knobs; map those
+        # missing fields to their historical effective defaults so hashes align.
+        out.setdefault("autonormuon_adapt_mode", "gnorm")
+        out.setdefault("autonormuon_gnorm_beta", 0.9)
+        out.setdefault("autonormuon_ratio_pow", 1.0)
+        out.setdefault("autonormuon_min_ratio", 0.0)
+        out.setdefault("autonormuon_var_eps", 1e-12)
+        out.setdefault("autonormuon_conflict_proj", False)
+        out.setdefault("autonormuon_lr_scope", "matrix")
+        out.setdefault("autonormuon_gnorm_source", "grad")
+        out.setdefault("autonormuon_second_moment_mode", "row_mean")
+
+        # Important: runs created before gmax-scope was introduced used matrix-
+        # local gmax behavior. Treat missing field as "matrix" to avoid reruns.
+        out.setdefault("autonormuon_gmax_scope", "matrix")
+        if out.get("autonormuon_gmax_scope") in (None, ""):
+            out["autonormuon_gmax_scope"] = "matrix"
 
     return out
 
