@@ -700,7 +700,7 @@ class SpicyDion(Optimizer):
                 # adaptive LR meets or exceeds base_lr, warmup is done.
                 _next_lr = median_adaptive_lr
 
-                if _next_lr >= self._base_lr:
+                if _next_lr >= self._base_lr and current_step > 1:
                     # Warmup complete — lock to base_lr, snapshot gnorm.
                     self._peak_detected = True
                     self._peak_step = current_step
