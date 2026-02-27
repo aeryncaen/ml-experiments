@@ -1,5 +1,5 @@
 [runner]
-# SpicyDion vs baselines at 5M tokens.
+# SpicyDion vs baselines on Yamit (~60M tokens).
 # SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, adaptive LR, sphere retract.
 metrics_dir = "experiments/tier4/runs"
 run_prefix = "rnd_spicydion"
@@ -7,23 +7,28 @@ skip_existing = true
 continue_on_error = true
 
 [base]
-# ~5M tokens at seq_len=1024: 611 * 8 * 1 * 1024 = 5,005,312
-train_steps = 611
-batch_size = 8
+# ~60M tokens at seq_len=1024: 1834 * 32 * 1 * 1024 = 60,063,744
+train_steps = 1834
+batch_size = 32
 grad_accum = 1
 seq_len = 1024
 
 metrics_every = 1
 val_every = 100
 
-train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
-val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
+# Yamit dataset (Qwen3 tokenizer, uint32)
+data_format = "yamit"
+data_path = "/data/yamit"
+train_files = "/data/yamit/train/**/*.bin"
+val_files = "/data/yamit/val/**/*.bin"
+token_bytes_path = "experiments/yamit/tokenizer/artifacts/qwen3/token_bytes.npy"
+vocab_size = 149760
 
 seed = 42
 init_mode = "default"
 
 [sweep]
-optimizer = ["spicydion", "autonormuon", "muon"]
+optimizer = ["spicydion", "autonormuon", "normuon"]
 
 # LR schedule: spicydion needs an external schedule now
 lr_schedule = ["cosine", "pressure"]
