@@ -26,6 +26,7 @@ vocab_size = 149760
 
 seed = 42
 init_mode = "default"
+lr_schedule = "cosine"  # used by normuon/autonormuon; spicydion self-schedules
 
 [sweep]
 optimizer = ["spicydion", "autonormuon", "normuon"]
