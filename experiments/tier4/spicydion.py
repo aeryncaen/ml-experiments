@@ -1236,7 +1236,7 @@ def spicydion_post_orthogonalize(
         adam:    1 / sqrt(v) — Adam second moment only
         ratio:  ratio — signal/max only
     """
-    beta2 = 0.999  # Second moment decay, same as Adam default
+    beta2 = 0.95  # Second moment decay — fast ~20-step window, matching NorMuon
 
     # Convert U to match parameter dtype
     dtype = X[0].dtype
