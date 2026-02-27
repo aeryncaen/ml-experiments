@@ -106,7 +106,7 @@ class HParams:
     warmup_frac: float = _env_float("WARMUP_FRAC", 0.02)  # fraction of total tokens for warmup (no grad_accum during warmup)
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
-    lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd
+    lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
@@ -4363,6 +4363,12 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
         # Cosine decay from peak to ~0 over the decay phase
         t = (tokens_seen - stable_end) / max(1, decay_tokens)
         return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+    elif HP.lr_schedule == "pressure":
+        # Hyperbolic pressure decay: lr = base / (1 + k * t/T)
+        # Decays faster early but has a longer tail than cosine.
+        k = 4.0
+        t = tokens_seen / max(1, total_tokens)
+        return HP.lr / (1.0 + k * t)
     else:
         # Default: cosine decay from warmup end to total_tokens
         t = (tokens_seen - warmup_tokens) / max(1, total_tokens - warmup_tokens)
@@ -4810,7 +4816,8 @@ def main():
         f"optimizer may have restructured param groups internally"
 
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
-    _is_auto = HP.optimizer in ("autonormuon", "spicydion")  # handle own LR schedule internally
+    _is_auto = HP.optimizer in ("autonormuon",)  # handle own LR schedule internally
+    _is_spicydion = HP.optimizer == "spicydion"  # needs external schedule (cosine or pressure)
     _is_plain_muon = HP.optimizer in ("muon", "normuon")
 
     profiler = None
@@ -4960,6 +4967,14 @@ def main():
         if _is_sf or _is_auto:
             # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
+        elif _is_spicydion:
+            # SpicyDion: apply external schedule (cosine/pressure/wsd) to all groups.
+            # SpicyDion's internal ratio+second-moment handles per-neuron distribution;
+            # this just controls the total LR envelope.
+            _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+            for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
+                pg["lr"] = base_lr * _lr_factor
+            lr = _base_lrs[0] * _lr_factor
         else:
             if _is_plain_muon:
                 # Muon/NorMuon: no LR warmup, only schedule shape

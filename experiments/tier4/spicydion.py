@@ -1171,8 +1171,7 @@ def spicydion_pre_orthogonalize(
     torch._foreach_lerp_(M, G, 1.0 - beta)
 
     # Nesterov extrapolation: update = lerp(G, M, beta)
-    beta_val = beta.item() if isinstance(beta, Tensor) else float(beta)
-    updates = [torch.lerp(g, m, beta_val) for g, m in zip(G, M)]
+    updates = [torch.lerp(g, m, beta) for g, m in zip(G, M)]
 
     U_stacked = torch.stack(updates, dim=0)
 

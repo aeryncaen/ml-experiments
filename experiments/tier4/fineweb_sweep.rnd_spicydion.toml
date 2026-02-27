@@ -1,6 +1,6 @@
 [runner]
 # SpicyDion vs baselines at 5M tokens.
-# SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, pressure-based LR (k=4), sphere retract, no wd.
+# SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, ratio+second-moment adaptive LR, sphere retract.
 metrics_dir = "experiments/tier4/runs"
 run_prefix = "rnd_spicydion"
 skip_existing = true
@@ -25,7 +25,10 @@ init_mode = "default"
 [sweep]
 optimizer = ["spicydion", "autonormuon", "muon"]
 
-# LR: spicydion handles its own schedule internally via pressure system
+# LR schedule: spicydion needs an external schedule now
+lr_schedule = ["cosine", "pressure"]
+
+# LR: sweep a couple values
 muon_lr = [0.023]
 
 # Momentum beta (ef_decay for spicydion, also used as NorMuon-EMA beta)
