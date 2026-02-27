@@ -68,13 +68,13 @@ class GnormScheduler:
     def __init__(
         self,
         base_lr: float,
-        # Tracker
-        ma_window: int = 15,
-        var_window: int = 10,
+        # Tracker (windows tuned for per-step gnorms; original data was every 20 steps)
+        ma_window: int = 300,
+        var_window: int = 200,
         stable_thresh: float = 0.02,
         tap_thresh: float = 0.0003,
-        tap_confirm: int = 5,
-        cooloff_steps: int = 30,
+        tap_confirm: int = 100,
+        cooloff_steps: int = 600,
         # Ramp
         ramp_steps: int = 100,
         # Cruise
