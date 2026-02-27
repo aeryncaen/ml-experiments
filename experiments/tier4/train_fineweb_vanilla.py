@@ -4819,6 +4819,11 @@ def main():
     _is_auto = HP.optimizer in ("autonormuon",)  # handle own LR schedule internally
     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
 
+    _gnorm_scheduler = None
+    if _is_spicydion:
+        from gnorm_scheduler import GnormScheduler
+        _gnorm_scheduler = GnormScheduler(base_lr=HP.lr)
+        print0(rank, f"  gnorm_scheduler: cold_lr={HP.lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
 
     profiler = None
     if HP.torch_profile:
@@ -5038,6 +5043,24 @@ def main():
         # Feed loss to optimizer for anneal gate (no-op if optimizer doesn't support it)
         if hasattr(optimizer, "set_train_loss"):
             optimizer.set_train_loss(float(loss.detach().item()) * _eff_accum)
+        # Gnorm scheduler: set LR and adaptive_active on param groups before step.
+        if _gnorm_scheduler is not None:
+            _sched = _gnorm_scheduler.step(float(grad_norm), step)
+            _sched_lr = _sched["lr"]
+            _sched_aa = 1.0 if _sched["adaptive_active"] else 0.0
+            for pg in optimizer.param_groups:
+                if pg.get("algorithm") == "spicydion":
+                    pg["lr"] = _sched_lr
+                    pg["scheduled_lr"] = _sched_lr
+                    pg["_adaptive_active"] = _sched_aa
+                else:
+                    # Adam/Lion groups get 1/3 of spicydion LR
+                    pg["lr"] = _sched_lr / 3.0
+                    pg["scheduled_lr"] = _sched_lr / 3.0
+                    pg["_adaptive_active"] = _sched_aa
+            if _sched["early_exit"]:
+                print0(rank, f"  GnormScheduler: early exit at step {step} — LR below floor ({_sched_lr:.2e}), tap_count={_sched['tap_count']}")
+                break
         optimizer.step()
         if _is_sf or _is_auto:
             lr = optimizer.param_groups[0].get("scheduled_lr", lr)  # read actual LR after step
@@ -5049,7 +5072,11 @@ def main():
         _train_acc_local = None
         if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
             _train_acc_local = _to_json_scalar(raw_model._last_acc)
-        _phase = "warmup-ramp" if _in_warmup and _in_accum_ramp else ("warmup" if _in_warmup else "stable")
+        if _gnorm_scheduler is not None:
+            _tc = _gnorm_scheduler.tap_count
+            _phase = f"{_gnorm_scheduler.phase}(t={_tc})" if _tc > 0 else _gnorm_scheduler.phase
+        else:
+            _phase = "warmup-ramp" if _in_warmup and _in_accum_ramp else ("warmup" if _in_warmup else "stable")
 
         if _metrics is not None and step % max(1, HP.metrics_every) == 0:
             _now = time.time()

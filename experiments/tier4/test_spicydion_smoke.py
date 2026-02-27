@@ -20,6 +20,7 @@ from experiments.tier4.normuon import SingleDeviceNorMuonWithAuxAdam
 from experiments.tier4.autonormuon import AutoNorMuon
 from dion.dion2 import Dion2
 from experiments.tier4.spicy_adam import SpicyAdam
+from experiments.tier4.gnorm_scheduler import GnormScheduler
 
 
 # ── Model ──────────────────────────────────────────────────────────────────
@@ -224,6 +225,121 @@ class SpicyDionWithAdam:
         return out
 
 
+class SpicyDionWithScheduler:
+    """Wrapper: SpicyDion + GnormScheduler for self-scheduled LR."""
+
+    def __init__(self, model, muon_lr=0.02, adam_lr=3e-4, fraction=1.0, total_steps=2000):
+        muon_p, adam_p = split_params(model)
+        self.spicy = SpicyDion(
+            muon_p,
+            distributed_mesh=None,
+            lr=muon_lr,
+            fraction=fraction,
+            ef_decay=0.95,
+            weight_decay=0,
+            adjust_lr="spectral_norm",
+            total_steps=total_steps,
+        )
+        self.adam = torch.optim.AdamW(adam_p, lr=adam_lr, weight_decay=0)
+        self.param_groups = self.spicy.param_groups + self.adam.param_groups
+        self.scheduler = GnormScheduler(base_lr=muon_lr)
+        self._adam_lr = adam_lr
+        self._step_num = 0
+
+    def zero_grad(self):
+        self.spicy.zero_grad()
+        self.adam.zero_grad()
+
+    def step(self):
+        # Compute grad norm for scheduler
+        all_params = []
+        for g in self.param_groups:
+            all_params.extend(g["params"])
+        gnorm = torch.cat([p.grad.flatten() for p in all_params if p.grad is not None]).norm().item()
+
+        # Run scheduler
+        sched = self.scheduler.step(gnorm, self._step_num)
+        sched_lr = sched["lr"]
+        aa = 1.0 if sched["adaptive_active"] else 0.0
+
+        # Set LR on param groups
+        for pg in self.spicy.param_groups:
+            pg["lr"] = sched_lr
+            pg["scheduled_lr"] = sched_lr
+            pg["_adaptive_active"] = aa
+        for pg in self.adam.param_groups:
+            pg["lr"] = sched_lr / 3.0
+
+        self.spicy.step()
+        self.adam.step()
+        self._step_num += 1
+
+    def effective_muon_lr(self):
+        return self.scheduler.current_lr
+
+    def gnorm_stats(self, step=0, total_steps=2000):
+        ratios = []
+        for p in self.spicy.param_groups[0]["params"]:
+            st = self.spicy.state.get(p, None)
+            if not st:
+                continue
+            ema = st.get("gnorm_ema")
+            gmax = st.get("gnorm_max")
+            if isinstance(ema, torch.Tensor) and isinstance(gmax, torch.Tensor) and ema.numel() > 0:
+                ratio = ema / gmax.clamp(min=1e-12)
+                ratios.append(ratio.reshape(-1).float())
+        if not ratios:
+            return None
+        r = torch.cat(ratios)
+        base_lr = self.scheduler.current_lr
+        lr_per_neuron = base_lr * r
+        pcts = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+        q = torch.tensor(pcts, device=r.device)
+        r_pct = torch.quantile(r, q)
+        lr_pct = torch.quantile(lr_per_neuron, q)
+        return {
+            "n_neurons": int(r.numel()),
+            "ratio_p0": float(r_pct[0]), "ratio_p10": float(r_pct[1]),
+            "ratio_p25": float(r_pct[2]), "ratio_p50": float(r_pct[3]),
+            "ratio_p75": float(r_pct[4]), "ratio_p90": float(r_pct[5]),
+            "ratio_p100": float(r_pct[6]),
+            "lr_p0": float(lr_pct[0]), "lr_p10": float(lr_pct[1]),
+            "lr_p25": float(lr_pct[2]), "lr_p50": float(lr_pct[3]),
+            "lr_p75": float(lr_pct[4]), "lr_p90": float(lr_pct[5]),
+            "lr_p100": float(lr_pct[6]),
+            "pressure": 0.0,
+            "phase": self.scheduler.phase,
+            "gnorm_ratio": self.scheduler.gnorm_ratio,
+            "tap_count": self.scheduler.tap_count,
+        }
+
+    def grad_norm_stats(self):
+        mat_l2 = []
+        row_l2 = []
+        for p in self.spicy.param_groups[0]["params"]:
+            g = p.grad
+            if g is None:
+                continue
+            gf = g.detach().float()
+            mat_l2.append(gf.norm().reshape(1))
+            if gf.ndim >= 2:
+                row_l2.append(gf.norm(dim=-1).reshape(-1))
+        if not mat_l2:
+            return None
+        mat = torch.cat(mat_l2)
+        out = {
+            "grad_mat_l2_med": float(mat.median().item()),
+            "grad_mat_l2_mean": float(mat.mean().item()),
+            "grad_mat_l2_max": float(mat.max().item()),
+        }
+        if row_l2:
+            rows = torch.cat(row_l2)
+            out["grad_row_l2_med"] = float(rows.median().item())
+            out["grad_row_l2_mean"] = float(rows.mean().item())
+            out["grad_row_l2_max"] = float(rows.max().item())
+        return out
+
+
 class Dion2WithAdam:
     """Wrapper: Dion2 for 2D params + plain AdamW for the rest."""
     def __init__(self, model, muon_lr=0.02, adam_lr=3e-4, fraction=0.25):
@@ -343,6 +459,9 @@ def make_dion2(model, muon_lr=0.02, adam_lr=3e-4, fraction=0.25):
 def make_spicydion(model, muon_lr=0.02, adam_lr=3e-4, fraction=0.25, total_steps=2000):
     return SpicyDionWithAdam(model, muon_lr=muon_lr, adam_lr=adam_lr, fraction=fraction, total_steps=total_steps)
 
+def make_spicydion_sched(model, muon_lr=0.02, adam_lr=3e-4, fraction=1.0, total_steps=2000):
+    return SpicyDionWithScheduler(model, muon_lr=muon_lr, adam_lr=adam_lr, fraction=fraction, total_steps=total_steps)
+
 
 def make_muon(model, muon_lr=0.02, adam_lr=3e-4):
     muon_p, adam_p = split_params(model)
@@ -397,8 +516,8 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
             cf = cosine_lr(1.0, step, steps)
             for g in optimizer.param_groups:
                 g["lr"] = adam_lr * cf
-        elif name.startswith("AutoNor"):
-            # AutoNorMuon handles cosine ceiling internally; don't touch LRs.
+        elif name.startswith("AutoNor") or name == "Spicy-Sched":
+            # AutoNorMuon / SpicyDion+GnormScheduler handle LR internally.
             pass
         else:
             # SpicyDion computes its own cosine ceiling internally.
@@ -433,7 +552,13 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
             if hasattr(optimizer, "gnorm_stats") and hasattr(optimizer.gnorm_stats, "__call__"):
                 stats = optimizer.gnorm_stats(step=step, total_steps=steps)
                 if stats is not None and "ratio_p50" in stats:
-                    print(f"  [{name:12s}] step {step:4d} | loss={lv:.4f} | P={stats['pressure']:.3f} | {elapsed:.1f}s")
+                    if "phase" in stats:
+                        tc = stats.get("tap_count", 0)
+                        tc_str = f"(t={tc})" if tc > 0 else ""
+                        phase_str = f" | {stats['phase']}{tc_str} gr={stats['gnorm_ratio']:.3f}"
+                    else:
+                        phase_str = ""
+                    print(f"  [{name:12s}] step {step:4d} | loss={lv:.4f} | P={stats['pressure']:.3f}{phase_str} | {elapsed:.1f}s")
                     print(f"    ratio  p0={stats['ratio_p0']:.3f} p10={stats['ratio_p10']:.3f}"
                           f" p25={stats['ratio_p25']:.3f} p50={stats['ratio_p50']:.3f}"
                           f" p75={stats['ratio_p75']:.3f} p90={stats['ratio_p90']:.3f}"
@@ -498,6 +623,7 @@ def main():
     # 2000-step side-by-side benchmark.
     results = []
     for name, make_opt in [
+         ("Spicy-Sched", lambda m: make_spicydion_sched(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
          ("Spicy-P", lambda m: make_spicydion(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
          #("AutoNorMuon", lambda m: make_autonormuon(m, muon_lr=muon_lr, adam_lr=adam_lr, total_steps=steps)),
          #("NorMuon", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),

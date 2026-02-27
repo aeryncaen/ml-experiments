@@ -658,13 +658,12 @@ class SpicyDion(Optimizer):
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
-        # Expose the effective (pressure-scheduled) LR for external logging.
-        # The training loop reads param_groups[0]["scheduled_lr"].
+        # Expose diagnostics for external logging (separate key, scheduler owns scheduled_lr).
         for group in spicydion_groups:
             for p in group["params"]:
                 if p in self.state and "gnorm_last_lr" in self.state[p]:
-                    group["scheduled_lr"] = self.state[p]["gnorm_last_lr"].item()
-                    break  # first param's median LR is representative
+                    group["_diag_median_adaptive_lr"] = self.state[p]["gnorm_last_lr"].item()
+                    break
 
         return loss
 
@@ -727,6 +726,7 @@ class SpicyDion(Optimizer):
                 adaptive_w_adam=1.0 if _alm == "adam" else 0.0,
                 adaptive_w_ratio=1.0 if _alm == "ratio" else 0.0,
                 ratio_power=self.ratio_power,
+                adaptive_active=float(group.get("_adaptive_active", 1.0)),
             )
 
             # Create batches of parameters of size self._world_size
@@ -1012,6 +1012,7 @@ def spicydion_update_batch_async(
     adaptive_w_adam: float = 0.0,
     adaptive_w_ratio: float = 0.0,
     ratio_power: float = 1.0,
+    adaptive_active: float = 1.0,
     verbose: bool = False,
 ) -> Generator[None, None, None]:
     """
@@ -1163,6 +1164,7 @@ def spicydion_update_batch_async(
         adaptive_w_adam=adaptive_w_adam,
         adaptive_w_ratio=adaptive_w_ratio,
         ratio_power=ratio_power,
+        adaptive_active=adaptive_active,
     )
 
 
@@ -1234,6 +1236,7 @@ def spicydion_post_orthogonalize(
     adaptive_w_adam: float = 0.0,
     adaptive_w_ratio: float = 0.0,
     ratio_power: float = 1.0,
+    adaptive_active: float = 1.0,
 ):
     """
     Apply weight update after orthogonalization.
@@ -1271,6 +1274,10 @@ def spicydion_post_orthogonalize(
         rows = u.float().reshape(u.shape[0], -1)
         units = rows.norm(dim=-1)
 
+        # aa = adaptive_active: 1.0 when per-neuron adaptation is active, 0.0 during cold start.
+        # When aa=0.0, state stays frozen (EMA/max/v don't update) and flat base_lr is used.
+        aa = adaptive_active
+
         prev_ema = g_ema
         prev_max = g_max
 
@@ -1279,29 +1286,35 @@ def spicydion_post_orthogonalize(
         max_candidate = torch.maximum(prev_max, units)
         max_u = torch.where(is_first, units, max_candidate)
 
-        g_ema.copy_(signal_u.detach())
-        g_max.copy_(max_u.detach())
+        # Gate state updates: only write when adaptive is active.
+        # When aa=0.0, state remains at its previous value (frozen).
+        g_ema.copy_((aa * signal_u + (1.0 - aa) * prev_ema).detach())
+        g_max.copy_((aa * max_u + (1.0 - aa) * prev_max).detach())
 
         # Second moment of post-ortho norms (Adam-style v).
         units_sq = units * units
-        v_candidate = beta2 * g_v + (1 - beta2) * units_sq
+        prev_v = g_v.clone()
+        v_candidate = beta2 * prev_v + (1 - beta2) * units_sq
         v_u = torch.where(is_first, units_sq, v_candidate)
-        g_v.copy_(v_u.detach())
+        g_v.copy_((aa * v_u + (1.0 - aa) * prev_v).detach())
 
         # Bias correction for second moment (same as Adam).
         step_float = step.float()
-        v_corrected = v_u / (1.0 - beta2 ** step_float)
+        v_corrected = v_u / (1.0 - beta2 ** step_float).clamp(min=1e-8)
 
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
         ratio_u = ratio_u.pow(ratio_power)
 
-        # Per-neuron adaptive LR — branchless for torch.compile
+        # Per-neuron adaptive LR — branchless for torch.compile.
+        # When aa=0.0, use flat base_lr. When aa=1.0, use adaptive LR.
         v_sqrt = v_corrected.sqrt() + 1e-8
         lr_geomean = base_lr * (ratio_u * v_sqrt).sqrt()
         lr_adam = base_lr / v_sqrt
         lr_ratio = base_lr * ratio_u
-        lr_u = lr_geomean * adaptive_w_geomean + lr_adam * adaptive_w_adam + lr_ratio * adaptive_w_ratio
+        lr_adaptive = lr_geomean * adaptive_w_geomean + lr_adam * adaptive_w_adam + lr_ratio * adaptive_w_ratio
+        lr_flat = base_lr.expand_as(lr_adaptive)
+        lr_u = aa * lr_adaptive + (1.0 - aa) * lr_flat
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))
