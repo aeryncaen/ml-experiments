@@ -106,7 +106,7 @@ class HParams:
     warmup_frac: float = _env_float("WARMUP_FRAC", 0.02)  # fraction of total tokens for warmup (no grad_accum during warmup)
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
-    lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure
+    lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure | gnorm
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
@@ -141,7 +141,6 @@ class HParams:
     spicydion_norm_direction: str = os.environ.get("SPICYDION_NORM_DIRECTION", "col_row")  # col_row | row_col | row | col
     spicydion_turbo_prescale: bool = _env_bool("SPICYDION_TURBO_PRESCALE", True)
     spicydion_adaptive_lr_mode: str = os.environ.get("SPICYDION_ADAPTIVE_LR_MODE", "geomean")  # geomean | adam | ratio
-    gnorm_scheduler: bool = _env_bool("GNORM_SCHEDULER", False)  # use GnormScheduler (plateau step-down) vs external lr_schedule
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
     init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
@@ -4821,7 +4820,7 @@ def main():
     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
 
     _gnorm_scheduler = None
-    if HP.gnorm_scheduler:
+    if HP.lr_schedule == "gnorm":
         from gnorm_scheduler import GnormScheduler
         _gnorm_scheduler = GnormScheduler(base_lr=HP.lr)
         print0(rank, f"  gnorm_scheduler: cold_lr={HP.lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
@@ -4969,11 +4968,8 @@ def main():
         else:
             _eff_accum = HP.grad_accum
 
-        if _is_sf or ((_is_auto or _is_spicydion) and _gnorm_scheduler is None):
-            # Schedule-free / AutoNorMuon / SpicyDion without GnormScheduler: optimizer handles its own LR
-            lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
-        elif _gnorm_scheduler is not None:
-            # GnormScheduler owns the LR — skip external schedule
+        if _is_sf or _is_auto or _is_spicydion or _gnorm_scheduler is not None:
+            # Schedule-free / self-scheduling optimizers / GnormScheduler: skip external LR schedule
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
         else:
             _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
