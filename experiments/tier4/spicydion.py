@@ -737,9 +737,12 @@ class SpicyDion(Optimizer):
             else:
                 group["lr"] = _spicy_lr / 3.0
 
-        # Expose for external logging
+        # Expose for external logging — report median per-neuron effective LR
         for group in spicydion_groups:
-            group["scheduled_lr"] = group["lr"]
+            for p in group["params"]:
+                if p in self.state and "gnorm_last_lr" in self.state[p]:
+                    group["scheduled_lr"] = self.state[p]["gnorm_last_lr"].item()
+                    break
             group["lr_mult"] = self._global_lr_mult
             group["peak_detected"] = self._peak_detected
             group["peak_step"] = self._peak_step
