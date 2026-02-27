@@ -4851,7 +4851,6 @@ def main():
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
-    _warmup_ramp_start = _warmup_tokens // 4
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     _metrics = None
@@ -4870,7 +4869,7 @@ def main():
                 "hostname": os.uname().nodename,
                 "total_tokens": _total_tokens,
                 "warmup_tokens": _warmup_tokens,
-                "warmup_ramp_start_tokens": _warmup_ramp_start,
+                "warmup_ramp_start_tokens": 0,  # grad_accum ramp removed
                 "tokens_per_microbatch": _tok_per_micro,
                 "muon_formula_lr": _muon_formula_lr,
                 "n_residuals": _n_residuals,
@@ -4951,20 +4950,10 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # During warmup: ramp grad_accum from 1 -> HP.grad_accum over second half.
-        # This is model/training warmup (independent of optimizer LR scheduling).
+        # grad_accum is always full from step 0 — no ramp.
         _in_warmup = tokens_seen < _warmup_tokens
-        _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
-        if _in_warmup:
-            if _in_accum_ramp:
-                _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
-                _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
-                _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
-                _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
-            else:
-                _eff_accum = 1
-        else:
-            _eff_accum = HP.grad_accum
+        _in_accum_ramp = False
+        _eff_accum = HP.grad_accum
 
         if _is_sf or _is_auto or _is_spicydion:
             # Schedule-free / AutoNorMuon / SpicyDion: optimizer handles its own LR schedule internally
@@ -5052,7 +5041,7 @@ def main():
         _train_acc_local = None
         if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
             _train_acc_local = _to_json_scalar(raw_model._last_acc)
-        _phase = "warmup-ramp" if _in_warmup and _in_accum_ramp else ("warmup" if _in_warmup else "stable")
+        _phase = "warmup" if _in_warmup else "stable"
 
         if _metrics is not None and step % max(1, HP.metrics_every) == 0:
             _now = time.time()
@@ -5070,7 +5059,7 @@ def main():
                 "throughput_tok_s": _tokens_per_sec,
                 "phase": _phase,
                 "in_warmup": _in_warmup,
-                "in_accum_ramp": _in_accum_ramp,
+                "in_accum_ramp": False,
                 "eff_accum": _eff_accum,
                 "lr": _to_json_scalar(lr),
                 "grad_norm": _to_json_scalar(grad_norm),
@@ -5096,7 +5085,12 @@ def main():
             _ch_raw_str = ""
             if _ch_active:
                 _ch_raw_str = f" | raw_loss {_ch_std_loss_sum / max(1, _eff_accum):.5f}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_raw_str}{_train_acc_str} | lr {lr:.3e} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+            _adapt_lr_str = ""
+            if _is_spicydion:
+                _adapt_lr = optimizer.param_groups[0].get("_diag_median_adaptive_lr")
+                if _adapt_lr is not None:
+                    _adapt_lr_str = f" | adapt_lr {_adapt_lr:.3e}"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_raw_str}{_train_acc_str} | lr {lr:.3e}{_adapt_lr_str} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")

@@ -575,6 +575,7 @@ class SpicyDion(Optimizer):
             flatten=flatten,
             adjust_lr=adjust_lr,
             algorithm="spicydion",
+            scheduled_lr=lr,
             step=0,
         )
         super().__init__(params, defaults)
@@ -734,18 +735,22 @@ class SpicyDion(Optimizer):
         for group in self.param_groups:
             if group["algorithm"] == "spicydion":
                 group["lr"] = _spicy_lr
+                group["scheduled_lr"] = _spicy_lr
             else:
                 group["lr"] = _spicy_lr / 3.0
+                group["scheduled_lr"] = _spicy_lr / 3.0
 
-        # Expose for external logging — report median per-neuron effective LR
+        # Expose diagnostics for external logging (NOT as "scheduled_lr" — that
+        # would create a feedback loop since the trainer reads scheduled_lr as
+        # the actual LR).
         for group in spicydion_groups:
             for p in group["params"]:
                 if p in self.state and "gnorm_last_lr" in self.state[p]:
-                    group["scheduled_lr"] = self.state[p]["gnorm_last_lr"].item()
+                    group["_diag_median_adaptive_lr"] = self.state[p]["gnorm_last_lr"].item()
                     break
-            group["lr_mult"] = self._global_lr_mult
-            group["peak_detected"] = self._peak_detected
-            group["peak_step"] = self._peak_step
+            group["_diag_lr_mult"] = self._global_lr_mult
+            group["_diag_peak_detected"] = self._peak_detected
+            group["_diag_peak_step"] = self._peak_step
 
         return loss
 
