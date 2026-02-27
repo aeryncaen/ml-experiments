@@ -704,6 +704,7 @@ class SpicyDion(Optimizer):
             # Here "fraction" only determines the dimension of the submatrix
             # to be orthonormalized. Hence, it doesn't need to be a tensor
             _dev = group["params"][0].device
+            _alm = self.adaptive_lr_mode
             spicydion_args = dict(
                 lr=torch.tensor(group["lr"], device=_dev),
                 initial_lr=torch.tensor(group["initial_lr"], device=_dev),
@@ -720,7 +721,9 @@ class SpicyDion(Optimizer):
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
-                adaptive_lr_mode={"geomean": 0, "adam": 1, "ratio": 2}[self.adaptive_lr_mode],
+                adaptive_w_geomean=1.0 if _alm == "geomean" else 0.0,
+                adaptive_w_adam=1.0 if _alm == "adam" else 0.0,
+                adaptive_w_ratio=1.0 if _alm == "ratio" else 0.0,
             )
 
             # Create batches of parameters of size self._world_size
@@ -1002,7 +1005,9 @@ def spicydion_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
-    adaptive_lr_mode: int = 0,  # 0=geomean, 1=adam, 2=ratio
+    adaptive_w_geomean: float = 1.0,
+    adaptive_w_adam: float = 0.0,
+    adaptive_w_ratio: float = 0.0,
     verbose: bool = False,
 ) -> Generator[None, None, None]:
     """
@@ -1150,7 +1155,9 @@ def spicydion_update_batch_async(
         total_steps=total_steps,
         gnorm_beta=gnorm_beta,
         weight_decay=weight_decay,
-        adaptive_lr_mode=adaptive_lr_mode,
+        adaptive_w_geomean=adaptive_w_geomean,
+        adaptive_w_adam=adaptive_w_adam,
+        adaptive_w_ratio=adaptive_w_ratio,
     )
 
 
@@ -1218,14 +1225,16 @@ def spicydion_post_orthogonalize(
     total_steps: Tensor,
     gnorm_beta: Tensor,
     weight_decay: Tensor,
-    adaptive_lr_mode: int = 0,
+    adaptive_w_geomean: float = 1.0,
+    adaptive_w_adam: float = 0.0,
+    adaptive_w_ratio: float = 0.0,
 ):
     """
     Apply weight update after orthogonalization.
-    Per-neuron adaptive LR modes:
-        0 (geomean): geometric mean of ratio and sqrt(v) — sqrt(ratio) * v^0.25
-        1 (adam):    pure Adam second moment — base_lr / sqrt(v)
-        2 (ratio):  pure ratio — base_lr * ratio
+    Per-neuron adaptive LR selected by pre-computed weights (exactly one is 1.0):
+        geomean: sqrt(ratio * sqrt(v)) — geometric mean
+        adam:    1 / sqrt(v) — Adam second moment only
+        ratio:  ratio — signal/max only
     """
     beta2 = 0.999  # Second moment decay, same as Adam default
 
@@ -1281,17 +1290,11 @@ def spicydion_post_orthogonalize(
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
         # Per-neuron adaptive LR — branchless for torch.compile
-        # 0=geomean: base_lr * sqrt(ratio * sqrt(v))
-        # 1=adam:    base_lr / sqrt(v)
-        # 2=ratio:   base_lr * ratio
         v_sqrt = v_corrected.sqrt() + 1e-8
         lr_geomean = base_lr * (ratio_u * v_sqrt).sqrt()
         lr_adam = base_lr / v_sqrt
         lr_ratio = base_lr * ratio_u
-        is_adam = float(adaptive_lr_mode == 1)
-        is_ratio = float(adaptive_lr_mode == 2)
-        is_geomean = 1.0 - is_adam - is_ratio
-        lr_u = lr_geomean * is_geomean + lr_adam * is_adam + lr_ratio * is_ratio
+        lr_u = lr_geomean * adaptive_w_geomean + lr_adam * adaptive_w_adam + lr_ratio * adaptive_w_ratio
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))

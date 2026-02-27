@@ -499,12 +499,12 @@ def main():
     results = []
     for name, make_opt in [
          ("Spicy-P", lambda m: make_spicydion(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
-         ("AutoNorMuon", lambda m: make_autonormuon(m, muon_lr=muon_lr, adam_lr=adam_lr, total_steps=steps)),
-         ("NorMuon", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
-         ("NorMuon-P", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
-         ("AdamW", lambda m: make_adamw(m, lr=adam_lr)),
-         ("AdamW-P", lambda m: make_adamw(m, lr=adam_lr)),
-         ("SpicyAdam-P", lambda m: make_spicy_adam(m, lr=2e-4)),
+         #("AutoNorMuon", lambda m: make_autonormuon(m, muon_lr=muon_lr, adam_lr=adam_lr, total_steps=steps)),
+         #("NorMuon", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
+         #("NorMuon-P", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
+         #("AdamW", lambda m: make_adamw(m, lr=adam_lr)),
+         #("AdamW-P", lambda m: make_adamw(m, lr=adam_lr)),
+         #("SpicyAdam-P", lambda m: make_spicy_adam(m, lr=2e-4)),
     ]:
         torch.manual_seed(42)
         model = MiniGPT(vocab, d_model, n_heads, n_layers, seq_len).to(device)
