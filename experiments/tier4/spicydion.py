@@ -541,6 +541,7 @@ class SpicyDion(Optimizer):
         gnorm_beta: float = 0.55,
         total_steps: int = 1,
         adaptive_lr_mode: str = "geomean",
+        ratio_power: float = 1.0,
         verbose: bool = False,
     ):
         # Validate hyperparameters
@@ -581,6 +582,7 @@ class SpicyDion(Optimizer):
         self.gnorm_beta = gnorm_beta
         self.total_steps = total_steps
         self.adaptive_lr_mode = adaptive_lr_mode
+        self.ratio_power = ratio_power
 
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
@@ -724,6 +726,7 @@ class SpicyDion(Optimizer):
                 adaptive_w_geomean=1.0 if _alm == "geomean" else 0.0,
                 adaptive_w_adam=1.0 if _alm == "adam" else 0.0,
                 adaptive_w_ratio=1.0 if _alm == "ratio" else 0.0,
+                ratio_power=self.ratio_power,
             )
 
             # Create batches of parameters of size self._world_size
@@ -1008,6 +1011,7 @@ def spicydion_update_batch_async(
     adaptive_w_geomean: float = 1.0,
     adaptive_w_adam: float = 0.0,
     adaptive_w_ratio: float = 0.0,
+    ratio_power: float = 1.0,
     verbose: bool = False,
 ) -> Generator[None, None, None]:
     """
@@ -1158,6 +1162,7 @@ def spicydion_update_batch_async(
         adaptive_w_geomean=adaptive_w_geomean,
         adaptive_w_adam=adaptive_w_adam,
         adaptive_w_ratio=adaptive_w_ratio,
+        ratio_power=ratio_power,
     )
 
 
@@ -1228,11 +1233,12 @@ def spicydion_post_orthogonalize(
     adaptive_w_geomean: float = 1.0,
     adaptive_w_adam: float = 0.0,
     adaptive_w_ratio: float = 0.0,
+    ratio_power: float = 1.0,
 ):
     """
     Apply weight update after orthogonalization.
     Per-neuron adaptive LR selected by pre-computed weights (exactly one is 1.0):
-        geomean: sqrt(ratio * sqrt(v)) — geometric mean
+        geomean: sqrt(ratio^p * sqrt(v)) — geometric mean
         adam:    1 / sqrt(v) — Adam second moment only
         ratio:  ratio — signal/max only
     """
@@ -1288,6 +1294,7 @@ def spicydion_post_orthogonalize(
 
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
+        ratio_u = ratio_u.pow(ratio_power)
 
         # Per-neuron adaptive LR — branchless for torch.compile
         v_sqrt = v_corrected.sqrt() + 1e-8
