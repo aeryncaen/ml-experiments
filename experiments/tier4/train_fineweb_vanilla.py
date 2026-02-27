@@ -141,6 +141,7 @@ class HParams:
     spicydion_norm_direction: str = os.environ.get("SPICYDION_NORM_DIRECTION", "col_row")  # col_row | row_col | row | col
     spicydion_turbo_prescale: bool = _env_bool("SPICYDION_TURBO_PRESCALE", True)
     spicydion_adaptive_lr_mode: str = os.environ.get("SPICYDION_ADAPTIVE_LR_MODE", "geomean")  # geomean | adam | ratio
+    gnorm_scheduler: bool = _env_bool("GNORM_SCHEDULER", False)  # use GnormScheduler (plateau step-down) vs external lr_schedule
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
     init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
@@ -4820,7 +4821,7 @@ def main():
     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
 
     _gnorm_scheduler = None
-    if _is_spicydion:
+    if HP.gnorm_scheduler:
         from gnorm_scheduler import GnormScheduler
         _gnorm_scheduler = GnormScheduler(base_lr=HP.lr)
         print0(rank, f"  gnorm_scheduler: cold_lr={HP.lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
@@ -4968,8 +4969,11 @@ def main():
         else:
             _eff_accum = HP.grad_accum
 
-        if _is_sf or _is_auto or _is_spicydion:
-            # Schedule-free / AutoNorMuon / SpicyDion: optimizer handles its own LR schedule internally
+        if _is_sf or ((_is_auto or _is_spicydion) and _gnorm_scheduler is None):
+            # Schedule-free / AutoNorMuon / SpicyDion without GnormScheduler: optimizer handles its own LR
+            lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
+        elif _gnorm_scheduler is not None:
+            # GnormScheduler owns the LR — skip external schedule
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
         else:
             _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
@@ -5049,14 +5053,15 @@ def main():
             _sched_lr = _sched["lr"]
             _sched_aa = 1.0 if _sched["adaptive_active"] else 0.0
             for pg in optimizer.param_groups:
-                if pg.get("algorithm") == "spicydion":
-                    pg["lr"] = _sched_lr
-                    pg["scheduled_lr"] = _sched_lr
-                    pg["_adaptive_active"] = _sched_aa
-                else:
-                    # Adam/Lion groups get 1/3 of spicydion LR
-                    pg["lr"] = _sched_lr / 3.0
-                    pg["scheduled_lr"] = _sched_lr / 3.0
+                # Muon/Dion/SpicyDion groups get full scheduled LR;
+                # Adam/auxiliary groups get 1/3.
+                _is_main = (pg.get("algorithm") == "spicydion"
+                            or pg.get("use_muon", False)
+                            or pg.get("algorithm") in ("muon", "normuon", "autonormuon"))
+                _pg_lr = _sched_lr if _is_main else _sched_lr / 3.0
+                pg["lr"] = _pg_lr
+                pg["scheduled_lr"] = _pg_lr
+                if _is_spicydion:
                     pg["_adaptive_active"] = _sched_aa
             if _sched["early_exit"]:
                 print0(rank, f"  GnormScheduler: early exit at step {step} — LR below floor ({_sched_lr:.2e}), tap_count={_sched['tap_count']}")

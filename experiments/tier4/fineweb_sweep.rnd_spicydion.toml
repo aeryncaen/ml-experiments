@@ -36,8 +36,9 @@ wsd_decay_frac = 0.10
 [sweep]
 optimizer = ["spicydion", "autonormuon", "normuon"]
 
-# SpicyDion is self-scheduling (no external lr_schedule needed).
-# AutoNorMuon and NorMuon handle their own schedules internally.
+# GnormScheduler: true = plateau step-down scheduler, false = external WSD schedule
+# Applies to ALL optimizers — A/B comparison of scheduling strategy.
+gnorm_scheduler = [true, false]
 
 # Adaptive LR mode (only affects spicydion)
 # geomean: sqrt(ratio * sqrt(v)) — geometric mean of ratio and second moment
