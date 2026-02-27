@@ -81,13 +81,26 @@ def _hash_view(hparams: dict) -> dict:
             out["init_mode"] = "default"
     out.setdefault("init_mode", "default")
 
-    # Autonormuon knobs are irrelevant for other optimizers.
+    # Optimizer-specific knobs are irrelevant for other optimizers.
     opt = str(out.get("optimizer", ""))
-    if opt != "autonormuon":
+
+    # SpicyDion knobs
+    if opt != "spicydion":
+        for k in list(out.keys()):
+            if k.startswith("spicydion_"):
+                out.pop(k, None)
+    else:
+        out.setdefault("spicydion_selection_sigma", 0.5)
+        out.setdefault("spicydion_ef_decay", 0.95)
+        out.setdefault("spicydion_norm_direction", "col_row")
+        out.setdefault("spicydion_turbo_prescale", True)
+
+    # Autonormuon knobs — shared beta/adaptation_scope also used by spicydion
+    if opt not in ("autonormuon", "spicydion"):
         for k in list(out.keys()):
             if k.startswith("autonormuon_"):
                 out.pop(k, None)
-    else:
+    elif opt == "autonormuon":
         out.setdefault("autonormuon_beta", 0.55)
         out.setdefault("autonormuon_adaptation_scope", "neuron")
         out.setdefault("autonormuon_grad_schedule", "off")
@@ -97,6 +110,15 @@ def _hash_view(hparams: dict) -> dict:
         out.setdefault("autonormuon_ratio_pow", 1.0)
         out.setdefault("autonormuon_min_ratio", 0.0)
         out = _canonical_autonormuon(out)
+    elif opt == "spicydion":
+        # SpicyDion uses only beta and adaptation_scope from autonormuon_* keys
+        out.setdefault("autonormuon_beta", 0.55)
+        out.setdefault("autonormuon_adaptation_scope", "neuron")
+        # Strip autonormuon-only knobs that don't apply to spicydion
+        for k in ("autonormuon_grad_schedule", "autonormuon_weight_schedule",
+                   "autonormuon_weight_mode", "autonormuon_gnorm_mode",
+                   "autonormuon_ratio_pow", "autonormuon_min_ratio"):
+            out.pop(k, None)
 
     return out
 
@@ -137,7 +159,15 @@ def _run_name(prefix: str, hp: dict, cfg_hash: str) -> str:
 def _normalize_overrides(ov: dict) -> dict:
     out = dict(ov)
     opt = str(out.get("optimizer", ""))
-    if opt != "autonormuon":
+
+    # Strip spicydion knobs for non-spicydion
+    if opt != "spicydion":
+        for k in list(out.keys()):
+            if k.startswith("spicydion_"):
+                out.pop(k, None)
+
+    # Strip autonormuon knobs for non-autonormuon/non-spicydion
+    if opt not in ("autonormuon", "spicydion"):
         out.pop("autonormuon_beta", None)
         out.pop("autonormuon_adaptation_scope", None)
         out.pop("autonormuon_grad_schedule", None)
@@ -146,8 +176,14 @@ def _normalize_overrides(ov: dict) -> dict:
         out.pop("autonormuon_gnorm_mode", None)
         out.pop("autonormuon_ratio_pow", None)
         out.pop("autonormuon_min_ratio", None)
-    else:
+    elif opt == "autonormuon":
         out = _canonical_autonormuon(out)
+    elif opt == "spicydion":
+        # Strip autonormuon-only knobs
+        for k in ("autonormuon_grad_schedule", "autonormuon_weight_schedule",
+                   "autonormuon_weight_mode", "autonormuon_gnorm_mode",
+                   "autonormuon_ratio_pow", "autonormuon_min_ratio"):
+            out.pop(k, None)
     return out
 
 

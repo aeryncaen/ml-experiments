@@ -136,6 +136,10 @@ class HParams:
     autonormuon_gnorm_mode: str = os.environ.get("AUTONORMUON_GNORM_MODE", "ema")  # ema | accumulate
     autonormuon_ratio_pow: float = _env_float("AUTONORMUON_RATIO_POW", 1.0)
     autonormuon_min_ratio: float = _env_float("AUTONORMUON_MIN_RATIO", 0.0)
+    spicydion_selection_sigma: float = _env_float("SPICYDION_SELECTION_SIGMA", 0.5)
+    spicydion_ef_decay: float = _env_float("SPICYDION_EF_DECAY", 0.95)
+    spicydion_norm_direction: str = os.environ.get("SPICYDION_NORM_DIRECTION", "col_row")  # col_row | row_col | row | col
+    spicydion_turbo_prescale: bool = _env_bool("SPICYDION_TURBO_PRESCALE", True)
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
     init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
@@ -4540,7 +4544,7 @@ def main():
     # Build optimizer param groups before compile/DDP wrap
     _is_ngpt = HP.ngpt or HP.model_type == "ngpt_moe"
     _wd = 0.0 if _is_ngpt else HP.weight_decay
-    _muon_like_opts = ("muon", "normuon", "autonormuon", "orion", "muon_sf", "normuon_sf")
+    _muon_like_opts = ("muon", "normuon", "autonormuon", "orion", "muon_sf", "normuon_sf", "spicydion")
     _n_residuals = HP.n_layer * 2
     _muon_formula_lr = 0.1 / math.sqrt(_n_residuals)
     # Names that identify embedding/head params (should not get Muon-style whitening)
@@ -4713,6 +4717,54 @@ def main():
             f"beta={HP.autonormuon_beta} adaptation_scope={HP.autonormuon_adaptation_scope} "
             f"ratio_pow={HP.autonormuon_ratio_pow} min_ratio={HP.autonormuon_min_ratio}"
         ))
+    elif HP.optimizer == "spicydion":
+        from spicydion import SpicyDion
+        # SpicyDion: PolarExpress + AOL + NorMuon-EMA + pressure-based LR + sphere retract.
+        # No external LR scheduling, no weight decay. Muon-like + Adam-like params via algorithm tags.
+        spicy_groups = []
+        for g in param_groups:
+            if g.get("use_muon", False):
+                spicy_groups.append({
+                    "params": g["params"],
+                    "lr": g["lr"],
+                    "ef_decay": HP.spicydion_ef_decay,
+                    "fraction": 1.0,
+                    "weight_decay": 0.0,
+                    "epsilon": 1e-8,
+                    "adjust_lr": None,
+                    "flatten": False,
+                    "algorithm": "spicydion",
+                    "step": 0,
+                })
+            else:
+                spicy_groups.append({
+                    "params": g["params"],
+                    "lr": g["lr"],
+                    "beta1": 0.9,
+                    "beta2": 0.95,
+                    "weight_decay": 0.0,
+                    "epsilon": 1e-10,
+                    "algorithm": "adamw",
+                    "step": 0,
+                })
+
+        optimizer = SpicyDion(
+            spicy_groups,
+            distributed_mesh=None,
+            lr=_base_lrs[0],
+            fraction=1.0,
+            ef_decay=HP.spicydion_ef_decay,
+            weight_decay=0.0,
+            adjust_lr=None,
+            gnorm_beta=HP.autonormuon_beta,
+            total_steps=HP.train_steps,
+        )
+        print0(rank, (
+            f"  spicydion: R={_n_residuals} base_lr={_base_lrs[0]:.6f} "
+            f"ef_decay={HP.spicydion_ef_decay} gnorm_beta={HP.autonormuon_beta} "
+            f"total_steps={HP.train_steps} k=4.0 wd=0 "
+            f"[PolarExpress+AOL, NorMuon-EMA, pressure-LR, sphere-retract]"
+        ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
         _sf_warmup = 0
@@ -4758,7 +4810,7 @@ def main():
         f"optimizer may have restructured param groups internally"
 
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
-    _is_auto = HP.optimizer == "autonormuon"  # autonormuon: handles its own LR schedule internally
+    _is_auto = HP.optimizer in ("autonormuon", "spicydion")  # handle own LR schedule internally
     _is_plain_muon = HP.optimizer in ("muon", "normuon")
 
     profiler = None

@@ -1,0 +1,39 @@
+[runner]
+# SpicyDion vs baselines at 5M tokens.
+# SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, pressure-based LR (k=4), sphere retract, no wd.
+metrics_dir = "experiments/tier4/runs"
+run_prefix = "rnd_spicydion"
+skip_existing = true
+continue_on_error = true
+
+[base]
+# ~5M tokens at seq_len=1024: 611 * 8 * 1 * 1024 = 5,005,312
+train_steps = 611
+batch_size = 8
+grad_accum = 1
+seq_len = 1024
+
+metrics_every = 1
+val_every = 100
+
+train_files = "experiments/tier4/data/fineweb10B/fineweb_train_*.bin"
+val_files = "experiments/tier4/data/fineweb10B/fineweb_val_*.bin"
+
+seed = 42
+init_mode = "default"
+
+[sweep]
+optimizer = ["spicydion", "autonormuon", "muon"]
+
+# LR: spicydion handles its own schedule internally via pressure system
+muon_lr = [0.023]
+
+# Momentum beta (ef_decay for spicydion, also used as NorMuon-EMA beta)
+spicydion_ef_decay = [0.95]
+
+# Gnorm EMA beta (used by both spicydion and autonormuon)
+autonormuon_beta = [0.55]
+
+# AutoNorMuon weight mode (only affects autonormuon)
+autonormuon_weight_mode = ["sphere"]
+autonormuon_gnorm_mode = ["ema"]
