@@ -4822,8 +4822,14 @@ def main():
     _gnorm_scheduler = None
     if HP.lr_schedule == "gnorm":
         from gnorm_scheduler import GnormScheduler
-        _gnorm_scheduler = GnormScheduler(base_lr=HP.lr)
-        print0(rank, f"  gnorm_scheduler: cold_lr={HP.lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
+        # Use the actual main-group LR (muon/dion LR), not the default HP.lr (Adam LR)
+        _main_lr = next(
+            (pg["lr"] for pg in optimizer.param_groups
+             if pg.get("use_muon", False) or pg.get("algorithm") == "spicydion"),
+            HP.lr,  # fallback
+        )
+        _gnorm_scheduler = GnormScheduler(base_lr=_main_lr)
+        print0(rank, f"  gnorm_scheduler: base_lr={_main_lr:.4e} cold_lr={_main_lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
 
     profiler = None
     if HP.torch_profile:
