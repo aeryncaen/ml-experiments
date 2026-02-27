@@ -1289,25 +1289,17 @@ def spicydion_post_orthogonalize(
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
-        # Save AOL-preconditioned Frobenius norm before per-neuron redistribution.
-        # AOL preconditioning (inside PolarExpress) sets the scale based on the
-        # gradient's spectral structure. Ratio only redistributes within this budget.
-        vnorm = u.float().norm()
-
-        # Per-neuron adaptive weights — branchless for torch.compile
+        # Per-neuron adaptive LR — branchless for torch.compile
         v_sqrt = v_corrected.sqrt() + 1e-8
-        w_geomean = (ratio_u * v_sqrt).sqrt()
-        w_adam = 1.0 / v_sqrt
-        w_ratio = ratio_u
-        w_u = w_geomean * adaptive_w_geomean + w_adam * adaptive_w_adam + w_ratio * adaptive_w_ratio
+        lr_geomean = base_lr * (ratio_u * v_sqrt).sqrt()
+        lr_adam = base_lr / v_sqrt
+        lr_ratio = base_lr * ratio_u
+        lr_u = lr_geomean * adaptive_w_geomean + lr_adam * adaptive_w_adam + lr_ratio * adaptive_w_ratio
 
-        # Apply per-neuron redistribution, then restore AOL Frobenius norm.
-        w_shape = (w_u.shape[0],) + (1,) * (u.ndim - 1)
-        u_redistributed = u * w_u.to(dtype=u.dtype).view(w_shape)
-        vnorm_new = u_redistributed.float().norm().clamp(min=1e-12)
-        u_scaled = -(u_redistributed * (vnorm / vnorm_new).to(dtype=u.dtype)) * base_lr.to(dtype=u.dtype)
+        lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
+        u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))
 
-        g_last_lr.copy_((w_u * base_lr).median().detach())
+        g_last_lr.copy_(lr_u.median().detach())
         g_last_units.copy_(units.median().detach())
         g_last_signal.copy_(signal_u.median().detach())
         g_last_max.copy_(max_u.median().detach())
