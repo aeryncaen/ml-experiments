@@ -107,6 +107,7 @@ class HParams:
     weight_decay: float = _env_float("WEIGHT_DECAY", 0.1)
     grad_clip: float = _env_float("GRAD_CLIP", 1.0)
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure | gnorm
+    schedule_power: float = _env_float("SCHEDULE_POWER", 0.5)  # exponent on gnorm ratio for lr_schedule=gnorm (0.5=sqrt, 1.0=linear)
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
@@ -4828,8 +4829,8 @@ def main():
              if pg.get("use_muon", False) or pg.get("algorithm") == "spicydion"),
             HP.lr,  # fallback
         )
-        _gnorm_scheduler = GnormScheduler(base_lr=_main_lr)
-        print0(rank, f"  gnorm_scheduler: base_lr={_main_lr:.4e} cold_lr={_main_lr*0.1:.4e} ramp_steps=100 schedule_power=1.0 step_down=5%")
+        _gnorm_scheduler = GnormScheduler(base_lr=_main_lr, schedule_power=HP.schedule_power)
+        print0(rank, f"  gnorm_scheduler: base_lr={_main_lr:.4e} cold_lr={_main_lr*0.1:.4e} ramp_steps=100 schedule_power={HP.schedule_power} step_down=5%")
 
     profiler = None
     if HP.torch_profile:
