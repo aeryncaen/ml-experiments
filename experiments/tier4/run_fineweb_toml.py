@@ -282,9 +282,13 @@ def main() -> None:
             rec["run_dir"] = str(metrics_dir / run_name)
             counts_by_opt[_opt]["ok"] += 1
         except Exception as e:
+            import traceback
             rec["status"] = "error"
             rec["error"] = str(e)
+            rec["traceback"] = traceback.format_exc()
             counts_by_opt[_opt]["error"] += 1
+            print(f"[ERROR] {run_name}: {e}")
+            traceback.print_exc()
             if not continue_on_error:
                 raise
         finally:

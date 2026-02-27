@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.distributed as dist
+from collections import defaultdict
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -8,20 +9,439 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from dion.newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
-from dion.opt_utils import (
-    AsyncRuntime,
-    AsyncTask,
-    create_param_batches,
-    pad_batch,
-    to_local,
-)
-from dion.scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+    triton = None
+    tl = None
 
-# Reuse Muon's helper functions
-from dion.muon import (
-    muon_update_newton_schulz,
-)
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ported from dion.opt_utils
+# ════════════════════════════════════════════════════════════════════════════
+
+def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]:
+    """Convert DTensor(s) to local tensors. No-op for regular tensors."""
+    if isinstance(tensor, Tensor):
+        return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    return [t.to_local() if isinstance(t, DTensor) else t for t in tensor]
+
+
+def create_param_batches(
+    params: List[Tensor], batch_size: int
+) -> Generator[List[Tensor], None, None]:
+    """Batch parameters into groups of size `batch_size` by (shape, sharding, dtype)."""
+    groups = defaultdict(list)
+    for p in params:
+        sharding = p.placements if isinstance(p, DTensor) else None
+        groups[(p.shape, sharding, p.dtype)].append(p)
+    for group in groups.values():
+        for i in range(0, len(group), batch_size):
+            yield group[i : i + batch_size]
+
+
+def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
+    """Insert dummy tensors so the batch has exactly `batch_size` elements."""
+    assert len(batch) > 0
+    assert len(batch) <= batch_size
+    while len(batch) < batch_size:
+        batch.append(torch.empty_like(batch[0]))
+    return batch
+
+
+class AsyncTask:
+    """Wraps a generator to run until the next yield (for async distributed ops)."""
+
+    def __init__(self, generator: Generator[None, None, None]):
+        self._generator = generator
+        self.run()
+
+    def run(self) -> bool:
+        try:
+            next(self._generator)
+            return True
+        except StopIteration:
+            pass
+        return False
+
+
+class AsyncRuntime:
+    """Event loop for running multiple AsyncTask objects concurrently."""
+
+    def __init__(
+        self, task_gen: Generator["AsyncTask", None, None], max_concurrent_tasks: int
+    ):
+        if max_concurrent_tasks <= 0:
+            raise ValueError(f"{max_concurrent_tasks=} cannot be <= 0")
+        self._task_gen = task_gen
+        self._max_concurrent_tasks = max_concurrent_tasks
+
+    def _get_next_task(self) -> Optional["AsyncTask"]:
+        try:
+            return next(self._task_gen)
+        except StopIteration:
+            return None
+
+    def run(self):
+        have_new_tasks = True
+        previous_tasks: List["AsyncTask"] = []
+        while have_new_tasks or previous_tasks:
+            running_tasks = []
+            if have_new_tasks and len(previous_tasks) < self._max_concurrent_tasks:
+                new_task = self._get_next_task()
+                if new_task is not None:
+                    running_tasks.append(new_task)
+                else:
+                    have_new_tasks = False
+            for task in previous_tasks:
+                if task.run():
+                    running_tasks.append(task)
+            previous_tasks = running_tasks
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ported from dion.scalar_opts
+# ════════════════════════════════════════════════════════════════════════════
+
+@torch.compile(fullgraph=True, disable=not torch.cuda.is_available())
+def adamw_update_foreach(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+    cautious_wd: bool = False,
+):
+    """AdamW optimizer (foreach implementation)."""
+    batch_size = len(X)
+    assert batch_size == len(G)
+    assert batch_size == len(M)
+    assert batch_size == len(V)
+
+    M_dtype = M[0].dtype
+    V_dtype = V[0].dtype
+
+    G = [g.to(dtype=M_dtype) for g in G]
+    torch._foreach_lerp_(M, G, [1 - beta1] * batch_size)
+
+    G_square = torch._foreach_mul(G, G)
+    G_square = [g.to(dtype=V_dtype) for g in G_square]
+    torch._foreach_lerp_(V, G_square, [1 - beta2] * batch_size)
+
+    bias_correction1 = 1 - beta1**step
+    bias_correction2 = 1 - beta2**step
+    bias_correction2_sqrt = bias_correction2.sqrt()
+
+    denom = torch._foreach_sqrt(V)
+    torch._foreach_div_(denom, bias_correction2_sqrt)
+    torch._foreach_add_(denom, [epsilon] * batch_size)
+
+    adj_lr = lr / bias_correction1
+    M_div = torch._foreach_div(M, denom)
+
+    if cautious_wd:
+        coeff = lr * weight_decay
+        decay_masks = torch._foreach_mul(X, M_div)
+        decay_masks = torch._foreach_sign(decay_masks)
+        decay_masks = torch._foreach_add(decay_masks, 1)
+        decay_masks = torch._foreach_minimum(decay_masks, 1)
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        torch._foreach_mul_(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        torch._foreach_mul_(X, 1 - lr * weight_decay)
+
+    torch._foreach_mul_(M_div, adj_lr)
+    torch._foreach_sub_(X, M_div)
+
+
+@torch.compile(fullgraph=True, disable=not torch.cuda.is_available())
+def lion_update_foreach(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    cautious_wd: bool = False,
+):
+    """Lion optimizer (foreach implementation)."""
+    batch_size = len(X)
+    assert batch_size == len(G)
+    assert batch_size == len(M)
+
+    dtype = M[0].dtype
+    G = [g.to(dtype=dtype) for g in G]
+
+    U = torch._foreach_lerp(M, G, [1 - beta1] * batch_size)
+    torch._foreach_sign_(U)
+
+    torch._foreach_lerp_(M, G, [1 - beta2] * batch_size)
+
+    if cautious_wd:
+        coeff = lr * weight_decay
+        decay_masks = torch._foreach_mul(X, U)
+        decay_masks = torch._foreach_sign(decay_masks)
+        decay_masks = torch._foreach_add(decay_masks, 1)
+        decay_masks = torch._foreach_minimum(decay_masks, 1)
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        torch._foreach_mul_(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        torch._foreach_mul_(X, 1 - lr * weight_decay)
+
+    torch._foreach_mul_(U, lr)
+    torch._foreach_sub_(X, U)
+
+
+def adamw_update_foreach_async(
+    X: List[Tensor], G: List[Tensor], M: List[Tensor], V: List[Tensor],
+    lr: Tensor, beta1: Tensor, beta2: Tensor, weight_decay: Tensor,
+    step: int, epsilon: float, cautious_wd: bool = False,
+) -> Generator[None, None, None]:
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd)
+    yield
+
+
+def lion_update_foreach_async(
+    X: List[Tensor], G: List[Tensor], M: List[Tensor],
+    lr: Tensor, beta1: Tensor, beta2: Tensor, weight_decay: Tensor,
+    cautious_wd: bool = False,
+) -> Generator[None, None, None]:
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd)
+    yield
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ported from dion.muon
+# ════════════════════════════════════════════════════════════════════════════
+
+def muon_update_newton_schulz(
+    X: Tensor,
+    newton_schulz_func: Callable,
+    flatten: bool,
+    epsilon: Tensor,
+) -> Tensor:
+    """Flatten if needed and call the Newton-Schulz function."""
+    original_shape = X.shape
+    if flatten and X.ndim >= 3:
+        X = X.flatten(start_dim=1)
+    elif X.ndim >= 4:
+        X = X.flatten(end_dim=-3)
+    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ported from dion.newton_schulz_triton
+# ════════════════════════════════════════════════════════════════════════════
+
+@torch.compile(dynamic=False, fullgraph=True, disable=not torch.cuda.is_available())
+def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
+    """Reference Newton-Schulz implementation (no Triton needed)."""
+    ns_consts = [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]
+    X = G.to(dtype=torch.bfloat16)
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    for a, b, c in ns_consts:
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+if HAS_TRITON:
+    def _get_autotune_configs():
+        return [
+            triton.Config(
+                {
+                    "BLOCK_SIZE_M": bm,
+                    "BLOCK_SIZE_N": bn,
+                    "BLOCK_SIZE_K": bk,
+                    "GROUP_SIZE_M": 8,
+                    "LOWER_UPPER": 1,
+                },
+                num_stages=stages,
+                num_warps=warps,
+            )
+            for bm in [64, 128]
+            for bn in [64, 128, 256]
+            for bk in [64, 128]
+            for stages, warps in [(3, 4), (3, 8), (4, 4)]
+            if bm // bn <= 2 and bn // bm <= 2
+        ]
+
+    @triton.jit
+    def _pid_to_block(
+        pid, M,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+        return pid_m, pid_n
+
+    @triton.autotune(configs=_get_autotune_configs(), key=["M"])
+    @triton.jit
+    def _ns_line_1_kernel(
+        a_ptr, c_ptr, M, K,
+        stride_ab, stride_am, stride_ak,
+        stride_cb, stride_cm, stride_cn,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+        LOWER_UPPER: tl.constexpr,
+    ):
+        batch_id = tl.program_id(axis=1)
+        pid = tl.program_id(axis=0)
+        pid_m, pid_n = _pid_to_block(pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+        if LOWER_UPPER == 1:
+            if pid_n > pid_m + 1:
+                return
+        elif LOWER_UPPER == 2:
+            if pid_m > pid_n + 1:
+                return
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % M
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + batch_id * stride_ab + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = a_ptr + batch_id * stride_ab + (offs_bn[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            accumulator = tl.dot(a, tl.trans(b), accumulator, out_dtype=tl.float32)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_ak
+        c = accumulator.to(tl.bfloat16)
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + batch_id * stride_cb + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+    @triton.autotune(configs=_get_autotune_configs(), key=["M"])
+    @triton.jit
+    def _ns_line_2_kernel(
+        a_ptr, c_ptr, M, alpha, beta,
+        stride_ab, stride_am, stride_ak,
+        stride_cb, stride_cm, stride_cn,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+        LOWER_UPPER: tl.constexpr,
+    ):
+        batch_id = tl.program_id(axis=1)
+        pid = tl.program_id(axis=0)
+        pid_m, pid_n = _pid_to_block(pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+        if LOWER_UPPER == 1:
+            if pid_n > pid_m + 1:
+                return
+        elif LOWER_UPPER == 2:
+            if pid_m > pid_n + 1:
+                return
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % M
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + batch_id * stride_ab + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = a_ptr + batch_id * stride_ab + (offs_bn[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+            accumulator = tl.dot(a, tl.trans(b), accumulator, out_dtype=tl.float32)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_ak
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + batch_id * stride_cb + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+        c_existing = tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+        c = (alpha * accumulator + beta * c_existing).to(tl.bfloat16)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+    def ns_line_1(X, out):
+        B = X.shape[0] if X.ndim > 2 else 1
+        M, K = X.shape[-2], X.shape[-1]
+        grid = lambda META: (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(M, META["BLOCK_SIZE_N"]), B,
+        )
+        _ns_line_1_kernel[grid](
+            X, out, M, K,
+            X.stride(-3) if X.ndim > 2 else 0, X.stride(-2), X.stride(-1),
+            out.stride(-3) if out.ndim > 2 else 0, out.stride(-2), out.stride(-1),
+        )
+
+    def ns_line_2(A, alpha, beta, out):
+        B = A.shape[0] if A.ndim > 2 else 1
+        M = A.shape[-2]
+        grid = lambda META: (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(M, META["BLOCK_SIZE_N"]), B,
+        )
+        _ns_line_2_kernel[grid](
+            A, out, M, alpha, beta,
+            A.stride(-3) if A.ndim > 2 else 0, A.stride(-2), A.stride(-1),
+            out.stride(-3) if out.ndim > 2 else 0, out.stride(-2), out.stride(-1),
+        )
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
+        """Triton implementation of Newton-Schulz iteration."""
+        ns_consts = [
+            (4.0848, -6.8946, 2.9270),
+            (3.9505, -6.3029, 2.6377),
+            (3.7418, -5.5913, 2.3037),
+            (2.8769, -3.1427, 1.2046),
+            (2.8366, -3.0525, 1.2012),
+        ]
+        X = G.to(dtype=torch.bfloat16)
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+        X = X.contiguous()
+        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+        ns_line_3 = torch.baddbmm if X.ndim > 2 else torch.addmm
+        for a, b, c in ns_consts:
+            ns_line_1(X, out=A)
+            ns_line_2(A, alpha=c, beta=b, out=B)
+            ns_line_3(X, B, X, beta=a, out=C)
+            X, C = C, X
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        return X
+
+else:
+    # No Triton — fall back to pure-PyTorch Newton-Schulz
+    def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
+        return zeropower_via_newtonschulz5(G, epsilon)
 
 
 # PolarExpress degree-5 coefficients from Amsel et al. (arXiv:2505.16932v3)
@@ -222,7 +642,7 @@ class SpicyDion(Optimizer):
             else:
                 raise ValueError(f"Unknown algorithm: {algo}")
 
-        # Create async tasks for each algorithm
+        # Create async tasks for spicydion (matrix params)
         spicydion_tasks = self._create_spicydion_tasks(spicydion_groups, verbose=self.verbose)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
@@ -360,6 +780,7 @@ class SpicyDion(Optimizer):
 
                 gnorm_ema = []
                 gnorm_max = []
+                gnorm_v = []
                 gnorm_last_lr = []
                 gnorm_last_units = []
                 gnorm_last_signal = []
@@ -370,12 +791,16 @@ class SpicyDion(Optimizer):
                     n_units = p.shape[-2] if p.ndim >= 2 else 1
                     cur_ema = s.get("gnorm_ema")
                     cur_max = s.get("gnorm_max")
+                    cur_v = s.get("gnorm_v")
                     if not isinstance(cur_ema, torch.Tensor) or cur_ema.shape != (n_units,):
                         cur_ema = torch.zeros((n_units,), device=p.device, dtype=torch.float32)
                         s["gnorm_ema"] = cur_ema
                     if not isinstance(cur_max, torch.Tensor) or cur_max.shape != (n_units,):
                         cur_max = torch.zeros((n_units,), device=p.device, dtype=torch.float32)
                         s["gnorm_max"] = cur_max
+                    if not isinstance(cur_v, torch.Tensor) or cur_v.shape != (n_units,):
+                        cur_v = torch.zeros((n_units,), device=p.device, dtype=torch.float32)
+                        s["gnorm_v"] = cur_v
                     cur_last_lr = s.get("gnorm_last_lr")
                     if not isinstance(cur_last_lr, torch.Tensor) or cur_last_lr.numel() != 1:
                         cur_last_lr = torch.zeros((), device=p.device, dtype=torch.float32)
@@ -398,6 +823,7 @@ class SpicyDion(Optimizer):
                         s["gnorm_last_ratio"] = cur_last_ratio
                     gnorm_ema.append(cur_ema)
                     gnorm_max.append(cur_max)
+                    gnorm_v.append(cur_v)
                     gnorm_last_lr.append(cur_last_lr)
                     gnorm_last_units.append(cur_last_units)
                     gnorm_last_signal.append(cur_last_signal)
@@ -408,12 +834,13 @@ class SpicyDion(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, ge, gm, gl, gu, gs, gx, gr in zip(
+                    for x, g, m, ge, gm, gv, gl, gu, gs, gx, gr in zip(
                         params,
                         gradients,
                         momentums,
                         gnorm_ema,
                         gnorm_max,
+                        gnorm_v,
                         gnorm_last_lr,
                         gnorm_last_units,
                         gnorm_last_signal,
@@ -427,6 +854,7 @@ class SpicyDion(Optimizer):
                                 M=[m],
                                 GNORM_EMA=[ge],
                                 GNORM_MAX=[gm],
+                                GNORM_V=[gv],
                                 GNORM_LAST_LR=[gl],
                                 GNORM_LAST_UNITS=[gu],
                                 GNORM_LAST_SIGNAL=[gs],
@@ -446,6 +874,7 @@ class SpicyDion(Optimizer):
                             M=pad_batch(momentums, self._world_size),
                             GNORM_EMA=pad_batch(gnorm_ema, self._world_size),
                             GNORM_MAX=pad_batch(gnorm_max, self._world_size),
+                            GNORM_V=pad_batch(gnorm_v, self._world_size),
                             GNORM_LAST_LR=pad_batch(gnorm_last_lr, self._world_size),
                             GNORM_LAST_UNITS=pad_batch(gnorm_last_units, self._world_size),
                             GNORM_LAST_SIGNAL=pad_batch(gnorm_last_signal, self._world_size),
@@ -505,7 +934,6 @@ class SpicyDion(Optimizer):
         for group in param_groups:
             assert group["algorithm"] == algo_name
 
-            # Get parameters and optimizer states
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
                 continue
@@ -514,7 +942,6 @@ class SpicyDion(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
             lr = torch.tensor(group["lr"])
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
@@ -544,6 +971,7 @@ def spicydion_update_batch_async(
     M: List[Tensor],  # Momentum buffer (modified in place)
     GNORM_EMA: List[Tensor],  # Per-unit EMA gnorm state (modified in place)
     GNORM_MAX: List[Tensor],  # Per-unit max gnorm state (modified in place)
+    GNORM_V: List[Tensor],  # Per-unit second moment of post-ortho norms (modified in place)
     GNORM_LAST_LR: List[Tensor],  # Last applied median LR (modified in place)
     GNORM_LAST_UNITS: List[Tensor],  # Last units median (EMA input)
     GNORM_LAST_SIGNAL: List[Tensor],  # Last signal median (EMA output)
@@ -576,6 +1004,7 @@ def spicydion_update_batch_async(
     assert len(X) == len(M)
     assert len(X) == len(GNORM_EMA)
     assert len(X) == len(GNORM_MAX)
+    assert len(X) == len(GNORM_V)
     assert len(X) == len(GNORM_LAST_LR)
     assert len(X) == len(GNORM_LAST_UNITS)
     assert len(X) == len(GNORM_LAST_SIGNAL)
@@ -700,12 +1129,13 @@ def spicydion_update_batch_async(
         indices=indices_list,
         GNORM_EMA=to_local(GNORM_EMA),
         GNORM_MAX=to_local(GNORM_MAX),
+        GNORM_V=to_local(GNORM_V),
         GNORM_LAST_LR=to_local(GNORM_LAST_LR),
         GNORM_LAST_UNITS=to_local(GNORM_LAST_UNITS),
         GNORM_LAST_SIGNAL=to_local(GNORM_LAST_SIGNAL),
         GNORM_LAST_MAX=to_local(GNORM_LAST_MAX),
         GNORM_LAST_RATIO=to_local(GNORM_LAST_RATIO),
-        base_lr=initial_lr,
+        base_lr=lr,
         step=step,
         total_steps=total_steps,
         gnorm_beta=gnorm_beta,
@@ -767,6 +1197,7 @@ def spicydion_post_orthogonalize(
     indices: List[Tensor],
     GNORM_EMA: List[Tensor],
     GNORM_MAX: List[Tensor],
+    GNORM_V: List[Tensor],
     GNORM_LAST_LR: List[Tensor],
     GNORM_LAST_UNITS: List[Tensor],
     GNORM_LAST_SIGNAL: List[Tensor],
@@ -780,27 +1211,27 @@ def spicydion_post_orthogonalize(
 ):
     """
     Apply weight update after orthogonalization.
-    Per-neuron LR via pressure-based force balance:
-        pressure = k * (step / total_steps)
-        lr_neuron = base_lr * ratio / (ratio + pressure)
-    Each neuron's gnorm ratio resists the external pressure independently.
+    Per-neuron adaptive LR combining ratio (temperature) with second moment:
+        ratio = signal / max  (how active is this neuron vs its historical peak)
+        v = beta2*v + (1-beta2)*units^2  (second moment of post-ortho norms)
+        lr_neuron = base_lr * ratio / sqrt(v + eps)
+    Ratio controls allocation; second moment controls volatility scaling.
     """
-    # Pressure increases linearly over training budget. k controls max pressure.
-    k = 4.0
-    pressure = k * ((step - 1) / total_steps)
+    beta2 = 0.999  # Second moment decay, same as Adam default
 
     # Convert U to match parameter dtype
     dtype = X[0].dtype
     U = [u.to(dtype=dtype) for u in U]
     is_first = (step <= 1)
 
-    for x, g, u, idx, g_ema, g_max, g_last_lr, g_last_units, g_last_signal, g_last_max, g_last_ratio in zip(
+    for x, g, u, idx, g_ema, g_max, g_v, g_last_lr, g_last_units, g_last_signal, g_last_max, g_last_ratio in zip(
         X,
         G,
         U,
         indices,
         GNORM_EMA,
         GNORM_MAX,
+        GNORM_V,
         GNORM_LAST_LR,
         GNORM_LAST_UNITS,
         GNORM_LAST_SIGNAL,
@@ -826,13 +1257,21 @@ def spicydion_post_orthogonalize(
         g_ema.copy_(signal_u.detach())
         g_max.copy_(max_u.detach())
 
-        # Per-neuron ratio: how strong is this neuron's gradient signal vs its peak?
+        # Second moment of post-ortho norms (Adam-style v).
+        units_sq = units * units
+        v_candidate = beta2 * g_v + (1 - beta2) * units_sq
+        v_u = torch.where(is_first, units_sq, v_candidate)
+        g_v.copy_(v_u.detach())
+
+        # Bias correction for second moment (same as Adam).
+        step_float = step.float()
+        v_corrected = v_u / (1.0 - beta2 ** step_float)
+
+        # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
-        # Force balance: ratio resists external pressure.
-        # lr = base_lr * ratio / (ratio + pressure), floored at 10% of base_lr
-        lr_u = base_lr * ratio_u / (ratio_u + pressure).clamp(min=1e-12)
-        lr_u = torch.clamp(lr_u, min=1e-3 * base_lr.item())
+        # Combined adaptive LR: ratio distributes budget, 1/sqrt(v) scales by volatility.
+        lr_u = base_lr * ratio_u / (v_corrected.sqrt() + 1e-8)
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))
