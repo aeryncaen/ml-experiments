@@ -4349,11 +4349,9 @@ def build_model_maybe_llada() -> nn.Module:
 
 
 def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
-    """LR schedule based on fraction of total tokens consumed."""
+    """LR schedule based on fraction of total tokens consumed. No LR warmup —
+    grad_accum ramp handles the warmup phase instead."""
     warmup_tokens = int(total_tokens * HP.warmup_frac)
-    # Warmup phase (same for all schedules)
-    if tokens_seen < warmup_tokens:
-        return HP.lr * tokens_seen / max(1, warmup_tokens)
 
     if HP.lr_schedule == "wsd":
         # Warmup-Stable-Decay: hold peak LR, then cosine decay in final fraction
@@ -4851,6 +4849,7 @@ def main():
     _tok_per_micro = HP.batch_size * HP.seq_len
     _total_tokens = HP.train_steps * HP.batch_size * HP.grad_accum * HP.seq_len
     _warmup_tokens = int(_total_tokens * HP.warmup_frac)
+    _warmup_ramp_start = _warmup_tokens // 4
     print0(rank, f"total_tokens={_total_tokens:,} warmup_tokens={_warmup_tokens:,} ({HP.warmup_frac*100:.1f}%)")
 
     _metrics = None
@@ -4869,7 +4868,7 @@ def main():
                 "hostname": os.uname().nodename,
                 "total_tokens": _total_tokens,
                 "warmup_tokens": _warmup_tokens,
-                "warmup_ramp_start_tokens": 0,  # grad_accum ramp removed
+                "warmup_ramp_start_tokens": _warmup_ramp_start,
                 "tokens_per_microbatch": _tok_per_micro,
                 "muon_formula_lr": _muon_formula_lr,
                 "n_residuals": _n_residuals,
@@ -4950,12 +4949,17 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # Ramp grad_accum from 1 → HP.grad_accum over the warmup phase.
+        # During warmup: ramp grad_accum from 1 -> HP.grad_accum over last 75%.
         _in_warmup = tokens_seen < _warmup_tokens
-        if _in_warmup and HP.grad_accum > 1:
-            _ramp_t = tokens_seen / max(1, _warmup_tokens)
-            _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
-            _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
+        _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
+        if _in_warmup:
+            if _in_accum_ramp:
+                _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
+                _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
+                _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+                _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
+            else:
+                _eff_accum = 1
         else:
             _eff_accum = HP.grad_accum
 
@@ -5045,7 +5049,7 @@ def main():
         _train_acc_local = None
         if hasattr(raw_model, '_last_acc') and raw_model._last_acc is not None:
             _train_acc_local = _to_json_scalar(raw_model._last_acc)
-        _phase = "warmup" if _in_warmup else "stable"
+        _phase = "warmup-ramp" if _in_warmup and _in_accum_ramp else ("warmup" if _in_warmup else "stable")
 
         if _metrics is not None and step % max(1, HP.metrics_every) == 0:
             _now = time.time()
@@ -5063,7 +5067,7 @@ def main():
                 "throughput_tok_s": _tokens_per_sec,
                 "phase": _phase,
                 "in_warmup": _in_warmup,
-                "in_accum_ramp": False,
+                "in_accum_ramp": _in_accum_ramp,
                 "eff_accum": _eff_accum,
                 "lr": _to_json_scalar(lr),
                 "grad_norm": _to_json_scalar(grad_norm),
