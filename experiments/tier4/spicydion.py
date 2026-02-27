@@ -1280,16 +1280,18 @@ def spicydion_post_orthogonalize(
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
-        # Per-neuron adaptive LR
-        if adaptive_lr_mode == 1:
-            # Pure Adam second moment: base_lr / sqrt(v)
-            lr_u = base_lr / (v_corrected.sqrt() + 1e-8)
-        elif adaptive_lr_mode == 2:
-            # Pure ratio: base_lr * ratio
-            lr_u = base_lr * ratio_u
-        else:
-            # Geometric mean of ratio and sqrt(v): base_lr * sqrt(ratio) * v^0.25
-            lr_u = base_lr * (ratio_u * (v_corrected.sqrt() + 1e-8)).sqrt()
+        # Per-neuron adaptive LR — branchless for torch.compile
+        # 0=geomean: base_lr * sqrt(ratio * sqrt(v))
+        # 1=adam:    base_lr / sqrt(v)
+        # 2=ratio:   base_lr * ratio
+        v_sqrt = v_corrected.sqrt() + 1e-8
+        lr_geomean = base_lr * (ratio_u * v_sqrt).sqrt()
+        lr_adam = base_lr / v_sqrt
+        lr_ratio = base_lr * ratio_u
+        is_adam = float(adaptive_lr_mode == 1)
+        is_ratio = float(adaptive_lr_mode == 2)
+        is_geomean = 1.0 - is_adam - is_ratio
+        lr_u = lr_geomean * is_geomean + lr_adam * is_adam + lr_ratio * is_ratio
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))
