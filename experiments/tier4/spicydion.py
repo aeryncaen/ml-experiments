@@ -674,7 +674,8 @@ class SpicyDion(Optimizer):
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
-        # --- Self-scheduling: aggregate global stats and update LR multiplier ---
+        # --- Self-scheduling ---
+        # Collect median adaptive LR and median gnorm from all spicydion params.
         all_lr_vals = []
         all_gnorm_vals = []
         current_step = 0
@@ -688,29 +689,34 @@ class SpicyDion(Optimizer):
                     all_gnorm_vals.append(s["gnorm_last_units"].item())
 
         if all_lr_vals:
-            global_median_lr = sorted(all_lr_vals)[len(all_lr_vals) // 2]
+            median_adaptive_lr = sorted(all_lr_vals)[len(all_lr_vals) // 2]
             global_median_gnorm = sorted(all_gnorm_vals)[len(all_gnorm_vals) // 2] if all_gnorm_vals else 0.0
 
             if not self._peak_detected:
-                # Phase 1: Warmup — track rising effective LR, detect peak
-                if global_median_lr > self._peak_lr:
-                    self._peak_lr = global_median_lr
-                    self._decline_count = 0
-                else:
-                    self._decline_count += 1
+                # Phase 1: Warmup — feedback loop.
+                # Median adaptive LR feeds back into scheduled_lr each step.
+                # This naturally warms up: ratio starts < 1 so LR compounds
+                # downward, then recovers as gradients stabilize. When median
+                # adaptive LR meets or exceeds base_lr, warmup is done.
+                _next_lr = median_adaptive_lr
 
-                if self._decline_count >= self._decline_threshold:
-                    # Peak confirmed — snapshot and transition to cruise
+                if _next_lr >= self._base_lr:
+                    # Warmup complete — lock to base_lr, snapshot gnorm.
                     self._peak_detected = True
                     self._peak_step = current_step
                     self._peak_median_gnorm = global_median_gnorm
                     self._slow_ema_gnorm = global_median_gnorm
-                    self._global_lr_mult = 1.0
+                    _next_lr = self._base_lr
 
-                # During warmup, no multiplier adjustment
-                self._global_lr_mult = 1.0
+                for group in self.param_groups:
+                    if group["algorithm"] == "spicydion":
+                        group["lr"] = _next_lr
+                        group["scheduled_lr"] = _next_lr
+                    else:
+                        group["lr"] = _next_lr / 3.0
+                        group["scheduled_lr"] = _next_lr / 3.0
             else:
-                # Phase 2/3: Cruise or Cooldown
+                # Phase 2/3: Cruise or Cooldown — no feedback loop.
                 cooldown_start_step = int(self.total_steps * (1.0 - self._cooldown_frac))
 
                 if current_step >= cooldown_start_step:
@@ -720,29 +726,24 @@ class SpicyDion(Optimizer):
                     t = (current_step - cooldown_start_step) / max(1, self.total_steps - cooldown_start_step)
                     self._global_lr_mult = self._cooldown_start_mult * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
                 else:
-                    # Phase 2: Cruise — slow EMA of gnorm / snapshot
+                    # Phase 2: Cruise — slow EMA of gnorm / snapshot → multiplier
                     self._slow_ema_gnorm = (
                         self._slow_ema_beta * self._slow_ema_gnorm
                         + (1.0 - self._slow_ema_beta) * global_median_gnorm
                     )
                     self._global_lr_mult = self._slow_ema_gnorm / max(self._peak_median_gnorm, 1e-12)
-                    # Clamp to [0, 1] — gnorm should only decrease from peak
                     self._global_lr_mult = min(1.0, self._global_lr_mult)
 
-        # Apply self-scheduled multiplier to all groups for next step.
-        # AdamW/Lion groups get 1/3 of the spicydion LR.
-        _spicy_lr = self._base_lr * self._global_lr_mult
-        for group in self.param_groups:
-            if group["algorithm"] == "spicydion":
-                group["lr"] = _spicy_lr
-                group["scheduled_lr"] = _spicy_lr
-            else:
-                group["lr"] = _spicy_lr / 3.0
-                group["scheduled_lr"] = _spicy_lr / 3.0
+                _spicy_lr = self._base_lr * self._global_lr_mult
+                for group in self.param_groups:
+                    if group["algorithm"] == "spicydion":
+                        group["lr"] = _spicy_lr
+                        group["scheduled_lr"] = _spicy_lr
+                    else:
+                        group["lr"] = _spicy_lr / 3.0
+                        group["scheduled_lr"] = _spicy_lr / 3.0
 
-        # Expose diagnostics for external logging (NOT as "scheduled_lr" — that
-        # would create a feedback loop since the trainer reads scheduled_lr as
-        # the actual LR).
+        # Diagnostics for external logging (separate key, no feedback).
         for group in spicydion_groups:
             for p in group["params"]:
                 if p in self.state and "gnorm_last_lr" in self.state[p]:

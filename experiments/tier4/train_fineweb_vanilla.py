@@ -4950,10 +4950,14 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # grad_accum is always full from step 0 — no ramp.
+        # Ramp grad_accum from 1 → HP.grad_accum over the warmup phase.
         _in_warmup = tokens_seen < _warmup_tokens
-        _in_accum_ramp = False
-        _eff_accum = HP.grad_accum
+        if _in_warmup and HP.grad_accum > 1:
+            _ramp_t = tokens_seen / max(1, _warmup_tokens)
+            _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+            _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
+        else:
+            _eff_accum = HP.grad_accum
 
         if _is_sf or _is_auto or _is_spicydion:
             # Schedule-free / AutoNorMuon / SpicyDion: optimizer handles its own LR schedule internally
