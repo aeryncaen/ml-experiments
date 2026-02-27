@@ -1,6 +1,6 @@
 [runner]
 # SpicyDion vs baselines at 5M tokens.
-# SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, ratio+second-moment adaptive LR, sphere retract.
+# SpicyDion: PolarExpress+AOL, NorMuon-EMA momentum, adaptive LR, sphere retract.
 metrics_dir = "experiments/tier4/runs"
 run_prefix = "rnd_spicydion"
 skip_existing = true
@@ -28,7 +28,13 @@ optimizer = ["spicydion", "autonormuon", "muon"]
 # LR schedule: spicydion needs an external schedule now
 lr_schedule = ["cosine", "pressure"]
 
-# LR: sweep a couple values
+# Adaptive LR mode (only affects spicydion)
+# geomean: sqrt(ratio * sqrt(v)) — geometric mean of ratio and second moment
+# adam: pure 1/sqrt(v) — Adam-style second moment only
+# ratio: pure ratio — signal/max only (same as autonormuon)
+spicydion_adaptive_lr_mode = ["geomean", "adam", "ratio"]
+
+# LR
 muon_lr = [0.023]
 
 # Momentum beta (ef_decay for spicydion, also used as NorMuon-EMA beta)

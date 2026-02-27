@@ -540,6 +540,7 @@ class SpicyDion(Optimizer):
         newton_schulz_func: Optional[Callable] = None,
         gnorm_beta: float = 0.55,
         total_steps: int = 1,
+        adaptive_lr_mode: str = "geomean",
         verbose: bool = False,
     ):
         # Validate hyperparameters
@@ -559,6 +560,9 @@ class SpicyDion(Optimizer):
             )
         if not (0.0 <= gnorm_beta <= 1.0):
             raise ValueError(f"gnorm_beta must be in [0, 1], got {gnorm_beta}")
+        _valid_modes = ("geomean", "adam", "ratio")
+        if adaptive_lr_mode not in _valid_modes:
+            raise ValueError(f"adaptive_lr_mode must be one of {_valid_modes}, got {adaptive_lr_mode}")
 
         defaults = dict(
             lr=lr,
@@ -576,6 +580,7 @@ class SpicyDion(Optimizer):
         super().__init__(params, defaults)
         self.gnorm_beta = gnorm_beta
         self.total_steps = total_steps
+        self.adaptive_lr_mode = adaptive_lr_mode
 
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
@@ -715,6 +720,7 @@ class SpicyDion(Optimizer):
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
+                adaptive_lr_mode=self.adaptive_lr_mode,
             )
 
             # Create batches of parameters of size self._world_size
@@ -996,6 +1002,7 @@ def spicydion_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
+    adaptive_lr_mode: str = "geomean",  # "geomean" | "adam" | "ratio"
     verbose: bool = False,
 ) -> Generator[None, None, None]:
     """
@@ -1143,6 +1150,7 @@ def spicydion_update_batch_async(
         total_steps=total_steps,
         gnorm_beta=gnorm_beta,
         weight_decay=weight_decay,
+        adaptive_lr_mode=adaptive_lr_mode,
     )
 
 
@@ -1210,14 +1218,14 @@ def spicydion_post_orthogonalize(
     total_steps: Tensor,
     gnorm_beta: Tensor,
     weight_decay: Tensor,
+    adaptive_lr_mode: str = "geomean",
 ):
     """
     Apply weight update after orthogonalization.
-    Per-neuron adaptive LR combining ratio (temperature) with second moment:
-        ratio = signal / max  (how active is this neuron vs its historical peak)
-        v = beta2*v + (1-beta2)*units^2  (second moment of post-ortho norms)
-        lr_neuron = base_lr * ratio / sqrt(v + eps)
-    Ratio controls allocation; second moment controls volatility scaling.
+    Per-neuron adaptive LR modes:
+        "geomean": geometric mean of ratio and sqrt(v) — sqrt(ratio) * v^0.25
+        "adam":    pure Adam second moment — base_lr / sqrt(v)
+        "ratio":  pure ratio — base_lr * ratio
     """
     beta2 = 0.999  # Second moment decay, same as Adam default
 
@@ -1272,9 +1280,16 @@ def spicydion_post_orthogonalize(
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
-        # Geometric mean of ratio and sqrt(v): feed active+volatile neurons.
-        # lr = base_lr * sqrt(ratio * sqrt(v)) = base_lr * sqrt(ratio) * v^0.25
-        lr_u = base_lr * (ratio_u * (v_corrected.sqrt() + 1e-8)).sqrt()
+        # Per-neuron adaptive LR
+        if adaptive_lr_mode == "adam":
+            # Pure Adam second moment: base_lr / sqrt(v)
+            lr_u = base_lr / (v_corrected.sqrt() + 1e-8)
+        elif adaptive_lr_mode == "ratio":
+            # Pure ratio: base_lr * ratio
+            lr_u = base_lr * ratio_u
+        else:
+            # Geometric mean of ratio and sqrt(v): base_lr * sqrt(ratio) * v^0.25
+            lr_u = base_lr * (ratio_u * (v_corrected.sqrt() + 1e-8)).sqrt()
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))

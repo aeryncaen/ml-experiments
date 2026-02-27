@@ -140,6 +140,7 @@ class HParams:
     spicydion_ef_decay: float = _env_float("SPICYDION_EF_DECAY", 0.95)
     spicydion_norm_direction: str = os.environ.get("SPICYDION_NORM_DIRECTION", "col_row")  # col_row | row_col | row | col
     spicydion_turbo_prescale: bool = _env_bool("SPICYDION_TURBO_PRESCALE", True)
+    spicydion_adaptive_lr_mode: str = os.environ.get("SPICYDION_ADAPTIVE_LR_MODE", "geomean")  # geomean | adam | ratio
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
     init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
@@ -4764,12 +4765,13 @@ def main():
             adjust_lr=None,
             gnorm_beta=HP.autonormuon_beta,
             total_steps=HP.train_steps,
+            adaptive_lr_mode=HP.spicydion_adaptive_lr_mode,
         )
         print0(rank, (
             f"  spicydion: R={_n_residuals} base_lr={_base_lrs[0]:.6f} "
             f"ef_decay={HP.spicydion_ef_decay} gnorm_beta={HP.autonormuon_beta} "
-            f"total_steps={HP.train_steps} k=4.0 wd=0 "
-            f"[PolarExpress+AOL, NorMuon-EMA, pressure-LR, sphere-retract]"
+            f"total_steps={HP.train_steps} adaptive_lr={HP.spicydion_adaptive_lr_mode} wd=0 "
+            f"[PolarExpress+AOL, NorMuon-EMA, sphere-retract]"
         ))
     elif HP.optimizer == "muon_sf":
         from muon_sf import ScheduleFreeMuon
