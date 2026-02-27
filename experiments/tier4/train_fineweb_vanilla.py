@@ -4820,7 +4820,7 @@ def main():
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
     _is_auto = HP.optimizer in ("autonormuon",)  # handle own LR schedule internally
     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
-    _is_plain_muon = HP.optimizer in ("muon", "normuon")
+
 
     profiler = None
     if HP.torch_profile:
@@ -4970,21 +4970,7 @@ def main():
             # Schedule-free / AutoNorMuon / SpicyDion: optimizer handles its own LR schedule internally
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
         else:
-            if _is_plain_muon:
-                # Muon/NorMuon: no LR warmup, only schedule shape
-                if HP.lr_schedule == "wsd":
-                    _decay_tokens = int(_total_tokens * HP.wsd_decay_frac)
-                    _stable_end = _total_tokens - _decay_tokens
-                    if tokens_seen <= _stable_end:
-                        _lr_factor = 1.0
-                    else:
-                        _t = (tokens_seen - _stable_end) / max(1, _decay_tokens)
-                        _lr_factor = 0.5 * (1.0 + math.cos(math.pi * min(1.0, _t)))
-                else:
-                    _t = tokens_seen / max(1, _total_tokens)
-                    _lr_factor = 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, _t))))
-            else:
-                _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
+            _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
             for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
                 pg["lr"] = base_lr * _lr_factor
                 if "adam_lr" in pg:

@@ -26,7 +26,12 @@ vocab_size = 149760
 
 seed = 42
 init_mode = "default"
-lr_schedule = "cosine"  # used by normuon/autonormuon; spicydion self-schedules
+
+# WSD schedule for normuon/autonormuon: 10% warmup, 80% stable, 10% cosine decay.
+# SpicyDion self-schedules and ignores these.
+lr_schedule = "wsd"
+warmup_frac = 0.10
+wsd_decay_frac = 0.10
 
 [sweep]
 optimizer = ["spicydion", "autonormuon", "normuon"]
