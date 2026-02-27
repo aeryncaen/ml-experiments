@@ -124,6 +124,7 @@ class GnormScheduler:
         # --- Public read-only ---
         self.current_lr: float = base_lr * 0.1
         self.gnorm_ratio: float = 1.0
+        self._ramp_progress: float = 0.0
 
     # ------------------------------------------------------------------
     # Tracker: update MA + variance, return (stable_triggered, tap_triggered)
@@ -202,6 +203,7 @@ class GnormScheduler:
                 self._ramp_start_step = step_num
             else:
                 self.current_lr = self.base_lr * 0.1
+                self._ramp_progress = 0.0
                 return self._result(adaptive_active=False)
 
         if self.phase == "ramp":
@@ -209,11 +211,13 @@ class GnormScheduler:
             if t >= 1.0:
                 self.phase = "cruise"
                 t = 1.0
+            self._ramp_progress = t
             self.current_lr = self.base_lr * (0.1 + 0.9 * t)
             return self._result(adaptive_active=True)
 
         # --- Cruise phase ---
         assert self.phase == "cruise"
+        self._ramp_progress = 1.0
 
         # Plateau step-down: reduce base_lr
         if tap_triggered:
@@ -248,4 +252,5 @@ class GnormScheduler:
             "tap_count": self.tap_count,
             "ma_variance": self.current_variance,
             "early_exit": self.current_lr < self._lr_floor,
+            "ramp_progress": self._ramp_progress,
         }

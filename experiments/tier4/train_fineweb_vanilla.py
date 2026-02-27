@@ -4954,19 +4954,30 @@ def main():
             if _is_sf:
                 optimizer.train()  # switch params back from x to y for training
 
-        # During warmup: ramp grad_accum from 1 -> HP.grad_accum over last 75%.
-        _in_warmup = tokens_seen < _warmup_tokens
-        _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
-        if _in_warmup:
-            if _in_accum_ramp:
-                _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
-                _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
-                _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
-                _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
-            else:
-                _eff_accum = 1
+        # During warmup: ramp grad_accum from 1 -> HP.grad_accum.
+        # When GnormScheduler is active, tie accum ramp to scheduler phase:
+        #   cold  → accum=1, ramp → linear 1→full, cruise → full.
+        # Otherwise use the token-based ramp (first 25% of warmup at accum=1,
+        # then linear ramp over remaining 75%).
+        if _gnorm_scheduler is not None and HP.grad_accum > 1:
+            _ramp_t = _gnorm_scheduler._ramp_progress
+            _in_warmup = _gnorm_scheduler.phase in ("cold", "ramp")
+            _in_accum_ramp = _gnorm_scheduler.phase == "ramp"
+            _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+            _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
         else:
-            _eff_accum = HP.grad_accum
+            _in_warmup = tokens_seen < _warmup_tokens
+            _in_accum_ramp = _in_warmup and HP.grad_accum > 1 and tokens_seen >= _warmup_ramp_start
+            if _in_warmup:
+                if _in_accum_ramp:
+                    _ramp_span = max(1, _warmup_tokens - _warmup_ramp_start)
+                    _ramp_t = (tokens_seen - _warmup_ramp_start) / _ramp_span
+                    _eff_accum = 1 + int(round(_ramp_t * (HP.grad_accum - 1)))
+                    _eff_accum = max(1, min(HP.grad_accum, _eff_accum))
+                else:
+                    _eff_accum = 1
+            else:
+                _eff_accum = HP.grad_accum
 
         if _is_sf or _is_auto or _is_spicydion or _gnorm_scheduler is not None:
             # Schedule-free / self-scheduling optimizers / GnormScheduler: skip external LR schedule
