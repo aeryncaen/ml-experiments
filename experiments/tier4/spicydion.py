@@ -582,6 +582,23 @@ class SpicyDion(Optimizer):
         self.total_steps = total_steps
         self.adaptive_lr_mode = adaptive_lr_mode
 
+        # --- Self-scheduling state ---
+        # Phase 1 (warmup): track effective LR rising. No multiplier applied.
+        # Phase 2 (cruise): after peak detected, slow EMA of gnorm / snapshot → multiplier.
+        # Phase 3 (cooldown): last 10% of steps, cosine from current multiplier to 0.
+        self._base_lr = lr  # original base LR, never modified
+        self._peak_lr = 0.0  # running max of global median effective LR
+        self._peak_detected = False
+        self._peak_step = 0
+        self._peak_median_gnorm = 0.0  # snapshot of median gnorm at peak
+        self._slow_ema_gnorm = 0.0  # slow EMA (β = 1 - 10/T) of median gnorm
+        self._slow_ema_beta = 1.0 - 10.0 / max(total_steps, 1)
+        self._decline_count = 0  # consecutive steps where effective LR < peak
+        self._decline_threshold = 20  # steps of decline to confirm peak
+        self._global_lr_mult = 1.0  # current global LR multiplier
+        self._cooldown_start_mult = 1.0  # multiplier at cooldown entry
+        self._cooldown_frac = 0.10  # last 10% of steps
+
         # Distributed configuration
         if isinstance(distributed_mesh, DeviceMesh):
             if distributed_mesh.ndim != 1:
@@ -656,13 +673,76 @@ class SpicyDion(Optimizer):
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
-        # Expose the effective (pressure-scheduled) LR for external logging.
-        # The training loop reads param_groups[0]["scheduled_lr"].
+        # --- Self-scheduling: aggregate global stats and update LR multiplier ---
+        all_lr_vals = []
+        all_gnorm_vals = []
+        current_step = 0
         for group in spicydion_groups:
+            current_step = group["step"]
             for p in group["params"]:
-                if p in self.state and "gnorm_last_lr" in self.state[p]:
-                    group["scheduled_lr"] = self.state[p]["gnorm_last_lr"].item()
-                    break  # first param's median LR is representative
+                s = self.state.get(p, {})
+                if "gnorm_last_lr" in s:
+                    all_lr_vals.append(s["gnorm_last_lr"].item())
+                if "gnorm_last_units" in s:
+                    all_gnorm_vals.append(s["gnorm_last_units"].item())
+
+        if all_lr_vals:
+            global_median_lr = sorted(all_lr_vals)[len(all_lr_vals) // 2]
+            global_median_gnorm = sorted(all_gnorm_vals)[len(all_gnorm_vals) // 2] if all_gnorm_vals else 0.0
+
+            if not self._peak_detected:
+                # Phase 1: Warmup — track rising effective LR, detect peak
+                if global_median_lr > self._peak_lr:
+                    self._peak_lr = global_median_lr
+                    self._decline_count = 0
+                else:
+                    self._decline_count += 1
+
+                if self._decline_count >= self._decline_threshold:
+                    # Peak confirmed — snapshot and transition to cruise
+                    self._peak_detected = True
+                    self._peak_step = current_step
+                    self._peak_median_gnorm = global_median_gnorm
+                    self._slow_ema_gnorm = global_median_gnorm
+                    self._global_lr_mult = 1.0
+
+                # During warmup, no multiplier adjustment
+                self._global_lr_mult = 1.0
+            else:
+                # Phase 2/3: Cruise or Cooldown
+                cooldown_start_step = int(self.total_steps * (1.0 - self._cooldown_frac))
+
+                if current_step >= cooldown_start_step:
+                    # Phase 3: Cooldown — cosine from current multiplier to 0
+                    if current_step == cooldown_start_step:
+                        self._cooldown_start_mult = self._global_lr_mult
+                    t = (current_step - cooldown_start_step) / max(1, self.total_steps - cooldown_start_step)
+                    self._global_lr_mult = self._cooldown_start_mult * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+                else:
+                    # Phase 2: Cruise — slow EMA of gnorm / snapshot
+                    self._slow_ema_gnorm = (
+                        self._slow_ema_beta * self._slow_ema_gnorm
+                        + (1.0 - self._slow_ema_beta) * global_median_gnorm
+                    )
+                    self._global_lr_mult = self._slow_ema_gnorm / max(self._peak_median_gnorm, 1e-12)
+                    # Clamp to [0, 1] — gnorm should only decrease from peak
+                    self._global_lr_mult = min(1.0, self._global_lr_mult)
+
+        # Apply self-scheduled multiplier to all groups for next step.
+        # AdamW/Lion groups get 1/3 of the spicydion LR.
+        _spicy_lr = self._base_lr * self._global_lr_mult
+        for group in self.param_groups:
+            if group["algorithm"] == "spicydion":
+                group["lr"] = _spicy_lr
+            else:
+                group["lr"] = _spicy_lr / 3.0
+
+        # Expose for external logging
+        for group in spicydion_groups:
+            group["scheduled_lr"] = group["lr"]
+            group["lr_mult"] = self._global_lr_mult
+            group["peak_detected"] = self._peak_detected
+            group["peak_step"] = self._peak_step
 
         return loss
 

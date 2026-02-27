@@ -4819,7 +4819,7 @@ def main():
 
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
     _is_auto = HP.optimizer in ("autonormuon",)  # handle own LR schedule internally
-    _is_spicydion = HP.optimizer == "spicydion"  # needs external schedule (cosine or pressure)
+     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
     _is_plain_muon = HP.optimizer in ("muon", "normuon")
 
     profiler = None
@@ -4966,17 +4966,9 @@ def main():
         else:
             _eff_accum = HP.grad_accum
 
-        if _is_sf or _is_auto:
-            # Schedule-free / AutoNorMuon: optimizer handles its own LR schedule internally
+        if _is_sf or _is_auto or _is_spicydion:
+            # Schedule-free / AutoNorMuon / SpicyDion: optimizer handles its own LR schedule internally
             lr = optimizer.param_groups[0].get("scheduled_lr", optimizer.param_groups[0]["lr"])
-        elif _is_spicydion:
-            # SpicyDion: apply external schedule (cosine/pressure/wsd) to all groups.
-            # SpicyDion's internal ratio+second-moment handles per-neuron distribution;
-            # this just controls the total LR envelope.
-            _lr_factor = lr_for_tokens(tokens_seen, _total_tokens) / max(HP.lr, 1e-12)
-            for pg, base_lr in zip(optimizer.param_groups, _base_lrs):
-                pg["lr"] = base_lr * _lr_factor
-            lr = _base_lrs[0] * _lr_factor
         else:
             if _is_plain_muon:
                 # Muon/NorMuon: no LR warmup, only schedule shape

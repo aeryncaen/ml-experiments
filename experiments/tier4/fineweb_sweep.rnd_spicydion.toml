@@ -30,8 +30,8 @@ init_mode = "default"
 [sweep]
 optimizer = ["spicydion", "autonormuon", "normuon"]
 
-# LR schedule: spicydion needs an external schedule now
-lr_schedule = ["cosine", "pressure"]
+# SpicyDion is self-scheduling (no external lr_schedule needed).
+# AutoNorMuon and NorMuon handle their own schedules internally.
 
 # Adaptive LR mode (only affects spicydion)
 # geomean: sqrt(ratio * sqrt(v)) — geometric mean of ratio and second moment
