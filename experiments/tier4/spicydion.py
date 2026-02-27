@@ -698,16 +698,17 @@ class SpicyDion(Optimizer):
             # Most hyperparameters as tensors for torch.compile
             # Here "fraction" only determines the dimension of the submatrix
             # to be orthonormalized. Hence, it doesn't need to be a tensor
+            _dev = group["params"][0].device
             spicydion_args = dict(
-                lr=torch.tensor(group["lr"]),
-                initial_lr=torch.tensor(group["initial_lr"]),
-                step=torch.tensor(group["step"]),
-                total_steps=torch.tensor(self.total_steps),
-                gnorm_beta=torch.tensor(self.gnorm_beta),
-                ef_decay=torch.tensor(group["ef_decay"]),
+                lr=torch.tensor(group["lr"], device=_dev),
+                initial_lr=torch.tensor(group["initial_lr"], device=_dev),
+                step=torch.tensor(group["step"], device=_dev),
+                total_steps=torch.tensor(self.total_steps, device=_dev),
+                gnorm_beta=torch.tensor(self.gnorm_beta, device=_dev),
+                ef_decay=torch.tensor(group["ef_decay"], device=_dev),
                 fraction=group["fraction"],
-                weight_decay=torch.tensor(group["weight_decay"]),
-                epsilon=torch.tensor(group["epsilon"]),
+                weight_decay=torch.tensor(group["weight_decay"], device=_dev),
+                epsilon=torch.tensor(group["epsilon"], device=_dev),
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 device_rank=self._device_rank,
@@ -906,10 +907,11 @@ class SpicyDion(Optimizer):
             momentums = [s["momentum"] for s in states]
 
             # Wrap hyperparameters in tensors for torch.compile
-            lr = torch.tensor(group["lr"])
-            beta1 = torch.tensor(group["beta1"])
-            beta2 = torch.tensor(group["beta2"])
-            weight_decay = torch.tensor(group["weight_decay"])
+            _dev = params[0].device
+            lr = torch.tensor(group["lr"], device=_dev)
+            beta1 = torch.tensor(group["beta1"], device=_dev)
+            beta2 = torch.tensor(group["beta2"], device=_dev)
+            weight_decay = torch.tensor(group["weight_decay"], device=_dev)
 
             yield AsyncTask(
                 lion_update_foreach_async(
@@ -942,12 +944,13 @@ class SpicyDion(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            lr = torch.tensor(group["lr"])
-            beta1 = torch.tensor(group["beta1"])
-            beta2 = torch.tensor(group["beta2"])
-            weight_decay = torch.tensor(group["weight_decay"])
-            epsilon = torch.tensor(group["epsilon"])
-            step = torch.tensor(group["step"])
+            _dev = params[0].device
+            lr = torch.tensor(group["lr"], device=_dev)
+            beta1 = torch.tensor(group["beta1"], device=_dev)
+            beta2 = torch.tensor(group["beta2"], device=_dev)
+            weight_decay = torch.tensor(group["weight_decay"], device=_dev)
+            epsilon = torch.tensor(group["epsilon"], device=_dev)
+            step = torch.tensor(group["step"], device=_dev)
 
             yield AsyncTask(
                 adamw_update_foreach_async(
@@ -1269,8 +1272,9 @@ def spicydion_post_orthogonalize(
         # Per-neuron ratio (temperature): how active is this neuron vs its peak?
         ratio_u = signal_u / max_u.clamp(min=1e-12)
 
-        # Combined adaptive LR: ratio distributes budget, 1/sqrt(v) scales by volatility.
-        lr_u = base_lr * ratio_u / (v_corrected.sqrt() + 1e-8)
+        # Geometric mean of ratio and sqrt(v): feed active+volatile neurons.
+        # lr = base_lr * sqrt(ratio * sqrt(v)) = base_lr * sqrt(ratio) * v^0.25
+        lr_u = base_lr * (ratio_u * (v_corrected.sqrt() + 1e-8)).sqrt()
 
         lr_shape = (lr_u.shape[0],) + (1,) * (u.ndim - 1)
         u_scaled = -(u * lr_u.to(dtype=u.dtype).view(lr_shape))
