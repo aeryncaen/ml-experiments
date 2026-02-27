@@ -4819,7 +4819,7 @@ def main():
 
     _is_sf = HP.optimizer.endswith("_sf")  # schedule-free: optimizer handles its own LR warmup/schedule
     _is_auto = HP.optimizer in ("autonormuon",)  # handle own LR schedule internally
-     _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
+    _is_spicydion = HP.optimizer == "spicydion"  # self-scheduling: handles own LR warmup/cruise/cooldown
     _is_plain_muon = HP.optimizer in ("muon", "normuon")
 
     profiler = None
