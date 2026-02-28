@@ -109,6 +109,7 @@ class GnormScheduler:
         self.phase: str = "cold"  # cold → ramp → cruise
         self._ramp_start_step: int = 0
         self.ramp_steps = ramp_steps
+        self._cruise_settle_remaining: int = _w  # 1x window delay before adaptive activates
 
         # --- Cruise state ---
         self.schedule_power = schedule_power
@@ -221,11 +222,20 @@ class GnormScheduler:
         assert self.phase == "cruise"
         self._ramp_progress = 1.0
 
-        # Plateau step-down: reduce base_lr
-        if tap_triggered:
+        # Settle delay: 1x window after ramp ends before activating adaptive
+        _settled = self._cruise_settle_remaining <= 0
+        if self._cruise_settle_remaining > 0:
+            self._cruise_settle_remaining -= 1
+
+        # Plateau step-down: reduce base_lr (only after settled)
+        if tap_triggered and _settled:
             self.base_lr *= (1.0 - self._step_down_fraction)
 
-        # Gnorm ratio tracking
+        # Gnorm ratio tracking (only after settled)
+        if not _settled:
+            self.current_lr = self.base_lr
+            return self._result(adaptive_active=False)
+
         b = self._gnorm_smooth_beta
         if not self._cruise_initialized:
             self._smooth_gnorm = gnorm
