@@ -80,14 +80,12 @@ class GnormScheduler:
         self.base_lr = base_lr
         self._original_base_lr = base_lr
 
-        # Dynamic window scaling: 20 * n_layers
-        # Base windows (15, 10, 5, 30) were tuned on every-20-step data.
-        # Running every step on a depth-L model: scale = 20 * L.
-        _s = 20 * max(1, n_layers)
-        ma_window = 15 * _s
-        var_window = 10 * _s
-        tap_confirm = 5 * _s
-        cooloff_steps = 30 * _s
+        # Window sizes scale with model depth: 20 * L
+        _w = 20 * max(1, n_layers)
+        ma_window = _w
+        var_window = _w
+        tap_confirm = _w
+        cooloff_steps = 3 * _w
 
         # --- Tracker state ---
         self._ma_buf: deque[float] = deque(maxlen=ma_window)
