@@ -33,20 +33,15 @@ class GnormScheduler:
     ----------
     base_lr : float
         Target peak learning rate (will be reduced by step-downs).
+    n_layers : int
+        Model depth. Windows scale as 20 * n_layers to account for
+        deeper models having longer gradient transients.
 
     Tracker params:
-    ma_window : int
-        Trailing window for causal moving average of raw gnorms.
-    var_window : int
-        How many MA values to compute variance over.
     stable_thresh : float
         MA variance below this → initial transient is over.
     tap_thresh : float
         MA variance below this → model is tapped out at current LR.
-    tap_confirm : int
-        Consecutive steps below tap_thresh before declaring tapped_out.
-    cooloff_steps : int
-        After each step-down, ignore tap detection for this many steps.
 
     Ramp params:
     ramp_steps : int
@@ -68,13 +63,10 @@ class GnormScheduler:
     def __init__(
         self,
         base_lr: float,
-        # Tracker (windows tuned for per-step gnorms; original data was every 20 steps)
-        ma_window: int = 300,
-        var_window: int = 200,
+        n_layers: int = 1,
+        # Tracker (base windows scaled by 20 * n_layers)
         stable_thresh: float = 0.02,
         tap_thresh: float = 0.0003,
-        tap_confirm: int = 100,
-        cooloff_steps: int = 600,
         # Ramp
         ramp_steps: int = 100,
         # Cruise
@@ -86,6 +78,15 @@ class GnormScheduler:
     ):
         self.base_lr = base_lr
         self._original_base_lr = base_lr
+
+        # Dynamic window scaling: 20 * n_layers
+        # Base windows (15, 10, 5, 30) were tuned on every-20-step data.
+        # Running every step on a depth-L model: scale = 20 * L.
+        _s = 20 * max(1, n_layers)
+        ma_window = 15 * _s
+        var_window = 10 * _s
+        tap_confirm = 5 * _s
+        cooloff_steps = 30 * _s
 
         # --- Tracker state ---
         self._ma_buf: deque[float] = deque(maxlen=ma_window)

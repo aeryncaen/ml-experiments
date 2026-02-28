@@ -4829,8 +4829,9 @@ def main():
              if pg.get("use_muon", False) or pg.get("algorithm") == "spicydion"),
             HP.lr,  # fallback
         )
-        _gnorm_scheduler = GnormScheduler(base_lr=_main_lr, schedule_power=HP.schedule_power)
-        print0(rank, f"  gnorm_scheduler: base_lr={_main_lr:.4e} cold_lr={_main_lr*0.1:.4e} ramp_steps=100 schedule_power={HP.schedule_power} step_down=5%")
+        _gnorm_scheduler = GnormScheduler(base_lr=_main_lr, n_layers=HP.n_layer, schedule_power=HP.schedule_power)
+        _gs = _gnorm_scheduler
+        print0(rank, f"  gnorm_scheduler: base_lr={_main_lr:.4e} cold_lr={_main_lr*0.1:.4e} n_layers={HP.n_layer} ma_win={_gs._ma_buf.maxlen} var_win={_gs._var_buf.maxlen} schedule_power={HP.schedule_power} step_down=5%")
 
     profiler = None
     if HP.torch_profile:

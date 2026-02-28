@@ -242,7 +242,7 @@ class SpicyDionWithScheduler:
         )
         self.adam = torch.optim.AdamW(adam_p, lr=adam_lr, weight_decay=0)
         self.param_groups = self.spicy.param_groups + self.adam.param_groups
-        self.scheduler = GnormScheduler(base_lr=muon_lr)
+        self.scheduler = GnormScheduler(base_lr=muon_lr, n_layers=4)
         self._adam_lr = adam_lr
         self._step_num = 0
 
