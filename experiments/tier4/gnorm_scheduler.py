@@ -213,7 +213,9 @@ class GnormScheduler:
                 t = 1.0
             self._ramp_progress = t
             self.current_lr = self.base_lr * (0.1 + 0.9 * t)
-            return self._result(adaptive_active=True)
+            # adaptive_active=False during ramp: per-neuron EMA/max/v and
+            # global gnorm smooth/max should not accumulate until cruise.
+            return self._result(adaptive_active=False)
 
         # --- Cruise phase ---
         assert self.phase == "cruise"
