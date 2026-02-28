@@ -66,7 +66,7 @@ class GnormScheduler:
         base_lr: float,
         n_layers: int = 1,
         # Tracker (base windows scaled by 20 * n_layers)
-        stable_thresh: float = 0.02,
+        stable_thresh: float = 0.01,
         tap_thresh: float = 0.0003,
         # Ramp
         ramp_steps: int = 100,
