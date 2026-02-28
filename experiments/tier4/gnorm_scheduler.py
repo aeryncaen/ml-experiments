@@ -22,6 +22,7 @@ The scheduler owns group["lr"] and group["scheduled_lr"]. The optimizer
 must NOT write to scheduled_lr.
 """
 
+import math
 from collections import deque
 
 
@@ -239,7 +240,12 @@ class GnormScheduler:
         self.gnorm_ratio = self._smooth_gnorm / max(
             self._smooth_max_gnorm, 1e-12
         )
-        mult = self.gnorm_ratio ** self.schedule_power
+        # Pre-map ratio with exponent, then apply cosine S-curve (AutoNorMuon style).
+        # ratio=1 → cos(0)=1 → mult=1.0 (full LR)
+        # ratio=0 → cos(π)=-1 → mult=0.0 (zero LR)
+        # Cosine is gentler near extremes, steeper in the middle.
+        mapped = self.gnorm_ratio ** self.schedule_power
+        mult = 0.5 * (1.0 + math.cos(math.pi * (1.0 - mapped)))
         self.current_lr = self.base_lr * mult
 
         return self._result(adaptive_active=True)
