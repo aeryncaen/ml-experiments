@@ -2022,13 +2022,7 @@ def _sphere_retract_weights(model: nn.Module):
     """Retract all 2D weight matrices to the product of spheres.
 
     After the optimizer step, each row of every 2D parameter is normalized
-    to unit norm. This keeps weights on the hypersphere without any changes
-    to the forward pass (no LERP, no alpha, no extra norms).
-
-    Skips:
-    - 1D params (biases, LayerNorm/RMSNorm scales, nGPT alphas)
-    - Params with _no_weight_decay or _ngpt_skip_normalize flags
-    - Embedding weights (identified by name) — these have their own geometry
+    to unit norm. Skips embeddings, biases, and 1D params.
     """
     _skip_names = {"wte", "lm_head", "embed", "query_bank", "queries", "memory",
                    "byte_memory", "token_embed", "token_params", "byte_embed"}
@@ -2041,7 +2035,6 @@ def _sphere_retract_weights(model: nn.Module):
             continue
         if any(k in name for k in _skip_names):
             continue
-        # Normalize each row to unit norm
         p.data.div_(p.data.norm(dim=-1, keepdim=True).clamp(min=1e-8))
 
 
@@ -4532,10 +4525,6 @@ def main():
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag} pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={HP.pit_bucket_mode}"
     elif _head == "pit":
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag}"
-    if HP.composite_embed:
-        _extra += " composite_embed=True"
-    if HP.sphere_retract:
-        _extra += " sphere_retract=True"
     if HP.ngpt:
         _extra += f" ngpt=True alpha_init={HP.ngpt_alpha_init}"
     if HP.dd_rope:
@@ -4544,6 +4533,10 @@ def main():
         _extra += " trap_mix=True"
     if HP.ch_loss:
         _extra += " ch_loss=True"
+    if HP.composite_embed:
+        _extra += " composite_embed=True"
+    if HP.sphere_retract:
+        _extra += " sphere_retract=True"
     _sched = f"lr_schedule={HP.lr_schedule}"
     if HP.lr_schedule == "wsd":
         _sched += f" decay_frac={HP.wsd_decay_frac}"
@@ -4721,7 +4714,7 @@ def main():
     raw_model = model  # keep ref before compile/DDP wrapping
     if HP.sphere_retract:
         _sphere_retract_weights(raw_model)
-        print0(rank, f"sphere_retract: initialized weights on product of spheres")
+        print0(rank, "sphere_retract: initial weight retraction applied")
     if HP.compile:
         model = torch.compile(model, dynamic=False)
     if world_size > 1:
