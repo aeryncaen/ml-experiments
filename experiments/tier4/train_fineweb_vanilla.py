@@ -1641,7 +1641,7 @@ class _FusedLerpNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, h: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         # mix = (1 - alpha) * x + alpha * h
-        mix = torch.lerp(x, h, alpha)
+        mix = x + alpha * (h - x)
         norm = mix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         out = mix / norm
         # Save: out (unit-norm result), alpha, norm, x, h
