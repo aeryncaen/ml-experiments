@@ -110,7 +110,7 @@ class HParams:
     schedule_power: float = _env_float("SCHEDULE_POWER", 0.5)  # exponent on gnorm ratio for lr_schedule=gnorm (0.5=sqrt, 1.0=linear)
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     wsd_decay_end_frac: float = _env_float("WSD_DECAY_END_FRAC", 0.0)  # S phase end LR as fraction of start (0.1 = S decays to 10%, D then decays to 10% of that)
-    grad_ckpt: bool = _env_bool("GRAD_CKPT", _env_bool("NGPT", False) or os.environ.get("MODEL_TYPE", "") == "ngpt_moe")
+    grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
     ckpt_dir: str = os.environ.get("CKPT_DIR", "")  # directory for checkpoints; empty = no saving
@@ -1626,16 +1626,6 @@ def _unit_norm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return F.normalize(x, p=2, dim=dim, eps=1e-8)
 
 
-def _lerp_norm(x: torch.Tensor, h: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    """out = unit_norm(x + alpha * (h - x)). Plain ops — compile-friendly."""
-    return _unit_norm(x + alpha * (h - x))
-
-
-def _norm_scale(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """out = unit_norm(x, dim=-1) * scale. Plain ops — compile-friendly."""
-    return _unit_norm(x, dim=-1) * scale
-
-
 def _ngpt_scale_param(shape, init_val: float, scale_val: float) -> nn.Parameter:
     """Create a scaling parameter with the nGPT init/scale trick.
 
@@ -1748,10 +1738,10 @@ class NGPTSelfAttention(nn.Module):
             k = k[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
             v = v[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
 
-        # nGPT: normalize q,k then apply learned scaling (fused for memory)
+        # nGPT: normalize q,k then apply learned scaling
         s_qk = _ngpt_actual(self.s_qk)
-        q = _norm_scale(q, s_qk)
-        k = _norm_scale(k, s_qk)
+        q = _unit_norm(q, dim=-1) * s_qk
+        k = _unit_norm(k, dim=-1) * s_qk
 
         if self.differential:
             return self._forward_diff(x, q, k, v, b, t, c)
@@ -1945,16 +1935,16 @@ class NGPTBlock(nn.Module):
         with torch.autograd.profiler.record_function("ngpt/block_attn"):
             h_a = _unit_norm(self.attn(x))
             alpha_a = _ngpt_actual(self.alpha_attn).abs()
-            x = _lerp_norm(x, h_a, alpha_a)
+            x = _unit_norm(x + alpha_a * (h_a - x))
         with torch.autograd.profiler.record_function("ngpt/block_mlp"):
             h_m = _unit_norm(self.mlp(x))
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
-            x = _lerp_norm(x, h_m, alpha_m)
+            x = _unit_norm(x + alpha_m * (h_m - x))
         if self.embed_gate and self._x0 is not None:
             with torch.autograd.profiler.record_function("ngpt/embed_gate"):
                 h_g = _unit_norm(self.gate_proj(x) * self._x0)
                 alpha_g = _ngpt_actual(self.alpha_gate).abs()
-                x = _lerp_norm(x, h_g, alpha_g)
+                x = _unit_norm(x + alpha_g * (h_g - x))
         return x
 
 
@@ -1998,16 +1988,16 @@ class NGPTMoEBlock(nn.Module):
         with torch.autograd.profiler.record_function("ngpt_moe/block_attn"):
             h_a = _unit_norm(self.attn(x))
             alpha_a = _ngpt_actual(self.alpha_attn).abs()
-            x = _lerp_norm(x, h_a, alpha_a)
+            x = _unit_norm(x + alpha_a * (h_a - x))
         with torch.autograd.profiler.record_function("ngpt_moe/block_mlp"):
             h_m = _unit_norm(self.mlp(x))  # DSMoEMLP returns tensor directly, no drops
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
-            x = _lerp_norm(x, h_m, alpha_m)
+            x = _unit_norm(x + alpha_m * (h_m - x))
         if self.embed_gate and self._x0 is not None:
             with torch.autograd.profiler.record_function("ngpt_moe/embed_gate"):
                 h_g = _unit_norm(self.gate_proj(x) * self._x0)
                 alpha_g = _ngpt_actual(self.alpha_gate).abs()
-                x = _lerp_norm(x, h_g, alpha_g)
+                x = _unit_norm(x + alpha_g * (h_g - x))
         return x
 
 
