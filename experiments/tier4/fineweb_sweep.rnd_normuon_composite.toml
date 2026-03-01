@@ -31,7 +31,7 @@ init_mode = "default"
 optimizer = "normuon"
 muon_lr = 0.023
 
-# WSD schedule: linear decay over final 10% of training, from 100% to 10% of peak LR
+# WSD schedule: S phase linearly decays from 100% to 10% of peak, D phase from 10% to 1% of peak
 lr_schedule = "wsd"
 warmup_frac = 0.10
 wsd_decay_frac = 0.10

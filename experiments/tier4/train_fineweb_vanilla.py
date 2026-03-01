@@ -109,7 +109,7 @@ class HParams:
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure | gnorm
     schedule_power: float = _env_float("SCHEDULE_POWER", 0.5)  # exponent on gnorm ratio for lr_schedule=gnorm (0.5=sqrt, 1.0=linear)
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
-    wsd_decay_end_frac: float = _env_float("WSD_DECAY_END_FRAC", 0.0)  # LR floor as fraction of peak (0.0 = decay to zero, 0.1 = decay to 10% of peak)
+    wsd_decay_end_frac: float = _env_float("WSD_DECAY_END_FRAC", 0.0)  # S phase end LR as fraction of start (0.1 = S decays to 10%, D then decays to 10% of that)
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
@@ -4356,16 +4356,22 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
     warmup_tokens = int(total_tokens * HP.warmup_frac)
 
     if HP.lr_schedule == "wsd":
-        # Warmup-Stable-Decay: hold peak LR, then linear decay in final fraction.
-        # Decays from peak_lr to peak_lr * wsd_decay_end_frac (default 0).
+        # Warmup-Stable-Decay with linear ramps in both S and D phases.
+        # S phase: linear from peak_lr → peak_lr * wsd_decay_end_frac.
+        # D phase: linear from S_end → S_end * wsd_decay_end_frac.
+        # With wsd_decay_end_frac=0.1: S decays to 10% of peak, D decays to 1% of peak.
         decay_tokens = int(total_tokens * HP.wsd_decay_frac)
         stable_end = total_tokens - decay_tokens
+        s_end_lr = HP.lr * HP.wsd_decay_end_frac
         if tokens_seen <= stable_end:
-            return HP.lr
-        t = (tokens_seen - stable_end) / max(1, decay_tokens)
-        t = min(1.0, t)
-        end_lr = HP.lr * HP.wsd_decay_end_frac
-        return HP.lr + (end_lr - HP.lr) * t
+            # S phase: linear decay from peak to s_end_lr
+            t = tokens_seen / max(1, stable_end)
+            return HP.lr + (s_end_lr - HP.lr) * t
+        else:
+            # D phase: linear decay from s_end_lr to s_end_lr * wsd_decay_end_frac
+            t = min(1.0, (tokens_seen - stable_end) / max(1, decay_tokens))
+            d_end_lr = s_end_lr * HP.wsd_decay_end_frac
+            return s_end_lr + (d_end_lr - s_end_lr) * t
     elif HP.lr_schedule == "pressure":
         # Hyperbolic pressure decay: lr = base / (1 + k * t/T)
         # Decays faster early but has a longer tail than cosine.
