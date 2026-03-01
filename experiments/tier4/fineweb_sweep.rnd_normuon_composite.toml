@@ -1,14 +1,14 @@
 [runner]
 # NorMuon transformer sweep: composite embed, LM head type, trap mix.
 # WSD schedule with linear decay from 100% to 10% of peak LR.
-# ~1.05B tokens at seq_len=2048: 8000 * 8 * 8 * 2048 = 1,048,576,000
+# ~262M tokens at seq_len=2048: 2000 * 8 * 8 * 2048 = 262,144,000
 metrics_dir = "experiments/tier4/runs"
 run_prefix = "rnd_normuon_composite"
 skip_existing = true
 continue_on_error = true
 
 [base]
-train_steps = 8000
+train_steps = 2000
 batch_size = 8
 grad_accum = 8
 seq_len = 2048
@@ -29,7 +29,7 @@ init_mode = "default"
 
 # NorMuon optimizer
 optimizer = "normuon"
-muon_lr = 0.23
+muon_lr = 0.023
 
 # WSD schedule: linear decay over final 10% of training, from 100% to 10% of peak LR
 lr_schedule = "wsd"
@@ -41,3 +41,4 @@ wsd_decay_end_frac = 0.10
 composite_embed = [false, true]
 lm_head_type = ["", "pit"]
 trap_mix = [false, true]
+ngpt = [false, true]
