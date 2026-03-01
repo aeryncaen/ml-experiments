@@ -4532,6 +4532,10 @@ def main():
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag} pit_n_buckets={HP.pit_n_buckets} pit_top_k={HP.pit_top_k} pit_router_aux={HP.pit_router_aux_weight} routing={HP.pit_bucket_mode}"
     elif _head == "pit":
         _extra += f" pit_eps={HP.pit_eps} pit_min_diag={HP.pit_min_diag}"
+    if HP.composite_embed:
+        _extra += " composite_embed=True"
+    if HP.sphere_retract:
+        _extra += " sphere_retract=True"
     if HP.ngpt:
         _extra += f" ngpt=True alpha_init={HP.ngpt_alpha_init}"
     if HP.dd_rope:
