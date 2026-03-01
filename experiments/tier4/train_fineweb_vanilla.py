@@ -146,6 +146,11 @@ class HParams:
     geomuon_ns_steps: int = _env_int("GEOMUON_NS_STEPS", 5)  # Newton-Schulz iterations for GeodesicMuon
     init_mode: str = os.environ.get("INIT_MODE", "default")  # default | sphere | ns5
 
+    # Retract weights to the product of spheres after each optimizer step.
+    # Each row of every 2D weight matrix is normalized to unit norm.
+    # This is the useful part of nGPT without the full LERP/alpha machinery.
+    sphere_retract: bool = _env_bool("SPHERE_RETRACT", False)
+
     # nGPT: normalized transformer on the hypersphere (Loshchilov et al. 2025)
     ngpt: bool = _env_bool("NGPT", False)
     ngpt_alpha_init: float = _env_float("NGPT_ALPHA_INIT", 0.0)    # 0 = auto -> 1/n_layers
@@ -2010,6 +2015,34 @@ def _ngpt_normalize_weights(model: nn.Module):
 def _ngpt_normalize_pit_memory(model: nn.Module):
     """No-op: PIT memory normalization removed."""
     pass
+
+
+@torch.no_grad()
+def _sphere_retract_weights(model: nn.Module):
+    """Retract all 2D weight matrices to the product of spheres.
+
+    After the optimizer step, each row of every 2D parameter is normalized
+    to unit norm. This keeps weights on the hypersphere without any changes
+    to the forward pass (no LERP, no alpha, no extra norms).
+
+    Skips:
+    - 1D params (biases, LayerNorm/RMSNorm scales, nGPT alphas)
+    - Params with _no_weight_decay or _ngpt_skip_normalize flags
+    - Embedding weights (identified by name) — these have their own geometry
+    """
+    _skip_names = {"wte", "lm_head", "embed", "query_bank", "queries", "memory",
+                   "byte_memory", "token_embed", "token_params", "byte_embed"}
+    for name, p in model.named_parameters():
+        if p.ndim < 2:
+            continue
+        if getattr(p, "_no_weight_decay", False):
+            continue
+        if getattr(p, "_ngpt_skip_normalize", False):
+            continue
+        if any(k in name for k in _skip_names):
+            continue
+        # Normalize each row to unit norm
+        p.data.div_(p.data.norm(dim=-1, keepdim=True).clamp(min=1e-8))
 
 
 class TransformerFeatureAttnBlock(nn.Module):
@@ -4682,6 +4715,9 @@ def main():
         _base_lrs = [HP.lr] * len(param_groups)
 
     raw_model = model  # keep ref before compile/DDP wrapping
+    if HP.sphere_retract:
+        _sphere_retract_weights(raw_model)
+        print0(rank, f"sphere_retract: initialized weights on product of spheres")
     if HP.compile:
         model = torch.compile(model, dynamic=False)
     if world_size > 1:
@@ -5096,6 +5132,8 @@ def main():
         if _is_ngpt:
             _ngpt_normalize_weights(raw_model)
             _ngpt_normalize_pit_memory(raw_model)
+        if HP.sphere_retract:
+            _sphere_retract_weights(raw_model)
 
         _train_loss_local = float((loss.detach() * _eff_accum).item())
         _train_acc_local = None
