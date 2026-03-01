@@ -1661,14 +1661,13 @@ class _FusedLerpNorm(torch.autograd.Function):
         d_x = d_mix * (1.0 - alpha)
         d_h = d_mix * alpha
 
-        # d_alpha: sum over the embedding dim since alpha broadcasts
-        # d_alpha_full = d_mix * (h - x), then sum over dims that alpha doesn't have
-        d_alpha_full = (d_mix * (h - x)).sum(dim=-1, keepdim=True)
-        # alpha shape is (D,) broadcast over (B,T,D) — sum over B,T
-        # But alpha could be various shapes, so reduce to match
-        if alpha.dim() == 1:
-            # alpha is (D,) — sum over all dims except last
-            d_alpha = d_alpha_full.sum(dim=tuple(range(d_alpha_full.dim() - 1)))
+        # d_alpha: element-wise d_mix * (h - x), then reduce to alpha's shape
+        # alpha is (D,) broadcast over (B,T,D) — sum over batch/seq dims
+        d_alpha_full = d_mix * (h - x)  # (B, T, D)
+        # Sum over all dims that alpha doesn't have (all except the last)
+        if alpha.dim() < d_alpha_full.dim():
+            reduce_dims = tuple(range(d_alpha_full.dim() - alpha.dim()))
+            d_alpha = d_alpha_full.sum(dim=reduce_dims)
         else:
             d_alpha = d_alpha_full
 
