@@ -31,6 +31,9 @@ muon_lr = [0.023]
 # Weight retraction OFF — isolate grad effect.
 autonormuon_weight_schedule = ["off"]
 
+# Sphere retraction: post-step row-norm to product of spheres (nGPT-lite).
+sphere_retract = [false, true]
+
 # Grad schedule ablation — both directions:
 autonormuon_grad_schedule = [
     "off",
