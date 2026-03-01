@@ -20,6 +20,7 @@ from experiments.tier4.normuon import SingleDeviceNorMuonWithAuxAdam
 from experiments.tier4.autonormuon import AutoNorMuon
 from dion.dion2 import Dion2
 from experiments.tier4.spicy_adam import SpicyAdam
+from experiments.tier4.magmuon import SingleDeviceMagMuonWithAuxAdam
 from experiments.tier4.gnorm_scheduler import GnormScheduler
 
 
@@ -245,6 +246,10 @@ class SpicyDionWithScheduler:
         self.scheduler = GnormScheduler(base_lr=muon_lr, n_layers=4)
         self._adam_lr = adam_lr
         self._step_num = 0
+        self._last_loss: float = 0.0
+
+    def set_train_loss(self, loss: float):
+        self._last_loss = loss
 
     def zero_grad(self):
         self.spicy.zero_grad()
@@ -258,7 +263,7 @@ class SpicyDionWithScheduler:
         gnorm = torch.cat([p.grad.flatten() for p in all_params if p.grad is not None]).norm().item()
 
         # Run scheduler
-        sched = self.scheduler.step(gnorm, self._step_num)
+        sched = self.scheduler.step(gnorm, self._last_loss, self._step_num)
         sched_lr = sched["lr"]
         aa = 1.0 if sched["adaptive_active"] else 0.0
 
@@ -309,7 +314,8 @@ class SpicyDionWithScheduler:
             "lr_p100": float(lr_pct[6]),
             "pressure": 0.0,
             "phase": self.scheduler.phase,
-            "gnorm_ratio": self.scheduler.gnorm_ratio,
+            "deviation": self.scheduler.deviation,
+            "loss_ratio": self.scheduler.loss_ratio,
             "tap_count": self.scheduler.tap_count,
         }
 
@@ -477,6 +483,13 @@ def make_normuon(model, muon_lr=0.02, adam_lr=3e-4):
         {"params": adam_p, "use_muon": False, "lr": adam_lr, "weight_decay": 0},
     ])
 
+def make_magmuon(model, muon_lr=0.02, adam_lr=3e-4):
+    muon_p, adam_p = split_params(model)
+    return SingleDeviceMagMuonWithAuxAdam([
+        {"params": muon_p, "use_muon": True, "lr": muon_lr, "weight_decay": 0},
+        {"params": adam_p, "use_muon": False, "lr": adam_lr, "weight_decay": 0},
+    ])
+
 
 def make_adamw(model, lr=3e-4):
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
@@ -505,7 +518,7 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
                 if "initial_lr" not in g:
                     g["initial_lr"] = g["lr"]
                 g["lr"] = pressure_lr(g["initial_lr"], step, steps)
-        elif name in ("Dion2", "Muon", "NorMuon"):
+        elif name in ("Dion2", "Muon", "NorMuon", "MagMuon"):
             cf = cosine_lr(1.0, step, steps)
             for g in optimizer.param_groups:
                 if g.get("use_muon") is True or g.get("algorithm") == "dion2":
@@ -541,6 +554,9 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
         if hasattr(optimizer, "grad_norm_stats"):
             last_grad_stats = optimizer.grad_norm_stats()
 
+        if hasattr(optimizer, "set_train_loss"):
+            optimizer.set_train_loss(float(loss.detach().item()))
+
         optimizer.step()
 
         lv = loss.item()
@@ -555,7 +571,7 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
                     if "phase" in stats:
                         tc = stats.get("tap_count", 0)
                         tc_str = f"(t={tc})" if tc > 0 else ""
-                        phase_str = f" | {stats['phase']}{tc_str} gr={stats['gnorm_ratio']:.3f}"
+                        phase_str = f" | {stats['phase']}{tc_str} dev={stats.get('deviation', 0):.3f}"
                     else:
                         phase_str = ""
                     print(f"  [{name:12s}] step {step:4d} | loss={lv:.4f} | P={stats['pressure']:.3f}{phase_str} | {elapsed:.1f}s")
@@ -602,7 +618,7 @@ def train_run(name, model, optimizer, steps, batch_size, seq_len, vocab, device,
 
 def main():
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    vocab, d_model, n_heads, n_layers, seq_len = 65, 256, 4, 4, 64
+    vocab, d_model, n_heads, n_layers, seq_len = 512, 256, 4, 4, 64
     batch_size, steps = 8, 2000
     muon_lr, adam_lr = 0.02, 3e-4
 
@@ -623,10 +639,11 @@ def main():
     # 2000-step side-by-side benchmark.
     results = []
     for name, make_opt in [
-         ("Spicy-Sched", lambda m: make_spicydion_sched(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
+         ("MagMuon", lambda m: make_magmuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
+         ("NorMuon", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
          ("Spicy-P", lambda m: make_spicydion(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
+         #("Spicy-Sched", lambda m: make_spicydion_sched(m, muon_lr=muon_lr, adam_lr=adam_lr, fraction=1.0, total_steps=steps)),
          #("AutoNorMuon", lambda m: make_autonormuon(m, muon_lr=muon_lr, adam_lr=adam_lr, total_steps=steps)),
-         #("NorMuon", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
          #("NorMuon-P", lambda m: make_normuon(m, muon_lr=muon_lr, adam_lr=adam_lr)),
          #("AdamW", lambda m: make_adamw(m, lr=adam_lr)),
          #("AdamW-P", lambda m: make_adamw(m, lr=adam_lr)),

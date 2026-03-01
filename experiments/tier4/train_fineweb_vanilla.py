@@ -109,6 +109,7 @@ class HParams:
     lr_schedule: str = os.environ.get("LR_SCHEDULE", "cosine")  # cosine | wsd | pressure | gnorm
     schedule_power: float = _env_float("SCHEDULE_POWER", 0.5)  # exponent on gnorm ratio for lr_schedule=gnorm (0.5=sqrt, 1.0=linear)
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
+    wsd_decay_end_frac: float = _env_float("WSD_DECAY_END_FRAC", 0.0)  # LR floor as fraction of peak (0.0 = decay to zero, 0.1 = decay to 10% of peak)
     grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
@@ -4355,14 +4356,16 @@ def lr_for_tokens(tokens_seen: int, total_tokens: int) -> float:
     warmup_tokens = int(total_tokens * HP.warmup_frac)
 
     if HP.lr_schedule == "wsd":
-        # Warmup-Stable-Decay: hold peak LR, then cosine decay in final fraction
+        # Warmup-Stable-Decay: hold peak LR, then linear decay in final fraction.
+        # Decays from peak_lr to peak_lr * wsd_decay_end_frac (default 0).
         decay_tokens = int(total_tokens * HP.wsd_decay_frac)
         stable_end = total_tokens - decay_tokens
         if tokens_seen <= stable_end:
             return HP.lr
-        # Cosine decay from peak to ~0 over the decay phase
         t = (tokens_seen - stable_end) / max(1, decay_tokens)
-        return HP.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+        t = min(1.0, t)
+        end_lr = HP.lr * HP.wsd_decay_end_frac
+        return HP.lr + (end_lr - HP.lr) * t
     elif HP.lr_schedule == "pressure":
         # Hyperbolic pressure decay: lr = base / (1 + k * t/T)
         # Decays faster early but has a longer tail than cosine.
@@ -5064,7 +5067,7 @@ def main():
             optimizer.set_train_loss(float(loss.detach().item()) * _eff_accum)
         # Gnorm scheduler: set LR and adaptive_active on param groups before step.
         if _gnorm_scheduler is not None:
-            _sched = _gnorm_scheduler.step(float(grad_norm), step)
+            _sched = _gnorm_scheduler.step(float(grad_norm), float(loss.detach().item()) * _eff_accum, step)
             _sched_lr = _sched["lr"]
             _sched_aa = 1.0 if _sched["adaptive_active"] else 0.0
             for pg in optimizer.param_groups:
@@ -5125,6 +5128,11 @@ def main():
                 "ch_weights": _ch_weights.detach().float().cpu().tolist() if _ch_active else None,
                 "optimizer_groups": _optimizer_group_metrics(optimizer),
             }
+            if _gnorm_scheduler is not None:
+                _train_event["loss_ratio"] = _gnorm_scheduler.loss_ratio
+                _train_event["deviation"] = _gnorm_scheduler.deviation
+                _train_event["ma_variance"] = _gnorm_scheduler.current_variance
+                _train_event["tap_count"] = _gnorm_scheduler.tap_count
             _write_metrics_event(_metrics, "train", _train_event, HP.metrics_flush_every)
 
         _last_step_wall = time.time()
@@ -5145,7 +5153,10 @@ def main():
                 _adapt_lr = optimizer.param_groups[0].get("_diag_median_adaptive_lr")
                 if _adapt_lr is not None:
                     _adapt_lr_str = f" | adapt_lr {_adapt_lr:.3e}"
-            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_raw_str}{_train_acc_str} | lr {lr:.3e}{_adapt_lr_str} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase} acc={_eff_accum}")
+            _lr_str = ""
+            if _gnorm_scheduler is not None:
+                _lr_str = f" | dev={_gnorm_scheduler.deviation:.3f}"
+            print0(rank, f"step {step:5d} | train_loss {loss_t.item():.5f}{_ch_raw_str}{_train_acc_str} | lr {lr:.3e}{_adapt_lr_str} | gnorm {grad_norm:.3f} | sec/step {dt:.3f} | {_phase}{_lr_str} acc={_eff_accum}")
             if _ch_active and step % 100 == 0:
                 _ch_parts = [f"{n}={_ch_source_losses[i]:.2f}({_ch_weights[i]:.3f})" for i, n in enumerate(train_stream.source_names)]
                 print0(rank, f"  ch_weights: {' '.join(_ch_parts)}")
