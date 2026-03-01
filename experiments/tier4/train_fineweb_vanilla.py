@@ -110,7 +110,7 @@ class HParams:
     schedule_power: float = _env_float("SCHEDULE_POWER", 0.5)  # exponent on gnorm ratio for lr_schedule=gnorm (0.5=sqrt, 1.0=linear)
     wsd_decay_frac: float = _env_float("WSD_DECAY_FRAC", 0.1)  # fraction of total tokens for decay phase
     wsd_decay_end_frac: float = _env_float("WSD_DECAY_END_FRAC", 0.0)  # S phase end LR as fraction of start (0.1 = S decays to 10%, D then decays to 10% of that)
-    grad_ckpt: bool = _env_bool("GRAD_CKPT", False)
+    grad_ckpt: bool = _env_bool("GRAD_CKPT", _env_bool("NGPT", False) or os.environ.get("MODEL_TYPE", "") == "ngpt_moe")
     dtype: str = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
     ch_loss: bool = _env_bool("CH_LOSS", False)  # contraharmonic mean loss across data sources
     ckpt_dir: str = os.environ.get("CKPT_DIR", "")  # directory for checkpoints; empty = no saving
@@ -1626,6 +1626,94 @@ def _unit_norm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return F.normalize(x, p=2, dim=dim, eps=1e-8)
 
 
+# ── Fused autograd functions for nGPT memory efficiency ─────────────────────
+# Without these, each _unit_norm + LERP creates ~4 intermediate tensors saved
+# for backward. The fused versions save only what's needed.
+
+class _FusedLerpNorm(torch.autograd.Function):
+    """Fused: out = unit_norm(x + alpha * (h - x))
+
+    Saves 3 tensors for backward (out, alpha, inv_norm) instead of ~6
+    intermediates from the unfused eager graph.
+    x and h are recomputed from out/alpha when needed for d_alpha.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, h: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        # mix = (1 - alpha) * x + alpha * h
+        mix = torch.lerp(x, h, alpha)
+        norm = mix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        out = mix / norm
+        # Save: out (unit-norm result), alpha, norm, x, h
+        # x and h are inputs already alive — saving references is cheap.
+        # We need them for d_alpha = sum(d_mix * (h - x)).
+        ctx.save_for_backward(out, alpha, norm, x, h)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        out, alpha, norm, x, h = ctx.saved_tensors
+        # Backward of normalize: d_mix = (g - out * (g·out).sum(-1,keepdim)) / norm
+        dot = (grad_out * out).sum(dim=-1, keepdim=True)
+        d_mix = (grad_out - out * dot) / norm
+
+        # Backward of lerp: mix = (1-alpha)*x + alpha*h
+        d_x = d_mix * (1.0 - alpha)
+        d_h = d_mix * alpha
+
+        # d_alpha: sum over the embedding dim since alpha broadcasts
+        # d_alpha_full = d_mix * (h - x), then sum over dims that alpha doesn't have
+        d_alpha_full = (d_mix * (h - x)).sum(dim=-1, keepdim=True)
+        # alpha shape is (D,) broadcast over (B,T,D) — sum over B,T
+        # But alpha could be various shapes, so reduce to match
+        if alpha.dim() == 1:
+            # alpha is (D,) — sum over all dims except last
+            d_alpha = d_alpha_full.sum(dim=tuple(range(d_alpha_full.dim() - 1)))
+        else:
+            d_alpha = d_alpha_full
+
+        return d_x, d_h, d_alpha
+
+
+def _fused_lerp_norm(x: torch.Tensor, h: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """out = unit_norm(x + alpha * (h - x)), memory-efficient."""
+    return _FusedLerpNorm.apply(x, h, alpha)
+
+
+class _FusedNormScale(torch.autograd.Function):
+    """Fused: out = unit_norm(x, dim=-1) * scale
+
+    Used for Q/K normalization + s_qk scaling in nGPT attention.
+    Saves 2 tensors (out, scale) instead of ~4 intermediates.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        x_normed = x / norm
+        out = x_normed * scale
+        ctx.save_for_backward(x_normed, scale, norm)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x_normed, scale, norm = ctx.saved_tensors
+        # Backward of scale: d_xnormed = g * scale, d_scale = sum(g * x_normed)
+        d_xnormed = grad_out * scale
+        d_scale = (grad_out * x_normed).sum(dim=tuple(range(grad_out.dim() - 1)))
+
+        # Backward of normalize: d_x = (d_xnormed - x_normed * (d_xnormed·x_normed).sum(-1,keepdim)) / norm
+        dot = (d_xnormed * x_normed).sum(dim=-1, keepdim=True)
+        d_x = (d_xnormed - x_normed * dot) / norm
+
+        return d_x, d_scale
+
+
+def _fused_norm_scale(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """out = unit_norm(x, dim=-1) * scale, memory-efficient."""
+    return _FusedNormScale.apply(x, scale)
+
+
 def _ngpt_scale_param(shape, init_val: float, scale_val: float) -> nn.Parameter:
     """Create a scaling parameter with the nGPT init/scale trick.
 
@@ -1738,10 +1826,10 @@ class NGPTSelfAttention(nn.Module):
             k = k[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
             v = v[:, :, :, None, :].expand(b, t, self.n_kv_head, self.n_kv_groups, self.head_dim).reshape(b, t, self.n_head, self.head_dim)
 
-        # nGPT: normalize q,k then apply learned scaling
+        # nGPT: normalize q,k then apply learned scaling (fused for memory)
         s_qk = _ngpt_actual(self.s_qk)
-        q = _unit_norm(q, dim=-1) * s_qk
-        k = _unit_norm(k, dim=-1) * s_qk
+        q = _fused_norm_scale(q, s_qk)
+        k = _fused_norm_scale(k, s_qk)
 
         if self.differential:
             return self._forward_diff(x, q, k, v, b, t, c)
@@ -1935,16 +2023,16 @@ class NGPTBlock(nn.Module):
         with torch.autograd.profiler.record_function("ngpt/block_attn"):
             h_a = _unit_norm(self.attn(x))
             alpha_a = _ngpt_actual(self.alpha_attn).abs()
-            x = _unit_norm(x + alpha_a * (h_a - x))
+            x = _fused_lerp_norm(x, h_a, alpha_a)
         with torch.autograd.profiler.record_function("ngpt/block_mlp"):
             h_m = _unit_norm(self.mlp(x))
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
-            x = _unit_norm(x + alpha_m * (h_m - x))
+            x = _fused_lerp_norm(x, h_m, alpha_m)
         if self.embed_gate and self._x0 is not None:
             with torch.autograd.profiler.record_function("ngpt/embed_gate"):
                 h_g = _unit_norm(self.gate_proj(x) * self._x0)
                 alpha_g = _ngpt_actual(self.alpha_gate).abs()
-                x = _unit_norm(x + alpha_g * (h_g - x))
+                x = _fused_lerp_norm(x, h_g, alpha_g)
         return x
 
 
@@ -1988,16 +2076,16 @@ class NGPTMoEBlock(nn.Module):
         with torch.autograd.profiler.record_function("ngpt_moe/block_attn"):
             h_a = _unit_norm(self.attn(x))
             alpha_a = _ngpt_actual(self.alpha_attn).abs()
-            x = _unit_norm(x + alpha_a * (h_a - x))
+            x = _fused_lerp_norm(x, h_a, alpha_a)
         with torch.autograd.profiler.record_function("ngpt_moe/block_mlp"):
             h_m = _unit_norm(self.mlp(x))  # DSMoEMLP returns tensor directly, no drops
             alpha_m = _ngpt_actual(self.alpha_mlp).abs()
-            x = _unit_norm(x + alpha_m * (h_m - x))
+            x = _fused_lerp_norm(x, h_m, alpha_m)
         if self.embed_gate and self._x0 is not None:
             with torch.autograd.profiler.record_function("ngpt_moe/embed_gate"):
                 h_g = _unit_norm(self.gate_proj(x) * self._x0)
                 alpha_g = _ngpt_actual(self.alpha_gate).abs()
-                x = _unit_norm(x + alpha_g * (h_g - x))
+                x = _fused_lerp_norm(x, h_g, alpha_g)
         return x
 
 
